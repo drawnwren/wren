@@ -2,7 +2,7 @@
 
 Measures the architecture's startup scenarios and records speculative-frame,
 head-validated correct-frame, and interactive times separately. Scenarios A
-and B1 can be gated at 10ms with `--gate`; B2–D are explicitly reported with
+and B1 can be gated at 5ms with `--gate`; B2–D are explicitly reported with
 cache-control limitations in the JSON metadata.
 
 ```sh

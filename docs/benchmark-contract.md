@@ -2,13 +2,14 @@
 
 `wren-latency` records physical-input-to-transaction, physical-input-to-grid,
 TaskCommand checkpoint/cancellation, and terminal completion distributions.
-The 4ms hard gate applies only to realtime desired grids and task yield gaps;
-terminal write and dropped-frame backpressure are reported separately.
+Realtime desired grids now gate at p99 <1ms. Task yield gaps gate at p99 <1ms
+while retaining the architecture's <4ms maximum safety ceiling. Terminal write
+and dropped-frame backpressure are reported separately.
 
 `wren-startup` records speculative, correct, and interactive timestamps for A,
 B1, B2, C, and D. A loads an actual persistent `PublishedViewport` and validates
 it through the daemon-style shared-memory head table. B1 uses a known deep byte
-range and page-cache-hot `pread`. A/B1 gate at 10ms. B3 is emitted only when a
+range and page-cache-hot `pread`. A/B1 gate at 5ms. B3 is emitted only when a
 caller supplies a mounted network/FUSE file; the harness does not mislabel a
 local path. B2/D disclose that portable user-space code does not control kernel
 cache eviction; the bare-metal runner controls that environment.
@@ -27,6 +28,8 @@ provider freshness and bounded latest-wins queue depth, snapshot retention
 remote materialization convergence plus fsynced persisted-save latency. The
 crash-recovery matrix is executed by the `wren-session` and `wren-sessiond`
 fault-injection suites in the same CI run.
+Provider-freshness p99 gates are 2ms for normal documents, 1ms for large
+documents, and 0.25ms for pathological documents.
 Its remote gate additionally requires active `tc netem` and a real dual-lane
 OpenSSH target; the local materializer/cache probe is labeled as a non-
 authoritative algorithm smoke test.

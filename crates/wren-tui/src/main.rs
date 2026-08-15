@@ -7525,6 +7525,7 @@ enum ProviderWorkerMessage {
     Refresh(Box<ProviderRefresh>),
     Complete(Box<ProviderCompletion>),
     HighlightNow(Box<ImmediateHighlight>),
+    Wake,
     Stop,
 }
 
@@ -7556,6 +7557,7 @@ enum ProviderWorkerResult {
 
 struct ProviderWorker {
     sender: mpsc::SyncSender<ProviderWorkerMessage>,
+    immediate_sender: mpsc::Sender<ProviderWorkerMessage>,
     results: mpsc::Receiver<ProviderWorkerResult>,
     join: Option<JoinHandle<()>>,
 }
@@ -7569,6 +7571,7 @@ fn join_worker_thread(join: &mut Option<JoinHandle<()>>) {
 impl ProviderWorker {
     fn start() -> Result<Self> {
         let (sender, requests) = mpsc::sync_channel(8);
+        let (immediate_sender, immediate_requests) = mpsc::channel();
         let (results, receiver) = mpsc::channel();
         #[cfg(not(test))]
         let executable = env::current_exe().context("locate provider executable")?;
@@ -7576,13 +7579,14 @@ impl ProviderWorker {
             .name("wren-provider-supervisor".to_owned())
             .spawn(move || {
                 #[cfg(test)]
-                provider_actor_loop(requests, results);
+                provider_actor_loop(requests, immediate_requests, results);
                 #[cfg(not(test))]
-                provider_process_loop(executable, requests, results);
+                provider_process_loop(executable, requests, immediate_requests, results);
             })
             .context("spawn provider supervisor")?;
         Ok(Self {
             sender,
+            immediate_sender,
             results: receiver,
             join: Some(join),
         })
@@ -7612,7 +7616,7 @@ impl ProviderWorker {
         bundle: LanguageBundle,
     ) -> Result<Vec<HighlightSpan>> {
         let (reply, response) = mpsc::channel();
-        self.sender
+        self.immediate_sender
             .send(ProviderWorkerMessage::HighlightNow(Box::new(
                 ImmediateHighlight {
                     document_id,
@@ -7623,6 +7627,15 @@ impl ProviderWorker {
                 },
             )))
             .map_err(|_| anyhow!("provider process stopped"))?;
+        // Wake an idle provider without putting the synchronous request behind
+        // already queued viewport or completion work. A full background queue
+        // already guarantees that the worker is awake.
+        if matches!(
+            self.sender.try_send(ProviderWorkerMessage::Wake),
+            Err(mpsc::TrySendError::Disconnected(_))
+        ) {
+            return Err(anyhow!("provider process stopped"));
+        }
         response
             .recv_timeout(Duration::from_millis(200))
             .map_err(|_| anyhow!("provider first-frame highlight timed out"))?
@@ -7641,34 +7654,46 @@ impl Drop for ProviderWorker {
 fn provider_process_loop(
     executable: PathBuf,
     requests: mpsc::Receiver<ProviderWorkerMessage>,
+    immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
     results: mpsc::Sender<ProviderWorkerResult>,
 ) {
     let supervisor = ProviderSupervisor::spawn_with_args(&executable, ["--internal-provider-host"]);
     let mut supervisor = match supervisor {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            provider_failures_until_stop(&requests, &results, error.to_string());
+            provider_failures_until_stop(
+                &requests,
+                &immediate_requests,
+                &results,
+                error.to_string(),
+            );
             return;
         }
     };
     if let Err(error) = supervisor.request(&ProviderRequest::Hello { protocol: 1 }) {
-        provider_failures_until_stop(&requests, &results, error.to_string());
+        provider_failures_until_stop(&requests, &immediate_requests, &results, error.to_string());
         return;
     }
-    provider_loop(requests, results, |request| supervisor.request(request));
+    provider_loop(requests, immediate_requests, results, |request| {
+        supervisor.request(request)
+    });
 }
 
 #[cfg(test)]
 fn provider_actor_loop(
     requests: mpsc::Receiver<ProviderWorkerMessage>,
+    immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
     results: mpsc::Sender<ProviderWorkerResult>,
 ) {
     let mut actor = ProviderActor::default();
-    provider_loop(requests, results, |request| actor.handle(request.clone()));
+    provider_loop(requests, immediate_requests, results, |request| {
+        actor.handle(request.clone())
+    });
 }
 
 fn provider_loop(
     requests: mpsc::Receiver<ProviderWorkerMessage>,
+    immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
     results: mpsc::Sender<ProviderWorkerResult>,
     mut request: impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) {
@@ -7677,7 +7702,16 @@ fn provider_loop(
     // scroll while still replacing the provider snapshot on each revision.
     let mut uploaded =
         BTreeMap::<DocumentId, (DocumentRevision, wren_types::ProviderGeneration)>::new();
-    while let Ok(message) = requests.recv() {
+    loop {
+        let message = match immediate_requests.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                let Ok(message) = requests.recv() else {
+                    return;
+                };
+                message
+            }
+        };
         match message {
             ProviderWorkerMessage::Refresh(refresh) => {
                 let refresh = *refresh;
@@ -7855,6 +7889,7 @@ fn provider_loop(
                 }
                 let _ = reply.send(result);
             }
+            ProviderWorkerMessage::Wake => {}
             ProviderWorkerMessage::Stop => return,
         }
     }
@@ -7863,10 +7898,20 @@ fn provider_loop(
 #[cfg(not(test))]
 fn provider_failures_until_stop(
     requests: &mpsc::Receiver<ProviderWorkerMessage>,
+    immediate_requests: &mpsc::Receiver<ProviderWorkerMessage>,
     results: &mpsc::Sender<ProviderWorkerResult>,
     message: String,
 ) {
-    while let Ok(request) = requests.recv() {
+    loop {
+        let request = match immediate_requests.try_recv() {
+            Ok(request) => request,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                let Ok(request) = requests.recv() else {
+                    return;
+                };
+                request
+            }
+        };
         match request {
             ProviderWorkerMessage::Refresh(refresh) => {
                 let _ = results.send(ProviderWorkerResult::Failed {
@@ -7886,6 +7931,7 @@ fn provider_failures_until_stop(
                 } = *highlight;
                 let _ = reply.send(Err(format!("document {document_id:?}: {message}")));
             }
+            ProviderWorkerMessage::Wake => {}
             ProviderWorkerMessage::Stop => break,
         }
     }
@@ -10727,14 +10773,94 @@ while True:
     }
 
     #[test]
+    fn immediate_highlight_overtakes_queued_background_provider_work() {
+        let (sender, requests) = mpsc::sync_channel(8);
+        let (immediate_sender, immediate_requests) = mpsc::channel();
+        let (results, _receiver) = mpsc::channel();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let update_order = Arc::new(Mutex::new(Vec::new()));
+        let observed_order = Arc::clone(&update_order);
+        let worker = thread::spawn(move || {
+            let mut actor = ProviderActor::default();
+            let mut first_update = true;
+            provider_loop(requests, immediate_requests, results, |request| {
+                if let ProviderRequest::UpdateDocument { document_id, .. } = request {
+                    observed_order
+                        .lock()
+                        .expect("update order")
+                        .push(*document_id);
+                    if first_update {
+                        first_update = false;
+                        started_sender.send(()).expect("signal first update");
+                        release_receiver.recv().expect("release first update");
+                    }
+                }
+                actor.handle(request.clone())
+            });
+        });
+        let revision = DocumentRevision::new(1);
+        let bundle = language_bundle(Some(Path::new("priority.rs")));
+        let refresh = |document_id: DocumentId| {
+            ProviderWorkerMessage::Refresh(Box::new(ProviderRefresh {
+                buffer_id: BufferId::new(document_id.get()),
+                document_id,
+                revision,
+                text: "fn background() {}\n".into(),
+                bundle: bundle.clone(),
+                visible: 0..19,
+                near_viewport: 0..19,
+            }))
+        };
+        let first = DocumentId::new(1);
+        let second = DocumentId::new(2);
+        let immediate = DocumentId::new(3);
+        sender.send(refresh(first)).expect("queue active refresh");
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first refresh started");
+        sender.send(refresh(second)).expect("queue waiting refresh");
+        let (reply, response) = mpsc::channel();
+        immediate_sender
+            .send(ProviderWorkerMessage::HighlightNow(Box::new(
+                ImmediateHighlight {
+                    document_id: immediate,
+                    revision,
+                    text: "fn immediate() {}\n".into(),
+                    bundle,
+                    reply,
+                },
+            )))
+            .expect("queue immediate highlight");
+        sender
+            .try_send(ProviderWorkerMessage::Wake)
+            .expect("wake provider");
+        release_sender.send(()).expect("release provider");
+        response
+            .recv_timeout(Duration::from_secs(1))
+            .expect("immediate response")
+            .expect("fresh immediate highlight");
+        assert_eq!(
+            &update_order.lock().expect("update order")[..2],
+            &[first, immediate],
+            "first-frame syntax must not wait behind queued background work"
+        );
+        sender
+            .send(ProviderWorkerMessage::Stop)
+            .expect("stop provider");
+        worker.join().expect("provider worker");
+    }
+
+    #[test]
     fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
         let (sender, requests) = mpsc::channel();
+        let (_immediate_sender, immediate_requests) = mpsc::channel();
         let (results, receiver) = mpsc::channel();
         let updates = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&updates);
         let worker = thread::spawn(move || {
             let mut actor = ProviderActor::default();
-            provider_loop(requests, results, |request| {
+            provider_loop(requests, immediate_requests, results, |request| {
                 if matches!(request, ProviderRequest::UpdateDocument { .. }) {
                     observed.fetch_add(1, Ordering::Relaxed);
                 }

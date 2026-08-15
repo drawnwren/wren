@@ -21,7 +21,9 @@ use wren_text::{DefaultText, TextStore};
 use wren_types::{CommandTask, CommandTaskId, DocumentId, Effects, Transaction};
 use wren_view::{TerminalPatch, ViewportLayout};
 
-const REALTIME_GATE_NANOS: u64 = 4_000_000;
+const REALTIME_P99_GATE_NANOS: u64 = 1_000_000;
+const TASK_YIELD_P99_GATE_NANOS: u64 = 1_000_000;
+const TASK_YIELD_MAX_GATE_NANOS: u64 = 4_000_000;
 
 #[derive(Debug)]
 struct Arguments {
@@ -410,7 +412,7 @@ fn main() -> Result<()> {
     let case_report = case_histograms
         .iter()
         .map(|(name, distribution_histogram)| {
-            let passed = distribution_histogram.value_at_quantile(0.99) < REALTIME_GATE_NANOS;
+            let passed = distribution_histogram.value_at_quantile(0.99) < REALTIME_P99_GATE_NANOS;
             (
                 (*name).to_owned(),
                 json!({
@@ -422,16 +424,18 @@ fn main() -> Result<()> {
         })
         .collect::<serde_json::Map<_, _>>();
     let realtime_pass = case_histograms.values().all(|distribution_histogram| {
-        distribution_histogram.value_at_quantile(0.99) < REALTIME_GATE_NANOS
+        distribution_histogram.value_at_quantile(0.99) < REALTIME_P99_GATE_NANOS
     });
-    let task_yield_pass = task_yields.max() < REALTIME_GATE_NANOS;
+    let task_yield_p99_pass = task_yields.value_at_quantile(0.99) < TASK_YIELD_P99_GATE_NANOS;
+    let task_yield_max_pass = task_yields.max() < TASK_YIELD_MAX_GATE_NANOS;
+    let task_yield_pass = task_yield_p99_pass && task_yield_max_pass;
     let report = json!({
         "schema": 2,
         "unit": "nanoseconds",
         "iterations": arguments.iterations,
         "cpu_requested": arguments.cpu,
         "cpu_pinned": pinned,
-        "hard_gate_nanos": REALTIME_GATE_NANOS,
+        "hard_gate_nanos": REALTIME_P99_GATE_NANOS,
         "physical_input_to_transaction_commit": distribution(&commit_histogram),
         "physical_input_to_desired_frame_ready": {
             "hard_gate": true,
@@ -442,6 +446,10 @@ fn main() -> Result<()> {
         "task_command_yield_to_ui": {
             "hard_gate": true,
             "passed": task_yield_pass,
+            "p99_gate_nanos": TASK_YIELD_P99_GATE_NANOS,
+            "maximum_gate_nanos": TASK_YIELD_MAX_GATE_NANOS,
+            "p99_passed": task_yield_p99_pass,
+            "maximum_passed": task_yield_max_pass,
             "distribution": distribution(&task_yields),
         },
         "task_command_cancellation_latency": distribution(&task_cancellations),
@@ -473,8 +481,15 @@ fn main() -> Result<()> {
     }
     println!("{rendered}");
     if arguments.gate {
-        anyhow::ensure!(realtime_pass, "RealtimeCommand p99 exceeded 4ms");
-        anyhow::ensure!(task_yield_pass, "TaskCommand checkpoint gap exceeded 4ms");
+        anyhow::ensure!(realtime_pass, "RealtimeCommand p99 exceeded 1ms");
+        anyhow::ensure!(
+            task_yield_p99_pass,
+            "TaskCommand checkpoint-gap p99 exceeded 1ms"
+        );
+        anyhow::ensure!(
+            task_yield_max_pass,
+            "TaskCommand checkpoint gap exceeded the 4ms safety ceiling"
+        );
     }
     Ok(())
 }

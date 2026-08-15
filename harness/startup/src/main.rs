@@ -21,7 +21,7 @@ use wren_types::{
 };
 use wren_view::ViewportLayout;
 
-const GATE_NANOS: u64 = 10_000_000;
+const GATE_NANOS: u64 = 5_000_000;
 const VIEWPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -546,8 +546,8 @@ fn main() -> Result<()> {
     }
     println!("{rendered}");
     if arguments.gate {
-        anyhow::ensure!(a_pass, "scenario A p99 exceeded 10ms");
-        anyhow::ensure!(b1_pass, "scenario B1 p99 exceeded 10ms");
+        anyhow::ensure!(a_pass, "scenario A p99 exceeded 5ms");
+        anyhow::ensure!(b1_pass, "scenario B1 p99 exceeded 5ms");
     }
     Ok(())
 }

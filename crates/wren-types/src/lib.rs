@@ -571,7 +571,7 @@ impl DocumentClass {
     pub const fn policy(self) -> DocumentPolicy {
         match self {
             Self::Normal => DocumentPolicy {
-                syntax_cpu_budget_micros: 8_000,
+                syntax_cpu_budget_micros: 2_000,
                 whole_document_syntax: true,
                 lsp_freshness_slo_millis: Some(250),
                 native_completion: true,
@@ -580,7 +580,7 @@ impl DocumentClass {
                 approximate_display_columns: false,
             },
             Self::Large => DocumentPolicy {
-                syntax_cpu_budget_micros: 2_000,
+                syntax_cpu_budget_micros: 1_000,
                 whole_document_syntax: false,
                 lsp_freshness_slo_millis: None,
                 native_completion: true,
@@ -589,7 +589,7 @@ impl DocumentClass {
                 approximate_display_columns: false,
             },
             Self::Pathological => DocumentPolicy {
-                syntax_cpu_budget_micros: 500,
+                syntax_cpu_budget_micros: 250,
                 whole_document_syntax: false,
                 lsp_freshness_slo_millis: None,
                 native_completion: true,
@@ -1503,6 +1503,9 @@ mod tests {
         assert!(large.native_completion && pathological.native_completion);
         assert!(normal.syntax_cpu_budget_micros > large.syntax_cpu_budget_micros);
         assert!(large.syntax_cpu_budget_micros > pathological.syntax_cpu_budget_micros);
+        assert_eq!(normal.syntax_cpu_budget_micros, 2_000);
+        assert_eq!(large.syntax_cpu_budget_micros, 1_000);
+        assert_eq!(pathological.syntax_cpu_budget_micros, 250);
         assert!(pathological.approximate_display_columns);
     }
 
