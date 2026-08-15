@@ -1,4 +1,8 @@
 /target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
 /result
 /result-*
 /.direnv/
@@ -8,4 +12,3 @@
 /harness/conformance/.determinism-*/
 /dhat-heap.json
 **/*.profraw
-

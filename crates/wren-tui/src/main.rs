@@ -26,7 +26,7 @@ use wren_provider::ProviderActor;
 use wren_provider::ProviderSupervisor;
 use wren_provider::{
     CompletionCandidate, CompletionSession, HighlightSpan, ProviderRequest, ProviderResponse,
-    fuzzy_rank, highlight_text,
+    fuzzy_rank, lexical_highlight_text,
 };
 use wren_session::{
     DocumentEncoding, LocalDocument, LocalWal, MutationOutbox, MutationSubmission, OpenedDocument,
@@ -5993,7 +5993,16 @@ impl App {
             return;
         }
         let bundle = language_bundle(self.active.document.presentation_path());
-        let spans = highlight_text(&self.active.editor.contents(), &bundle.language_id)
+        let text = self.active.editor.contents();
+        let spans = self
+            .provider
+            .highlight_now(
+                self.active.document_id,
+                revision,
+                text.clone().into_boxed_str(),
+                bundle,
+            )
+            .unwrap_or_else(|_| lexical_highlight_text(&text))
             .into_iter()
             .map(|span| provider_decoration(span, self.theme))
             .collect::<Vec<_>>();
@@ -6011,7 +6020,6 @@ impl App {
         }
         let text_store = self.active.editor.text();
         let text_len = text_store.len_bytes();
-        let bundle = language_bundle(self.active.document.presentation_path());
         let mut targets = transaction
             .edits
             .iter()
@@ -6046,7 +6054,7 @@ impl App {
                 continue;
             };
             replacement.extend(
-                highlight_text(source, &bundle.language_id)
+                lexical_highlight_text(source)
                     .into_iter()
                     .map(|mut span| {
                         span.range.start = span.range.start.saturating_add(context.start);
@@ -6766,7 +6774,17 @@ impl App {
             Err(error) => format!("Unable to preview file: {error}"),
         });
         let bundle = language_bundle(Some(&path));
-        self.picker_preview_decorations = highlight_text(&self.picker_preview, &bundle.language_id)
+        let revision = DocumentRevision::new(0);
+        let spans = self
+            .provider
+            .highlight_now(
+                stable_document_id(Some(&path)),
+                revision,
+                self.picker_preview.clone().into_boxed_str(),
+                bundle,
+            )
+            .unwrap_or_else(|_| lexical_highlight_text(&self.picker_preview));
+        self.picker_preview_decorations = spans
             .into_iter()
             .map(|span| provider_decoration(span, self.theme))
             .collect();
@@ -7402,7 +7420,16 @@ struct LspBackgroundResult {
 enum ProviderWorkerMessage {
     Refresh(Box<ProviderRefresh>),
     Complete(Box<ProviderCompletion>),
+    HighlightNow(Box<ImmediateHighlight>),
     Stop,
+}
+
+struct ImmediateHighlight {
+    document_id: DocumentId,
+    revision: DocumentRevision,
+    text: Box<str>,
+    bundle: LanguageBundle,
+    reply: mpsc::Sender<Result<Vec<HighlightSpan>, String>>,
 }
 
 enum ProviderWorkerResult {
@@ -7471,6 +7498,31 @@ impl ProviderWorker {
 
     fn try_result(&self) -> Option<ProviderWorkerResult> {
         self.results.try_recv().ok()
+    }
+
+    fn highlight_now(
+        &self,
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        text: Box<str>,
+        bundle: LanguageBundle,
+    ) -> Result<Vec<HighlightSpan>> {
+        let (reply, response) = mpsc::channel();
+        self.sender
+            .send(ProviderWorkerMessage::HighlightNow(Box::new(
+                ImmediateHighlight {
+                    document_id,
+                    revision,
+                    text,
+                    bundle,
+                    reply,
+                },
+            )))
+            .map_err(|_| anyhow!("provider process stopped"))?;
+        response
+            .recv_timeout(Duration::from_millis(200))
+            .map_err(|_| anyhow!("provider first-frame highlight timed out"))?
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -7649,6 +7701,56 @@ fn provider_loop(
                     return;
                 }
             }
+            ProviderWorkerMessage::HighlightNow(highlight) => {
+                let ImmediateHighlight {
+                    document_id,
+                    revision,
+                    text,
+                    bundle,
+                    reply,
+                } = *highlight;
+                let identity = (revision, bundle.provider_generation());
+                let text_len = text.len();
+                let update = request(&ProviderRequest::UpdateDocument {
+                    document_id,
+                    revision,
+                    text,
+                    bundle,
+                });
+                let outcome = match update {
+                    Ok(ProviderResponse::Updated { .. }) => {
+                        uploaded.insert(document_id, identity);
+                        request(&ProviderRequest::Demand {
+                            document_id,
+                            demand: ProviderDemand {
+                                revision,
+                                visible: std::iter::once(0..text_len).collect(),
+                                near_viewport: Vec::new(),
+                                priority: Priority::Visible,
+                            },
+                        })
+                    }
+                    Ok(response) => Err(wren_provider::ProviderError::Json(serde_json::Error::io(
+                        std::io::Error::other(format!(
+                            "unexpected immediate highlight response {response:?}"
+                        )),
+                    ))),
+                    Err(error) => Err(error),
+                };
+                let result = match outcome {
+                    Ok(ProviderResponse::Highlight(highlight))
+                        if highlight.freshness == Freshness::Fresh =>
+                    {
+                        Ok(highlight.spans)
+                    }
+                    Ok(response) => Err(format!("stale or unexpected highlight {response:?}")),
+                    Err(error) => Err(error.to_string()),
+                };
+                if result.is_err() {
+                    uploaded.remove(&document_id);
+                }
+                let _ = reply.send(result);
+            }
             ProviderWorkerMessage::Stop => return,
         }
     }
@@ -7673,6 +7775,12 @@ fn provider_failures_until_stop(
                     document_id: completion.document_id,
                     message: message.clone(),
                 });
+            }
+            ProviderWorkerMessage::HighlightNow(highlight) => {
+                let ImmediateHighlight {
+                    document_id, reply, ..
+                } = *highlight;
+                let _ = reply.send(Err(format!("document {document_id:?}: {message}")));
             }
             ProviderWorkerMessage::Stop => break,
         }
@@ -7839,14 +7947,13 @@ fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (String, Vec<
         let trimmed = line.trim();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if let Some((start, language)) = code_block.take() {
-                code_spans.extend(
-                    highlight_text(&text[start..], normalized_fence_language(&language))
-                        .into_iter()
-                        .map(|mut span| {
-                            span.range = start + span.range.start..start + span.range.end;
-                            provider_decoration(span, theme)
-                        }),
-                );
+                let _language = normalized_fence_language(&language);
+                code_spans.extend(lexical_highlight_text(&text[start..]).into_iter().map(
+                    |mut span| {
+                        span.range = start + span.range.start..start + span.range.end;
+                        provider_decoration(span, theme)
+                    },
+                ));
             } else {
                 code_block = Some((text.len(), fence.trim().to_owned()));
             }
@@ -7855,8 +7962,9 @@ fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (String, Vec<
         text.push_str(line);
     }
     if let Some((start, language)) = code_block {
+        let _language = normalized_fence_language(&language);
         code_spans.extend(
-            highlight_text(&text[start..], normalized_fence_language(&language))
+            lexical_highlight_text(&text[start..])
                 .into_iter()
                 .map(|mut span| {
                     span.range = start + span.range.start..start + span.range.end;

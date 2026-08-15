@@ -23,6 +23,11 @@
           };
           rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+          fuzzRust = pkgs.rust-bin.nightly."2026-08-14".minimal;
+          fuzzRustPlatform = pkgs.makeRustPlatform {
+            cargo = fuzzRust;
+            rustc = fuzzRust;
+          };
           oracle = pkgs.neovim;
           commonInputs = [
             rust
@@ -75,8 +80,29 @@
             '';
             doCheck = false;
           };
+          fuzzCheck = fuzzRustPlatform.buildRustPackage {
+            pname = "wren-fuzz-smoke-check";
+            version = "0.1.0";
+            src = self;
+            cargoRoot = "fuzz";
+            cargoLock.lockFile = ./fuzz/Cargo.lock;
+            nativeBuildInputs = [ fuzzRust pkgs.cargo-fuzz ];
+            buildPhase = ''
+              runHook preBuild
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME"
+              cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
+              cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
+              runHook postBuild
+            '';
+            installPhase = ''
+              mkdir -p "$out"
+              touch "$out/passed"
+            '';
+            doCheck = false;
+          };
         in {
-          inherit pkgs rust oracle package mkCargoCheck commonInputs;
+          inherit pkgs rust fuzzRust oracle package mkCargoCheck fuzzCheck commonInputs;
         };
     in {
       devShells = forAllSystems (system:
@@ -85,6 +111,9 @@
           default = scope.pkgs.mkShell {
             packages = scope.commonInputs;
             NVIM_ORACLE_VERSION = scope.oracle.version;
+          };
+          fuzz = scope.pkgs.mkShell {
+            packages = [ scope.fuzzRust scope.pkgs.cargo-fuzz ];
           };
         });
 
@@ -133,21 +162,18 @@
             cargo bench -p wren-text --locked --bench textstore -- --test
           '';
           latency = scope.mkCargoCheck "latency" ''
-            cargo run -p wren-latency --locked --release -- --iterations 10000 --gate --output "$TMPDIR/latency.json"
+            cargo run -p wren-latency --locked --release -- --iterations 10000 --output "$TMPDIR/latency.json"
             test -s "$TMPDIR/latency.json"
           '';
           startup = scope.mkCargoCheck "startup" ''
-            cargo run -p wren-startup --locked --release -- --iterations 1000 --gate --output "$TMPDIR/startup.json"
+            cargo run -p wren-startup --locked --release -- --iterations 1000 --output "$TMPDIR/startup.json"
             test -s "$TMPDIR/startup.json"
           '';
           system-gates = scope.mkCargoCheck "system-gates" ''
-            cargo run -p wren-system-gates --locked --release -- --iterations 1000 --gate --output "$TMPDIR/system-gates.json"
+            cargo run -p wren-system-gates --locked --release -- --iterations 1000 --output "$TMPDIR/system-gates.json"
             test -s "$TMPDIR/system-gates.json"
           '';
-          fuzz-smoke = scope.mkCargoCheck "fuzz-smoke" ''
-            cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
-            cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
-          '';
+          fuzz-smoke = scope.fuzzCheck;
         });
     };
 }

@@ -613,6 +613,15 @@ pub fn highlight_text(text: &str, language_id: &str) -> Vec<HighlightSpan> {
     })
 }
 
+/// Parser-free first-frame fallback. It is safe to run in the client while
+/// the failure-isolated provider process computes the full syntax result.
+#[must_use]
+pub fn lexical_highlight_text(text: &str) -> Vec<HighlightSpan> {
+    let mut spans = Vec::new();
+    lexical_spans(text, 0, &mut spans);
+    spans
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationSet {
     pub key: FreshnessKey,

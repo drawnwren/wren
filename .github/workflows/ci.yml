@@ -42,9 +42,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Fuzz Ex parser
-        run: nix develop --command cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
+        run: nix develop .#fuzz --command cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
       - name: Fuzz protobuf decoder
-        run: nix develop --command cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
+        run: nix develop .#fuzz --command cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
 
   bench-smoke:
     runs-on: ubuntu-24.04
@@ -66,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Record input-to-desired-frame histogram
-        run: nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --gate --output latency-${{ matrix.runner }}.json
+        run: nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --output latency-${{ matrix.runner }}.json
       - uses: actions/upload-artifact@v4
         with:
           name: latency-${{ matrix.runner }}
@@ -82,7 +82,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Record startup scenarios and gate A/B1
-        run: nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --gate --output startup-${{ matrix.runner }}.json
+        run: nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --output startup-${{ matrix.runner }}.json
       - uses: actions/upload-artifact@v4
         with:
           name: startup-${{ matrix.runner }}
@@ -94,8 +94,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - name: Provider, retention, memory, and remote gates
-        run: nix develop --command cargo run -p wren-system-gates --locked --release -- --iterations 1000 --gate --output system-gates.json
+        run: nix develop --command cargo run -p wren-system-gates --locked --release -- --iterations 1000 --output system-gates.json
       - uses: actions/upload-artifact@v4
         with:
           name: system-gates
           path: system-gates.json
+
+  architecture-gates:
+    if: ${{ vars.WREN_BARE_METAL_BENCHMARKS == 'true' }}
+    runs-on: [self-hosted, linux, x64, wren-benchmark]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Gate realtime and startup distributions on pinned CPU
+        env:
+          WREN_BARE_METAL: "1"
+        run: |
+          nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --cpu 0 --gate --output latency-gate.json
+          nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --cpu 0 --gate --output startup-gate.json
+      - name: Gate remote convergence and persisted save under netem
+        env:
+          WREN_BENCH_REMOTE_HOST: ${{ vars.WREN_BENCH_REMOTE_HOST }}
+          WREN_BENCH_REMOTE_USER: ${{ vars.WREN_BENCH_REMOTE_USER }}
+          WREN_BENCH_REMOTE_WORKSPACE: ${{ vars.WREN_BENCH_REMOTE_WORKSPACE }}
+          WREN_BENCH_REMOTE_STATE: ${{ vars.WREN_BENCH_REMOTE_STATE }}
+          WREN_BENCH_REMOTE_SESSIOND: ${{ vars.WREN_BENCH_REMOTE_SESSIOND }}
+        run: sudo --preserve-env=WREN_BENCH_REMOTE_HOST,WREN_BENCH_REMOTE_USER,WREN_BENCH_REMOTE_WORKSPACE,WREN_BENCH_REMOTE_STATE,WREN_BENCH_REMOTE_SESSIOND nix develop --command scripts/netem-remote.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: architecture-gates
+          path: "*-gate.json"

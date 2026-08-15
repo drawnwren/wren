@@ -16,9 +16,17 @@ cache eviction; the bare-metal runner controls that environment.
 Both harnesses emit HDR histogram JSON and accept CPU affinity. Macro-replayed
 keys are excluded by construction.
 
+`--gate` is authoritative only with `WREN_BARE_METAL=1`, an explicit `--cpu`,
+and successful affinity. Hosted CI runs publish non-gating distributions. The
+dedicated architecture runner additionally verifies its CPU governor; hardware
+key-to-photon JSON is included when supplied and is never a gate.
+
 `wren-system-gates` covers the remaining recorded families: per-DocumentClass
 provider freshness and bounded latest-wins queue depth, snapshot retention
 (`oldest_live_revision` and retained bytes), process peak/steady RSS, and
 remote materialization convergence plus fsynced persisted-save latency. The
 crash-recovery matrix is executed by the `wren-session` and `wren-sessiond`
 fault-injection suites in the same CI run.
+Its remote gate additionally requires active `tc netem` and a real dual-lane
+OpenSSH target; the local materializer/cache probe is labeled as a non-
+authoritative algorithm smoke test.

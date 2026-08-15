@@ -157,6 +157,52 @@ fn fixture_text() -> String {
     line.repeat(24_000)
 }
 
+fn mounted_filesystem_type(path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+        return mountinfo
+            .lines()
+            .filter_map(|line| {
+                let (mount, filesystem) = line.split_once(" - ")?;
+                let mountpoint = PathBuf::from(mount.split_whitespace().nth(4)?);
+                canonical
+                    .starts_with(&mountpoint)
+                    .then(|| filesystem.split_whitespace().next().map(str::to_owned))
+                    .flatten()
+                    .map(|filesystem| (mountpoint.components().count(), filesystem))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, filesystem)| filesystem);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("stat")
+            .args(["-f", "%T"])
+            .arg(canonical)
+            .output()
+            .ok()?;
+        return output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn is_network_or_fuse_path(path: &Path) -> bool {
+    mounted_filesystem_type(path).is_some_and(|filesystem| {
+        let filesystem = filesystem.to_ascii_lowercase();
+        filesystem.starts_with("fuse")
+            || matches!(
+                filesystem.as_str(),
+                "nfs" | "nfs4" | "cifs" | "smbfs" | "sshfs" | "9p" | "afs" | "davfs"
+            )
+    })
+}
+
 fn resume_state() -> ResumeViewState {
     ResumeViewState {
         client_id: ClientId::new(1),
@@ -399,6 +445,12 @@ fn main() -> Result<()> {
     }
     let cpu_pinned = arguments.cpu.is_some_and(pin_cpu);
     validate_gate_environment(&arguments, cpu_pinned)?;
+    if let Some(path) = &arguments.b3_path {
+        anyhow::ensure!(
+            is_network_or_fuse_path(path),
+            "--b3-path must resolve to a mounted network or FUSE filesystem"
+        );
+    }
     let fixture = fixture_text();
     let directory = tempdir().context("startup fixture directory")?;
     let fixture_path = directory.path().join("fixture.rs");

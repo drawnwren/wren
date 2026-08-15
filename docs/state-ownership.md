@@ -12,7 +12,8 @@ mutation path here before implementation.
 | resume cursor/selections/layout | `wren-client-state` | client durable | atomic checksummed checkpoint |
 | published viewport cache | `wren-client-state` | disposable | full-keyed checkpoint; shared-head validation |
 | whole-mutation outbox | `wren-session::MutationOutbox` | client durable | append before send; compact on `Durable` only |
-| registers, histories, macro/dot state, undo branch head | durable client state | client durable | mutation state deltas + async checkpoint |
+| registers, histories, macro recordings (raw keys + IR), dot state | durable client state | client durable | mutation state deltas + async checkpoint |
+| global jumplist/marks and undo branch head | durable client state | client durable | document anchors + atomic mutation state deltas |
 | canonical text, revision, immutable undo groups | session authority | document | fenced `DocumentMutation` only |
 | session event order, leases, dedup | session authority journal | workspace session | synchronized journal records |
 | shared authoritative heads | `wren-sessiond` / `wren-shmem` | daemon | single-writer atomic seqlock batch |

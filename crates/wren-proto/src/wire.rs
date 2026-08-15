@@ -1451,11 +1451,29 @@ mod tests {
             mutation_id: semantic::MutationId::new(9),
             client_id: semantic::ClientId::new(4),
             client_sequence: semantic::ClientSequence::new(3),
-            state_deltas: vec![semantic::StateDelta::Register {
-                name: 'a',
-                text: "copied".into(),
-                linewise: false,
-            }],
+            state_deltas: vec![
+                semantic::StateDelta::Register {
+                    name: 'a',
+                    text: "copied".into(),
+                    linewise: false,
+                },
+                semantic::StateDelta::MacroRecording {
+                    name: 'q',
+                    raw_keys: vec![1, 2],
+                    lowered_ir: vec![3, 4],
+                },
+                semantic::StateDelta::JumpList {
+                    entries: vec![semantic::DurableJumpEntry {
+                        document_id: semantic::DocumentId::new(2),
+                        anchor: semantic::Anchor {
+                            byte: 7,
+                            bias: semantic::Bias::Right,
+                        },
+                        path_hint: Some("/workspace/main.rs".into()),
+                    }],
+                    current: Some(0),
+                },
+            ],
             documents: vec![semantic::DocumentMutation {
                 document_id: semantic::DocumentId::new(2),
                 lease_epoch: semantic::LeaseEpoch::new(7),

@@ -314,14 +314,14 @@ fn simulated_remote_metrics(iterations: u64) -> Result<Value> {
     }
     let verified = cache.get(hash)?.as_deref() == Some(bytes.as_slice());
     Ok(json!({
-            "authoritative_gate": false,
-            "verified": verified,
-            "workspace_generation": WorkspaceGeneration::new(1).get(),
-            "bytes": bytes.len(),
-            "chunks": chunks.len(),
-            "remote_convergence": distribution(&convergence),
-            "persisted_save": distribution(&persisted_save),
-        }))
+        "authoritative_gate": false,
+        "verified": verified,
+        "workspace_generation": WorkspaceGeneration::new(1).get(),
+        "bytes": bytes.len(),
+        "chunks": chunks.len(),
+        "remote_convergence": distribution(&convergence),
+        "persisted_save": distribution(&persisted_save),
+    }))
 }
 
 fn remote_metrics(iterations: u64, spec: &OpenSshSpec) -> Result<(Value, bool)> {
@@ -334,8 +334,8 @@ fn remote_metrics(iterations: u64, spec: &OpenSshSpec) -> Result<(Value, bool)> 
     .wrapping_add(u64::from(std::process::id()));
     let client_id = ClientId::new(nonce.max(1));
     let document_id = DocumentId::new(nonce.rotate_left(17).max(1));
-    let path = env::var("WREN_BENCH_REMOTE_PATH")
-        .unwrap_or_else(|_| ".wren-system-gates.txt".to_owned());
+    let path =
+        env::var("WREN_BENCH_REMOTE_PATH").unwrap_or_else(|_| ".wren-system-gates.txt".to_owned());
     let mut client = RemoteWorkspaceClient::connect(spec)?;
     client.heartbeat(nonce)?;
     let opened = client.open(document_id, client_id, path, None)?;
