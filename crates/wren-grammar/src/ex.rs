@@ -124,6 +124,7 @@ pub enum ExCommand {
     Help {
         topic: Option<Box<str>>,
     },
+    Messages,
     ConvertUtf8,
     Terminal {
         program: Option<Box<str>>,
@@ -276,6 +277,7 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
         "h" | "help" => Ok(ExCommand::Help {
             topic: optional_argument(argument),
         }),
+        "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
         "convertutf8" => Ok(ExCommand::ConvertUtf8),
         "term" | "terminal" => {
             let mut words = argument.split_whitespace();
@@ -675,6 +677,15 @@ mod tests {
             ExCommand::Find {
                 query: "src main".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_message_and_debug_log_commands() {
+        assert_eq!(parse_ex("messages").expect("messages"), ExCommand::Messages);
+        assert_eq!(
+            parse_ex("debuglog").expect("debug log"),
+            ExCommand::Messages
         );
     }
 

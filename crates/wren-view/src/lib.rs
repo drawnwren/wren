@@ -1879,6 +1879,13 @@ impl ViewportLayout {
             background: Some(CellColor::Rgb(self.theme.base)),
             ..CellStyle::default()
         };
+        // A popup can extend past the final explicit cell in a short editor
+        // row. Preserve that row's implicit tail before painting the float;
+        // otherwise the terminal diff uses the popup border as the style for
+        // ClearToEndOfLine and floods everything to its right with that color.
+        for target in rows.iter_mut().skip(row).take(height) {
+            materialize_row_tail(target, grid.width);
+        }
         draw_popup_frame(
             &mut rows,
             column,
@@ -2650,6 +2657,23 @@ fn pad_row_to(row: &mut CellRow, column: usize) {
             style: CellStyle::default(),
         });
     }
+}
+
+fn materialize_row_tail(row: &mut CellRow, width: usize) {
+    let current = row
+        .cells
+        .iter()
+        .map(|cell| usize::from(cell.width))
+        .sum::<usize>();
+    let style = row
+        .cells
+        .last()
+        .map_or_else(CellStyle::default, |cell| cell.style);
+    row.cells.extend((current..width).map(|_| Cell {
+        grapheme: " ".into(),
+        width: 1,
+        style,
+    }));
 }
 
 fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: RgbColor) {
@@ -3568,6 +3592,36 @@ mod tests {
                 Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
             );
         }
+    }
+
+    #[test]
+    fn text_popup_crossing_color_limit_preserves_the_underlying_tail_background() {
+        let mut layout = ViewportLayout::new(120, 8);
+        layout.configure_dotfile_profile();
+        let base = layout.desired_grid(&EngineFrame {
+            text: "x\nx\nx\nx\n".into(),
+            cursor_byte: 0,
+        });
+        let popup = TextPopup {
+            title: "hover".into(),
+            text: "a".repeat(80).into(),
+            scroll: 0,
+            decorations: Vec::new(),
+        };
+
+        let grid = layout.apply_text_popup(base, &popup);
+        let interior = &grid.rows[2];
+
+        assert_eq!(
+            interior.cells[82].style.background,
+            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)),
+            "popup must repaint the color-column cell with its own surface"
+        );
+        assert_eq!(
+            interior.cells[100].style.background,
+            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)),
+            "the terminal tail beyond the popup must retain the editor overflow background"
+        );
     }
 
     #[test]

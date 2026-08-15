@@ -46,8 +46,8 @@ use wren_types::{
 use wren_view::{
     AceJumpOverlay, AceJumpTarget, CatppuccinFlavor, CatppuccinPalette, CellColor, CellStyle,
     ClientViewModel, CompletionOverlay, CompletionOverlayRow, DebugOverlay, DecorationSpan,
-    DesiredGrid, LineDecoration, PickerOverlay, PickerOverlayRow, RgbColor, SplitAxis,
-    StatusOverlay, StatusSegment, TextPopup, ViewportLayout, WindowDirection,
+    DesiredGrid, LineDecoration, MessageEntry, MessageSeverity, PickerOverlay, PickerOverlayRow,
+    RgbColor, SplitAxis, StatusOverlay, StatusSegment, TextPopup, ViewportLayout, WindowDirection,
 };
 use wren_workflow::{
     DocumentVisibility, LspClient, LspPosition, LspTextEdit, PtySession, SavePolicy,
@@ -98,6 +98,7 @@ EX COMMANDS:
     :s/old/new/g   :%s/old/new/g       literal substitution
     :undo   :redo   :normal KEYS       editing commands
     :registers   :marks                inspect durable state
+    :messages / :debuglog               view debug output
     :find [QUERY]                       fuzzy file picker
     :terminal [PROGRAM]                 interactive terminal buffer
     :make PROGRAM [ARGS]                cancellable build task
@@ -180,6 +181,7 @@ fn main() -> Result<()> {
                         if let Err(error) = result {
                             app.show_error(error);
                         }
+                        app.capture_debug_output();
                         needs_render = true;
                         let clipboard_after = app
                             .active
@@ -229,6 +231,7 @@ fn main() -> Result<()> {
         if app.poll_popup_timeout() {
             needs_render = true;
         }
+        app.capture_debug_output();
         presenter.check_failure()?;
         if !app.quit && needs_render {
             app.schedule_provider_refreshes(layout.height);
@@ -1187,6 +1190,7 @@ impl App {
             viewport_rows: 24,
             quit: false,
         };
+        app.capture_debug_output();
         app.record_active_file();
         app.prime_active_syntax();
         app.begin_lsp_start();
@@ -1414,6 +1418,7 @@ impl App {
                     "buffer",
                     "cdo",
                     "close",
+                    "debuglog",
                     "edit",
                     "find",
                     "format",
@@ -1421,6 +1426,7 @@ impl App {
                     "help",
                     "make",
                     "marks",
+                    "messages",
                     "nohlsearch",
                     "normal",
                     "quit",
@@ -1543,7 +1549,12 @@ impl App {
         if self.ace_jump.is_some() {
             return self.handle_ace_jump_key(key);
         }
-        if key.code == TerminalKeyCode::Escape && self.popup.take().is_some() {
+        let dismisses_popup = key.code == TerminalKeyCode::Escape
+            || (key.code == TerminalKeyCode::Char('K')
+                && !key.control
+                && !key.alt
+                && !key.super_key);
+        if dismisses_popup && self.popup.take().is_some() {
             self.popup_deadline = None;
             self.leader_keys = None;
             self.leader_deadline = None;
@@ -2291,16 +2302,99 @@ impl App {
         Ok(true)
     }
 
+    fn show_info(&mut self, information: impl std::fmt::Display) {
+        self.show_message(MessageSeverity::Info, information);
+    }
+
     fn show_error(&mut self, error: impl std::fmt::Display) {
-        let message = error.to_string();
+        self.show_message(MessageSeverity::Error, error);
+    }
+
+    fn show_message(&mut self, severity: MessageSeverity, message: impl std::fmt::Display) {
+        let message = message.to_string();
+        self.record_debug_output(severity, &message);
         self.message = message.clone();
+        if severity == MessageSeverity::Error {
+            self.popup = Some(TextPopup {
+                title: "Error".into(),
+                text: message.into(),
+                scroll: 0,
+                decorations: Vec::new(),
+            });
+            self.popup_deadline = Some(Instant::now() + Duration::from_secs(8));
+        }
+    }
+
+    fn capture_debug_output(&mut self) {
+        if self.message.is_empty() {
+            return;
+        }
+        let message = self.message.clone();
+        self.record_debug_output(MessageSeverity::Info, &message);
+    }
+
+    fn record_debug_output(&mut self, severity: MessageSeverity, text: &str) {
+        const MAX_ENTRIES: usize = 512;
+        if text.trim().is_empty()
+            || self
+                .views
+                .messages
+                .entries
+                .last()
+                .is_some_and(|entry| entry.text.as_ref() == text)
+        {
+            return;
+        }
+        let sequence = self
+            .views
+            .messages
+            .entries
+            .last()
+            .map_or(1, |entry| entry.sequence.saturating_add(1));
+        self.views.messages.entries.push(MessageEntry {
+            sequence,
+            severity,
+            text: text.into(),
+        });
+        let overflow = self
+            .views
+            .messages
+            .entries
+            .len()
+            .saturating_sub(MAX_ENTRIES);
+        if overflow > 0 {
+            self.views.messages.entries.drain(..overflow);
+        }
+    }
+
+    fn show_debug_output(&mut self) {
+        self.capture_debug_output();
+        let text = if self.views.messages.entries.is_empty() {
+            "No debug output has been recorded.".to_owned()
+        } else {
+            self.views
+                .messages
+                .entries
+                .iter()
+                .map(|entry| {
+                    let severity = match entry.severity {
+                        MessageSeverity::Info => "INFO",
+                        MessageSeverity::Warning => "WARN",
+                        MessageSeverity::Error => "ERROR",
+                    };
+                    format!("{:04} [{severity}] {}", entry.sequence, entry.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         self.popup = Some(TextPopup {
-            title: "Error".into(),
-            text: message.into(),
+            title: "Messages · debug output".into(),
+            text: text.into(),
             scroll: 0,
             decorations: Vec::new(),
         });
-        self.popup_deadline = Some(Instant::now() + Duration::from_secs(8));
+        self.popup_deadline = None;
+        self.message.clear();
     }
 
     fn poll_popup_timeout(&mut self) -> bool {
@@ -2342,10 +2436,16 @@ impl App {
     }
 
     fn engine_error(&mut self, error: EngineError) {
-        if matches!(error, EngineError::InvalidGrammar) {
-            self.active.editor.cancel_pending();
+        match error {
+            EngineError::InvalidGrammar { sequence, reason } => {
+                self.active.editor.cancel_pending();
+                self.show_info(format!(
+                    "grammar rejected sequence {:?}: {reason}",
+                    format_key_sequence(&sequence)
+                ));
+            }
+            error => self.show_error(error),
         }
-        self.show_error(error);
     }
 
     fn after_transaction(&mut self, transaction: Option<wren_types::Transaction>) {
@@ -2692,6 +2792,10 @@ impl App {
                     || "run `wren --help` for the command reference".to_owned(),
                     |topic| format!("help for {topic}: run `wren --help`"),
                 );
+                Ok(())
+            }
+            ExCommand::Messages => {
+                self.show_debug_output();
                 Ok(())
             }
             ExCommand::Grep { pattern, paths } => self.grep(&pattern, &paths),
@@ -9400,6 +9504,50 @@ fn grammar_key(key: TerminalKey) -> Option<KeyEvent> {
     Some(KeyEvent { code, modifiers })
 }
 
+fn format_key_sequence(sequence: &[KeyEvent]) -> String {
+    sequence.iter().map(format_key_event).collect()
+}
+
+fn format_key_event(key: &KeyEvent) -> String {
+    let base = match key.code {
+        KeyCode::Char(' ') => "Space".to_owned(),
+        KeyCode::Char(character) => character.to_string(),
+        KeyCode::Escape => "Esc".to_owned(),
+        KeyCode::Enter => "CR".to_owned(),
+        KeyCode::Tab => "Tab".to_owned(),
+        KeyCode::Backspace => "BS".to_owned(),
+        KeyCode::Delete => "Del".to_owned(),
+        KeyCode::Home => "Home".to_owned(),
+        KeyCode::End => "End".to_owned(),
+        KeyCode::PageUp => "PageUp".to_owned(),
+        KeyCode::PageDown => "PageDown".to_owned(),
+        KeyCode::Left => "Left".to_owned(),
+        KeyCode::Right => "Right".to_owned(),
+        KeyCode::Up => "Up".to_owned(),
+        KeyCode::Down => "Down".to_owned(),
+    };
+    if key.modifiers.is_empty() {
+        return match key.code {
+            KeyCode::Char(character) if character != ' ' && !character.is_control() => base,
+            _ => format!("<{base}>"),
+        };
+    }
+    let mut modifiers = Vec::with_capacity(4);
+    if key.modifiers.contains(Modifiers::CONTROL) {
+        modifiers.push("C");
+    }
+    if key.modifiers.contains(Modifiers::SHIFT) {
+        modifiers.push("S");
+    }
+    if key.modifiers.contains(Modifiers::ALT) {
+        modifiers.push("A");
+    }
+    if key.modifiers.contains(Modifiers::SUPER) {
+        modifiers.push("D");
+    }
+    format!("<{}-{base}>", modifiers.join("-"))
+}
+
 fn register_snapshot(editor: &Editor<DefaultText>) -> BTreeMap<char, (Box<str>, bool)> {
     editor
         .registers()
@@ -10676,6 +10824,25 @@ while True:
     }
 
     #[test]
+    fn k_closes_an_open_popup_instead_of_requesting_another_hover() {
+        let mut app = App::open(None, None).expect("app");
+        app.popup = Some(TextPopup {
+            title: "Documentation".into(),
+            text: "hover details".into(),
+            scroll: 0,
+            decorations: Vec::new(),
+        });
+        app.popup_deadline = Some(Instant::now() + Duration::from_secs(6));
+
+        app.handle_editor_key(terminal_character('K'))
+            .expect("dismiss popup");
+
+        assert!(app.popup.is_none());
+        assert!(app.popup_deadline.is_none());
+        assert!(app.pending_lsp_hover.is_none());
+    }
+
+    #[test]
     fn recoverable_errors_render_as_timed_help_style_floats() {
         let mut app = App::open(None, None).expect("app");
         app.show_error("definition response omitted its URI");
@@ -10700,6 +10867,46 @@ while True:
         assert!(rendered.contains("╭"));
         assert!(rendered.contains("Error"));
         assert!(rendered.contains("definition response omitted its URI"));
+    }
+
+    #[test]
+    fn messages_command_opens_bounded_severity_tagged_debug_output() {
+        let mut app = App::open(None, None).expect("app");
+        app.message = "language server starting".to_owned();
+        app.capture_debug_output();
+        app.show_error("provider worker disconnected");
+
+        app.execute_ex("messages").expect("show messages");
+
+        let popup = app.popup.as_ref().expect("debug output popup");
+        assert_eq!(popup.title.as_ref(), "Messages · debug output");
+        assert!(popup.text.contains("[INFO] language server starting"));
+        assert!(popup.text.contains("[ERROR] provider worker disconnected"));
+        assert!(app.popup_deadline.is_none());
+        assert!(app.message.is_empty());
+    }
+
+    #[test]
+    fn rejected_grammar_sequence_is_info_and_does_not_open_an_error_popup() {
+        let mut app = App::open(None, None).expect("app");
+
+        app.dispatch_key(KeyEvent::character('d'));
+        app.dispatch_key(KeyEvent::character('Q'));
+
+        assert!(app.popup.is_none());
+        assert!(app.popup_deadline.is_none());
+        assert!(app.message.contains("grammar rejected sequence \"dQ\""));
+        assert!(app.views.messages.entries.last().is_some_and(|entry| {
+            entry.severity == MessageSeverity::Info && entry.text.contains("\"dQ\"")
+        }));
+
+        app.show_error("provider crashed");
+        assert!(app.popup.as_ref().is_some_and(|popup| {
+            popup.title.as_ref() == "Error" && popup.text.as_ref() == "provider crashed"
+        }));
+        assert!(app.views.messages.entries.last().is_some_and(|entry| {
+            entry.severity == MessageSeverity::Error && entry.text.as_ref() == "provider crashed"
+        }));
     }
 
     #[cfg(unix)]

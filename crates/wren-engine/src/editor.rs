@@ -115,8 +115,11 @@ pub enum EngineError {
     RevisionMismatch { expected: u64, actual: u64 },
     #[error("document revision overflow")]
     RevisionOverflow,
-    #[error("grammar rejected the pending key sequence")]
-    InvalidGrammar,
+    #[error("grammar rejected the pending key sequence: {reason}")]
+    InvalidGrammar {
+        sequence: Box<[KeyEvent]>,
+        reason: Box<str>,
+    },
     #[error("macro recursion limit exceeded")]
     MacroRecursion,
     #[error("document is read-only")]
@@ -727,10 +730,13 @@ impl<T: TextStore> Editor<T> {
                 self.parse_state = Some(state);
                 Ok(None)
             }
-            ParseResult::Invalid(_) => {
-                self.pending_keys.clear();
+            ParseResult::Invalid(error) => {
+                let sequence = std::mem::take(&mut self.pending_keys).into_boxed_slice();
                 self.parse_state = None;
-                Err(EngineError::InvalidGrammar)
+                Err(EngineError::InvalidGrammar {
+                    sequence,
+                    reason: error.to_string().into(),
+                })
             }
             ParseResult::Command(command) => {
                 self.pending_keys.clear();
@@ -848,18 +854,26 @@ impl<T: TextStore> Editor<T> {
                 self.parse_state = Some(state);
                 Ok(None)
             }
-            ParseResult::Invalid(_) => {
-                self.cancel_pending();
-                Err(EngineError::InvalidGrammar)
+            ParseResult::Invalid(error) => {
+                let sequence = std::mem::take(&mut self.pending_keys).into_boxed_slice();
+                self.parse_state = None;
+                Err(EngineError::InvalidGrammar {
+                    sequence,
+                    reason: error.to_string().into(),
+                })
             }
             ParseResult::Command(Command::Move { motion, count }) => {
                 self.cancel_pending();
                 self.move_visual_head(motion, count.get());
                 Ok(None)
             }
-            ParseResult::Command(_) => {
-                self.cancel_pending();
-                Err(EngineError::InvalidGrammar)
+            ParseResult::Command(command) => {
+                let sequence = std::mem::take(&mut self.pending_keys).into_boxed_slice();
+                self.parse_state = None;
+                Err(EngineError::InvalidGrammar {
+                    sequence,
+                    reason: format!("command {command:?} is not valid in visual mode").into(),
+                })
             }
         }
     }
@@ -2208,8 +2222,19 @@ impl<T: TextStore> Editor<T> {
         control: PendingControl,
         key: KeyEvent,
     ) -> Result<Option<Transaction>, EngineError> {
+        let prefix = match control {
+            PendingControl::RecordMacro => 'q',
+            PendingControl::ReplayMacro => '@',
+            PendingControl::SetMark => 'm',
+            PendingControl::JumpMark { linewise: true } => '\'',
+            PendingControl::JumpMark { linewise: false } => '`',
+        };
+        let rejected = || EngineError::InvalidGrammar {
+            sequence: vec![KeyEvent::character(prefix), key].into_boxed_slice(),
+            reason: "invalid target for pending command".into(),
+        };
         let KeyCode::Char(character) = key.code else {
-            return Err(EngineError::InvalidGrammar);
+            return Err(rejected());
         };
         match control {
             PendingControl::RecordMacro if character.is_ascii_alphanumeric() => {
@@ -2243,7 +2268,7 @@ impl<T: TextStore> Editor<T> {
                 }
                 Ok(None)
             }
-            _ => Err(EngineError::InvalidGrammar),
+            _ => Err(rejected()),
         }
     }
 
