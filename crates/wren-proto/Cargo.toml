@@ -1,0 +1,13 @@
+[package]
+name = "wren-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "wren-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+filetime.workspace = true
+imara-diff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wren-proto = { version = "0.1.0", path = "../wren-proto" }
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

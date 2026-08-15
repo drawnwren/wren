@@ -1,0 +1,33 @@
+[package]
+name = "wren-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wren-grammar = { path = "../crates/wren-grammar" }
+wren-proto = { path = "../crates/wren-proto" }
+
+[[bin]]
+name = "ex_parse"
+path = "fuzz_targets/ex_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "deny"

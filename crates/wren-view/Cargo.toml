@@ -1,0 +1,16 @@
+[package]
+name = "wren-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+serde.workspace = true
+wren-engine = { version = "0.1.0", path = "../wren-engine" }
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[lints]
+workspace = true

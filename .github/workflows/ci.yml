@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Generate non-committed corpus
+        run: nix develop --command cargo run -p wren-corpus --locked --bin wren-corpus -- generate
+      - name: Format
+        run: nix develop --command cargo fmt --all --check
+      - name: Clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings -D unsafe-code
+      - name: Dependency policy
+        run: nix develop --command cargo deny check
+      - name: Layer policy
+        run: nix develop --command python3 scripts/layer-check.py
+      - name: Tests
+        run: nix develop --command cargo nextest run --workspace --locked
+
+  conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Deterministic Neovim oracle regeneration
+        run: nix develop --command cargo run -p wren-conformance --locked -- --check-determinism
+      - name: Wren differential against pinned goldens
+        run: nix develop --command cargo run -p wren-conformance --locked -- --check-wren
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Fuzz Ex parser
+        run: nix develop --command cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
+      - name: Fuzz protobuf decoder
+        run: nix develop --command cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
+
+  bench-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Generate benchmark corpus
+        run: nix develop --command cargo run -p wren-corpus --locked --bin wren-corpus -- generate
+      - name: Complete Criterion smoke run
+        run: nix develop --command cargo bench -p wren-text --locked --bench textstore -- --test
+
+  latency:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Record input-to-desired-frame histogram
+        run: nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --gate --output latency-${{ matrix.runner }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latency-${{ matrix.runner }}
+          path: latency-${{ matrix.runner }}.json
+
+  startup:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Record startup scenarios and gate A/B1
+        run: nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --gate --output startup-${{ matrix.runner }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: startup-${{ matrix.runner }}
+          path: startup-${{ matrix.runner }}.json
+
+  system-gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Provider, retention, memory, and remote gates
+        run: nix develop --command cargo run -p wren-system-gates --locked --release -- --iterations 1000 --gate --output system-gates.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: system-gates
+          path: system-gates.json

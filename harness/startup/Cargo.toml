@@ -1,0 +1,21 @@
+[package]
+name = "wren-startup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+core_affinity.workspace = true
+hdrhistogram.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
+wren-client-state = { version = "0.1.0", path = "../../crates/wren-client-state" }
+wren-session = { version = "0.1.0", path = "../../crates/wren-session" }
+wren-shmem = { version = "0.1.0", path = "../../crates/wren-shmem" }
+wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
+wren-view = { version = "0.1.0", path = "../../crates/wren-view" }
+
+[lints]
+workspace = true

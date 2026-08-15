@@ -1,0 +1,4 @@
+# Add only reviewed, intentional semantic differences from the pinned oracle.
+# Every entry requires an exact JSON pointer and an explanation.
+divergence = []
+

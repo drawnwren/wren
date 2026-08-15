@@ -1,0 +1,21 @@
+[package]
+name = "wren-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+proptest.workspace = true
+rmpv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+wren-grammar = { version = "0.1.0", path = "../../crates/wren-grammar" }
+wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
+wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
+
+[lints]
+workspace = true

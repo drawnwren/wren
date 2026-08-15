@@ -1,0 +1,31 @@
+[package]
+name = "wren-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+memory-profiling = ["dep:dhat"]
+
+[dependencies]
+crop.workspace = true
+dhat = { workspace = true, optional = true }
+ropey.workspace = true
+thiserror.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[dev-dependencies]
+anyhow.workspace = true
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "textstore"
+harness = false
+
+[[example]]
+name = "textstore_memory"
+required-features = ["memory-profiling"]
+
+[lints]
+workspace = true

@@ -1,0 +1,538 @@
+{
+  "oracle_version": "0.12.4",
+  "scenario": "motions",
+  "initial": {
+    "mode": "n",
+    "pending_operator": "",
+    "buffer": [
+      "one two three",
+      "four five",
+      "six"
+    ],
+    "cursor": [
+      1,
+      1
+    ],
+    "selections": {
+      "end": [
+        0,
+        0
+      ],
+      "start": [
+        0,
+        0
+      ]
+    },
+    "registers": [
+      {
+        "name": "\"",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "0",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "1",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "a",
+        "type": "",
+        "value": []
+      }
+    ],
+    "marks": {
+      "global": [],
+      "local": [
+        {
+          "mark": "'\"",
+          "pos": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        {
+          "mark": "'.",
+          "pos": [
+            1,
+            1,
+            1,
+            0
+          ]
+        }
+      ]
+    },
+    "jumplist": [
+      [],
+      0
+    ],
+    "changelist": [
+      [
+        {
+          "col": 0,
+          "coladd": 0,
+          "lnum": 1
+        }
+      ],
+      1
+    ],
+    "search": {
+      "forward": 1,
+      "hlsearch": 0,
+      "pattern": ""
+    },
+    "messages": "",
+    "undo_tree": {
+      "entries": [],
+      "save_cur": 0,
+      "save_last": 0,
+      "seq_cur": 0,
+      "seq_last": 0,
+      "synced": 1
+    },
+    "options": {
+      "expandtab": 0,
+      "selection": "inclusive",
+      "shiftwidth": 8,
+      "tabstop": 8,
+      "virtualedit": "",
+      "whichwrap": "b,s"
+    }
+  },
+  "steps": [
+    {
+      "keys": "w",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "one two three",
+          "four five",
+          "six"
+        ],
+        "cursor": [
+          1,
+          5
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "",
+            "value": []
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 0,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 0,
+          "seq_last": 0,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": "2j",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "one two three",
+          "four five",
+          "six"
+        ],
+        "cursor": [
+          3,
+          3
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "",
+            "value": []
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 0,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 0,
+          "seq_last": 0,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": "0",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "one two three",
+          "four five",
+          "six"
+        ],
+        "cursor": [
+          3,
+          1
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "",
+            "value": []
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 0,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 0,
+          "seq_last": 0,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": "$",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "one two three",
+          "four five",
+          "six"
+        ],
+        "cursor": [
+          3,
+          3
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "",
+            "value": []
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 0,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 0,
+          "seq_last": 0,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    }
+  ]
+}

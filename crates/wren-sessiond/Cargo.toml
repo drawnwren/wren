@@ -1,0 +1,21 @@
+[package]
+name = "wren-sessiond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wren-proto = { version = "0.1.0", path = "../wren-proto" }
+wren-remote = { version = "0.1.0", path = "../wren-remote" }
+wren-session = { version = "0.1.0", path = "../wren-session" }
+wren-shmem = { version = "0.1.0", path = "../wren-shmem" }
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

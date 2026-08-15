@@ -1,0 +1,19 @@
+[package]
+name = "wren-shmem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mmap-io.workspace = true
+thiserror.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

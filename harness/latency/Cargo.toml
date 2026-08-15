@@ -1,0 +1,23 @@
+[package]
+name = "wren-latency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+core_affinity.workspace = true
+hdrhistogram.workspace = true
+serde_json.workspace = true
+wren-command = { version = "0.1.0", path = "../../crates/wren-command" }
+wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
+wren-grammar = { version = "0.1.0", path = "../../crates/wren-grammar" }
+wren-presenter = { version = "0.1.0", path = "../../crates/wren-presenter" }
+wren-provider = { version = "0.1.0", path = "../../crates/wren-provider" }
+wren-term = { version = "0.1.0", path = "../../crates/wren-term" }
+wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
+wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
+wren-view = { version = "0.1.0", path = "../../crates/wren-view" }
+
+[lints]
+workspace = true

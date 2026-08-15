@@ -1,0 +1,12 @@
+[package]
+name = "wren-command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[lints]
+workspace = true

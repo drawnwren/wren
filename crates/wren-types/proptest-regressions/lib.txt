@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6b0b556733e83d7b0bf94d0b7ff2f73ca54474c547ac98005178854941e5add3 # shrinks to base = "aaaaaaaaaaaaaaaaaaaaaaaa", a = 0, b = 24, first_insert = "", c = 0, d = 0, second_insert = "0", raw_offset = 24, use_right_bias = false
+cc 07772501775ba910ae1f4b84fbf4ad7cb3e017aabdb0f0b63f210cc5ea3467d9 # shrinks to base = "aaaaa", a = 5, b = 5, first_insert = "A", c = 0, d = 6, second_insert = "0", raw_offset = 5, use_right_bias = false
+cc b18fbcaa2a808d3cbce90a5161fe5c1aa810191a3ee89a83803b5b9998785b56 # shrinks to base = "aaaaaaaaaaaaaaaaaaaaaaaaaaa", a = 27, b = 0, first_insert = "A", c = 1, d = 1, second_insert = "0", raw_offset = 0, use_right_bias = true
+cc 775f47b33ffc3f6f38bee09b4df350102088f84b6049c3b5b41169a2a2897d97 # shrinks to base = "aaaaaaaaaaaaaaaaaaaaaaaaaa", a = 11, b = 5, first_insert = "AA", c = 0, d = 22, second_insert = "0", raw_offset = 26, use_right_bias = false

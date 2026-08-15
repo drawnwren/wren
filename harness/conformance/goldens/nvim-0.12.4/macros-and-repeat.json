@@ -1,0 +1,693 @@
+{
+  "oracle_version": "0.12.4",
+  "scenario": "macros-and-repeat",
+  "initial": {
+    "mode": "n",
+    "pending_operator": "",
+    "buffer": [
+      "alpha",
+      "beta",
+      "gamma"
+    ],
+    "cursor": [
+      1,
+      1
+    ],
+    "selections": {
+      "end": [
+        0,
+        0
+      ],
+      "start": [
+        0,
+        0
+      ]
+    },
+    "registers": [
+      {
+        "name": "\"",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "0",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "1",
+        "type": "",
+        "value": []
+      },
+      {
+        "name": "a",
+        "type": "",
+        "value": []
+      }
+    ],
+    "marks": {
+      "global": [],
+      "local": [
+        {
+          "mark": "'\"",
+          "pos": [
+            1,
+            1,
+            1,
+            0
+          ]
+        },
+        {
+          "mark": "'.",
+          "pos": [
+            1,
+            1,
+            1,
+            0
+          ]
+        }
+      ]
+    },
+    "jumplist": [
+      [],
+      0
+    ],
+    "changelist": [
+      [
+        {
+          "col": 0,
+          "coladd": 0,
+          "lnum": 1
+        }
+      ],
+      1
+    ],
+    "search": {
+      "forward": 1,
+      "hlsearch": 0,
+      "pattern": ""
+    },
+    "messages": "",
+    "undo_tree": {
+      "entries": [],
+      "save_cur": 0,
+      "save_last": 0,
+      "seq_cur": 6,
+      "seq_last": 6,
+      "synced": 1
+    },
+    "options": {
+      "expandtab": 0,
+      "selection": "inclusive",
+      "shiftwidth": 8,
+      "tabstop": 8,
+      "virtualedit": "",
+      "whichwrap": "b,s"
+    }
+  },
+  "steps": [
+    {
+      "keys": "qaA!<Esc>q",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "alpha!",
+          "beta",
+          "gamma"
+        ],
+        "cursor": [
+          1,
+          6
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "v",
+            "value": [
+              "A!\u001b"
+            ]
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'[",
+              "pos": [
+                1,
+                1,
+                6,
+                0
+              ]
+            },
+            {
+              "mark": "']",
+              "pos": [
+                1,
+                1,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'^",
+              "pos": [
+                1,
+                1,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                6,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 5,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [
+            {
+              "newhead": 1,
+              "seq": 7
+            }
+          ],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 7,
+          "seq_last": 7,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": "j",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "alpha!",
+          "beta",
+          "gamma"
+        ],
+        "cursor": [
+          2,
+          4
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "v",
+            "value": [
+              "A!\u001b"
+            ]
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'[",
+              "pos": [
+                1,
+                1,
+                6,
+                0
+              ]
+            },
+            {
+              "mark": "']",
+              "pos": [
+                1,
+                1,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'^",
+              "pos": [
+                1,
+                1,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                1,
+                6,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 5,
+              "coladd": 0,
+              "lnum": 1
+            }
+          ],
+          1
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [
+            {
+              "newhead": 1,
+              "seq": 7
+            }
+          ],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 7,
+          "seq_last": 7,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": "@a",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "alpha!",
+          "beta!",
+          "gamma"
+        ],
+        "cursor": [
+          2,
+          5
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "v",
+            "value": [
+              "A!\u001b"
+            ]
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'[",
+              "pos": [
+                1,
+                2,
+                5,
+                0
+              ]
+            },
+            {
+              "mark": "']",
+              "pos": [
+                1,
+                2,
+                6,
+                0
+              ]
+            },
+            {
+              "mark": "'^",
+              "pos": [
+                1,
+                2,
+                6,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                2,
+                5,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 5,
+              "coladd": 0,
+              "lnum": 1
+            },
+            {
+              "col": 4,
+              "coladd": 0,
+              "lnum": 2
+            }
+          ],
+          2
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [
+            {
+              "seq": 7
+            },
+            {
+              "newhead": 1,
+              "seq": 8
+            }
+          ],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 8,
+          "seq_last": 8,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    },
+    {
+      "keys": ".",
+      "state": {
+        "mode": "n",
+        "pending_operator": "",
+        "buffer": [
+          "alpha!",
+          "beta!!",
+          "gamma"
+        ],
+        "cursor": [
+          2,
+          6
+        ],
+        "selections": {
+          "end": [
+            0,
+            0
+          ],
+          "start": [
+            0,
+            0
+          ]
+        },
+        "registers": [
+          {
+            "name": "\"",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "0",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "1",
+            "type": "",
+            "value": []
+          },
+          {
+            "name": "a",
+            "type": "v",
+            "value": [
+              "A!\u001b"
+            ]
+          }
+        ],
+        "marks": {
+          "global": [],
+          "local": [
+            {
+              "mark": "'\"",
+              "pos": [
+                1,
+                1,
+                1,
+                0
+              ]
+            },
+            {
+              "mark": "'[",
+              "pos": [
+                1,
+                2,
+                6,
+                0
+              ]
+            },
+            {
+              "mark": "']",
+              "pos": [
+                1,
+                2,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'^",
+              "pos": [
+                1,
+                2,
+                7,
+                0
+              ]
+            },
+            {
+              "mark": "'.",
+              "pos": [
+                1,
+                2,
+                6,
+                0
+              ]
+            }
+          ]
+        },
+        "jumplist": [
+          [],
+          0
+        ],
+        "changelist": [
+          [
+            {
+              "col": 5,
+              "coladd": 0,
+              "lnum": 1
+            },
+            {
+              "col": 5,
+              "coladd": 0,
+              "lnum": 2
+            }
+          ],
+          2
+        ],
+        "search": {
+          "forward": 1,
+          "hlsearch": 0,
+          "pattern": ""
+        },
+        "messages": "",
+        "undo_tree": {
+          "entries": [
+            {
+              "seq": 7
+            },
+            {
+              "seq": 8
+            },
+            {
+              "newhead": 1,
+              "seq": 9
+            }
+          ],
+          "save_cur": 0,
+          "save_last": 0,
+          "seq_cur": 9,
+          "seq_last": 9,
+          "synced": 1
+        },
+        "options": {
+          "expandtab": 0,
+          "selection": "inclusive",
+          "shiftwidth": 8,
+          "tabstop": 8,
+          "virtualedit": "",
+          "whichwrap": "b,s"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+[package]
+name = "wren-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wren"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+wren-command = { version = "0.1.0", path = "../wren-command" }
+wren-client-state = { version = "0.1.0", path = "../wren-client-state" }
+wren-config = { version = "0.1.0", path = "../wren-config" }
+wren-engine = { version = "0.1.0", path = "../wren-engine" }
+wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
+wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
+wren-provider = { version = "0.1.0", path = "../wren-provider" }
+wren-session = { version = "0.1.0", path = "../wren-session" }
+wren-term = { version = "0.1.0", path = "../wren-term" }
+wren-text = { version = "0.1.0", path = "../wren-text" }
+wren-types = { version = "0.1.0", path = "../wren-types" }
+wren-view = { version = "0.1.0", path = "../wren-view" }
+wren-workflow = { version = "0.1.0", path = "../wren-workflow" }
+
+[lints]
+workspace = true

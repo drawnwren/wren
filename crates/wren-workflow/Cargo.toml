@@ -1,0 +1,20 @@
+[package]
+name = "wren-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ast-grep-core.workspace = true
+ast-grep-language.workspace = true
+imara-diff.workspace = true
+nix.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+vt100.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[lints]
+workspace = true

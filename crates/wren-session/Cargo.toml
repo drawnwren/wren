@@ -1,0 +1,21 @@
+[package]
+name = "wren-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+filetime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+xattr.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types" }
+
+[dev-dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true

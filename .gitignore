@@ -1,0 +1,11 @@
+/target/
+/result
+/result-*
+/.direnv/
+/.envrc.local
+/harness/corpus/generated/large-100mb.js
+/harness/corpus/generated/oneline-8mb.json
+/harness/conformance/.determinism-*/
+/dhat-heap.json
+**/*.profraw
+

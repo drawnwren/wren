@@ -1,0 +1,77 @@
+package wren:extension@1.0.0;
+
+interface types {
+  record byte-range {
+    start: u64,
+    end: u64,
+  }
+
+  record completion-request {
+    document-id: u64,
+    document-revision: u64,
+    prefix: string,
+    max-candidates: u32,
+  }
+
+  record candidate {
+    label: string,
+    insert-text: string,
+    kind: string,
+  }
+
+  record decoration-request {
+    document-id: u64,
+    document-revision: u64,
+    visible: list<byte-range>,
+  }
+
+  record decoration {
+    range: byte-range,
+    class: string,
+  }
+}
+
+interface completion-source {
+  use types.{completion-request, candidate};
+
+  /// WASI 0.3 async stream. Hosts apply bounded-chunk backpressure and may
+  /// cancel while the component is producing results.
+  complete: async func(request: completion-request) -> stream<candidate>;
+}
+
+interface decoration-provider {
+  use types.{decoration-request, decoration};
+  decorate: async func(request: decoration-request) -> list<decoration>;
+}
+
+interface host-document {
+  use types.{byte-range};
+  read-snapshot: async func(document-id: u64, revision: u64) -> result<string, string>;
+  propose-edit: async func(document-id: u64, revision: u64, range: byte-range, text: string) -> result<_, string>;
+}
+
+interface host-workspace {
+  read: async func(path: string) -> result<list<u8>, string>;
+  search: async func(query: string) -> stream<string>;
+  spawn-task: async func(task-id: string, args: list<string>) -> result<u64, string>;
+}
+
+interface host-client {
+  notify: func(message: string);
+  open-url: func(url: string) -> result<_, string>;
+}
+
+world client-extension {
+  import host-document;
+  import host-client;
+  export completion-source;
+  export decoration-provider;
+}
+
+world workspace-extension {
+  import host-document;
+  import host-workspace;
+  import host-client;
+  export completion-source;
+  export decoration-provider;
+}
