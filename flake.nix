@@ -5,13 +5,14 @@
     # This exact nixpkgs revision pins the Neovim oracle. Bump it and regenerate
     # version-keyed goldens in the same change.
     nixpkgs.url = "github:NixOS/nixpkgs/0e251e24a4f24e036a084b6b4b2d2491af4167f4";
+    crane.url = "github:ipetkov/crane";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs = { self, nixpkgs, crane, rust-overlay }:
     let
       systems = [ "x86_64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -22,15 +23,11 @@
             overlays = [ rust-overlay.overlays.default ];
           };
           rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform { cargo = rust; rustc = rust; };
+          craneLib = (crane.mkLib pkgs).overrideToolchain rust;
           fuzzRust = pkgs.rust-bin.nightly."2026-08-14".minimal;
-          fuzzRustPlatform = pkgs.makeRustPlatform {
-            cargo = fuzzRust;
-            rustc = fuzzRust;
-          };
+          fuzzCraneLib = (crane.mkLib pkgs).overrideToolchain fuzzRust;
           oracle = pkgs.neovim;
-          commonInputs = [
-            rust
+          developmentInputs = [
             pkgs.cargo-deny
             pkgs.cargo-fuzz
             pkgs.cargo-nextest
@@ -42,78 +39,98 @@
             pkgs.bashInteractive
             oracle
           ];
-          package = rustPlatform.buildRustPackage {
+          commonArgs = {
             pname = "wren";
             version = "0.1.0";
             src = self;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [ "--workspace" ];
-            nativeBuildInputs = [
-              pkgs.installShellFiles
-              pkgs.makeWrapper
-              pkgs.bashInteractive
-              pkgs.git
-              pkgs.ripgrep
-            ];
+            strictDeps = true;
+            cargoExtraArgs = "--locked --workspace";
+          };
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            pname = "wren-dependencies";
+          });
+          package = craneLib.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
             doCheck = true;
+            nativeBuildInputs = [
+              pkgs.makeWrapper
+            ];
             postFixup = ''
               wrapProgram "$out/bin/wren" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssh pkgs.git pkgs.ripgrep pkgs.bashInteractive ]}
             '';
-          };
-          mkCargoCheck = name: command: rustPlatform.buildRustPackage {
+          });
+          mkCargoCheck = name: command: craneLib.mkCargoDerivation (commonArgs // {
             pname = "wren-${name}-check";
-            version = "0.1.0";
-            src = self;
-            cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = commonInputs;
-            buildPhase = ''
-              runHook preBuild
+            inherit cargoArtifacts;
+            nativeBuildInputs = developmentInputs;
+            preBuild = ''
               export HOME="$TMPDIR/home"
               mkdir -p "$HOME"
-              ${command}
-              runHook postBuild
             '';
-            installPhase = ''
+            buildPhaseCargoCommand = command;
+            doInstallCargoArtifacts = false;
+            installPhaseCommand = ''
               mkdir -p "$out"
               touch "$out/passed"
             '';
             doCheck = false;
-          };
-          fuzzCheck = fuzzRustPlatform.buildRustPackage {
+          });
+          fuzzArgs = {
             pname = "wren-fuzz-smoke-check";
             version = "0.1.0";
             src = self;
-            cargoRoot = "fuzz";
-            cargoLock.lockFile = ./fuzz/Cargo.lock;
-            nativeBuildInputs = [ fuzzRust pkgs.cargo-fuzz ];
-            buildPhase = ''
-              runHook preBuild
+            strictDeps = true;
+            cargoLock = ./fuzz/Cargo.lock;
+            cargoExtraArgs = "--locked --manifest-path fuzz/Cargo.toml";
+          };
+          fuzzCargoArtifacts = fuzzCraneLib.buildDepsOnly (fuzzArgs // {
+            pname = "wren-fuzz-dependencies";
+          });
+          fuzzCheck = fuzzCraneLib.mkCargoDerivation (fuzzArgs // {
+            cargoArtifacts = fuzzCargoArtifacts;
+            nativeBuildInputs = [ pkgs.cargo-fuzz ];
+            preBuild = ''
               export HOME="$TMPDIR/home"
               mkdir -p "$HOME"
+            '';
+            buildPhaseCargoCommand = ''
               cargo fuzz run --fuzz-dir fuzz ex_parse -- -runs=1000
               cargo fuzz run --fuzz-dir fuzz protocol_decode -- -runs=1000
-              runHook postBuild
             '';
-            installPhase = ''
+            doInstallCargoArtifacts = false;
+            installPhaseCommand = ''
               mkdir -p "$out"
               touch "$out/passed"
             '';
             doCheck = false;
-          };
+          });
         in {
-          inherit pkgs rust fuzzRust oracle package mkCargoCheck fuzzCheck commonInputs;
+          inherit
+            pkgs
+            rust
+            craneLib
+            fuzzRust
+            fuzzCraneLib
+            oracle
+            package
+            mkCargoCheck
+            fuzzCheck
+            developmentInputs
+            commonArgs
+            cargoArtifacts
+            ;
         };
     in {
       devShells = forAllSystems (system:
         let scope = perSystem system;
         in {
-          default = scope.pkgs.mkShell {
-            packages = scope.commonInputs;
+          default = scope.craneLib.devShell {
+            packages = scope.developmentInputs;
             NVIM_ORACLE_VERSION = scope.oracle.version;
           };
-          fuzz = scope.pkgs.mkShell {
-            packages = [ scope.fuzzRust scope.pkgs.cargo-fuzz ];
+          fuzz = scope.fuzzCraneLib.devShell {
+            packages = [ scope.pkgs.cargo-fuzz ];
           };
         });
 
@@ -146,13 +163,20 @@
         let scope = perSystem system;
         in {
           package = scope.package;
-          fmt = scope.mkCargoCheck "fmt" "cargo fmt --all --check";
-          clippy = scope.mkCargoCheck "clippy" "cargo clippy --workspace --all-targets --locked -- -D warnings";
+          fmt = scope.craneLib.cargoFmt (scope.commonArgs // {
+            cargoExtraArgs = "--all";
+          });
+          clippy = scope.craneLib.cargoClippy (scope.commonArgs // {
+            cargoArtifacts = scope.cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- -D warnings";
+          });
           # Advisory DB refresh needs network and remains part of CI's full
           # `cargo deny check`; the sandboxed flake check covers local policy.
           deny = scope.mkCargoCheck "deny" "cargo deny check bans licenses sources";
           layer = scope.mkCargoCheck "layer" "python3 scripts/layer-check.py";
-          nextest = scope.mkCargoCheck "nextest" "cargo nextest run --workspace --locked";
+          nextest = scope.craneLib.cargoNextest (scope.commonArgs // {
+            cargoArtifacts = scope.cargoArtifacts;
+          });
           conformance = scope.mkCargoCheck "conformance" ''
             cargo run -p wren-conformance --locked -- --check-determinism
             cargo run -p wren-conformance --locked -- --check-wren
@@ -160,6 +184,7 @@
           bench-smoke = scope.mkCargoCheck "bench-smoke" ''
             cargo run -p wren-corpus --locked --bin wren-corpus -- generate
             cargo bench -p wren-text --locked --bench textstore -- --test
+            cargo bench -p wren-provider --locked --bench provider_acceleration -- --test
           '';
           latency = scope.mkCargoCheck "latency" ''
             cargo run -p wren-latency --locked --release -- --iterations 10000 --output "$TMPDIR/latency.json"

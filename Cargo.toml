@@ -16,6 +16,7 @@ mmap-io = { version = "1", features = ["atomic"] }
 ast-grep-core = "0.45"
 ast-grep-language = "0.45"
 portable-pty = "0.9"
+pollster = "1"
 vt100 = "0.16.2"
 nix = { version = "0.28", features = ["fs", "mman", "process", "resource", "signal"] }
 xattr = "1"
@@ -41,6 +42,7 @@ termina = "0.3.3"
 toml = "0.8"
 unicode-segmentation = "1"
 unicode-width = "0.2"
+wgpu = "30"
 wasmtime = { version = "47.0.3", default-features = false, features = ["anyhow", "component-model", "cranelift", "runtime", "std", "wat"] }
 wit-parser = "0.252.0"
 

@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+#[cfg(feature = "gpu")]
+mod gpu;
+
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::ops::Range;
@@ -124,9 +127,114 @@ pub enum GrammarBackend {
     DynamicWasmFallback,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelerationBackend {
+    Pending,
+    Gpu,
+    Cpu,
+}
+
+// Below this point dispatch, synchronization, and readback cost more than the
+// serial lexer on the benchmarked hardware. Keep interactive viewport work on
+// CPU and reserve the GPU for provider-scale batches.
+const MIN_GPU_CLASSIFICATION_BYTES: usize = 4 * 1024 * 1024;
+
+struct LexicalAccelerator {
+    backend: AccelerationBackend,
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu::GpuLexical>,
+}
+
+impl std::fmt::Debug for LexicalAccelerator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LexicalAccelerator")
+            .field("backend", &self.backend)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LexicalAccelerator {
+    fn prefer_gpu() -> Self {
+        Self {
+            backend: if cfg!(feature = "gpu") {
+                AccelerationBackend::Pending
+            } else {
+                AccelerationBackend::Cpu
+            },
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        }
+    }
+
+    fn cpu_only() -> Self {
+        Self {
+            backend: AccelerationBackend::Cpu,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+        }
+    }
+
+    fn classify(&mut self, text: &str) -> Option<Vec<Range<usize>>> {
+        if text.len() < MIN_GPU_CLASSIFICATION_BYTES
+            || !text.is_ascii()
+            || self.backend == AccelerationBackend::Cpu
+        {
+            return None;
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.backend = AccelerationBackend::Cpu;
+            let _ = text;
+            None
+        }
+        #[cfg(feature = "gpu")]
+        {
+            if self.backend == AccelerationBackend::Pending {
+                let initialized =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(gpu::GpuLexical::new));
+                match initialized {
+                    Ok(Ok(gpu)) => {
+                        self.gpu = Some(gpu);
+                        self.backend = AccelerationBackend::Gpu;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        self.backend = AccelerationBackend::Cpu;
+                        return None;
+                    }
+                }
+            }
+            let gpu = self.gpu.as_mut()?;
+            if !gpu.supports(text.len()) {
+                return None;
+            }
+            let classified =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.classify(text)));
+            match classified {
+                Ok(Ok(ranges)) => Some(ranges),
+                Ok(Err(_)) | Err(_) => {
+                    self.gpu = None;
+                    self.backend = AccelerationBackend::Cpu;
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ProviderActor {
     documents: BTreeMap<DocumentId, ProviderDocument>,
+    lexical_accelerator: LexicalAccelerator,
+}
+
+impl Default for ProviderActor {
+    fn default() -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            lexical_accelerator: LexicalAccelerator::prefer_gpu(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +320,19 @@ impl LatestDemandQueue {
 }
 
 impl ProviderActor {
+    #[must_use]
+    pub fn cpu_only() -> Self {
+        Self {
+            documents: BTreeMap::new(),
+            lexical_accelerator: LexicalAccelerator::cpu_only(),
+        }
+    }
+
+    #[must_use]
+    pub const fn acceleration_backend(&self) -> AccelerationBackend {
+        self.lexical_accelerator.backend
+    }
+
     pub fn handle(&mut self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match request {
             ProviderRequest::Hello { protocol } => Ok(ProviderResponse::Hello { protocol }),
@@ -270,12 +391,12 @@ impl ProviderActor {
     }
 
     fn highlight(
-        &self,
+        &mut self,
         document_id: DocumentId,
         demand: ProviderDemand,
     ) -> Result<HighlightResult, ProviderError> {
-        let document = self
-            .documents
+        let (documents, lexical_accelerator) = (&self.documents, &mut self.lexical_accelerator);
+        let document = documents
             .get(&document_id)
             .ok_or(ProviderError::UnknownDocument(document_id))?;
         let freshness = revision_freshness(document.revision, demand.revision);
@@ -297,9 +418,19 @@ impl ProviderActor {
                     .cloned(),
             );
         }
-        if document.grammar_backend == GrammarBackend::DynamicWasmFallback || spans.is_empty() {
+        if document.grammar_backend == GrammarBackend::DynamicWasmFallback
+            || (document.grammar_backend == GrammarBackend::BundledNative && spans.is_empty())
+        {
             for range in &requested_ranges {
-                lexical_spans(&document.text[range.clone()], range.start, &mut spans);
+                let source = &document.text[range.clone()];
+                if let Some(ranges) = lexical_accelerator.classify(source) {
+                    spans.extend(ranges.into_iter().map(|span| HighlightSpan {
+                        range: range.start + span.start..range.start + span.end,
+                        kind: "keyword".into(),
+                    }));
+                } else {
+                    lexical_spans(source, range.start, &mut spans);
+                }
             }
         }
         spans.sort_by_key(|span| span.range.start);
@@ -1111,6 +1242,94 @@ mod tests {
                 }),
                 "missing {kind} for {needle:?} occurrence {occurrence}: {spans:?}"
             );
+        }
+    }
+
+    #[test]
+    fn cpu_fallback_highlights_unsupported_and_unicode_documents() {
+        let source = "fn café() { let return_value = return; }\n";
+        let mut fallback_bundle = bundle();
+        fallback_bundle.language_id = "unsupported-language".into();
+        let mut actor = ProviderActor::cpu_only();
+        actor
+            .handle(ProviderRequest::UpdateDocument {
+                document_id: DocumentId::new(9),
+                revision: DocumentRevision::new(1),
+                text: source.into(),
+                bundle: fallback_bundle,
+            })
+            .expect("update unsupported document");
+        let ProviderResponse::Highlight(result) = actor
+            .handle(ProviderRequest::Demand {
+                document_id: DocumentId::new(9),
+                demand: ProviderDemand {
+                    revision: DocumentRevision::new(1),
+                    visible: std::iter::once(0..source.len()).collect(),
+                    near_viewport: Vec::new(),
+                    priority: Priority::Visible,
+                },
+            })
+            .expect("highlight unsupported document")
+        else {
+            panic!("highlight response");
+        };
+        assert_eq!(actor.acceleration_backend(), AccelerationBackend::Cpu);
+        assert_eq!(result.spans, lexical_highlight_text(source));
+    }
+
+    #[test]
+    fn small_workloads_preserve_cpu_lexical_results() {
+        let source = "pub fn generated() { let value = match value { _ => return }; }\n";
+        let mut fallback_bundle = bundle();
+        fallback_bundle.language_id = "unsupported-language".into();
+        let mut actor = ProviderActor::default();
+        actor
+            .handle(ProviderRequest::UpdateDocument {
+                document_id: DocumentId::new(10),
+                revision: DocumentRevision::new(1),
+                text: source.into(),
+                bundle: fallback_bundle,
+            })
+            .expect("update accelerated document");
+        let ProviderResponse::Highlight(result) = actor
+            .handle(ProviderRequest::Demand {
+                document_id: DocumentId::new(10),
+                demand: ProviderDemand {
+                    revision: DocumentRevision::new(1),
+                    visible: std::iter::once(0..source.len()).collect(),
+                    near_viewport: Vec::new(),
+                    priority: Priority::Visible,
+                },
+            })
+            .expect("highlight accelerated document")
+        else {
+            panic!("highlight response");
+        };
+        assert!(matches!(
+            actor.acceleration_backend(),
+            AccelerationBackend::Pending | AccelerationBackend::Cpu
+        ));
+        assert_eq!(result.spans, lexical_highlight_text(source));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_lexical_classifier_matches_cpu_when_an_adapter_is_available() {
+        let Ok(mut gpu) = gpu::GpuLexical::new() else {
+            return;
+        };
+        for source in [
+            "fn",
+            "x fn let struct return while trait enum impl match pub use mut if else for",
+            "diffn fn_ fn\nlet\tmut; struct-item return_value return!",
+            "pub fn generated() { let value = match value { _ => return }; }\n",
+        ] {
+            let expected = lexical_highlight_text(source)
+                .into_iter()
+                .map(|span| span.range)
+                .collect::<Vec<_>>();
+            let actual = gpu.classify(source).expect("GPU lexical classification");
+            assert_eq!(actual, expected, "GPU mismatch for {source:?}");
         }
     }
 

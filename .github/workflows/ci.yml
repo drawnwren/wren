@@ -54,7 +54,23 @@ jobs:
       - name: Generate benchmark corpus
         run: nix develop --command cargo run -p wren-corpus --locked --bin wren-corpus -- generate
       - name: Complete Criterion smoke run
-        run: nix develop --command cargo bench -p wren-text --locked --bench textstore -- --test
+        run: |
+          nix develop --command cargo bench -p wren-text --locked --bench textstore -- --test
+          nix develop --command cargo bench -p wren-provider --locked --bench provider_acceleration -- --test
+
+  provider-acceleration:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Compare hardware GPU and CPU provider throughput
+        run: nix develop --command cargo bench -p wren-provider --locked --bench provider_acceleration
+      - name: Require significant GPU speedup
+        run: nix develop --command python3 scripts/check-provider-gpu-speedup.py target/criterion/provider-lexical-classification --minimum-speedup 1.5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: provider-acceleration-macos-15
+          path: target/criterion/provider-lexical-classification
 
   latency:
     strategy:

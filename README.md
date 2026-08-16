@@ -46,6 +46,8 @@ named buffer.
   `Ctrl-N`/`Ctrl-P`, explicit `Enter` acceptance, and `Ctrl-E` cancellation
 - Tree-sitter syntax decorations, Catppuccin semantic groups, rendered Markdown,
   diagnostics, Git hunk signs, and breakpoint/conditional-breakpoint marks
+- Lazy cross-platform GPU compute for parallel provider classification when
+  suitable, with transparent CPU fallback when an adapter or workload is unsupported
 - Native Git hunk navigation, stage/reset/undo/preview/blame/diff plus
   Fugitive-style `:Git`, `:Gwrite`, and `:Gdiffsplit`
 - Rust, TypeScript/JavaScript, Python, Go, Terraform, Nix, Haskell, Lua, shell,

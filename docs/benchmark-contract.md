@@ -50,3 +50,16 @@ authoritative runner because they cannot be reproduced by a hosted process.
 The performance changes that beat a gate are part of the product; harnesses may
 not omit work, downgrade durability, discard terminal samples, or relabel a
 software timestamp as a physical photon measurement.
+
+`wren-provider` also owns a comparative Criterion benchmark for GPU lexical
+classification. It times identical 4 MiB, 8 MiB, and 32 MiB
+generated-provider demands through `ProviderActor`, validates byte-identical
+CPU/GPU responses before each comparison, excludes lazy adapter initialization
+from the timed region, and reports bytes per second. Software adapters are
+rejected; machines without a hardware GPU record only the CPU baselines. This
+comparison documents the 4 MiB routing crossover and is smoke-tested in CI,
+but it is not a portable hard architecture gate because hosted runner GPU
+availability and models vary.
+The macOS hardware-GPU job does enforce a same-run relative guard: each GPU
+median must be at least 1.5 times faster than its matching CPU median, and the
+Criterion report is retained as a CI artifact.
