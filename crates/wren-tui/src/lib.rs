@@ -1457,6 +1457,38 @@ impl BufferDecorations {
             .collect();
     }
 
+    fn map_through(&mut self, transaction: &Transaction, revision: DocumentRevision) {
+        let spans = std::mem::take(&mut self.spans);
+        self.spans = spans
+            .into_iter()
+            .filter_map(|span| map_decoration_span(span, transaction))
+            .collect();
+        self.revision = revision;
+        self.rebuild_index();
+    }
+
+    fn replace_after_transaction(
+        &mut self,
+        transaction: &Transaction,
+        revision: DocumentRevision,
+        ranges: &[Range<usize>],
+        mut replacement: Vec<DecorationSpan>,
+    ) {
+        let spans = std::mem::take(&mut self.spans);
+        let mapped = spans.into_iter().filter_map(|span| {
+            let span = map_decoration_span(span, transaction)?;
+            (!ranges
+                .iter()
+                .any(|range| ranges_overlap(&span.range, range)))
+            .then_some(span)
+        });
+        replacement.sort_by(decoration_order);
+        replacement.dedup();
+        self.spans = merge_sorted_decorations(mapped, replacement.into_iter());
+        self.revision = revision;
+        self.rebuild_index();
+    }
+
     fn spans_in(&self, range: Range<usize>) -> Vec<DecorationSpan> {
         let first = self
             .prefix_max_end
@@ -1470,6 +1502,54 @@ impl BufferDecorations {
             .cloned()
             .collect()
     }
+}
+
+fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Option<DecorationSpan> {
+    let start = transaction.map_offset(span.range.start, Bias::Left).ok()?;
+    let end = transaction.map_offset(span.range.end, Bias::Right).ok()?;
+    (start < end).then_some(DecorationSpan {
+        range: start..end,
+        style: span.style,
+        priority: span.priority,
+    })
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn decoration_order(left: &DecorationSpan, right: &DecorationSpan) -> std::cmp::Ordering {
+    (left.range.start, std::cmp::Reverse(left.range.end))
+        .cmp(&(right.range.start, std::cmp::Reverse(right.range.end)))
+}
+
+fn merge_sorted_decorations(
+    left: impl Iterator<Item = DecorationSpan>,
+    right: impl Iterator<Item = DecorationSpan>,
+) -> Vec<DecorationSpan> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    let mut merged = Vec::with_capacity(left.size_hint().0.saturating_add(right.size_hint().0));
+    loop {
+        let next = match (left.peek(), right.peek()) {
+            (Some(left_span), Some(right_span)) => {
+                if decoration_order(left_span, right_span).is_le() {
+                    left.next()
+                } else {
+                    right.next()
+                }
+            }
+            (Some(_), None) => left.next(),
+            (None, Some(_)) => right.next(),
+            (None, None) => break,
+        };
+        if let Some(span) = next
+            && merged.last() != Some(&span)
+        {
+            merged.push(span);
+        }
+    }
+    merged
 }
 
 fn ace_jump_labels(count: usize) -> Vec<String> {

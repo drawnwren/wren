@@ -75,15 +75,12 @@ impl App {
         }
         targets.sort_by_key(|(target, _)| target.start);
         let frame = self.active.editor.frame();
-        let text = frame.text.as_ref();
         let language = language_bundle(self.active.document.presentation_path()).language_id;
         let mut replacement = Vec::new();
         for (target, context) in &targets {
-            let Some(source) = text.get(context.clone()) else {
-                continue;
-            };
+            let source = frame.text.slice(context.clone());
             replacement.extend(
-                highlight_text(source, &language)
+                highlight_text(&source, &language)
                     .into_iter()
                     .map(|mut span| {
                         span.range.start = span.range.start.saturating_add(context.start);
@@ -99,18 +96,15 @@ impl App {
             .decorations
             .entry(self.active.buffer_id)
             .or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
-        state.spans.retain(|span| {
-            !targets
-                .iter()
-                .any(|(target, _)| span.range.start < target.end && target.start < span.range.end)
-        });
-        state.spans.extend(replacement);
-        state
-            .spans
-            .sort_by_key(|span| (span.range.start, std::cmp::Reverse(span.range.end)));
-        state.spans.dedup();
-        state.revision = revision;
-        state.rebuild_index();
+        let target_ranges = targets
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect::<Vec<_>>();
+        if state.revision == transaction.base_revision {
+            state.replace_after_transaction(transaction, revision, &target_ranges, replacement);
+        } else {
+            *state = BufferDecorations::new(revision, replacement);
+        }
     }
 
     pub(super) fn schedule_provider_refreshes(&mut self, viewport_height: usize) {

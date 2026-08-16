@@ -702,7 +702,7 @@ fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
                 buffer_id: BufferId::new(1),
                 document_id: DocumentId::new(1),
                 revision,
-                text: Arc::from(text.as_str()),
+                text: FrameText::from(text.as_str()),
                 bundle: language_bundle(Some(Path::new("latency.rs"))),
                 visible: visible.clone(),
                 near_viewport: visible,

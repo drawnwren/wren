@@ -488,43 +488,10 @@ impl App {
         let Some(transaction) = transaction else {
             return;
         };
-        if let Some(syntax) = self.decorations.get_mut(&self.active.buffer_id)
-            && syntax.revision == transaction.base_revision
-        {
-            syntax.spans = syntax
-                .spans
-                .iter()
-                .filter_map(|span| {
-                    let start = transaction.map_offset(span.range.start, Bias::Left).ok()?;
-                    let end = transaction.map_offset(span.range.end, Bias::Right).ok()?;
-                    (start < end).then_some(DecorationSpan {
-                        range: start..end,
-                        style: span.style,
-                        priority: span.priority,
-                    })
-                })
-                .collect();
-            syntax.revision = self.active.editor.revision();
-            syntax.rebuild_index();
-        }
         if let Some(semantic) = self.semantic_decorations.get_mut(&self.active.buffer_id)
             && semantic.revision == transaction.base_revision
         {
-            semantic.spans = semantic
-                .spans
-                .iter()
-                .filter_map(|span| {
-                    let start = transaction.map_offset(span.range.start, Bias::Left).ok()?;
-                    let end = transaction.map_offset(span.range.end, Bias::Right).ok()?;
-                    (start < end).then_some(DecorationSpan {
-                        range: start..end,
-                        style: span.style,
-                        priority: span.priority,
-                    })
-                })
-                .collect();
-            semantic.revision = self.active.editor.revision();
-            semantic.rebuild_index();
+            semantic.map_through(&transaction, self.active.editor.revision());
         }
         self.refresh_changed_syntax(&transaction);
         if let Some(before) = self.active.git_index_text.as_ref().map(Arc::clone) {

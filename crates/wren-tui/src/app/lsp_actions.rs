@@ -734,7 +734,7 @@ impl App {
     }
 
     pub(super) fn finish_lsp_hover(&mut self, method: &str, result: &serde_json::Value) {
-        let rendered = render_lsp_text(&result);
+        let rendered = render_lsp_text(result);
         if rendered.is_empty() {
             self.popup = None;
             self.popup_deadline = None;

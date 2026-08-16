@@ -3596,11 +3596,6 @@ impl GridBuilder {
         }
     }
 
-    fn push_document(&mut self, text: &str, cursor_byte: usize, decorations: &[DecorationSpan]) {
-        let visible = text.get(self.document_start..).unwrap_or_default();
-        self.push_grapheme_document(visible, cursor_byte, decorations);
-    }
-
     fn push_grapheme_document(
         &mut self,
         visible: &str,
@@ -4108,15 +4103,6 @@ fn advance_visual_cell(row: &mut usize, column: &mut usize, width: usize, cell_w
         *column = 0;
     }
     *column = column.saturating_add(cell_width);
-}
-
-fn byte_of_line(text: &str, line: usize) -> usize {
-    if line == 0 {
-        return 0;
-    }
-    text.match_indices('\n')
-        .nth(line - 1)
-        .map_or(text.len(), |(offset, _)| offset + 1)
 }
 
 #[must_use]

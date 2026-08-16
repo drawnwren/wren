@@ -362,6 +362,11 @@ impl FrameText {
             .then_some(self.single_line_change)
             .flatten()
     }
+
+    #[cfg(test)]
+    fn is_materialized(&self) -> bool {
+        self.storage.materialized.get().is_some()
+    }
 }
 
 impl PartialEq for FrameText {
@@ -451,6 +456,7 @@ impl EchoEngine {
 #[cfg(test)]
 mod tests {
     use super::FrameText;
+    use wren_types::{DocumentRevision, Edit, Transaction};
 
     #[test]
     fn snapshot_identity_does_not_confuse_equal_independent_text() {
@@ -461,5 +467,38 @@ mod tests {
         assert!(snapshot.same_snapshot(&cloned));
         assert!(!snapshot.same_snapshot(&independent));
         assert_eq!(snapshot, independent);
+    }
+
+    #[test]
+    fn edited_snapshot_serves_bounded_slices_without_materializing_the_file() {
+        let original = FrameText::from("alpha\nbeta\ngamma\n");
+        let transaction =
+            Transaction::new(DocumentRevision::new(0), vec![Edit::new(6..10, "βeta")])
+                .expect("transaction");
+        let edited = original.edited(&transaction).expect("edited snapshot");
+
+        assert!(!edited.is_materialized());
+        assert_eq!(edited.slice(6..11), "βeta");
+        assert_eq!(edited.byte_of_line(2), 12);
+        assert!(!edited.is_materialized());
+        assert_eq!(edited.shared().as_ref(), "alpha\nβeta\ngamma\n");
+        assert!(edited.is_materialized());
+    }
+
+    #[test]
+    fn lazy_snapshot_preserves_multiple_edits_and_unicode_boundaries() {
+        let original = FrameText::from("α one\nβ two\n");
+        let transaction = Transaction::new(
+            DocumentRevision::new(0),
+            vec![Edit::new(0..2, "λ"), Edit::new(10..13, "three")],
+        )
+        .expect("transaction");
+        let edited = original.edited(&transaction).expect("edited snapshot");
+
+        assert_eq!(edited.slice(0..edited.len()), "λ one\nβ three\n");
+        assert!(edited.is_char_boundary(2));
+        assert!(!edited.is_char_boundary(1));
+        assert_eq!(edited.line_of_byte(8), 1);
+        assert_eq!(edited.shared().as_ref(), "λ one\nβ three\n");
     }
 }
