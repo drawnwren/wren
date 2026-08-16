@@ -2,8 +2,8 @@
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-  echo "netem remote fault test: skipped (Linux only)"
-  exit 0
+  echo "netem remote hard gate: Linux with tc netem is required" >&2
+  exit 77
 fi
 if [[ "$(id -u)" != "0" ]]; then
   echo "netem remote fault test: requires a privileged bare-metal runner" >&2

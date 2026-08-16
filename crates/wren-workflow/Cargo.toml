@@ -16,5 +16,8 @@ thiserror.workspace = true
 vt100.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

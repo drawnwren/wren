@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use wren_engine::EngineFrame;
+use wren_engine::{EngineFrame, FrameText};
 use wren_types::{BufferId, DocumentId, FloatingSurfaceId, TabId, ViewId, WindowId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -978,6 +979,12 @@ pub struct StatusOverlay {
 pub struct DecorationSpan {
     pub range: Range<usize>,
     pub style: CellStyle,
+    #[serde(default = "default_decoration_priority")]
+    pub priority: u32,
+}
+
+const fn default_decoration_priority() -> u32 {
+    1_000_000
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,6 +1086,26 @@ pub struct DesiredGrid {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedEditorRender {
+    text: FrameText,
+    content_row_lines: Vec<Option<usize>>,
+    top_line: usize,
+    width: usize,
+    height: usize,
+    tab_width: usize,
+    line_numbers: bool,
+    relative_numbers: bool,
+    number_width: usize,
+    color_column: Option<usize>,
+    theme: CatppuccinPalette,
+    status: Box<str>,
+    prompt: Option<Box<str>>,
+    decorations: Vec<DecorationSpan>,
+    line_decorations: Vec<LineDecoration>,
+    relative_cursor_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalPatch {
     Clear,
     ClearToEndOfLine(CellStyle),
@@ -1102,6 +1129,8 @@ pub struct ViewportLayout {
     theme: CatppuccinPalette,
     epoch: u64,
     cached_rows: Vec<Arc<CellRow>>,
+    cached_editor_render: Option<CachedEditorRender>,
+    pane_layouts: BTreeMap<WindowId, Box<ViewportLayout>>,
 }
 
 impl ViewportLayout {
@@ -1120,6 +1149,8 @@ impl ViewportLayout {
             theme: CatppuccinPalette::MOCHA,
             epoch: 0,
             cached_rows: Vec::new(),
+            cached_editor_render: None,
+            pane_layouts: BTreeMap::new(),
         }
     }
 
@@ -1127,6 +1158,8 @@ impl ViewportLayout {
         if self.theme != theme {
             self.theme = theme;
             self.cached_rows.clear();
+            self.cached_editor_render = None;
+            self.pane_layouts.clear();
             self.epoch = self.epoch.saturating_add(1);
         }
     }
@@ -1144,6 +1177,8 @@ impl ViewportLayout {
         self.number_width = 3;
         self.color_column = Some(80);
         self.cached_rows.clear();
+        self.cached_editor_render = None;
+        self.pane_layouts.clear();
         self.epoch = self.epoch.saturating_add(1);
     }
 
@@ -1152,6 +1187,8 @@ impl ViewportLayout {
         self.height = height.max(1);
         self.epoch = self.epoch.saturating_add(1);
         self.cached_rows.clear();
+        self.cached_editor_render = None;
+        self.pane_layouts.clear();
     }
 
     /// Maps a terminal cell back through the same pane, gutter, tab, Unicode,
@@ -1214,7 +1251,7 @@ impl ViewportLayout {
             .saturating_sub(rectangle.column)
             .saturating_sub(gutter);
         let local_row = row.saturating_sub(rectangle.row);
-        let start_byte = byte_of_line(&frame.text, pane.top_line);
+        let start_byte = self.cached_frame_byte_of_line(frame, pane.top_line);
         let byte = byte_at_visual_cell(
             &frame.text,
             start_byte,
@@ -1232,10 +1269,7 @@ impl ViewportLayout {
 
     pub fn ensure_cursor_visible(&mut self, frame: &EngineFrame, reserved_rows: usize) {
         let cursor = frame.cursor_byte.min(frame.text.len());
-        let cursor_line = frame.text[..cursor]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count();
+        let cursor_line = self.frame_line_of_byte(frame, cursor);
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
         let margin = self
             .scrolloff
@@ -1250,6 +1284,22 @@ impl ViewportLayout {
                 .saturating_sub(content_height);
             self.epoch = self.epoch.saturating_add(1);
         }
+    }
+
+    fn frame_line_of_byte(&mut self, frame: &EngineFrame, byte: usize) -> usize {
+        frame.text.line_of_byte(byte)
+    }
+
+    fn frame_byte_of_line(&mut self, frame: &EngineFrame, line: usize) -> usize {
+        frame.text.byte_of_line(line)
+    }
+
+    fn cached_frame_byte_of_line(&self, frame: &EngineFrame, line: usize) -> usize {
+        frame.text.byte_of_line(line)
+    }
+
+    fn cached_frame_line_of_byte(&self, frame: &EngineFrame, byte: usize) -> usize {
+        frame.text.line_of_byte(byte)
     }
 
     #[must_use]
@@ -1287,9 +1337,22 @@ impl ViewportLayout {
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
     ) -> DesiredGrid {
+        if self.editor_render_is_cached(frame, status, prompt, decorations, line_decorations) {
+            return self.reuse_editor_render(frame, status, prompt);
+        }
+        if let Some(grid) =
+            self.update_cached_editor_viewport(frame, status, prompt, decorations, line_decorations)
+        {
+            return grid;
+        }
+        if let Some(grid) =
+            self.update_cached_editor_line(frame, status, prompt, decorations, line_decorations)
+        {
+            return grid;
+        }
         let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        let start_byte = byte_of_line(&frame.text, self.top_line);
+        let start_byte = self.frame_byte_of_line(frame, self.top_line);
         let gutter = if self.line_numbers {
             self.number_width.min(self.width.saturating_sub(1))
         } else {
@@ -1302,14 +1365,18 @@ impl ViewportLayout {
             start_byte,
             self.top_line,
         );
-        builder.push_document(&frame.text, frame.cursor_byte, decorations);
+        let end_byte = frame
+            .text
+            .byte_of_line(self.top_line.saturating_add(content_height));
+        let visible = frame.text.slice(start_byte..end_byte);
+        builder.push_grapheme_document(&visible, frame.cursor_byte, decorations);
+        let mut content_row_lines = builder.row_lines.clone();
+        content_row_lines.resize(content_height, None);
+        content_row_lines.truncate(content_height);
         let mut rows = builder.rows;
         let mut cursor = builder.cursor.unwrap_or((0, 0));
         if gutter > 0 {
-            let cursor_line = frame.text[..frame.cursor_byte.min(frame.text.len())]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count();
+            let cursor_line = self.frame_line_of_byte(frame, frame.cursor_byte);
             prepend_line_numbers(
                 &mut rows,
                 &builder.row_lines,
@@ -1365,12 +1432,374 @@ impl ViewportLayout {
             })
             .collect();
         self.cached_rows.clone_from(&rows);
+        self.cached_editor_render = Some(CachedEditorRender {
+            text: frame.text.clone(),
+            content_row_lines,
+            top_line: self.top_line,
+            width: self.width,
+            height: self.height,
+            tab_width: self.tab_width,
+            line_numbers: self.line_numbers,
+            relative_numbers: self.relative_numbers,
+            number_width: self.number_width,
+            color_column: self.color_column,
+            theme: self.theme,
+            status: status.into(),
+            prompt: prompt.map(Into::into),
+            decorations: decorations.to_vec(),
+            line_decorations: line_decorations.to_vec(),
+            relative_cursor_line: self
+                .relative_numbers
+                .then(|| self.frame_line_of_byte(frame, frame.cursor_byte)),
+        });
         self.epoch = self.epoch.saturating_add(1);
         DesiredGrid {
             epoch: self.epoch,
             width: self.width,
             height: self.height,
             rows,
+            cursor,
+        }
+    }
+
+    fn editor_render_is_cached(
+        &self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> bool {
+        let Some(cached) = &self.cached_editor_render else {
+            return false;
+        };
+        cached.text.same_snapshot(&frame.text)
+            && self.editor_render_context_is_cached(
+                frame,
+                status,
+                prompt,
+                decorations,
+                line_decorations,
+            )
+    }
+
+    fn editor_render_context_is_cached(
+        &self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> bool {
+        let Some(cached) = &self.cached_editor_render else {
+            return false;
+        };
+        self.cached_rows.len() == self.height
+            && cached.top_line == self.top_line
+            && self.editor_render_stable_context_is_cached(
+                frame,
+                status,
+                prompt,
+                decorations,
+                line_decorations,
+            )
+    }
+
+    fn editor_render_stable_context_is_cached(
+        &self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> bool {
+        let Some(cached) = &self.cached_editor_render else {
+            return false;
+        };
+        self.cached_rows.len() == self.height
+            && cached.width == self.width
+            && cached.height == self.height
+            && cached.tab_width == self.tab_width
+            && cached.line_numbers == self.line_numbers
+            && cached.relative_numbers == self.relative_numbers
+            && cached.number_width == self.number_width
+            && cached.color_column == self.color_column
+            && cached.theme == self.theme
+            && cached.status.as_ref() == status
+            && cached.prompt.as_deref() == prompt
+            && cached.decorations == decorations
+            && cached.line_decorations == line_decorations
+            && cached.relative_cursor_line
+                == self
+                    .relative_numbers
+                    .then(|| frame.text.line_of_byte(frame.cursor_byte))
+    }
+
+    fn update_cached_editor_viewport(
+        &mut self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> Option<DesiredGrid> {
+        let cached = self.cached_editor_render.as_ref()?;
+        if !cached.text.same_snapshot(&frame.text)
+            || self.top_line != cached.top_line.saturating_add(1)
+            || !self.editor_render_stable_context_is_cached(
+                frame,
+                status,
+                prompt,
+                decorations,
+                line_decorations,
+            )
+        {
+            return None;
+        }
+        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
+        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        if cached.content_row_lines.len() != content_height
+            || !cached
+                .content_row_lines
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| *line == Some(cached.top_line.saturating_add(offset)))
+        {
+            return None;
+        }
+
+        self.cached_rows[..content_height].rotate_left(1);
+        let logical_line = self
+            .top_line
+            .saturating_add(content_height.saturating_sub(1));
+        let start = self.frame_byte_of_line(frame, logical_line);
+        let end = frame
+            .text
+            .byte_of_line(logical_line.saturating_add(1))
+            .min(frame.text.len());
+        let end = if end > start && frame.text.slice(end - 1..end).as_ref() == "\n" {
+            end - 1
+        } else {
+            end
+        };
+        let cursor_line = self.cached_frame_line_of_byte(frame, frame.cursor_byte);
+        let mut rendered = self.render_editor_line(
+            &frame.text,
+            logical_line,
+            cursor_line,
+            start,
+            end,
+            1,
+            decorations,
+            line_decorations,
+        );
+        self.cached_rows[content_height - 1] = Arc::new(rendered.pop()?);
+
+        let cached = self.cached_editor_render.as_mut()?;
+        cached.top_line = self.top_line;
+        cached.content_row_lines.rotate_left(1);
+        cached.content_row_lines[content_height - 1] = Some(logical_line);
+        Some(self.reuse_editor_render(frame, status, prompt))
+    }
+
+    fn update_cached_editor_line(
+        &mut self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> Option<DesiredGrid> {
+        let cached = self.cached_editor_render.as_ref()?;
+        if self.cached_rows.len() != self.height
+            || cached.top_line != self.top_line
+            || cached.width != self.width
+            || cached.height != self.height
+            || cached.tab_width != self.tab_width
+            || cached.line_numbers != self.line_numbers
+            || cached.relative_numbers != self.relative_numbers
+            || cached.number_width != self.number_width
+            || cached.color_column != self.color_column
+            || cached.theme != self.theme
+            || cached.prompt.as_deref() != prompt
+            || cached.status.is_empty() != status.is_empty()
+            || cached.line_decorations != line_decorations
+            || cached.relative_cursor_line
+                != self
+                    .relative_numbers
+                    .then(|| frame.text.line_of_byte(frame.cursor_byte))
+        {
+            return None;
+        }
+        let change = single_line_change(&cached.text, &frame.text)?;
+        if !decorations_match_outside_change(&cached.decorations, decorations, change) {
+            return None;
+        }
+        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
+        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        if change.line < self.top_line
+            || change.line >= self.top_line.saturating_add(content_height)
+        {
+            self.cached_editor_render
+                .as_mut()?
+                .text
+                .clone_from(&frame.text);
+            return Some(self.reuse_editor_render(frame, status, prompt));
+        }
+        let gutter = if self.line_numbers {
+            self.number_width.min(self.width.saturating_sub(1))
+        } else {
+            0
+        };
+        let content_width = self.width.saturating_sub(gutter).max(1);
+        let screen_row = visual_rows_between_lines(
+            &cached.text,
+            self.top_line,
+            change.line,
+            content_width,
+            self.tab_width,
+        );
+        let old_rows = visual_line_rows(
+            &change.old_text(&cached.text),
+            content_width,
+            self.tab_width,
+        );
+        let new_rows =
+            visual_line_rows(&change.new_text(&frame.text), content_width, self.tab_width);
+        if old_rows != new_rows {
+            return None;
+        }
+        let cursor_line = self.frame_line_of_byte(frame, frame.cursor_byte);
+        if screen_row < content_height {
+            let visible_rows = content_height.saturating_sub(screen_row).min(new_rows);
+            let rendered = self.render_editor_line(
+                &frame.text,
+                change.line,
+                cursor_line,
+                change.new_start,
+                change.new_end,
+                visible_rows,
+                decorations,
+                line_decorations,
+            );
+            if rendered.len() != visible_rows {
+                return None;
+            }
+            for (offset, row) in rendered.into_iter().enumerate() {
+                self.cached_rows[screen_row + offset] = Arc::new(row);
+            }
+        }
+        let cached = self.cached_editor_render.as_mut()?;
+        cached.text.clone_from(&frame.text);
+        cached.status = status.into();
+        cached.decorations = decorations.to_vec();
+        cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
+        if !status.is_empty() || prompt.is_some() {
+            let label = prompt.unwrap_or(status);
+            let style = if prompt.is_some() {
+                CellStyle::default()
+            } else {
+                CellStyle {
+                    bold: true,
+                    reverse: true,
+                    ..CellStyle::default()
+                }
+            };
+            let status_row = self.height.saturating_sub(1);
+            self.cached_rows[status_row] =
+                Arc::new(row_from_text(label, self.width, style, self.tab_width));
+        }
+        Some(self.reuse_editor_render(frame, status, prompt))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_editor_line(
+        &self,
+        text: &FrameText,
+        logical_line: usize,
+        cursor_line: usize,
+        start: usize,
+        end: usize,
+        height: usize,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> Vec<CellRow> {
+        let gutter = if self.line_numbers {
+            self.number_width.min(self.width.saturating_sub(1))
+        } else {
+            0
+        };
+        let mut builder = GridBuilder::new(
+            self.width.saturating_sub(gutter),
+            height.max(1),
+            self.tab_width,
+            start,
+            logical_line,
+        );
+        let visible = text.slice(start..end);
+        builder.push_grapheme_document(&visible, usize::MAX, decorations);
+        let mut rows = builder.rows;
+        if gutter > 0 {
+            prepend_line_numbers(
+                &mut rows,
+                &builder.row_lines,
+                cursor_line,
+                gutter,
+                self.relative_numbers,
+                line_decorations,
+            );
+        }
+        if let Some(column) = self.color_column {
+            mark_color_column(
+                &mut rows,
+                gutter.saturating_add(column.saturating_sub(1)),
+                self.width,
+                self.theme.mantle,
+            );
+        }
+        ensure_row_backgrounds(&mut rows);
+        apply_theme_to_rows(&mut rows, self.theme);
+        rows
+    }
+
+    fn reuse_editor_render(
+        &mut self,
+        frame: &EngineFrame,
+        status: &str,
+        prompt: Option<&str>,
+    ) -> DesiredGrid {
+        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
+        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        let gutter = if self.line_numbers {
+            self.number_width.min(self.width.saturating_sub(1))
+        } else {
+            0
+        };
+        let start = self.frame_byte_of_line(frame, self.top_line);
+        let cursor = frame.cursor_byte.min(frame.text.len());
+        let visible = frame.text.slice(start..cursor.max(start));
+        let mut cursor = cursor_visual_position(
+            &visible,
+            0,
+            visible.len(),
+            self.width.saturating_sub(gutter).max(1),
+            content_height,
+            self.tab_width,
+        );
+        cursor.0 = cursor.0.saturating_add(gutter);
+        if let Some(label) = prompt {
+            let input = label.split("  │  ").next().unwrap_or(label);
+            cursor = (
+                display_width(input, self.tab_width).min(self.width.saturating_sub(1)),
+                self.height.saturating_sub(1),
+            );
+        }
+        self.epoch = self.epoch.saturating_add(1);
+        DesiredGrid {
+            epoch: self.epoch,
+            width: self.width,
+            height: self.height,
+            rows: self.cached_rows.clone(),
             cursor,
         }
     }
@@ -1417,8 +1846,6 @@ impl ViewportLayout {
     ) -> DesiredGrid {
         let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        let mut rows = vec![CellRow::default(); self.height];
-        let mut cursor = (0, 0);
         let tab = model.active_tab();
         let mut panes = Vec::new();
         split_rectangles(
@@ -1431,6 +1858,42 @@ impl ViewportLayout {
             },
             &mut panes,
         );
+        self.pane_layouts
+            .retain(|window_id, _| panes.iter().any(|(visible, _)| visible == window_id));
+
+        if panes.len() == 1 {
+            let (window_id, rectangle) = panes[0];
+            if rectangle.column == 0
+                && rectangle.row == 0
+                && rectangle.width == self.width
+                && rectangle.height == content_height
+                && let Some(window) = model.windows.iter().find(|window| window.id == window_id)
+                && let Some((_, frame)) = frames
+                    .iter()
+                    .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
+            {
+                let buffer_decorations = decorations
+                    .iter()
+                    .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
+                    .map_or(&[][..], |(_, spans)| spans.as_slice());
+                let buffer_line_decorations = line_decorations
+                    .iter()
+                    .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
+                    .map_or(&[][..], |(_, spans)| spans.as_slice());
+                let grid = self.render_workspace_pane(
+                    window_id,
+                    rectangle,
+                    window.top_line,
+                    frame,
+                    buffer_decorations,
+                    buffer_line_decorations,
+                );
+                return self.finish_single_pane_workspace(grid, status, prompt);
+            }
+        }
+
+        let mut rows = vec![CellRow::default(); self.height];
+        let mut cursor = (0, 0);
         for (window_id, rectangle) in panes {
             let Some(window) = model.windows.iter().find(|window| window.id == window_id) else {
                 continue;
@@ -1441,16 +1904,6 @@ impl ViewportLayout {
             else {
                 continue;
             };
-            let mut pane = Self::new(rectangle.width.max(1), rectangle.height.max(1));
-            pane.top_line = window.top_line;
-            pane.tab_width = self.tab_width;
-            pane.scrolloff = self.scrolloff;
-            pane.line_numbers = self.line_numbers;
-            pane.relative_numbers = self.relative_numbers;
-            pane.number_width = self.number_width;
-            pane.color_column = self.color_column;
-            pane.theme = self.theme;
-            pane.ensure_cursor_visible(frame, 0);
             let buffer_decorations = decorations
                 .iter()
                 .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
@@ -1459,10 +1912,11 @@ impl ViewportLayout {
                 .iter()
                 .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
                 .map_or(&[][..], |(_, spans)| spans.as_slice());
-            let grid = pane.desired_editor_grid_with_line_decorations(
+            let grid = self.render_workspace_pane(
+                window_id,
+                rectangle,
+                window.top_line,
                 frame,
-                "",
-                None,
                 buffer_decorations,
                 buffer_line_decorations,
             );
@@ -1529,6 +1983,92 @@ impl ViewportLayout {
         }
     }
 
+    fn render_workspace_pane(
+        &mut self,
+        window_id: WindowId,
+        rectangle: Rect,
+        top_line: usize,
+        frame: &EngineFrame,
+        decorations: &[DecorationSpan],
+        line_decorations: &[LineDecoration],
+    ) -> DesiredGrid {
+        let pane = self.pane_layouts.entry(window_id).or_insert_with(|| {
+            Box::new(Self::new(rectangle.width.max(1), rectangle.height.max(1)))
+        });
+        let pane_width = rectangle.width.max(1);
+        let pane_height = rectangle.height.max(1);
+        if pane.width != pane_width || pane.height != pane_height {
+            pane.resize(pane_width, pane_height);
+        }
+        pane.top_line = top_line;
+        pane.tab_width = self.tab_width;
+        pane.scrolloff = self.scrolloff;
+        pane.line_numbers = self.line_numbers;
+        pane.relative_numbers = self.relative_numbers;
+        pane.number_width = self.number_width;
+        pane.color_column = self.color_column;
+        pane.set_theme(self.theme);
+        pane.ensure_cursor_visible(frame, 0);
+        pane.desired_editor_grid_with_line_decorations(
+            frame,
+            "",
+            None,
+            decorations,
+            line_decorations,
+        )
+    }
+
+    fn finish_single_pane_workspace(
+        &mut self,
+        grid: DesiredGrid,
+        status: &str,
+        prompt: Option<&str>,
+    ) -> DesiredGrid {
+        let mut rows = grid.rows;
+        let mut cursor = grid.cursor;
+        if !status.is_empty() || prompt.is_some() {
+            let label = prompt.unwrap_or(status);
+            let style = if prompt.is_some() {
+                CellStyle::default()
+            } else {
+                CellStyle {
+                    bold: true,
+                    reverse: true,
+                    ..CellStyle::default()
+                }
+            };
+            let mut status_rows = vec![row_from_text(label, self.width, style, self.tab_width)];
+            ensure_row_backgrounds(&mut status_rows);
+            apply_theme_to_rows(&mut status_rows, self.theme);
+            let row = status_rows.pop().unwrap_or_default();
+            rows.push(
+                self.cached_rows
+                    .last()
+                    .filter(|cached| cached.as_ref() == &row)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(row)),
+            );
+            if prompt.is_some() {
+                let input = label.split("  │  ").next().unwrap_or(label);
+                cursor = (
+                    display_width(input, self.tab_width).min(self.width.saturating_sub(1)),
+                    self.height.saturating_sub(1),
+                );
+            }
+        }
+        rows.resize_with(self.height, || Arc::new(CellRow::default()));
+        rows.truncate(self.height);
+        self.cached_rows.clone_from(&rows);
+        self.epoch = self.epoch.saturating_add(1);
+        DesiredGrid {
+            epoch: self.epoch,
+            width: self.width,
+            height: self.height,
+            rows,
+            cursor,
+        }
+    }
+
     /// Draws Telescope's horizontal results/preview layout as a floating surface.
     /// The overlay deliberately lives above the editor grid so picker interaction
     /// never mutates buffer or split state.
@@ -1541,11 +2081,27 @@ impl ViewportLayout {
         if self.width < 20 || self.height < 8 {
             return grid;
         }
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let mut rows = overlay_rows(&grid);
+        let geometry = self.picker_geometry();
+        let styles = self.picker_styles();
+        self.draw_picker_shell(&mut rows, picker, geometry, styles);
+        self.draw_picker_results(&mut rows, picker, geometry, styles);
+        self.draw_picker_preview(&mut rows, picker, geometry, styles);
+        self.finish_overlay(
+            grid,
+            rows,
+            (
+                geometry
+                    .column
+                    .saturating_add(3)
+                    .saturating_add(display_width(&picker.prompt, self.tab_width))
+                    .min(geometry.column + geometry.width - 2),
+                geometry.prompt_row,
+            ),
+        )
+    }
+
+    fn picker_geometry(&self) -> PickerGeometry {
         let width = self.width.saturating_sub(4).clamp(16, 120);
         let height = self
             .height
@@ -1561,70 +2117,116 @@ impl ViewportLayout {
         } else {
             inner_width
         };
-        let preview_width = inner_width.saturating_sub(result_width + usize::from(preview_visible));
-        let base_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-        let border_style = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.blue)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-        let title_style = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.lavender)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-        let selected_style = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.surface2)),
-            ..CellStyle::default()
-        };
-        let detail_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.subtext0)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-
-        for target_row in row..row.saturating_add(height).min(rows.len()) {
-            paint_text(&mut rows[target_row], column, width, "", base_style);
-        }
-        let top = format!("╭{}╮", "─".repeat(width.saturating_sub(2)));
-        let bottom = format!("╰{}╯", "─".repeat(width.saturating_sub(2)));
-        paint_text(&mut rows[row], column, width, &top, border_style);
-        paint_text(
-            &mut rows[row + height - 1],
-            column,
+        let prompt_row = row + height - 2;
+        let content_start = row + 2;
+        PickerGeometry {
             width,
-            &bottom,
-            border_style,
+            height,
+            column,
+            row,
+            preview_visible,
+            inner_width,
+            result_width,
+            preview_width: inner_width.saturating_sub(result_width + usize::from(preview_visible)),
+            prompt_row,
+            content_start,
+            content_height: prompt_row.saturating_sub(content_start),
+        }
+    }
+
+    fn picker_styles(&self) -> PickerStyles {
+        PickerStyles {
+            base: CellStyle {
+                foreground: Some(CellColor::Rgb(self.theme.text)),
+                background: Some(CellColor::Rgb(self.theme.mantle)),
+                ..CellStyle::default()
+            },
+            border: CellStyle {
+                bold: true,
+                foreground: Some(CellColor::Rgb(self.theme.blue)),
+                background: Some(CellColor::Rgb(self.theme.mantle)),
+                ..CellStyle::default()
+            },
+            title: CellStyle {
+                bold: true,
+                foreground: Some(CellColor::Rgb(self.theme.lavender)),
+                background: Some(CellColor::Rgb(self.theme.mantle)),
+                ..CellStyle::default()
+            },
+            selected: CellStyle {
+                bold: true,
+                foreground: Some(CellColor::Rgb(self.theme.text)),
+                background: Some(CellColor::Rgb(self.theme.surface2)),
+                ..CellStyle::default()
+            },
+            detail: CellStyle {
+                foreground: Some(CellColor::Rgb(self.theme.subtext0)),
+                background: Some(CellColor::Rgb(self.theme.mantle)),
+                ..CellStyle::default()
+            },
+        }
+    }
+
+    fn draw_picker_shell(
+        &self,
+        rows: &mut [CellRow],
+        picker: &PickerOverlay,
+        geometry: PickerGeometry,
+        styles: PickerStyles,
+    ) {
+        for target_row in geometry.row..geometry.row.saturating_add(geometry.height).min(rows.len())
+        {
+            paint_text(
+                &mut rows[target_row],
+                geometry.column,
+                geometry.width,
+                "",
+                styles.base,
+            );
+        }
+        let top = format!("╭{}╮", "─".repeat(geometry.width.saturating_sub(2)));
+        let bottom = format!("╰{}╯", "─".repeat(geometry.width.saturating_sub(2)));
+        paint_text(
+            &mut rows[geometry.row],
+            geometry.column,
+            geometry.width,
+            &top,
+            styles.border,
         );
-        for target in rows.iter_mut().take(row + height - 1).skip(row + 1) {
-            paint_text(target, column, 1, "│", border_style);
-            paint_text(target, column + width - 1, 1, "│", border_style);
+        paint_text(
+            &mut rows[geometry.row + geometry.height - 1],
+            geometry.column,
+            geometry.width,
+            &bottom,
+            styles.border,
+        );
+        for target in rows
+            .iter_mut()
+            .take(geometry.row + geometry.height - 1)
+            .skip(geometry.row + 1)
+        {
+            paint_text(target, geometry.column, 1, "│", styles.border);
+            paint_text(
+                target,
+                geometry.column + geometry.width - 1,
+                1,
+                "│",
+                styles.border,
+            );
         }
         let title = format!(" {} ({}) ", picker.title, picker.rows.len());
         paint_text(
-            &mut rows[row],
-            column + 2,
-            title.len().min(width.saturating_sub(4)),
+            &mut rows[geometry.row],
+            geometry.column + 2,
+            title.len().min(geometry.width.saturating_sub(4)),
             &title,
-            title_style,
+            styles.title,
         );
-
-        let prompt_row = row + height - 2;
-        let content_start = row + 2;
-        let content_height = prompt_row.saturating_sub(content_start);
         let prompt = format!("❯ {}", picker.prompt);
         paint_text(
-            &mut rows[prompt_row],
-            column + 1,
-            inner_width,
+            &mut rows[geometry.prompt_row],
+            geometry.column + 1,
+            geometry.inner_width,
             &prompt,
             CellStyle {
                 foreground: Some(CellColor::Rgb(self.theme.text)),
@@ -1632,26 +2234,35 @@ impl ViewportLayout {
                 ..CellStyle::default()
             },
         );
-        let footer_width = display_width(&picker.footer, 1).min(result_width.saturating_sub(2));
+        let footer_width =
+            display_width(&picker.footer, 1).min(geometry.result_width.saturating_sub(2));
         if footer_width > 0 {
             paint_text(
-                &mut rows[row + 1],
-                column + 2,
+                &mut rows[geometry.row + 1],
+                geometry.column + 2,
                 footer_width,
                 &picker.footer,
-                detail_style,
+                styles.detail,
             );
         }
+    }
 
+    fn draw_picker_results(
+        &self,
+        rows: &mut [CellRow],
+        picker: &PickerOverlay,
+        geometry: PickerGeometry,
+        styles: PickerStyles,
+    ) {
         let selected = picker.selected.min(picker.rows.len().saturating_sub(1));
         let result_start = selected
-            .saturating_sub(content_height.saturating_sub(1) / 2)
-            .min(picker.rows.len().saturating_sub(content_height));
+            .saturating_sub(geometry.content_height.saturating_sub(1) / 2)
+            .min(picker.rows.len().saturating_sub(geometry.content_height));
         for (screen_index, item) in picker
             .rows
             .iter()
             .skip(result_start)
-            .take(content_height)
+            .take(geometry.content_height)
             .enumerate()
         {
             let item_index = result_start + screen_index;
@@ -1662,75 +2273,73 @@ impl ViewportLayout {
                 format!("{marker}{}  {}", item.label, item.detail)
             };
             paint_text(
-                &mut rows[content_start + screen_index],
-                column + 1,
-                result_width,
+                &mut rows[geometry.content_start + screen_index],
+                geometry.column + 1,
+                geometry.result_width,
                 &label,
                 if item_index == selected {
-                    selected_style
+                    styles.selected
                 } else {
-                    base_style
+                    styles.base
                 },
             );
         }
+    }
 
-        if preview_visible {
-            let divider_column = column + 1 + result_width;
-            for target in rows.iter_mut().take(prompt_row).skip(row + 1) {
-                paint_text(target, divider_column, 1, "│", border_style);
-            }
-            let preview_column = divider_column + 1;
-            paint_text(
-                &mut rows[row + 1],
-                preview_column,
-                preview_width,
-                &format!(" {} ", picker.preview_title),
-                title_style,
-            );
-            let preview_lines = wrap_popup_text(&picker.preview, preview_width, self.tab_width);
-            for (line_offset, line) in preview_lines
-                .iter()
-                .filter(|line| line.source_line >= picker.preview_scroll)
-                .take(content_height)
-                .enumerate()
-            {
-                let style = if picker.preview_highlight_line == Some(line.source_line) {
-                    selected_style
-                } else {
-                    base_style
-                };
-                paint_text(
-                    &mut rows[content_start + line_offset],
-                    preview_column,
-                    preview_width,
-                    &line.text,
-                    style,
-                );
-                paint_decorated_popup_text(
-                    &mut rows[content_start + line_offset],
-                    preview_column,
-                    line,
-                    &picker.preview_decorations,
-                    style,
-                    self.tab_width,
-                );
-            }
+    fn draw_picker_preview(
+        &self,
+        rows: &mut [CellRow],
+        picker: &PickerOverlay,
+        geometry: PickerGeometry,
+        styles: PickerStyles,
+    ) {
+        if !geometry.preview_visible {
+            return;
         }
-
-        apply_theme_to_rows(&mut rows, self.theme);
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: grid.width,
-            height: grid.height,
-            rows: rows.into_iter().map(Arc::new).collect(),
-            cursor: (
-                column
-                    .saturating_add(3)
-                    .saturating_add(display_width(&picker.prompt, self.tab_width))
-                    .min(column + width - 2),
-                prompt_row,
-            ),
+        let divider_column = geometry.column + 1 + geometry.result_width;
+        for target in rows
+            .iter_mut()
+            .take(geometry.prompt_row)
+            .skip(geometry.row + 1)
+        {
+            paint_text(target, divider_column, 1, "│", styles.border);
+        }
+        let preview_column = divider_column + 1;
+        paint_text(
+            &mut rows[geometry.row + 1],
+            preview_column,
+            geometry.preview_width,
+            &format!(" {} ", picker.preview_title),
+            styles.title,
+        );
+        let preview_lines =
+            wrap_popup_text(&picker.preview, geometry.preview_width, self.tab_width);
+        for (line_offset, line) in preview_lines
+            .iter()
+            .filter(|line| line.source_line >= picker.preview_scroll)
+            .take(geometry.content_height)
+            .enumerate()
+        {
+            let style = if picker.preview_highlight_line == Some(line.source_line) {
+                styles.selected
+            } else {
+                styles.base
+            };
+            paint_text(
+                &mut rows[geometry.content_start + line_offset],
+                preview_column,
+                geometry.preview_width,
+                &line.text,
+                style,
+            );
+            paint_decorated_popup_text(
+                &mut rows[geometry.content_start + line_offset],
+                preview_column,
+                line,
+                &picker.preview_decorations,
+                style,
+                self.tab_width,
+            );
         }
     }
 
@@ -1746,11 +2355,7 @@ impl ViewportLayout {
             return grid;
         }
         let cursor = grid.cursor;
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let mut rows = overlay_rows(&grid);
         let visible_rows = completion.rows.len().min(10);
         let menu_height = visible_rows + 2;
         let longest = completion
@@ -1840,70 +2445,84 @@ impl ViewportLayout {
             );
         }
 
-        if !completion.documentation.is_empty() && self.width >= 48 {
-            let available_right = self.width.saturating_sub(menu_column + menu_width + 1);
-            let docs_width = 50
-                .min(self.width.saturating_sub(2))
-                .min(if available_right >= 24 {
-                    available_right
-                } else {
-                    menu_column.saturating_sub(1)
-                });
-            if docs_width >= 20 {
-                let docs_column = if available_right >= docs_width {
-                    menu_column + menu_width + 1
-                } else {
-                    menu_column.saturating_sub(docs_width + 1)
-                };
-                let docs_height = (completion
-                    .documentation
-                    .lines()
-                    .skip(completion.documentation_scroll)
-                    .count()
-                    .min(12)
-                    + 2)
-                .clamp(4, self.height.saturating_sub(menu_row).max(4));
-                draw_popup_frame(
-                    &mut rows,
-                    docs_column,
-                    menu_row,
-                    docs_width,
-                    docs_height,
-                    CellStyle {
-                        background: Some(CellColor::Rgb(self.theme.mantle)),
-                        ..base_style
-                    },
-                    border_style,
-                    "documentation",
-                );
-                for (offset, line) in completion
-                    .documentation
-                    .lines()
-                    .skip(completion.documentation_scroll)
-                    .take(docs_height.saturating_sub(2))
-                    .enumerate()
-                {
-                    paint_text(
-                        &mut rows[menu_row + 1 + offset],
-                        docs_column + 1,
-                        docs_width.saturating_sub(2),
-                        line,
-                        CellStyle {
-                            background: Some(CellColor::Rgb(self.theme.mantle)),
-                            ..base_style
-                        },
-                    );
-                }
-            }
+        self.draw_completion_documentation(
+            &mut rows,
+            completion,
+            Rect {
+                column: menu_column,
+                row: menu_row,
+                width: menu_width,
+                height: menu_height,
+            },
+            base_style,
+            border_style,
+        );
+        self.finish_overlay(grid, rows, cursor)
+    }
+
+    fn draw_completion_documentation(
+        &self,
+        rows: &mut [CellRow],
+        completion: &CompletionOverlay,
+        menu: Rect,
+        base_style: CellStyle,
+        border_style: CellStyle,
+    ) {
+        if completion.documentation.is_empty() || self.width < 48 {
+            return;
         }
-        apply_theme_to_rows(&mut rows, self.theme);
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: grid.width,
-            height: grid.height,
-            rows: rows.into_iter().map(Arc::new).collect(),
-            cursor,
+        let available_right = self.width.saturating_sub(menu.column + menu.width + 1);
+        let docs_width = 50
+            .min(self.width.saturating_sub(2))
+            .min(if available_right >= 24 {
+                available_right
+            } else {
+                menu.column.saturating_sub(1)
+            });
+        if docs_width < 20 {
+            return;
+        }
+        let docs_column = if available_right >= docs_width {
+            menu.column + menu.width + 1
+        } else {
+            menu.column.saturating_sub(docs_width + 1)
+        };
+        let docs_height = (completion
+            .documentation
+            .lines()
+            .skip(completion.documentation_scroll)
+            .count()
+            .min(12)
+            + 2)
+        .clamp(4, self.height.saturating_sub(menu.row).max(4));
+        let docs_style = CellStyle {
+            background: Some(CellColor::Rgb(self.theme.mantle)),
+            ..base_style
+        };
+        draw_popup_frame(
+            rows,
+            docs_column,
+            menu.row,
+            docs_width,
+            docs_height,
+            docs_style,
+            border_style,
+            "documentation",
+        );
+        for (offset, line) in completion
+            .documentation
+            .lines()
+            .skip(completion.documentation_scroll)
+            .take(docs_height.saturating_sub(2))
+            .enumerate()
+        {
+            paint_text(
+                &mut rows[menu.row + 1 + offset],
+                docs_column + 1,
+                docs_width.saturating_sub(2),
+                line,
+                docs_style,
+            );
         }
     }
 
@@ -1935,11 +2554,7 @@ impl ViewportLayout {
         } else {
             cursor.1.saturating_sub(height)
         };
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let mut rows = overlay_rows(&grid);
         let base_style = CellStyle {
             foreground: Some(CellColor::Rgb(self.theme.text)),
             background: Some(CellColor::Rgb(self.theme.mantle)),
@@ -1989,15 +2604,7 @@ impl ViewportLayout {
                 self.tab_width,
             );
         }
-        apply_theme_to_rows(&mut rows, self.theme);
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: grid.width,
-            height: grid.height,
-            rows: rows.into_iter().map(Arc::new).collect(),
-            cursor,
-        }
+        self.finish_overlay(grid, rows, cursor)
     }
 
     /// The default nvim-dap-ui layout: scopes/breakpoints/stacks/watches on
@@ -2007,11 +2614,7 @@ impl ViewportLayout {
         if self.width < 30 || self.height < 12 {
             return grid;
         }
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let mut rows = overlay_rows(&grid);
         let status_rows = 1;
         let usable_height = self.height.saturating_sub(status_rows);
         let bottom_height = usable_height.clamp(6, 10);
@@ -2094,15 +2697,7 @@ impl ViewportLayout {
             base_style,
             border_style,
         );
-        apply_theme_to_rows(&mut rows, self.theme);
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: grid.width,
-            height: grid.height,
-            rows: rows.into_iter().map(Arc::new).collect(),
-            cursor,
-        }
+        self.finish_overlay(grid, rows, cursor)
     }
 
     /// Paints AceJump-style labels directly over visible matches in the active
@@ -2149,7 +2744,7 @@ impl ViewportLayout {
             0
         };
         let content_width = rectangle.width.saturating_sub(gutter).max(1);
-        let start_byte = byte_of_line(&frame.text, window.top_line);
+        let start_byte = self.frame_byte_of_line(frame, window.top_line);
         let wanted = overlay
             .targets
             .iter()
@@ -2160,7 +2755,11 @@ impl ViewportLayout {
         let mut byte = start_byte;
         let mut screen_row = 0_usize;
         let mut screen_column = 0_usize;
-        for grapheme in frame.text[start_byte..].graphemes(true) {
+        let end_byte = frame
+            .text
+            .byte_of_line(window.top_line.saturating_add(rectangle.height.max(1)));
+        let visible = frame.text.slice(start_byte..end_byte);
+        for grapheme in visible.graphemes(true) {
             if let Some(label) = wanted.get(&byte)
                 && screen_row < rectangle.height
             {
@@ -2193,11 +2792,7 @@ impl ViewportLayout {
                 break;
             }
         }
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let mut rows = overlay_rows(&grid);
         let style = CellStyle {
             bold: true,
             foreground: Some(CellColor::Rgb(self.theme.base)),
@@ -2224,14 +2819,8 @@ impl ViewportLayout {
                 );
             }
         }
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: grid.width,
-            height: grid.height,
-            rows: rows.into_iter().map(Arc::new).collect(),
-            cursor: grid.cursor,
-        }
+        let cursor = grid.cursor;
+        self.finish_overlay(grid, rows, cursor)
     }
 
     #[must_use]
@@ -2243,13 +2832,12 @@ impl ViewportLayout {
         if self.height == 0 {
             return grid;
         }
-        let mut rows = grid
-            .rows
-            .iter()
-            .map(|row| row.as_ref().clone())
-            .collect::<Vec<_>>();
+        let width = grid.width;
+        let height = grid.height;
+        let cursor = grid.cursor;
+        let mut rows = grid.rows;
         let row_index = self.height - 1;
-        rows[row_index] = row_from_text(
+        let mut row = row_from_text(
             &" ".repeat(self.width),
             self.width,
             CellStyle {
@@ -2262,13 +2850,7 @@ impl ViewportLayout {
         let mut left_column = 0;
         for segment in &status.left {
             let width = display_width(&segment.text, 1).min(self.width.saturating_sub(left_column));
-            paint_text(
-                &mut rows[row_index],
-                left_column,
-                width,
-                &segment.text,
-                segment.style,
-            );
+            paint_text(&mut row, left_column, width, &segment.text, segment.style);
             left_column = left_column.saturating_add(width);
         }
         let right_width = status
@@ -2281,15 +2863,29 @@ impl ViewportLayout {
         for segment in &status.right {
             let width =
                 display_width(&segment.text, 1).min(self.width.saturating_sub(right_column));
-            paint_text(
-                &mut rows[row_index],
-                right_column,
-                width,
-                &segment.text,
-                segment.style,
-            );
+            paint_text(&mut row, right_column, width, &segment.text, segment.style);
             right_column = right_column.saturating_add(width);
         }
+        apply_theme_to_rows(std::slice::from_mut(&mut row), self.theme);
+        if let Some(target) = rows.get_mut(row_index) {
+            *target = Arc::new(row);
+        }
+        self.epoch = self.epoch.saturating_add(1);
+        DesiredGrid {
+            epoch: self.epoch,
+            width,
+            height,
+            rows,
+            cursor,
+        }
+    }
+
+    fn finish_overlay(
+        &mut self,
+        grid: DesiredGrid,
+        mut rows: Vec<CellRow>,
+        cursor: (usize, usize),
+    ) -> DesiredGrid {
         apply_theme_to_rows(&mut rows, self.theme);
         self.epoch = self.epoch.saturating_add(1);
         DesiredGrid {
@@ -2297,9 +2893,37 @@ impl ViewportLayout {
             width: grid.width,
             height: grid.height,
             rows: rows.into_iter().map(Arc::new).collect(),
-            cursor: grid.cursor,
+            cursor,
         }
     }
+}
+
+fn overlay_rows(grid: &DesiredGrid) -> Vec<CellRow> {
+    grid.rows.iter().map(|row| row.as_ref().clone()).collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerGeometry {
+    width: usize,
+    height: usize,
+    column: usize,
+    row: usize,
+    preview_visible: bool,
+    inner_width: usize,
+    result_width: usize,
+    preview_width: usize,
+    prompt_row: usize,
+    content_start: usize,
+    content_height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PickerStyles {
+    base: CellStyle,
+    border: CellStyle,
+    title: CellStyle,
+    selected: CellStyle,
+    detail: CellStyle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2311,6 +2935,9 @@ struct Rect {
 }
 
 fn apply_theme_to_rows(rows: &mut [CellRow], theme: CatppuccinPalette) {
+    if theme == CatppuccinPalette::MOCHA {
+        return;
+    }
     for cell in rows.iter_mut().flat_map(|row| &mut row.cells) {
         cell.style.foreground = cell
             .style
@@ -2866,14 +3493,16 @@ fn draw_split_borders(
 }
 
 fn byte_at_visual_cell(
-    text: &str,
+    text: &FrameText,
     document_start: usize,
     width: usize,
     tab_width: usize,
     target_column: usize,
     target_row: usize,
 ) -> Option<usize> {
-    let visible = text.get(document_start..)?;
+    let start_line = text.line_of_byte(document_start);
+    let end = text.byte_of_line(start_line.saturating_add(target_row).saturating_add(1));
+    let visible = text.slice(document_start..end);
     let width = width.max(1);
     let tab_width = tab_width.max(1);
     let mut absolute_byte = document_start;
@@ -2947,23 +3576,39 @@ impl GridBuilder {
         document_start: usize,
         start_line: usize,
     ) -> Self {
+        let mut rows = Vec::with_capacity(height.max(1));
+        rows.push(CellRow {
+            cells: Vec::with_capacity(width.min(256)),
+        });
+        let mut row_lines = Vec::with_capacity(height.max(1));
+        row_lines.push(Some(start_line));
         Self {
             width: width.max(1),
             height: height.max(1),
             tab_width: tab_width.max(1),
             document_start,
-            rows: vec![CellRow::default()],
+            rows,
             row: 0,
             column: 0,
             cursor: None,
-            row_lines: vec![Some(start_line)],
+            row_lines,
             logical_line: start_line,
         }
     }
 
     fn push_document(&mut self, text: &str, cursor_byte: usize, decorations: &[DecorationSpan]) {
         let visible = text.get(self.document_start..).unwrap_or_default();
+        self.push_grapheme_document(visible, cursor_byte, decorations);
+    }
+
+    fn push_grapheme_document(
+        &mut self,
+        visible: &str,
+        cursor_byte: usize,
+        decorations: &[DecorationSpan],
+    ) {
         let mut absolute_byte = self.document_start;
+        let mut decoration_resolver = DecorationResolver::new(decorations);
         if cursor_byte < self.document_start {
             self.cursor = Some((0, 0));
         }
@@ -2973,7 +3618,11 @@ impl GridBuilder {
                 self.cursor = Some((self.column, self.row));
             }
             absolute_byte += grapheme.len();
-            let style = decoration_style(decorations, grapheme_start..absolute_byte);
+            let style = if decorations.is_empty() {
+                CellStyle::default()
+            } else {
+                decoration_resolver.style(grapheme_start..absolute_byte)
+            };
             if grapheme == "\n" {
                 self.logical_line = self.logical_line.saturating_add(1);
                 if !self.next_row(Some(self.logical_line)) {
@@ -3032,9 +3681,43 @@ impl GridBuilder {
         if self.row >= self.height {
             return false;
         }
-        self.rows.push(CellRow::default());
+        self.rows.push(CellRow {
+            cells: Vec::with_capacity(self.width.min(256)),
+        });
         self.row_lines.push(logical_line);
         true
+    }
+}
+
+struct DecorationResolver<'a> {
+    decorations: &'a [DecorationSpan],
+    starts: Vec<usize>,
+    next: usize,
+    active: Vec<usize>,
+}
+
+impl<'a> DecorationResolver<'a> {
+    fn new(decorations: &'a [DecorationSpan]) -> Self {
+        let mut starts = (0..decorations.len()).collect::<Vec<_>>();
+        starts.sort_by_key(|index| (decorations[*index].range.start, *index));
+        Self {
+            decorations,
+            starts,
+            next: 0,
+            active: Vec::new(),
+        }
+    }
+
+    fn style(&mut self, range: Range<usize>) -> CellStyle {
+        self.active
+            .retain(|index| self.decorations[*index].range.end > range.start);
+        while let Some(index) = self.starts.get(self.next).copied()
+            && self.decorations[index].range.start < range.end
+        {
+            self.active.push(index);
+            self.next += 1;
+        }
+        decoration_style_from_indices(self.decorations, self.active.iter().copied(), range)
     }
 }
 
@@ -3082,14 +3765,42 @@ fn prepend_line_numbers(
 }
 
 fn decoration_style(decorations: &[DecorationSpan], range: Range<usize>) -> CellStyle {
-    decorations
-        .iter()
-        .filter(|decoration| {
-            decoration.range.start < range.end && range.start < decoration.range.end
-        })
-        .fold(CellStyle::default(), |style, decoration| {
-            merge_styles(style, decoration.style)
-        })
+    decoration_style_from_indices(decorations, 0..decorations.len(), range)
+}
+
+fn decoration_style_from_indices(
+    decorations: &[DecorationSpan],
+    indices: impl IntoIterator<Item = usize>,
+    range: Range<usize>,
+) -> CellStyle {
+    let mut style = CellStyle::default();
+    let mut foreground_priority = None::<(u32, usize)>;
+    let mut background_priority = None::<(u32, usize)>;
+    for order in indices {
+        let decoration = &decorations[order];
+        if decoration.range.start >= range.end || range.start >= decoration.range.end {
+            continue;
+        }
+        style.bold |= decoration.style.bold;
+        style.italic |= decoration.style.italic;
+        style.underline |= decoration.style.underline;
+        style.strikethrough |= decoration.style.strikethrough;
+        style.reverse |= decoration.style.reverse;
+        let precedence = (decoration.priority, order);
+        if let Some(foreground) = decoration.style.foreground
+            && foreground_priority.is_none_or(|current| precedence >= current)
+        {
+            style.foreground = Some(foreground);
+            foreground_priority = Some(precedence);
+        }
+        if let Some(background) = decoration.style.background
+            && background_priority.is_none_or(|current| precedence >= current)
+        {
+            style.background = Some(background);
+            background_priority = Some(precedence);
+        }
+    }
+    style
 }
 
 fn escape_grapheme(grapheme: &str) -> Vec<String> {
@@ -3169,6 +3880,234 @@ fn display_width(text: &str, tab_width: usize) -> usize {
         }
     }
     width
+}
+
+fn line_of_byte(text: &str, byte: usize) -> usize {
+    text.get(..byte.min(text.len()))
+        .unwrap_or_default()
+        .bytes()
+        .filter(|value| *value == b'\n')
+        .count()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SingleLineChange {
+    line: usize,
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+}
+
+impl SingleLineChange {
+    fn old_text(self, text: &FrameText) -> Cow<'_, str> {
+        text.slice(self.old_start..self.old_end)
+    }
+
+    fn new_text(self, text: &FrameText) -> Cow<'_, str> {
+        text.slice(self.new_start..self.new_end)
+    }
+}
+
+fn single_line_change(old: &FrameText, new: &FrameText) -> Option<SingleLineChange> {
+    if let Some(change) = new.single_line_change_from(old) {
+        return Some(SingleLineChange {
+            line: change.line,
+            old_start: change.old_start,
+            old_end: change.old_end,
+            new_start: change.new_start,
+            new_end: change.new_end,
+        });
+    }
+    let mut difference = old
+        .bytes()
+        .zip(new.bytes())
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| old.len().min(new.len()));
+    if old == new {
+        return None;
+    }
+    while difference > 0 && (!old.is_char_boundary(difference) || !new.is_char_boundary(difference))
+    {
+        difference -= 1;
+    }
+    let old_start = old
+        .get(..difference)?
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let new_start = new
+        .get(..difference)?
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let old_end = old[difference..]
+        .find('\n')
+        .map_or(old.len(), |offset| difference + offset);
+    let new_end = new[difference..]
+        .find('\n')
+        .map_or(new.len(), |offset| difference + offset);
+    if old.get(..old_start) != new.get(..new_start) || old.get(old_end..) != new.get(new_end..) {
+        return None;
+    }
+    Some(SingleLineChange {
+        line: line_of_byte(old, old_start),
+        old_start,
+        old_end,
+        new_start,
+        new_end,
+    })
+}
+
+fn decorations_match_outside_change(
+    old: &[DecorationSpan],
+    new: &[DecorationSpan],
+    change: SingleLineChange,
+) -> bool {
+    fn outside(
+        decorations: &[DecorationSpan],
+        start: usize,
+        end: usize,
+        mapped_end: usize,
+    ) -> Option<Vec<DecorationSpan>> {
+        let mut result = Vec::with_capacity(decorations.len());
+        for decoration in decorations {
+            if decoration.range.end <= start {
+                result.push(decoration.clone());
+            } else if decoration.range.start >= end {
+                let mut decoration = decoration.clone();
+                decoration.range.start = shift_after_line(decoration.range.start, end, mapped_end)?;
+                decoration.range.end = shift_after_line(decoration.range.end, end, mapped_end)?;
+                result.push(decoration);
+            } else if decoration.range.start < start || decoration.range.end > end {
+                return None;
+            }
+        }
+        Some(result)
+    }
+
+    let Some(mapped_old) = outside(old, change.old_start, change.old_end, change.new_end) else {
+        return false;
+    };
+    let Some(new_outside) = outside(new, change.new_start, change.new_end, change.new_end) else {
+        return false;
+    };
+    mapped_old == new_outside
+}
+
+fn shift_after_line(byte: usize, old_end: usize, new_end: usize) -> Option<usize> {
+    if new_end >= old_end {
+        byte.checked_add(new_end - old_end)
+    } else {
+        byte.checked_sub(old_end - new_end)
+    }
+}
+
+fn visual_rows_between_lines(
+    text: &FrameText,
+    start_line: usize,
+    end_line: usize,
+    width: usize,
+    tab_width: usize,
+) -> usize {
+    (start_line..end_line)
+        .map(|line| {
+            let start = text.byte_of_line(line);
+            let mut end = text.byte_of_line(line.saturating_add(1));
+            if end > start && text.slice(end - 1..end).as_ref() == "\n" {
+                end -= 1;
+            }
+            visual_line_rows(&text.slice(start..end), width, tab_width)
+        })
+        .sum()
+}
+
+fn visual_line_rows(text: &str, width: usize, tab_width: usize) -> usize {
+    let mut row = 0;
+    let mut column = 0;
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\t" {
+            let spaces = tab_width.max(1) - (column % tab_width.max(1));
+            for _ in 0..spaces {
+                advance_visual_cell(&mut row, &mut column, width, 1);
+            }
+        } else if grapheme.chars().all(|character| !character.is_control()) {
+            advance_visual_cell(
+                &mut row,
+                &mut column,
+                width,
+                UnicodeWidthStr::width(grapheme).max(1),
+            );
+        } else {
+            for escaped in escape_grapheme(grapheme) {
+                advance_visual_cell(
+                    &mut row,
+                    &mut column,
+                    width,
+                    UnicodeWidthStr::width(escaped.as_str()).max(1),
+                );
+            }
+        }
+    }
+    row.saturating_add(1)
+}
+
+fn cursor_visual_position(
+    text: &str,
+    start_byte: usize,
+    cursor_byte: usize,
+    width: usize,
+    height: usize,
+    tab_width: usize,
+) -> (usize, usize) {
+    if cursor_byte <= start_byte {
+        return (0, 0);
+    }
+    let visible = text
+        .get(start_byte..cursor_byte.min(text.len()))
+        .unwrap_or_default();
+    let mut row = 0_usize;
+    let mut column = 0_usize;
+    for grapheme in visible.graphemes(true) {
+        if grapheme == "\n" {
+            row = row.saturating_add(1);
+            column = 0;
+        } else if grapheme == "\t" {
+            let spaces = tab_width.max(1) - (column % tab_width.max(1));
+            for _ in 0..spaces {
+                advance_visual_cell(&mut row, &mut column, width, 1);
+            }
+        } else if grapheme.chars().all(|character| !character.is_control()) {
+            advance_visual_cell(
+                &mut row,
+                &mut column,
+                width,
+                UnicodeWidthStr::width(grapheme).max(1),
+            );
+        } else {
+            for escaped in escape_grapheme(grapheme) {
+                advance_visual_cell(
+                    &mut row,
+                    &mut column,
+                    width,
+                    UnicodeWidthStr::width(escaped.as_str()).max(1),
+                );
+            }
+        }
+        if row >= height {
+            break;
+        }
+    }
+    (
+        column.min(width.saturating_sub(1)),
+        row.min(height.saturating_sub(1)),
+    )
+}
+
+fn advance_visual_cell(row: &mut usize, column: &mut usize, width: usize, cell_width: usize) {
+    if column.saturating_add(cell_width) > width && *column > 0 {
+        *row = row.saturating_add(1);
+        *column = 0;
+    }
+    *column = column.saturating_add(cell_width);
 }
 
 fn byte_of_line(text: &str, line: usize) -> usize {
@@ -3410,6 +4349,7 @@ mod tests {
                 preview_highlight_line: Some(1),
                 preview_decorations: vec![DecorationSpan {
                     range: 0..2,
+                    priority: 100,
                     style: CellStyle {
                         bold: true,
                         foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)),
@@ -3465,6 +4405,7 @@ mod tests {
                 preview_highlight_line: Some(0),
                 preview_decorations: vec![DecorationSpan {
                     range: 0..preview.len(),
+                    priority: 100,
                     style: CellStyle {
                         bold: true,
                         foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)),
@@ -3612,7 +4553,7 @@ mod tests {
     #[test]
     fn wraps_graphemes_without_splitting_them() {
         let frame = EngineFrame {
-            text: Box::from("ab界c"),
+            text: "ab界c".into(),
             cursor_byte: "ab界".len(),
         };
         let grid = ViewportLayout::new(3, 3).desired_grid(&frame);
@@ -3734,7 +4675,7 @@ mod tests {
     #[test]
     fn controls_are_escaped_before_terminal_patches() {
         let frame = EngineFrame {
-            text: Box::from("a\u{1b}\u{0}b"),
+            text: "a\u{1b}\u{0}b".into(),
             cursor_byte: 0,
         };
         let grid = ViewportLayout::new(20, 2).desired_grid(&frame);
@@ -3782,6 +4723,7 @@ mod tests {
                     first,
                     vec![DecorationSpan {
                         range: "界\t".len().."界\tfn".len(),
+                        priority: 100,
                         style: keyword,
                     }],
                 ),
@@ -3789,6 +4731,7 @@ mod tests {
                     second,
                     vec![DecorationSpan {
                         range: 0..3,
+                        priority: 100,
                         style: keyword,
                     }],
                 ),
@@ -3829,6 +4772,7 @@ mod tests {
             None,
             &[DecorationSpan {
                 range: 0..2,
+                priority: 100,
                 style: syntax,
             }],
             &[LineDecoration {
@@ -3851,7 +4795,7 @@ mod tests {
     #[test]
     fn cursor_scrolls_into_view_and_prompt_owns_last_row() {
         let frame = EngineFrame {
-            text: Box::from("0\n1\n2\n3\n4\n"),
+            text: "0\n1\n2\n3\n4\n".into(),
             cursor_byte: "0\n1\n2\n3\n".len(),
         };
         let mut layout = ViewportLayout::new(10, 3);
@@ -3864,11 +4808,11 @@ mod tests {
     #[test]
     fn shrinking_rows_emits_clear_to_end() {
         let old = ViewportLayout::new(20, 2).desired_grid(&EngineFrame {
-            text: Box::from("long line"),
+            text: "long line".into(),
             cursor_byte: 0,
         });
         let new = ViewportLayout::new(20, 2).desired_grid(&EngineFrame {
-            text: Box::from("x"),
+            text: "x".into(),
             cursor_byte: 0,
         });
         assert!(
@@ -3881,14 +4825,180 @@ mod tests {
     #[test]
     fn unchanged_rows_are_arc_reused_while_frame_epochs_advance() {
         let frame = EngineFrame {
-            text: Box::from("same\nrows"),
+            text: "same\nrows".into(),
             cursor_byte: 0,
         };
         let mut layout = ViewportLayout::new(20, 2);
         let first = layout.desired_grid(&frame);
-        let second = layout.desired_grid(&frame);
+        let second = layout.desired_grid(&EngineFrame {
+            cursor_byte: 5,
+            ..frame
+        });
         assert!(second.epoch > first.epoch);
         assert!(Arc::ptr_eq(&first.rows[0], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
+        assert_eq!(second.cursor, (0, 1));
+    }
+
+    #[test]
+    fn unicode_line_edits_only_rebuild_the_changed_visual_rows() {
+        let mut layout = ViewportLayout::new(30, 3);
+        let first = layout.desired_grid(&EngineFrame {
+            text: "界 alpha\nβeta\ngamma".into(),
+            cursor_byte: 0,
+        });
+        let second = layout.desired_grid(&EngineFrame {
+            text: "界λ alpha\nβeta\ngamma".into(),
+            cursor_byte: "界λ".len(),
+        });
+
+        assert!(!Arc::ptr_eq(&first.rows[0], &second.rows[0]));
+        assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
+        assert!(Arc::ptr_eq(&first.rows[2], &second.rows[2]));
+        assert_eq!(second.cursor, (3, 0));
+        assert_eq!(
+            second.rows[0]
+                .cells
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>(),
+            "界λ alpha"
+        );
+    }
+
+    #[test]
+    fn one_line_viewport_scroll_reuses_visible_unicode_rows() {
+        let frame = EngineFrame {
+            text: "αlpha\nβeta\nγamma\nδelta".into(),
+            cursor_byte: 0,
+        };
+        let mut layout = ViewportLayout::new(30, 3);
+        let first = layout.desired_grid(&frame);
+        layout.top_line = 1;
+        let second = layout.desired_grid(&frame);
+
+        assert!(Arc::ptr_eq(&first.rows[1], &second.rows[0]));
+        assert!(Arc::ptr_eq(&first.rows[2], &second.rows[1]));
+        assert_eq!(
+            second.rows[2]
+                .cells
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>(),
+            "δelta"
+        );
+    }
+
+    #[test]
+    fn production_workspace_retains_unchanged_pane_rows() {
+        let model = ClientViewModel::new(DocumentId::new(10), "main.rs");
+        let buffer_id = model.active_buffer();
+        let window_id = model.active_window().id;
+        let mut layout = ViewportLayout::new(30, 4);
+        let first = layout.desired_workspace_grid(
+            &model,
+            &[(
+                buffer_id,
+                EngineFrame {
+                    text: "界 alpha\nβeta\ngamma".into(),
+                    cursor_byte: 0,
+                },
+            )],
+            "NORMAL",
+            None,
+        );
+        let cached_second_row = Arc::clone(&layout.pane_layouts[&window_id].cached_rows[1]);
+        let second = layout.desired_workspace_grid(
+            &model,
+            &[(
+                buffer_id,
+                EngineFrame {
+                    text: "界λ alpha\nβeta\ngamma".into(),
+                    cursor_byte: "界λ".len(),
+                },
+            )],
+            "NORMAL",
+            None,
+        );
+
+        assert!(Arc::ptr_eq(
+            &cached_second_row,
+            &layout.pane_layouts[&window_id].cached_rows[1]
+        ));
+        assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
+        assert_eq!(second.cursor, (3, 0));
+    }
+
+    #[test]
+    fn offscreen_line_edits_do_not_replace_visible_rows() {
+        let mut layout = ViewportLayout::new(30, 2);
+        layout.top_line = 1;
+        let first = layout.desired_grid(&EngineFrame {
+            text: "alpha\nbeta\ngamma".into(),
+            cursor_byte: "alpha\n".len(),
+        });
+        let second = layout.desired_grid(&EngineFrame {
+            text: "alphax\nbeta\ngamma".into(),
+            cursor_byte: "alphax\n".len(),
+        });
+
+        assert!(Arc::ptr_eq(&first.rows[0], &second.rows[0]));
+        assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
+        assert_eq!(
+            second.rows[0]
+                .cells
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>(),
+            "beta"
+        );
+    }
+
+    #[test]
+    fn ordered_decoration_sweep_matches_full_overlap_resolution() {
+        let decorations = vec![
+            DecorationSpan {
+                range: 4..9,
+                priority: 20,
+                style: CellStyle {
+                    foreground: Some(CellColor::Palette(2)),
+                    ..CellStyle::default()
+                },
+            },
+            DecorationSpan {
+                range: 0..12,
+                priority: 10,
+                style: CellStyle {
+                    bold: true,
+                    foreground: Some(CellColor::Palette(1)),
+                    ..CellStyle::default()
+                },
+            },
+            DecorationSpan {
+                range: 7..11,
+                priority: 20,
+                style: CellStyle {
+                    underline: true,
+                    foreground: Some(CellColor::Palette(3)),
+                    ..CellStyle::default()
+                },
+            },
+            DecorationSpan {
+                range: 2..5,
+                priority: 30,
+                style: CellStyle {
+                    background: Some(CellColor::Palette(4)),
+                    ..CellStyle::default()
+                },
+            },
+        ];
+        let mut resolver = DecorationResolver::new(&decorations);
+        for start in 0..14 {
+            let range = start..start + 1;
+            assert_eq!(
+                resolver.style(range.clone()),
+                decoration_style(&decorations, range)
+            );
+        }
     }
 }

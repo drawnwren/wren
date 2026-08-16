@@ -3756,6 +3756,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wren-benchmark-support"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core_affinity",
+ "hdrhistogram",
+ "serde_json",
+]
+
+[[package]]
 name = "wren-client-state"
 version = "0.1.0"
 dependencies = [
@@ -3868,11 +3878,11 @@ name = "wren-latency"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "core_affinity",
  "hdrhistogram",
  "serde",
  "serde_json",
  "tempfile",
+ "wren-benchmark-support",
  "wren-command",
  "wren-engine",
  "wren-grammar",
@@ -3880,6 +3890,7 @@ dependencies = [
  "wren-provider",
  "wren-term",
  "wren-text",
+ "wren-tui",
  "wren-types",
  "wren-view",
 ]
@@ -3917,13 +3928,16 @@ dependencies = [
 name = "wren-provider"
 version = "0.1.0"
 dependencies = [
+ "ast-grep-core",
  "ast-grep-language",
  "criterion",
  "nucleo-matcher",
  "pollster",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tree-sitter",
  "wgpu",
  "wren-types",
 ]
@@ -3990,10 +4004,10 @@ name = "wren-startup"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "core_affinity",
  "hdrhistogram",
  "serde_json",
  "tempfile",
+ "wren-benchmark-support",
  "wren-client-state",
  "wren-engine",
  "wren-session",
@@ -4008,11 +4022,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
- "core_affinity",
  "hdrhistogram",
  "nix",
  "serde_json",
  "tempfile",
+ "wren-benchmark-support",
  "wren-provider",
  "wren-remote",
  "wren-text",
@@ -4101,6 +4115,7 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "vt100",
  "wren-types",

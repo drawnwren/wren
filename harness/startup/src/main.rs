@@ -11,6 +11,10 @@ use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tempfile::tempdir;
+use wren_benchmark_support::{
+    ArgumentCursor, CommonArguments, bare_metal_declared, elapsed_nanos, emit_report, histogram,
+    percentiles, pin_requested_cpu, require_bare_metal_cpu, ten_percent_cut,
+};
 use wren_client_state::{ClientViewStateStore, PublishedViewport};
 use wren_engine::EngineFrame;
 use wren_session::{SessionAuthority, SessionJournal};
@@ -21,16 +25,13 @@ use wren_types::{
 };
 use wren_view::ViewportLayout;
 
-const SCENARIO_A_P99_GATE_NANOS: u64 = 3_098_418;
-const SCENARIO_B1_P99_GATE_NANOS: u64 = 385_688;
+const SCENARIO_A_P99_GATE_NANOS: u64 = ten_percent_cut(3_098_418);
+const SCENARIO_B1_P99_GATE_NANOS: u64 = ten_percent_cut(385_688);
 const VIEWPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 struct Arguments {
-    iterations: u64,
-    cpu: Option<usize>,
-    output: Option<PathBuf>,
-    gate: bool,
+    common: CommonArguments,
     b3_path: Option<PathBuf>,
     probe_file: Option<PathBuf>,
 }
@@ -62,95 +63,41 @@ impl Timings {
         json!({
             "unit": "nanoseconds",
             "samples": self.correct.len(),
-            "time_to_speculative_frame": distribution(&self.speculative),
-            "time_to_correct_frame": distribution(&self.correct),
-            "time_to_interactive": distribution(&self.interactive),
+            "time_to_speculative_frame": percentiles(&self.speculative),
+            "time_to_correct_frame": percentiles(&self.correct),
+            "time_to_interactive": percentiles(&self.interactive),
         })
     }
 }
 
-fn histogram() -> Result<Histogram<u64>> {
-    Histogram::new_with_bounds(1, 60_000_000_000, 3).map_err(Into::into)
-}
-
-fn distribution(histogram: &Histogram<u64>) -> Value {
-    json!({
-        "min": histogram.min(),
-        "p50": histogram.value_at_quantile(0.50),
-        "p90": histogram.value_at_quantile(0.90),
-        "p99": histogram.value_at_quantile(0.99),
-        "max": histogram.max(),
-    })
-}
-
 fn arguments() -> Result<Arguments> {
-    let values: Vec<String> = env::args().skip(1).collect();
     let mut arguments = Arguments {
-        iterations: 1_000,
-        cpu: None,
-        output: None,
-        gate: false,
+        common: CommonArguments::new(1_000),
         b3_path: None,
         probe_file: None,
     };
-    let mut index = 0;
-    while index < values.len() {
-        match values[index].as_str() {
-            "--iterations" => {
-                index += 1;
-                arguments.iterations = values
-                    .get(index)
-                    .context("--iterations needs a value")?
-                    .parse()?;
-            }
-            "--cpu" => {
-                index += 1;
-                arguments.cpu = Some(values.get(index).context("--cpu needs a value")?.parse()?);
-            }
-            "--output" => {
-                index += 1;
-                arguments.output = Some(PathBuf::from(
-                    values.get(index).context("--output needs a value")?,
-                ));
-            }
-            "--b3-path" => {
-                index += 1;
-                arguments.b3_path = Some(PathBuf::from(
-                    values.get(index).context("--b3-path needs a value")?,
-                ));
-            }
-            "--probe-file" => {
-                index += 1;
-                arguments.probe_file = Some(PathBuf::from(
-                    values.get(index).context("--probe-file needs a value")?,
-                ));
-            }
-            "--gate" => arguments.gate = true,
+    let mut cursor = ArgumentCursor::from_env();
+    while let Some(argument) = cursor.next() {
+        if arguments.common.consume(&argument, &mut cursor)? {
+            continue;
+        }
+        match argument.as_str() {
+            "--b3-path" => arguments.b3_path = Some(cursor.path(&argument)?),
+            "--probe-file" => arguments.probe_file = Some(cursor.path(&argument)?),
             argument => anyhow::bail!("unknown argument: {argument}"),
         }
-        index += 1;
     }
-    anyhow::ensure!(arguments.iterations > 0, "--iterations must be positive");
+    arguments.common.validate()?;
     Ok(arguments)
 }
 
-fn pin_cpu(index: usize) -> bool {
-    core_affinity::get_core_ids()
-        .and_then(|ids| ids.get(index).copied())
-        .is_some_and(core_affinity::set_for_current)
-}
-
 fn validate_gate_environment(arguments: &Arguments, pinned: bool) -> Result<()> {
-    if !arguments.gate {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        env::var("WREN_BARE_METAL").as_deref() == Ok("1"),
-        "--gate requires WREN_BARE_METAL=1 on the dedicated benchmark runner"
-    );
-    anyhow::ensure!(arguments.cpu.is_some(), "--gate requires --cpu");
-    anyhow::ensure!(pinned, "requested benchmark CPU could not be pinned");
-    Ok(())
+    require_bare_metal_cpu(
+        arguments.common.gate,
+        arguments.common.cpu,
+        pinned,
+        "--gate",
+    )
 }
 
 fn fixture_text() -> String {
@@ -283,14 +230,14 @@ fn scenario_a(
         );
         let speculative_grid = Arc::new(cached.grid);
         black_box(&speculative_grid);
-        let speculative = nanos(started);
+        let speculative = elapsed_nanos(started);
         anyhow::ensure!(
             heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct,
             "scenario A published viewport was not head-valid"
         );
-        let correct = nanos(started);
+        let correct = elapsed_nanos(started);
         black_box((speculative_grid.cursor, state.selections.primary));
-        timings.record(speculative, correct, nanos(started))?;
+        timings.record(speculative, correct, elapsed_nanos(started))?;
     }
     Ok(timings)
 }
@@ -316,14 +263,14 @@ fn scenario_b1(
             text: text.into(),
             cursor_byte: 0,
         });
-        let speculative = nanos(started);
+        let speculative = elapsed_nanos(started);
         anyhow::ensure!(
             heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct,
             "scenario B1 frontier was not head-valid"
         );
         black_box(grid);
-        let correct = nanos(started);
-        timings.record(speculative, correct, nanos(started))?;
+        let correct = elapsed_nanos(started);
+        timings.record(speculative, correct, elapsed_nanos(started))?;
     }
     Ok(timings)
 }
@@ -336,13 +283,13 @@ fn scenario_full_read(iterations: u64, path: &Path) -> Result<Timings> {
         let text = String::from_utf8(bytes).context("startup fixture must be UTF-8")?;
         let mut layout = ViewportLayout::new(120, 40);
         let grid = layout.desired_grid(&EngineFrame {
-            text: text.into_boxed_str(),
+            text: text.into(),
             cursor_byte: 0,
         });
-        let speculative = nanos(started);
+        let speculative = elapsed_nanos(started);
         black_box(grid);
-        let correct = nanos(started);
-        timings.record(speculative, correct, nanos(started))?;
+        let correct = elapsed_nanos(started);
+        timings.record(speculative, correct, elapsed_nanos(started))?;
     }
     Ok(timings)
 }
@@ -364,13 +311,13 @@ fn scenario_c(iterations: u64, directory: &Path, text: &str) -> Result<Timings> 
             .context("recovered startup document")?;
         let mut layout = ViewportLayout::new(120, 40);
         let grid = layout.desired_grid(&EngineFrame {
-            text: document.text.clone().into_boxed_str(),
+            text: document.text.clone().into(),
             cursor_byte: 0,
         });
-        let speculative = nanos(started);
+        let speculative = elapsed_nanos(started);
         black_box(grid);
-        let correct = nanos(started);
-        timings.record(speculative, correct, nanos(started))?;
+        let correct = elapsed_nanos(started);
+        timings.record(speculative, correct, elapsed_nanos(started))?;
     }
     Ok(timings)
 }
@@ -386,7 +333,7 @@ fn scenario_d(iterations: u64, path: &Path) -> Result<Timings> {
             .status()
             .context("spawn cold-process probe")?;
         anyhow::ensure!(status.success(), "cold-process probe failed");
-        let elapsed = nanos(started);
+        let elapsed = elapsed_nanos(started);
         timings.record(elapsed, elapsed, elapsed)?;
     }
     Ok(timings)
@@ -397,16 +344,10 @@ fn probe(path: &Path) -> Result<()> {
     let text = String::from_utf8(bytes).context("probe file must be UTF-8")?;
     let mut layout = ViewportLayout::new(120, 40);
     black_box(layout.desired_grid(&EngineFrame {
-        text: text.into_boxed_str(),
+        text: text.into(),
         cursor_byte: 0,
     }));
     Ok(())
-}
-
-fn nanos(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos())
-        .unwrap_or(u64::MAX)
-        .max(1)
 }
 
 #[cfg(unix)]
@@ -439,13 +380,16 @@ fn read_at(file: &File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> 
     Ok(bytes)
 }
 
-fn main() -> Result<()> {
-    let arguments = arguments()?;
-    if let Some(path) = arguments.probe_file {
-        return probe(&path);
-    }
-    let cpu_pinned = arguments.cpu.is_some_and(pin_cpu);
-    validate_gate_environment(&arguments, cpu_pinned)?;
+struct StartupMetrics {
+    scenario_a: Timings,
+    scenario_b1: Timings,
+    scenario_b2: Timings,
+    scenario_b3: Option<Timings>,
+    scenario_c: Timings,
+    scenario_d: Timings,
+}
+
+fn startup_metrics(arguments: &Arguments) -> Result<StartupMetrics> {
     if let Some(path) = &arguments.b3_path {
         anyhow::ensure!(
             is_network_or_fuse_path(path),
@@ -462,62 +406,104 @@ fn main() -> Result<()> {
     let (_head_writer, head_reader) = shared_heads(directory.path())?;
 
     let scenario_a = scenario_a(
-        arguments.iterations,
+        arguments.common.iterations,
         directory.path(),
         &fixture,
         &head_reader,
     )?;
     let scenario_b1 = scenario_b1(
-        arguments.iterations,
+        arguments.common.iterations,
         &fixture_path,
         known_offset,
         &head_reader,
     )?;
-    let b2_iterations = arguments.iterations.min(25);
+    let b2_iterations = arguments.common.iterations.min(25);
     let scenario_b2 = scenario_full_read(b2_iterations, &fixture_path)?;
     let scenario_c = scenario_c(
-        arguments.iterations.min(100),
+        arguments.common.iterations.min(100),
         &directory.path().join("session"),
         &fixture,
     )?;
-    let scenario_d = scenario_d(arguments.iterations, &fixture_path)?;
+    let scenario_d = scenario_d(arguments.common.iterations, &fixture_path)?;
     let scenario_b3 = arguments
         .b3_path
         .as_deref()
         .map(|path| scenario_full_read(b2_iterations, path))
         .transpose()?;
+    Ok(StartupMetrics {
+        scenario_a,
+        scenario_b1,
+        scenario_b2,
+        scenario_b3,
+        scenario_c,
+        scenario_d,
+    })
+}
 
-    let a_pass = scenario_a.correct.value_at_quantile(0.99) < SCENARIO_A_P99_GATE_NANOS;
-    let b1_pass = scenario_b1.correct.value_at_quantile(0.99) < SCENARIO_B1_P99_GATE_NANOS;
-    let report = json!({
+#[derive(Debug, Clone, Copy)]
+struct StartupGates {
+    scenario_a: bool,
+    scenario_b1: bool,
+}
+
+impl StartupGates {
+    fn evaluate(metrics: &StartupMetrics) -> Self {
+        Self {
+            scenario_a: metrics.scenario_a.correct.value_at_quantile(0.99)
+                < SCENARIO_A_P99_GATE_NANOS,
+            scenario_b1: metrics.scenario_b1.correct.value_at_quantile(0.99)
+                < SCENARIO_B1_P99_GATE_NANOS,
+        }
+    }
+
+    fn enforce(self) -> Result<()> {
+        anyhow::ensure!(
+            self.scenario_a,
+            "scenario A p99 exceeded its tightened gate"
+        );
+        anyhow::ensure!(
+            self.scenario_b1,
+            "scenario B1 p99 exceeded its tightened gate"
+        );
+        Ok(())
+    }
+}
+
+fn report(
+    arguments: &Arguments,
+    cpu_pinned: bool,
+    metrics: &StartupMetrics,
+    gates: StartupGates,
+) -> Value {
+    json!({
         "schema": 2,
-        "cpu_requested": arguments.cpu,
+        "cpu_requested": arguments.common.cpu,
         "cpu_pinned": cpu_pinned,
         "runner_contract": {
-            "bare_metal_declared": env::var("WREN_BARE_METAL").as_deref() == Ok("1"),
-            "gate_authoritative": arguments.gate,
+            "bare_metal_declared": bare_metal_declared(),
+            "gate_authoritative": arguments.common.gate,
             "kernel_cache_state_runner_controlled": true,
         },
         "scenario_a": {
             "contract": "warm session + warm published viewport + local head validation",
             "gated": true,
             "p99_gate_nanos": SCENARIO_A_P99_GATE_NANOS,
-            "passed": a_pass,
-            "metrics": scenario_a.report(),
+            "passed": gates.scenario_a,
+            "metrics": metrics.scenario_a.report(),
         },
         "scenario_b1": {
             "contract": "unopened page-cache-hot local file + known byte range + head validation",
             "gated": true,
             "p99_gate_nanos": SCENARIO_B1_P99_GATE_NANOS,
-            "passed": b1_pass,
-            "metrics": scenario_b1.report(),
+            "passed": gates.scenario_b1,
+            "metrics": metrics.scenario_b1.report(),
         },
         "scenario_b2": {
             "contract": "unopened local file, cache state uncontrolled by portable harness",
             "gated": false,
-            "metrics": scenario_b2.report(),
+            "metrics": metrics.scenario_b2.report(),
         },
-        "scenario_b3": match scenario_b3 {
+        "scenario_b3": match &metrics.scenario_b3 {
             Some(metrics) => json!({
                 "contract": "caller-supplied network/FUSE path",
                 "gated": false,
@@ -533,23 +519,31 @@ fn main() -> Result<()> {
         "scenario_c": {
             "contract": "cold session authority + warm filesystem",
             "gated": false,
-            "metrics": scenario_c.report(),
+            "metrics": metrics.scenario_c.report(),
         },
         "scenario_d": {
             "contract": "fresh process + full file read; binary/fs cache eviction is runner-controlled",
             "gated": false,
-            "metrics": scenario_d.report(),
+            "metrics": metrics.scenario_d.report(),
         },
-    });
-    let rendered = serde_json::to_string_pretty(&report)?;
-    if let Some(path) = arguments.output {
-        fs::write(&path, format!("{rendered}\n"))
-            .with_context(|| format!("write {}", path.display()))?;
+    })
+}
+
+fn main() -> Result<()> {
+    let arguments = arguments()?;
+    if let Some(path) = &arguments.probe_file {
+        return probe(path);
     }
-    println!("{rendered}");
-    if arguments.gate {
-        anyhow::ensure!(a_pass, "scenario A p99 exceeded its 90%-of-baseline gate");
-        anyhow::ensure!(b1_pass, "scenario B1 p99 exceeded its 90%-of-baseline gate");
+    let cpu_pinned = pin_requested_cpu(arguments.common.cpu);
+    validate_gate_environment(&arguments, cpu_pinned)?;
+    let metrics = startup_metrics(&arguments)?;
+    let gates = StartupGates::evaluate(&metrics);
+    emit_report(
+        &report(&arguments, cpu_pinned, &metrics, gates),
+        arguments.common.output.as_deref(),
+    )?;
+    if arguments.common.gate {
+        gates.enforce()?;
     }
     Ok(())
 }

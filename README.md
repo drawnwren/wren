@@ -51,8 +51,8 @@ named buffer.
   diagnostics, Git hunk signs, and breakpoint/conditional-breakpoint marks
 - Lazy cross-platform GPU compute for parallel provider classification when
   suitable, with transparent CPU fallback when an adapter or workload is unsupported
-- Native Git hunk navigation, stage/reset/undo/preview/blame/diff plus
-  Fugitive-style `:Git`, `:Gwrite`, and `:Gdiffsplit`
+- Native Git hunk navigation, stage/reset/undo/preview/blame/diff, a full-screen
+  lazygit diff/status interface at `:Git`, and `:Gwrite`/`:Gdiffsplit`
 - Rust, TypeScript/JavaScript, Python, Go, Terraform, Nix, Haskell, Lua, shell,
   and C/C++ language-server profiles with navigation, hover/signature help,
   references, rename, code actions/lenses, workspace folders, and formatting

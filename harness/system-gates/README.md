@@ -3,9 +3,9 @@
 Cross-phase observability harness for provider freshness/queue depth, snapshot
 retention, process memory, and remote convergence/persisted-save latency. It
 emits HDR distributions and gates provider-freshness p99 at
-102,066ns/192,613ns/225ns for normal/large/pathological documents. Real
-dual-OpenSSH convergence and fsynced save gate below 4,397,874ns and
-17,783,192ns p99 for the checked-in loopback profile. Missing SSH
+91,859ns/173,351ns/202ns for normal/large/pathological documents. Real
+dual-OpenSSH convergence and fsynced save gate below 3,958,086ns and
+16,004,872ns p99 for the checked-in loopback profile. Missing SSH
 configuration fails the hard gate. A `--gate` run is accepted only on a
 CPU-pinned bare-metal runner with active `tc netem`, a real dual-OpenSSH remote
 target, and `WREN_REMOTE_BASELINE_JSON` for that exact network profile.
@@ -26,9 +26,17 @@ The remote baseline report is intentionally separate from the measured output:
 }
 ```
 
-The harness computes both hard targets as the floor of 90% of this baseline.
+The harness computes both hard targets by taking the floor of 90% twice: a
+second 10% cut from the prior hard target, approximately 81% of this baseline.
 The runner fails if the report is absent or malformed; a loopback baseline is
 never presented as an authoritative netem target.
+
+The `architecture-gates` CI job is unconditional and requires a runner carrying
+the `self-hosted`, `linux`, `x64`, and `wren-benchmark` labels. Runner-local
+paths to the physical and remote baseline reports are supplied through
+`WREN_KEY_TO_PHOTON_JSON` and `WREN_REMOTE_BASELINE_JSON`; absent reports fail
+instead of disabling the job. `scripts/netem-remote.sh` likewise returns a
+nonzero status when Linux, privilege, netem, or remote inputs are unavailable.
 
 On the authoritative runner, capture current performance and then gate the
 optimized build with the same profile:

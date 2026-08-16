@@ -37,40 +37,61 @@
             pkgs.basedpyright
             pkgs.bash-language-server
             pkgs.cargo
+            pkgs.clang
             pkgs.clang-tools
             pkgs.clippy
             pkgs.fourmolu
+            pkgs.ghc
+            pkgs.go
             pkgs.gopls
             pkgs.haskell-language-server
+            pkgs.lua
             pkgs.lua-language-server
+            pkgs.nix
             pkgs.nixd
             pkgs.nixfmt
+            pkgs.opentofu
             pkgs.pnpm
             pkgs.python3
             pkgs.ruff
             pkgs.rust-analyzer
             pkgs.rustfmt
             pkgs.terraform-ls
+            pkgs.typescript
             pkgs.typescript-language-server
           ];
           runtimeInputs = [
             pkgs.openssh
             pkgs.git
+            pkgs.lazygit
             pkgs.ripgrep
             pkgs.bashInteractive
           ] ++ languageRuntimeInputs;
-          developmentInputs = [
+          developmentInputs = runtimeInputs ++ [
             pkgs.cargo-deny
             pkgs.cargo-fuzz
             pkgs.cargo-nextest
-            pkgs.python3
             pkgs.tree-sitter
-            pkgs.openssh
-            pkgs.git
-            pkgs.ripgrep
-            pkgs.bashInteractive
             oracle
           ];
+          runtimeToolsCheck = pkgs.runCommand "wren-runtime-tools-check" {
+            nativeBuildInputs = runtimeInputs;
+          } ''
+            for tool in \
+              astyle basedpyright-langserver bash-language-server cargo clang++ clangd \
+              clippy-driver fourmolu ghc ghci go gofmt gopls \
+              haskell-language-server-wrapper lua-language-server luac \
+              nix-instantiate nixd nixfmt pnpm python3 ruff rust-analyzer rustfmt \
+              lazygit terraform-ls tofu tsc typescript-language-server
+            do
+              if ! command -v "$tool" >/dev/null; then
+                echo "missing packaged runtime tool: $tool" >&2
+                exit 1
+              fi
+            done
+            mkdir -p "$out"
+            touch "$out/passed"
+          '';
           commonArgs = {
             pname = "wren";
             version = "0.1.0";
@@ -177,6 +198,7 @@
             package
             mkCargoCheck
             fuzzCheck
+            runtimeToolsCheck
             languageRuntimeInputs
             runtimeInputs
             developmentInputs
@@ -226,6 +248,7 @@
         let scope = perSystem system;
         in {
           package = scope.package;
+          runtime-tools = scope.runtimeToolsCheck;
           fmt = scope.craneLib.cargoFmt (scope.commonArgs // {
             cargoExtraArgs = "--all";
           });

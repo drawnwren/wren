@@ -214,6 +214,26 @@ pub struct TerminalSurface {
     parser: vt100::Parser,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalColor {
+    Default,
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalCell<'a> {
+    pub contents: &'a str,
+    pub wide: bool,
+    pub wide_continuation: bool,
+    pub foreground: TerminalColor,
+    pub background: TerminalColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
 impl TerminalSurface {
     #[must_use]
     pub fn new(rows: u16, columns: u16) -> Self {
@@ -239,6 +259,41 @@ impl TerminalSurface {
     pub fn cursor_position(&self) -> (u16, u16) {
         self.parser.screen().cursor_position()
     }
+
+    #[must_use]
+    pub fn size(&self) -> (u16, u16) {
+        self.parser.screen().size()
+    }
+
+    #[must_use]
+    pub fn cell(&self, row: u16, column: u16) -> Option<TerminalCell<'_>> {
+        let cell = self.parser.screen().cell(row, column)?;
+        Some(TerminalCell {
+            contents: cell.contents(),
+            wide: cell.is_wide(),
+            wide_continuation: cell.is_wide_continuation(),
+            foreground: terminal_color(cell.fgcolor()),
+            background: terminal_color(cell.bgcolor()),
+            bold: cell.bold(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            reverse: cell.inverse(),
+        })
+    }
+
+    #[must_use]
+    pub fn accepts_sgr_mouse(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+            && self.parser.screen().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
+    }
+}
+
+const fn terminal_color(color: vt100::Color) -> TerminalColor {
+    match color {
+        vt100::Color::Default => TerminalColor::Default,
+        vt100::Color::Idx(index) => TerminalColor::Palette(index),
+        vt100::Color::Rgb(red, green, blue) => TerminalColor::Rgb(red, green, blue),
+    }
 }
 
 /// Live PTY session. Output is drained continuously on a background thread,
@@ -260,6 +315,27 @@ impl PtySession {
         rows: u16,
         columns: u16,
     ) -> Result<Self, WorkflowError> {
+        let directory = std::env::current_dir().ok();
+        Self::spawn_with_directory(program, arguments, rows, columns, directory.as_deref())
+    }
+
+    pub fn spawn_in(
+        program: &str,
+        arguments: &[&str],
+        rows: u16,
+        columns: u16,
+        directory: &Path,
+    ) -> Result<Self, WorkflowError> {
+        Self::spawn_with_directory(program, arguments, rows, columns, Some(directory))
+    }
+
+    fn spawn_with_directory(
+        program: &str,
+        arguments: &[&str],
+        rows: u16,
+        columns: u16,
+        directory: Option<&Path>,
+    ) -> Result<Self, WorkflowError> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -270,7 +346,10 @@ impl PtySession {
             .map_err(|error| WorkflowError::Pty(format!("open failed: {error}")))?;
         let mut command = CommandBuilder::new(resolve_pty_program(program));
         command.args(arguments);
-        if let Ok(directory) = std::env::current_dir() {
+        if std::env::var_os("TERM").is_none() {
+            command.env("TERM", "xterm-256color");
+        }
+        if let Some(directory) = directory {
             command.cwd(directory);
         }
         let child = pair
@@ -1538,9 +1617,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pty_output_is_emulated_into_a_terminal_surface() {
-        let output = run_pty("sh", &["-c", "printf '\\033[31mRED\\033[0m'"], 4, 20).expect("pty");
+        let output = run_pty(
+            "sh",
+            &[
+                "-c",
+                "printf '\\033[1;31;44mRED\\033[0m\\033[?1000h\\033[?1006h'",
+            ],
+            4,
+            20,
+        )
+        .expect("pty");
         assert!(output.exit_success);
         assert_eq!(output.surface.contents(), "RED");
+        let cell = output.surface.cell(0, 0).expect("styled terminal cell");
+        assert_eq!(cell.contents, "R");
+        assert_eq!(cell.foreground, TerminalColor::Palette(1));
+        assert_eq!(cell.background, TerminalColor::Palette(4));
+        assert!(cell.bold);
+        assert!(output.surface.accepts_sgr_mouse());
     }
 
     #[cfg(unix)]
@@ -1564,6 +1658,36 @@ mod tests {
         assert_eq!(session.exit_code(), Some(0));
         assert!(session.surface().contents().contains("got:hello"));
         assert!(session.bytes_read() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pty_can_start_in_an_explicit_workspace() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let mut session = PtySession::spawn_in(
+            "sh",
+            &["-c", "printf '%s' \"$PWD\""],
+            4,
+            80,
+            directory.path(),
+        )
+        .expect("spawn PTY in workspace");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.exit_code().is_none() && Instant::now() < deadline {
+            session.poll().expect("poll");
+            thread::yield_now();
+        }
+        session.poll().expect("final poll");
+        assert_eq!(session.exit_code(), Some(0));
+        assert_eq!(
+            Path::new(session.surface().contents().trim())
+                .canonicalize()
+                .expect("canonical PTY directory"),
+            directory
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+        );
     }
 
     #[test]

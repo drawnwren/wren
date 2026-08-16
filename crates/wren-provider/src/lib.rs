@@ -8,12 +8,14 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Pattern};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tree_sitter::{Query, QueryCursor, QueryMatch, QueryPredicateArg, StreamingIterator};
 use wren_types::{
     Bias, DocumentId, DocumentRevision, Edit, Freshness, FreshnessKey, LanguageBundle,
     ProviderDemand, ProviderGeneration, Transaction,
@@ -59,6 +61,12 @@ pub enum ProviderResponse {
 pub struct HighlightSpan {
     pub range: Range<usize>,
     pub kind: Arc<str>,
+    #[serde(default = "default_highlight_priority")]
+    pub priority: u32,
+}
+
+const fn default_highlight_priority() -> u32 {
+    1_000_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,7 +356,7 @@ impl ProviderActor {
                         || (GrammarBackend::DynamicWasmFallback, Vec::new()),
                         |spans| (GrammarBackend::BundledNative, spans),
                     );
-                syntax_spans.sort_by_key(|span| (span.range.start, span.range.end));
+                syntax_spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
                 let mut maximum_end = 0;
                 let syntax_prefix_max_end = syntax_spans
                     .iter()
@@ -427,14 +435,15 @@ impl ProviderActor {
                     spans.extend(ranges.into_iter().map(|span| HighlightSpan {
                         range: range.start + span.start..range.start + span.end,
                         kind: "keyword".into(),
+                        priority: default_highlight_priority(),
                     }));
                 } else {
                     lexical_spans(source, range.start, &mut spans);
                 }
             }
         }
-        spans.sort_by_key(|span| span.range.start);
-        spans.dedup_by(|left, right| left.range == right.range && left.kind == right.kind);
+        spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
+        spans.dedup();
         Ok(HighlightResult {
             key: document_key(document_id, document.revision, document.generation),
             freshness,
@@ -491,283 +500,502 @@ impl ProviderActor {
 }
 
 fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
+    query_tree_sitter_spans(text, language_id)
+}
+
+fn query_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
     use ast_grep_language::{LanguageExt, SupportLang};
 
-    let language = language_id.parse::<SupportLang>().ok()?;
-    let document = language.ast_grep(text);
-    Some(
-        document
-            .root()
-            .dfs()
-            .filter_map(|node| {
-                let kind = node.kind();
-                let kind = kind.as_ref();
-                let source = node.text();
-                let token = source.as_ref();
-                let parent = node.parent();
-                let parent_kind = parent
-                    .as_ref()
-                    .map_or_else(String::new, |parent| parent.kind().into_owned());
-                let grandparent_kind = parent
-                    .as_ref()
-                    .and_then(|parent| parent.parent())
-                    .map_or_else(String::new, |parent| parent.kind().into_owned());
-                let is_parent_field = |field: &str| {
-                    parent
-                        .as_ref()
-                        .and_then(|parent| parent.field(field))
-                        .is_some_and(|field_node| field_node.range() == node.range())
-                };
-                let in_attribute = node.ancestors().take(5).any(|ancestor| {
-                    let ancestor = ancestor.kind();
-                    ancestor.contains("attribute") || ancestor.contains("decorator")
+    let supported = language_id.parse::<SupportLang>().ok()?;
+    let language = supported.get_ts_language();
+    let query = cached_highlight_query(language_id, &language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(text, None)?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    let mut lua_patterns = BTreeMap::<Box<str>, Regex>::new();
+    let mut spans = Vec::new();
+    while let Some(query_match) = matches.next() {
+        if !satisfies_neovim_predicates(&query, query_match, text, &mut lua_patterns) {
+            continue;
+        }
+        let base_priority = query
+            .property_settings(query_match.pattern_index)
+            .iter()
+            .rev()
+            .find(|property| property.key.as_ref() == "priority")
+            .and_then(|property| property.value.as_deref())
+            .and_then(|priority| priority.parse::<u32>().ok())
+            .unwrap_or(100);
+        let priority = base_priority
+            .saturating_mul(10_000)
+            .saturating_add(u32::try_from(query_match.pattern_index).unwrap_or(u32::MAX));
+        for capture in query_match.captures {
+            let Some(kind) = query.capture_names().get(capture.index as usize) else {
+                continue;
+            };
+            if kind.starts_with('_') || matches!(*kind, "spell" | "nospell" | "none") {
+                continue;
+            }
+            let range = neovim_capture_range(&query, query_match, capture.index, text)
+                .unwrap_or_else(|| capture.node.byte_range());
+            if range.start < range.end && range.end <= text.len() {
+                spans.push(HighlightSpan {
+                    range,
+                    kind: Arc::from(*kind),
+                    priority,
                 });
-                let in_method_declaration = node.ancestors().take(6).any(|ancestor| {
-                    matches!(
-                        ancestor.kind().as_ref(),
-                        "impl_item"
-                            | "class_body"
-                            | "class_definition"
-                            | "method_definition"
-                            | "method_declaration"
-                    )
-                });
+            }
+        }
+    }
+    spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
+    spans.dedup();
+    Some(spans)
+}
 
-                let highlight = if kind.contains("comment") {
-                    "comment"
-                } else if kind.contains("heading") {
-                    "markup.heading"
-                } else if kind.contains("code_span") || kind.contains("fenced_code") {
-                    "markup.raw"
-                } else if kind.contains("preproc") || matches!(kind, "shebang" | "directive") {
-                    "preproc"
-                } else if in_attribute {
-                    "attribute"
-                } else if kind.contains("escape") {
-                    "escape"
-                } else if kind.contains("string")
-                    || matches!(kind, "template_literal" | "quoted_attribute_value")
-                {
-                    "string"
-                } else if kind.contains("char") && kind != "character_count" {
-                    "character"
-                } else if matches!(token, "true" | "false") {
-                    "boolean"
-                } else if kind.contains("number")
-                    || kind.contains("integer")
-                    || kind.contains("float")
-                {
-                    "number"
-                } else if matches!(token, "null" | "nil" | "none" | "None" | "undefined") {
-                    "constant.builtin"
-                } else if matches!(token, "self" | "this" | "super" | "Self") {
-                    "variable.builtin"
-                } else if matches!(
-                    token,
-                    "if" | "else" | "elif" | "case" | "match" | "switch" | "then" | "when"
-                ) {
-                    "conditional"
-                } else if matches!(token, "for" | "while" | "loop" | "repeat") {
-                    "repeat"
-                } else if matches!(
-                    token,
-                    "import"
-                        | "from"
-                        | "include"
-                        | "require"
-                        | "use"
-                        | "module"
-                        | "package"
-                        | "export"
-                ) {
-                    "include"
-                } else if matches!(
-                    token,
-                    "try" | "catch" | "except" | "finally" | "throw" | "raise"
-                ) {
-                    "exception"
-                } else if matches!(token, "let" | "var" | "const" | "static" | "mut" | "val") {
-                    "storage"
-                } else if matches!(
-                    token,
-                    "struct" | "class" | "enum" | "trait" | "interface" | "type" | "typedef"
-                ) {
-                    "type.definition"
-                } else if matches!(token, "impl" | "extends" | "implements" | "where") {
-                    "type.qualifier"
-                } else if matches!(
-                    token,
-                    "as" | "in"
-                        | "is"
-                        | "and"
-                        | "or"
-                        | "not"
-                        | "instanceof"
-                        | "+"
-                        | "-"
-                        | "*"
-                        | "/"
-                        | "%"
-                        | "="
-                        | "=="
-                        | "!="
-                        | "<"
-                        | ">"
-                        | "<="
-                        | ">="
-                        | "&&"
-                        | "||"
-                        | "!"
-                        | "&"
-                        | "|"
-                        | "^"
-                        | "~"
-                        | "<<"
-                        | ">>"
-                        | "+="
-                        | "-="
-                        | "*="
-                        | "/="
-                        | "%="
-                        | "=>"
-                        | "->"
-                        | "?"
-                ) {
-                    "operator"
-                } else if matches!(token, "(" | ")" | "[" | "]" | "{" | "}") {
-                    "punctuation.bracket"
-                } else if matches!(token, "." | "," | ";" | ":" | "::") {
-                    "punctuation.delimiter"
-                } else if kind.contains("type_identifier")
-                    || kind == "primitive_type"
-                    || kind.contains("type_name")
-                    || kind.contains("builtin_type")
-                {
-                    if kind == "primitive_type" || kind.contains("builtin_type") {
-                        "type.builtin"
-                    } else {
-                        "type"
-                    }
-                } else if kind.contains("tag_name") {
-                    "tag"
-                } else if matches!(kind, "attribute_name" | "attribute_selector") {
-                    "tag.attribute"
-                } else if kind.contains("field_identifier")
-                    || kind.contains("property_identifier")
-                    || kind == "shorthand_property_identifier"
-                {
-                    if parent_kind.contains("field_expression")
-                        && grandparent_kind.contains("call_expression")
-                    {
-                        "method"
-                    } else {
-                        "property"
-                    }
-                } else if kind.contains("namespace") || kind.contains("module_name") {
-                    "namespace"
-                } else if matches!(kind, "function_name" | "function_identifier") {
-                    "function"
-                } else if matches!(kind, "method_name" | "method_identifier") {
-                    "method"
-                } else if matches!(kind, "self" | "this" | "super") {
-                    "variable.builtin"
-                } else if kind.contains("identifier") || kind == "name" {
-                    if parent_kind.contains("macro") {
-                        "function.macro"
-                    } else if parent_kind.contains("parameter")
-                        || parent_kind == "formal"
-                        || grandparent_kind.contains("parameter")
-                    {
-                        "parameter"
-                    } else if parent_kind == "attrpath" && grandparent_kind == "binding" {
-                        "property"
-                    } else if parent_kind == "attrpath"
-                        && grandparent_kind == "select_expression"
-                        && node
-                            .ancestors()
-                            .take(5)
-                            .any(|ancestor| ancestor.kind().as_ref() == "apply_expression")
-                    {
-                        "function"
-                    } else if parent_kind == "attrpath" && grandparent_kind == "select_expression" {
-                        "property"
-                    } else if (parent_kind.contains("function") || parent_kind.contains("method"))
-                        && (is_parent_field("name") || is_parent_field("declarator"))
-                    {
-                        if in_method_declaration {
-                            "method"
-                        } else {
-                            "function"
-                        }
-                    } else if parent_kind.contains("call_expression")
-                        && (is_parent_field("function") || is_parent_field("callee"))
-                    {
-                        "function"
-                    } else if parent_kind.contains("scoped_identifier")
-                        && grandparent_kind.contains("call_expression")
-                        && is_parent_field("name")
-                    {
-                        if token == "new" || token.starts_with("new_") {
-                            "constructor"
-                        } else {
-                            "function"
-                        }
-                    } else if parent_kind.contains("scoped_identifier")
-                        || parent_kind.contains("qualified_name")
-                        || parent_kind.contains("use_")
-                    {
-                        if token.chars().next().is_some_and(char::is_uppercase) {
-                            "type"
-                        } else {
-                            "namespace"
-                        }
-                    } else if token.chars().all(|character| {
-                        character.is_ascii_uppercase()
-                            || character.is_ascii_digit()
-                            || character == '_'
-                    }) {
-                        "constant"
-                    } else if token.chars().next().is_some_and(char::is_uppercase) {
-                        "type"
-                    } else {
-                        "variable"
-                    }
-                } else if matches!(
-                    token,
-                    "async"
-                        | "await"
-                        | "break"
-                        | "continue"
-                        | "data"
-                        | "def"
-                        | "do"
-                        | "fn"
-                        | "func"
-                        | "inherit"
-                        | "lambda"
-                        | "new"
-                        | "private"
-                        | "pub"
-                        | "public"
-                        | "rec"
-                        | "return"
-                        | "assert"
-                        | "yield"
-                        | "with"
-                ) {
-                    "keyword"
-                } else if kind.contains("constant") {
-                    "constant"
-                } else {
-                    return None;
+fn cached_highlight_query(
+    language_id: &str,
+    language: &tree_sitter::Language,
+) -> Option<Arc<Query>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<&'static str, Arc<Query>>>> = OnceLock::new();
+
+    let (canonical_id, source) = highlight_query_source(language_id)?;
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(queries) = cache.lock()
+        && let Some(query) = queries.get(canonical_id)
+    {
+        return Some(Arc::clone(query));
+    }
+    let query = Arc::new(compile_compatible_query(language, source).ok()?);
+    if let Ok(mut queries) = cache.lock() {
+        queries.insert(canonical_id, Arc::clone(&query));
+    }
+    Some(query)
+}
+
+fn compile_compatible_query(
+    language: &tree_sitter::Language,
+    source: &str,
+) -> Result<Query, tree_sitter::QueryError> {
+    let mut compatible = source.to_owned();
+    loop {
+        match Query::new(language, &compatible) {
+            Ok(query) => return Ok(query),
+            Err(error) => {
+                let Some(range) = query_pattern_range(&compatible, error.offset) else {
+                    return Err(error);
                 };
-                Some(HighlightSpan {
-                    range: node.range(),
-                    kind: highlight.into(),
-                })
+                compatible.replace_range(range, "");
+            }
+        }
+    }
+}
+
+/// Find the complete top-level query pattern containing an incompatibility.
+/// Neovim's query pack tracks newer parsers closely; when a bundled grammar is
+/// one release behind, omitting only the unknown pattern preserves the rest of
+/// the same language query instead of discarding highlighting for the file.
+fn query_pattern_range(source: &str, error_offset: usize) -> Option<Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut depth = 0_usize;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if in_comment {
+            if byte == b'\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b';' => in_comment = true,
+            b'"' => in_string = true,
+            b'(' | b'[' => {
+                if depth == 0 {
+                    start = Some(source[..index].rfind('\n').map_or(0, |line| line + 1));
+                }
+                depth = depth.saturating_add(1);
+            }
+            b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && index >= error_offset
+                    && let Some(start) = start
+                {
+                    let end = source[index..]
+                        .find('\n')
+                        .map_or(source.len(), |line| index + line + 1);
+                    return Some(start..end);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn highlight_query_source(language_id: &str) -> Option<(&'static str, &'static str)> {
+    Some(match language_id {
+        "bash" => ("bash", include_str!("../queries/bash.scm")),
+        "c" => ("c", include_str!("../queries/c.scm")),
+        "cpp" => (
+            "cpp",
+            concat!(
+                include_str!("../queries/c.scm"),
+                "\n",
+                include_str!("../queries/cpp.scm")
+            ),
+        ),
+        "csharp" => ("csharp", include_str!("../queries/c_sharp.scm")),
+        "css" => ("css", include_str!("../queries/css.scm")),
+        "dart" => ("dart", include_str!("../queries/dart.scm")),
+        "elixir" => ("elixir", include_str!("../queries/elixir.scm")),
+        "go" => ("go", include_str!("../queries/go.scm")),
+        "haskell" => ("haskell", include_str!("../queries/haskell.scm")),
+        "hcl" => ("hcl", include_str!("../queries/hcl.scm")),
+        "html" => (
+            "html",
+            concat!(
+                include_str!("../queries/html_tags.scm"),
+                "\n",
+                include_str!("../queries/html.scm")
+            ),
+        ),
+        "java" => ("java", include_str!("../queries/java.scm")),
+        "javascript" => (
+            "javascript",
+            concat!(
+                include_str!("../queries/ecma.scm"),
+                "\n",
+                include_str!("../queries/jsx.scm"),
+                "\n",
+                include_str!("../queries/javascript.scm")
+            ),
+        ),
+        "json" => ("json", include_str!("../queries/json.scm")),
+        "kotlin" => ("kotlin", include_str!("../queries/kotlin.scm")),
+        "lua" => ("lua", include_str!("../queries/lua.scm")),
+        "markdown" => ("markdown", include_str!("../queries/markdown.scm")),
+        "nix" => ("nix", include_str!("../queries/nix.scm")),
+        "php" => (
+            "php",
+            concat!(
+                include_str!("../queries/php_only.scm"),
+                "\n",
+                include_str!("../queries/php.scm")
+            ),
+        ),
+        "python" => ("python", include_str!("../queries/python.scm")),
+        "ruby" => ("ruby", include_str!("../queries/ruby.scm")),
+        "rust" => ("rust", include_str!("../queries/rust.scm")),
+        "scala" => ("scala", include_str!("../queries/scala.scm")),
+        "solidity" => ("solidity", include_str!("../queries/solidity.scm")),
+        "swift" => ("swift", include_str!("../queries/swift.scm")),
+        "tsx" => (
+            "tsx",
+            concat!(
+                include_str!("../queries/ecma.scm"),
+                "\n",
+                include_str!("../queries/typescript.scm"),
+                "\n",
+                include_str!("../queries/jsx.scm"),
+                "\n",
+                include_str!("../queries/tsx.scm")
+            ),
+        ),
+        "typescript" => (
+            "typescript",
+            concat!(
+                include_str!("../queries/ecma.scm"),
+                "\n",
+                include_str!("../queries/typescript.scm")
+            ),
+        ),
+        "yaml" => ("yaml", include_str!("../queries/yaml.scm")),
+        _ => return None,
+    })
+}
+
+fn satisfies_neovim_predicates(
+    query: &Query,
+    query_match: &QueryMatch<'_, '_>,
+    text: &str,
+    lua_patterns: &mut BTreeMap<Box<str>, Regex>,
+) -> bool {
+    query
+        .general_predicates(query_match.pattern_index)
+        .iter()
+        .all(|predicate| match predicate.operator.as_ref() {
+            "lua-match?" | "not-lua-match?" => {
+                let Some((QueryPredicateArg::Capture(capture), QueryPredicateArg::String(pattern))) =
+                    predicate.args.first().zip(predicate.args.get(1))
+                else {
+                    return false;
+                };
+                let regex = if let Some(regex) = lua_patterns.get(pattern.as_ref()) {
+                    regex
+                } else {
+                    let Ok(regex) = lua_pattern_regex(pattern) else {
+                        return false;
+                    };
+                    lua_patterns.insert(pattern.clone(), regex);
+                    lua_patterns.get(pattern.as_ref()).unwrap_or_else(|| unreachable!())
+                };
+                let matched = query_match.nodes_for_capture_index(*capture).all(|node| {
+                    text.get(node.byte_range())
+                        .is_some_and(|source| regex.is_match(source))
+                });
+                matched == (predicate.operator.as_ref() == "lua-match?")
+            }
+            "has-ancestor?" | "not-has-ancestor?" => {
+                neovim_ancestor_predicate(query_match, &predicate.args, false)
+                    == (predicate.operator.as_ref() == "has-ancestor?")
+            }
+            "has-parent?" | "not-has-parent?" => {
+                neovim_ancestor_predicate(query_match, &predicate.args, true)
+                    == (predicate.operator.as_ref() == "has-parent?")
+            }
+            "contains?" => neovim_contains_predicate(query_match, &predicate.args, text),
+            // These change display metadata or byte ranges, not whether a
+            // query pattern matches. Byte offsets are applied separately.
+            "offset!" => true,
+            _ => true,
+        })
+}
+
+fn neovim_ancestor_predicate(
+    query_match: &QueryMatch<'_, '_>,
+    args: &[QueryPredicateArg],
+    parent_only: bool,
+) -> bool {
+    let Some(QueryPredicateArg::Capture(capture)) = args.first() else {
+        return false;
+    };
+    let kinds = args.iter().skip(1).filter_map(|arg| match arg {
+        QueryPredicateArg::String(kind) => Some(kind.as_ref()),
+        QueryPredicateArg::Capture(_) => None,
+    });
+    let kinds = kinds.collect::<Vec<_>>();
+    query_match.nodes_for_capture_index(*capture).all(|node| {
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if kinds.iter().any(|kind| *kind == current.kind()) {
+                return true;
+            }
+            if parent_only {
+                return false;
+            }
+            ancestor = current.parent();
+        }
+        false
+    })
+}
+
+fn neovim_contains_predicate(
+    query_match: &QueryMatch<'_, '_>,
+    args: &[QueryPredicateArg],
+    text: &str,
+) -> bool {
+    let Some(QueryPredicateArg::Capture(capture)) = args.first() else {
+        return false;
+    };
+    let needles = args.iter().skip(1).filter_map(|arg| match arg {
+        QueryPredicateArg::String(needle) => Some(needle.as_ref()),
+        QueryPredicateArg::Capture(_) => None,
+    });
+    let needles = needles.collect::<Vec<_>>();
+    query_match.nodes_for_capture_index(*capture).all(|node| {
+        text.get(node.byte_range())
+            .is_some_and(|source| needles.iter().any(|needle| source.contains(needle)))
+    })
+}
+
+fn neovim_capture_range(
+    query: &Query,
+    query_match: &QueryMatch<'_, '_>,
+    capture_index: u32,
+    text: &str,
+) -> Option<Range<usize>> {
+    let capture = query_match
+        .captures
+        .iter()
+        .find(|capture| capture.index == capture_index)?;
+    let mut range = capture.node.byte_range();
+    for predicate in query.general_predicates(query_match.pattern_index) {
+        if predicate.operator.as_ref() != "offset!"
+            || !matches!(
+                predicate.args.first(),
+                Some(QueryPredicateArg::Capture(index)) if *index == capture_index
+            )
+        {
+            continue;
+        }
+        let offsets = predicate
+            .args
+            .iter()
+            .skip(1)
+            .filter_map(|arg| match arg {
+                QueryPredicateArg::String(value) => value.parse::<isize>().ok(),
+                QueryPredicateArg::Capture(_) => None,
             })
-            .collect(),
-    )
+            .collect::<Vec<_>>();
+        if let [start_row, start_column, end_row, end_column] = offsets.as_slice() {
+            range.start = offset_byte(
+                text,
+                capture.node.start_position().row,
+                capture.node.start_position().column,
+                *start_row,
+                *start_column,
+            );
+            range.end = offset_byte(
+                text,
+                capture.node.end_position().row,
+                capture.node.end_position().column,
+                *end_row,
+                *end_column,
+            );
+        }
+    }
+    Some(range)
+}
+
+fn offset_byte(
+    text: &str,
+    row: usize,
+    column: usize,
+    row_delta: isize,
+    column_delta: isize,
+) -> usize {
+    let last_row = text.bytes().filter(|byte| *byte == b'\n').count();
+    let target_row = row.saturating_add_signed(row_delta).min(last_row);
+    let line_start = if target_row == 0 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(target_row - 1)
+            .map_or(text.len(), |(offset, _)| offset.saturating_add(1))
+    };
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |offset| line_start.saturating_add(offset));
+    let target_column = column.saturating_add_signed(column_delta);
+    floor_boundary(text, line_start.saturating_add(target_column).min(line_end))
+}
+
+fn lua_pattern_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    let mut regex = String::with_capacity(pattern.len().saturating_add(8));
+    let mut characters = pattern.chars().peekable();
+    let mut in_class = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '[' => {
+                in_class = true;
+                regex.push(character);
+            }
+            ']' => {
+                in_class = false;
+                regex.push(character);
+            }
+            '%' => {
+                let Some(escaped) = characters.next() else {
+                    regex.push('%');
+                    break;
+                };
+                let class = match escaped {
+                    'a' => Some("A-Za-z"),
+                    'd' => Some("0-9"),
+                    'l' => Some("a-z"),
+                    's' => Some("\\s"),
+                    'u' => Some("A-Z"),
+                    'w' => Some("A-Za-z0-9"),
+                    'x' => Some("A-Fa-f0-9"),
+                    'z' => Some("\\x00"),
+                    _ => None,
+                };
+                if let Some(class) = class {
+                    if in_class || class.starts_with('\\') {
+                        regex.push_str(class);
+                    } else {
+                        regex.push('[');
+                        regex.push_str(class);
+                        regex.push(']');
+                    }
+                } else {
+                    regex.push_str(&regex::escape(&escaped.to_string()));
+                }
+            }
+            '-' if !in_class => regex.push_str("*?"),
+            '\\' => regex.push_str("\\\\"),
+            _ => regex.push(character),
+        }
+    }
+    Regex::new(&regex)
+}
+
+/// Resolves every grammar bundled by `ast-grep-language` from its complete
+/// extension table. Keeping this next to the parser prevents the client from
+/// maintaining a smaller, drifting copy of the supported language list.
+#[must_use]
+pub fn bundled_language_id(path: &Path) -> Option<&'static str> {
+    use ast_grep_core::Language as _;
+    use ast_grep_language::SupportLang;
+
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if let Some(language) = match extension.as_str() {
+        // User-configured and common aliases which the bundled grammar can
+        // parse even though ast-grep's upstream extension table omits them.
+        "hxx" | "msg" => Some("cpp"),
+        "lhs" => Some("haskell"),
+        "phtml" => Some("php"),
+        _ => None,
+    } {
+        return Some(language);
+    }
+    let candidate = PathBuf::from(format!("file.{extension}"));
+    let language = SupportLang::from_path(candidate)?;
+    Some(match language {
+        SupportLang::Bash => "bash",
+        SupportLang::C => "c",
+        SupportLang::Cpp => "cpp",
+        SupportLang::CSharp => "csharp",
+        SupportLang::Css => "css",
+        SupportLang::Dart => "dart",
+        SupportLang::Elixir => "elixir",
+        SupportLang::Go => "go",
+        SupportLang::Haskell => "haskell",
+        SupportLang::Hcl => "hcl",
+        SupportLang::Html => "html",
+        SupportLang::Java => "java",
+        SupportLang::JavaScript => "javascript",
+        SupportLang::Json => "json",
+        SupportLang::Kotlin => "kotlin",
+        SupportLang::Lua => "lua",
+        SupportLang::Markdown => "markdown",
+        SupportLang::Nix => "nix",
+        SupportLang::Php => "php",
+        SupportLang::Python => "python",
+        SupportLang::Ruby => "ruby",
+        SupportLang::Rust => "rust",
+        SupportLang::Scala => "scala",
+        SupportLang::Solidity => "solidity",
+        SupportLang::Swift => "swift",
+        SupportLang::Tsx => "tsx",
+        SupportLang::TypeScript => "typescript",
+        SupportLang::Yaml => "yaml",
+    })
 }
 
 /// Synchronously highlights bounded UI text such as a Telescope preview using
@@ -809,6 +1037,7 @@ impl DecorationSet {
                 mapped.push(HighlightSpan {
                     range: start..end,
                     kind: span.kind.clone(),
+                    priority: span.priority,
                 });
             }
         }
@@ -1106,6 +1335,7 @@ fn lexical_spans(text: &str, base: usize, output: &mut Vec<HighlightSpan>) {
             output.push(HighlightSpan {
                 range: base + offset..base + offset + word.len(),
                 kind: "keyword".into(),
+                priority: default_highlight_priority(),
             });
         }
         offset += token.len();
@@ -1220,7 +1450,7 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|span| span.range == (0..3) && span.kind.as_ref() == "include"),
+                .any(|span| span.range == (0..3) && span.kind.as_ref() == "keyword.import"),
             "{spans:?}"
         );
         for (needle, kind) in [
@@ -1244,12 +1474,12 @@ mod tests {
         let spans = highlight_text(source, "rust");
         for (needle, occurrence, kind) in [
             ("Widget", 0, "type"),
-            ("compute", 0, "method"),
-            ("extra", 0, "parameter"),
+            ("compute", 0, "function"),
+            ("extra", 0, "variable.parameter"),
             ("total", 0, "variable"),
-            ("value", 0, "property"),
+            ("value", 0, "variable.member"),
             ("+", 0, "operator"),
-            ("compute", 1, "method"),
+            ("compute", 1, "function.call"),
         ] {
             let start = source
                 .match_indices(needle)
@@ -1310,8 +1540,8 @@ mod tests {
             ("yaml", "answer: 42\nenabled: true\n"),
         ];
         for (language, source) in samples {
-            let spans = native_tree_sitter_spans(source, language)
-                .unwrap_or_else(|| panic!("bundled {language} grammar was not resolved"));
+            let spans = query_tree_sitter_spans(source, language)
+                .unwrap_or_else(|| panic!("bundled {language} highlight query did not compile"));
             assert!(
                 !spans.is_empty(),
                 "bundled {language} grammar emitted no highlights"
@@ -1326,27 +1556,101 @@ mod tests {
     }
 
     #[test]
+    fn dotfile_queries_compile_strictly_for_primary_languages() {
+        use ast_grep_language::{LanguageExt, SupportLang};
+
+        for language_id in ["nix", "haskell", "rust", "typescript", "tsx", "c", "cpp"] {
+            let language = language_id
+                .parse::<SupportLang>()
+                .unwrap_or_else(|_| panic!("missing parser for {language_id}"))
+                .get_ts_language();
+            let (_, source) = highlight_query_source(language_id)
+                .unwrap_or_else(|| panic!("missing query for {language_id}"));
+            Query::new(&language, source)
+                .unwrap_or_else(|error| panic!("{language_id} query is incompatible: {error}"));
+        }
+    }
+
+    #[test]
+    fn later_specific_tree_sitter_captures_outrank_generic_variables() {
+        for (language, source, needle, expected) in [
+            ("rust", "fn compute() {}\n", "compute", "function"),
+            (
+                "nix",
+                "{ lib, ... }: { enabled = lib.mkDefault true; }\n",
+                "mkDefault",
+                "function.call",
+            ),
+            (
+                "typescript",
+                "const compute = () => 42; compute();\n",
+                "compute",
+                "function",
+            ),
+        ] {
+            let start = source.find(needle).expect("sample token");
+            let winner = query_tree_sitter_spans(source, language)
+                .expect("query spans")
+                .into_iter()
+                .filter(|span| span.range == (start..start + needle.len()))
+                .max_by_key(|span| span.priority)
+                .unwrap_or_else(|| panic!("no capture for {language} {needle}"));
+            assert_eq!(winner.kind.as_ref(), expected, "wrong winner: {winner:?}");
+        }
+    }
+
+    #[test]
+    fn complete_bundled_extension_table_is_resolved_case_insensitively() {
+        for (path, expected) in [
+            ("script.bats", "bash"),
+            ("header.h", "c"),
+            ("kernel.cu", "cpp"),
+            ("style.scss", "css"),
+            ("build.exs", "elixir"),
+            ("service.nomad", "hcl"),
+            ("page.xhtml", "html"),
+            ("module.ktm", "kotlin"),
+            ("rules.bzl", "python"),
+            ("build.sbt", "scala"),
+            ("types.cts", "typescript"),
+            ("component.tsx", "tsx"),
+            ("FLAKE.NIX", "nix"),
+        ] {
+            assert_eq!(
+                bundled_language_id(Path::new(path)),
+                Some(expected),
+                "wrong bundled grammar for {path}"
+            );
+        }
+        assert_eq!(bundled_language_id(Path::new("README")), None);
+    }
+
+    #[test]
     fn nix_haskell_typescript_and_c_have_tree_sitter_semantic_baselines() {
         let cases = [
             (
                 "nix",
                 "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n",
                 [
-                    ("lib", "parameter"),
-                    ("enabled", "property"),
-                    ("mkDefault", "function"),
+                    ("lib", "variable.parameter"),
+                    ("enabled", "variable.member"),
+                    ("mkDefault", "function.call"),
                 ],
             ),
             (
                 "haskell",
                 "module Main where\nanswer :: Int\nanswer = 42\n",
-                [("module", "include"), ("Int", "type"), ("42", "number")],
+                [
+                    ("module", "keyword.import"),
+                    ("Int", "type"),
+                    ("42", "number"),
+                ],
             ),
             (
                 "typescript",
                 "interface User { name: string }\nconst answer = 42;\n",
                 [
-                    ("interface", "type.definition"),
+                    ("interface", "keyword.type"),
                     ("User", "type"),
                     ("42", "number"),
                 ],
@@ -1355,7 +1659,7 @@ mod tests {
                 "c",
                 "struct User { int value; }; int answer(void) { return 42; }\n",
                 [
-                    ("struct", "type.definition"),
+                    ("struct", "keyword.type"),
                     ("answer", "function"),
                     ("42", "number"),
                 ],
@@ -1475,6 +1779,7 @@ mod tests {
             spans: vec![HighlightSpan {
                 range: 2..4,
                 kind: "keyword".into(),
+                priority: default_highlight_priority(),
             }],
         };
         decorations.map_through(

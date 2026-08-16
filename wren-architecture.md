@@ -31,8 +31,8 @@ WORKSPACE AUTHORITY          DERIVED / EXTENSION STATE
 
    | scenario | session | document | target |
    |---|---|---|---|
-   | A  | warm | warm (snapshot published, head-validated) | p99 < 3,098,418ns, gated |
-   | B1 | warm | unopened, page-cache-hot local fs, initial viewport at known byte range | p99 < 385,688ns, gated |
+   | A  | warm | warm (snapshot published, head-validated) | p99 < 2,788,576ns, gated |
+   | B1 | warm | unopened, page-cache-hot local fs, initial viewport at known byte range | p99 < 347,119ns, gated |
    | B2 | warm | unopened, uncached local fs | reported |
    | B3 | warm | network/FUSE filesystem | reported |
    | C  | cold session | warm fs | reported |
@@ -43,14 +43,14 @@ WORKSPACE AUTHORITY          DERIVED / EXTENSION STATE
    deep in a never-indexed file is B2, not B1. `time_to_speculative_frame`,
    `time_to_correct_frame`, `time_to_interactive` reported separately.
 3. **Latency.** All `RealtimeCommand`s (see Command execution) satisfy
-   `physical-input-read → desired-frame-ready` aggregate p99 < 86,283ns on a
+   `physical-input-read → desired-frame-ready` aggregate p99 < 77,654ns on a
    pinned bare-metal runner with fixed workloads, with tighter per-command
    gates recorded by the harness. Long-running native commands gate at
-   69,176ns p99 and 71,077ns maximum yield gaps and execute as cancellable
-   tasks. `input → terminal-write-completed` is a hard p99 < 115,141ns gate
+   62,258ns p99 and 63,969ns maximum yield gaps and execute as cancellable
+   tasks. `input → terminal-write-completed` is a hard p99 < 103,626ns gate
    with zero dropped or missing samples. Freshness SLOs gate alongside latency
    per `DocumentClass`. The hardware key-to-photon rig is a mandatory hard
-   gate at 90% of its recorded baseline; absence fails rather than degrading
+   gate at 81% of its recorded baseline; absence fails rather than degrading
    to a software proxy.
 4. **Vim.** Full native modal grammar (operators × counts × registers × text
    objects × marks × macros; operator-pending as real parser state) plus a
@@ -622,15 +622,15 @@ events**; macro-replayed keys are excluded. Recorded:
 
 1. physical input → transaction commit
 2. physical input → desired-frame-ready — **hard gate, RealtimeCommands only**
-3. TaskCommand yield-to-UI latency (p99 < 69,176ns; max < 71,077ns) + cancellation latency
-4. input → terminal-write-completed (hard p99 < 115,141ns; no drops)
+3. TaskCommand yield-to-UI latency (p99 < 62,258ns; max < 63,969ns) + cancellation latency
+4. input → terminal-write-completed (hard p99 < 103,626ns; no drops)
 5. provider freshness + queue depth (gated per DocumentClass)
 6. snapshot retention (`oldest_live_revision`, bytes)
 7. memory peak/steady
 8. startup scenarios A–D (A/B1 gated)
-9. hardware key-to-photon (hard; measured p99 < 90% of rig baseline)
+9. hardware key-to-photon (hard; measured p99 < 81% of rig baseline)
 10. remote convergence + persisted-save latency (hard loopback p99 <
-    4,397,874ns/17,783,192ns; authoritative netem p99 < 90% of its
+    3,958,086ns/16,004,872ns; authoritative netem p99 < 81% of its
     profile-bound baseline)
 11. crash-recovery matrix (protocol section) as CI-run fault-injection tests
 

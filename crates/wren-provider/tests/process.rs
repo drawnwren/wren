@@ -73,9 +73,9 @@ fn provider_process_loads_nix_tree_sitter_without_runtime_installation() {
         panic!("unexpected provider response");
     };
     for (needle, kind) in [
-        ("lib", "parameter"),
-        ("enabled", "property"),
-        ("mkDefault", "function"),
+        ("lib", "variable.parameter"),
+        ("enabled", "variable.member"),
+        ("mkDefault", "function.call"),
     ] {
         let start = source.find(needle).expect("Nix token");
         assert!(

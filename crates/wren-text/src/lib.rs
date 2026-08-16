@@ -17,9 +17,17 @@ pub use snapshot::{
 pub trait TextStore: Clone {
     fn from_reader(reader: impl Read) -> io::Result<Self>;
     fn len_bytes(&self) -> usize;
+    fn content_eq(&self, other: &Self) -> bool;
+    fn is_char_boundary(&self, byte: usize) -> bool;
     fn slice(&self, range: Range<usize>) -> Cow<'_, str>;
     fn line_of_byte(&self, byte: usize) -> usize;
     fn byte_of_line(&self, line: usize) -> usize;
+    fn line_starts(&self) -> Vec<usize> {
+        let last_line = self.line_of_byte(self.len_bytes());
+        (0..=last_line)
+            .map(|line| self.byte_of_line(line))
+            .collect()
+    }
     fn apply(&mut self, transaction: &Transaction);
     fn snapshot(&self) -> Self;
 }
@@ -37,6 +45,14 @@ impl TextStore for RopeyText {
 
     fn len_bytes(&self) -> usize {
         self.rope.len_bytes()
+    }
+
+    fn content_eq(&self, other: &Self) -> bool {
+        self.rope == other.rope
+    }
+
+    fn is_char_boundary(&self, byte: usize) -> bool {
+        byte <= self.rope.len_bytes() && self.rope.try_byte_to_char(byte).is_ok()
     }
 
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
@@ -95,6 +111,14 @@ impl TextStore for CropText {
         self.rope.byte_len()
     }
 
+    fn content_eq(&self, other: &Self) -> bool {
+        self.rope == other.rope
+    }
+
+    fn is_char_boundary(&self, byte: usize) -> bool {
+        byte <= self.rope.byte_len() && self.rope.is_char_boundary(byte)
+    }
+
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
         Cow::Owned(self.rope.byte_slice(range).to_string())
     }
@@ -139,6 +163,32 @@ impl TextStore for PieceTreeStub {
 
     fn len_bytes(&self) -> usize {
         self.text.len()
+    }
+
+    fn line_starts(&self) -> Vec<usize> {
+        let mut starts = Vec::with_capacity(
+            self.text
+                .bytes()
+                .filter(|value| *value == b'\n')
+                .count()
+                .saturating_add(1),
+        );
+        starts.push(0);
+        starts.extend(
+            self.text
+                .bytes()
+                .enumerate()
+                .filter_map(|(byte, value)| (value == b'\n').then_some(byte + 1)),
+        );
+        starts
+    }
+
+    fn content_eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+
+    fn is_char_boundary(&self, byte: usize) -> bool {
+        self.text.is_char_boundary(byte)
     }
 
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
@@ -195,17 +245,29 @@ mod tests {
         let source = "alpha\nβeta\n👩🏽‍💻 end\n";
         let mut store = T::from_reader(Cursor::new(source)).expect("source is valid UTF-8");
         let snapshot = store.snapshot();
+        assert!(store.content_eq(&snapshot));
         let transaction = Transaction::new(DocumentRevision::new(0), vec![Edit::new(6..8, "B")])
             .expect("valid edit");
         store.apply(&transaction);
+        assert!(!store.content_eq(&snapshot));
         assert_eq!(store.slice(0..store.len_bytes()), "alpha\nBeta\n👩🏽‍💻 end\n");
         assert_eq!(snapshot.slice(0..snapshot.len_bytes()), source);
         assert_eq!(store.line_of_byte(6), 1);
         assert_eq!(store.byte_of_line(2), 11);
         assert_eq!(store.byte_of_line(usize::MAX), store.len_bytes());
+        let line_starts = store.line_starts();
+        assert_eq!(line_starts.first(), Some(&0));
+        assert_eq!(line_starts.len(), 4);
+        assert!(
+            line_starts
+                .iter()
+                .enumerate()
+                .all(|(line, byte)| store.byte_of_line(line) == *byte)
+        );
 
         let empty = T::from_reader(Cursor::new("")).expect("empty UTF-8 document loads");
         assert_eq!(empty.byte_of_line(24), 0);
+        assert_eq!(empty.line_starts(), vec![0]);
     }
 
     #[test]

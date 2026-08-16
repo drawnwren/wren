@@ -4,10 +4,10 @@ use serde::Serialize;
 use thiserror::Error;
 use wren_types::{
     AcceptedDocument, ClientId, ClientMutation, ClientSequence, DocumentFrontier, DocumentId,
-    DocumentRevision, EventOrigin, LeaseEpoch, LeaseGrant, MutationId, MutationResult,
-    MutationValidationError, OfflinePolicy, Resume, ResumeResult, SessionEpoch, SessionEvent,
-    SessionEventPayload, SessionId, SessionSequence, StateCheckpoint, StateDelta, Transaction,
-    WorkspaceGeneration,
+    DocumentMutation, DocumentRevision, EventOrigin, LeaseEpoch, LeaseGrant, MutationId,
+    MutationResult, MutationValidationError, OfflinePolicy, Resume, ResumeResult, SessionEpoch,
+    SessionEvent, SessionEventPayload, SessionId, SessionSequence, StateCheckpoint, StateDelta,
+    Transaction, WorkspaceGeneration,
 };
 
 use crate::journal::{JournalEntry, RegisteredDocument};
@@ -306,19 +306,53 @@ impl SessionAuthority {
     ) -> Result<MutationSubmission, AuthorityError> {
         mutation.validate()?;
         let mutation_hash = canonical_hash(&mutation)?;
-        if let Some(existing) = self.dedup.get(&mutation.mutation_id) {
-            if existing.mutation_hash != mutation_hash {
-                return Err(AuthorityError::MutationIdCollision {
-                    mutation_id: mutation.mutation_id,
-                });
-            }
-            return Ok(MutationSubmission::Accepted {
-                received: MutationResult::Received {
-                    mutation_id: mutation.mutation_id,
-                },
-                durable: existing.durable.clone(),
+        if let Some(submission) = self.previous_submission(&mutation, mutation_hash)? {
+            return Ok(submission);
+        }
+        self.validate_client_sequence(&mutation)?;
+        let mut staged_documents = match self.stage_documents(&mutation)? {
+            Ok(documents) => documents,
+            Err(rejection) => return Ok(MutationSubmission::Rejected(rejection)),
+        };
+        let (events, final_sequence) = self.events_for(&mutation)?;
+        let durable = durable_result(&mutation, final_sequence)?;
+
+        // The append includes sync_data. Only after it succeeds may memory
+        // expose the accepted state or the client receive `Durable`.
+        self.journal.append_mutation(&mutation, &durable, &events)?;
+        self.apply_staged_documents(&mut staged_documents);
+        self.install_committed(&mutation, durable.clone(), events, mutation_hash)?;
+        self.enforce_event_retention()?;
+        Ok(MutationSubmission::Accepted {
+            received: MutationResult::Received {
+                mutation_id: mutation.mutation_id,
+            },
+            durable,
+        })
+    }
+
+    fn previous_submission(
+        &self,
+        mutation: &ClientMutation,
+        mutation_hash: [u8; 32],
+    ) -> Result<Option<MutationSubmission>, AuthorityError> {
+        let Some(existing) = self.dedup.get(&mutation.mutation_id) else {
+            return Ok(None);
+        };
+        if existing.mutation_hash != mutation_hash {
+            return Err(AuthorityError::MutationIdCollision {
+                mutation_id: mutation.mutation_id,
             });
         }
+        Ok(Some(MutationSubmission::Accepted {
+            received: MutationResult::Received {
+                mutation_id: mutation.mutation_id,
+            },
+            durable: existing.durable.clone(),
+        }))
+    }
+
+    fn validate_client_sequence(&self, mutation: &ClientMutation) -> Result<(), AuthorityError> {
         if let Some(previous) = self.highest_client_sequence.get(&mutation.client_id)
             && mutation.client_sequence <= *previous
         {
@@ -328,11 +362,18 @@ impl SessionAuthority {
                 actual: mutation.client_sequence,
             });
         }
+        Ok(())
+    }
 
-        let mut staged_documents = BTreeMap::new();
+    fn stage_documents(
+        &self,
+        mutation: &ClientMutation,
+    ) -> Result<Result<BTreeMap<DocumentId, StagedDocumentUpdate>, MutationResult>, AuthorityError>
+    {
+        let mut staged = BTreeMap::new();
         for document_mutation in &mutation.documents {
             let Some(document) = self.documents.get(&document_mutation.document_id) else {
-                return Ok(MutationSubmission::Rejected(MutationResult::Conflict {
+                return Ok(Err(MutationResult::Conflict {
                     document_id: document_mutation.document_id,
                     reason: "document is not registered in this session".into(),
                 }));
@@ -340,67 +381,29 @@ impl SessionAuthority {
             if document_mutation.lease_epoch != document.lease.lease_epoch
                 || mutation.client_id != document.lease.holder_id
             {
-                return Ok(MutationSubmission::Rejected(MutationResult::LeaseLost {
+                return Ok(Err(MutationResult::LeaseLost {
                     document_id: document_mutation.document_id,
                     current_lease_epoch: document.lease.lease_epoch,
                 }));
             }
             if document_mutation.base_revision != document.revision {
-                let delta_since_base = document.delta_since(document_mutation.base_revision);
-                return Ok(MutationSubmission::Rejected(
-                    MutationResult::RebaseRequired {
-                        mutation_id: mutation.mutation_id,
-                        document_id: document_mutation.document_id,
-                        authoritative_revision: document.revision,
-                        delta_since_base,
-                    },
-                ));
+                return Ok(Err(MutationResult::RebaseRequired {
+                    mutation_id: mutation.mutation_id,
+                    document_id: document_mutation.document_id,
+                    authoritative_revision: document.revision,
+                    delta_since_base: document.delta_since(document_mutation.base_revision),
+                }));
             }
-            let mut text = document.text.clone();
-            let mut revision = document.revision;
-            let mut transactions = Vec::with_capacity(document_mutation.transactions.len());
-            for transaction in &document_mutation.transactions {
-                text = transaction.apply_to_string(&text).map_err(|error| {
-                    AuthorityError::Replay(format!(
-                        "transaction for {:?} could not apply: {error}",
-                        document_mutation.document_id
-                    ))
-                })?;
-                revision = revision.next().ok_or(AuthorityError::CounterOverflow)?;
-                transactions.push(transaction.clone());
-            }
-            staged_documents.insert(
-                document_mutation.document_id,
-                StagedDocumentUpdate {
-                    text,
-                    revision,
-                    transactions,
-                },
-            );
+            let update = stage_document(document, document_mutation)?;
+            staged.insert(document_mutation.document_id, update);
         }
+        Ok(Ok(staged))
+    }
 
-        let (events, final_sequence) = self.events_for(&mutation)?;
-        let documents = mutation
-            .documents
-            .iter()
-            .map(|document| {
-                Ok(AcceptedDocument {
-                    document_id: document.document_id,
-                    accepted_revision: document.accepted_revision()?,
-                    canonical_transaction_hash: canonical_hash(document)?,
-                })
-            })
-            .collect::<Result<Vec<_>, AuthorityError>>()?;
-        let durable = MutationResult::Durable {
-            mutation_id: mutation.mutation_id,
-            client_sequence: mutation.client_sequence,
-            session_sequence: final_sequence,
-            documents,
-        };
-
-        // The append includes sync_data. Only after it succeeds may memory
-        // expose the accepted state or the client receive `Durable`.
-        self.journal.append_mutation(&mutation, &durable, &events)?;
+    fn apply_staged_documents(
+        &mut self,
+        staged_documents: &mut BTreeMap<DocumentId, StagedDocumentUpdate>,
+    ) {
         for document in self.documents.values_mut() {
             if let Some(staged) = staged_documents.remove(&document.document_id) {
                 document.text = staged.text;
@@ -408,14 +411,6 @@ impl SessionAuthority {
                 document.history.extend(staged.transactions);
             }
         }
-        self.install_committed(&mutation, durable.clone(), events, mutation_hash)?;
-        self.enforce_event_retention()?;
-        Ok(MutationSubmission::Accepted {
-            received: MutationResult::Received {
-                mutation_id: mutation.mutation_id,
-            },
-            durable,
-        })
     }
 
     pub fn grant_lease(
@@ -732,6 +727,53 @@ impl MutationService for SessionAuthority {
     fn resume_session(&self, request: &Resume) -> ResumeResult {
         self.resume(request)
     }
+}
+
+fn stage_document(
+    document: &AuthorityDocument,
+    mutation: &DocumentMutation,
+) -> Result<StagedDocumentUpdate, AuthorityError> {
+    let mut text = document.text.clone();
+    let mut revision = document.revision;
+    let mut transactions = Vec::with_capacity(mutation.transactions.len());
+    for transaction in &mutation.transactions {
+        text = transaction.apply_to_string(&text).map_err(|error| {
+            AuthorityError::Replay(format!(
+                "transaction for {:?} could not apply: {error}",
+                mutation.document_id
+            ))
+        })?;
+        revision = revision.next().ok_or(AuthorityError::CounterOverflow)?;
+        transactions.push(transaction.clone());
+    }
+    Ok(StagedDocumentUpdate {
+        text,
+        revision,
+        transactions,
+    })
+}
+
+fn durable_result(
+    mutation: &ClientMutation,
+    session_sequence: SessionSequence,
+) -> Result<MutationResult, AuthorityError> {
+    let documents = mutation
+        .documents
+        .iter()
+        .map(|document| {
+            Ok(AcceptedDocument {
+                document_id: document.document_id,
+                accepted_revision: document.accepted_revision()?,
+                canonical_transaction_hash: canonical_hash(document)?,
+            })
+        })
+        .collect::<Result<Vec<_>, AuthorityError>>()?;
+    Ok(MutationResult::Durable {
+        mutation_id: mutation.mutation_id,
+        client_sequence: mutation.client_sequence,
+        session_sequence,
+        documents,
+    })
 }
 
 fn canonical_hash(value: &impl Serialize) -> Result<[u8; 32], AuthorityError> {

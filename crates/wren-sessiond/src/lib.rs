@@ -166,6 +166,17 @@ impl SessionServer {
     where
         S: Read + Write,
     {
+        let negotiated_limit = self.negotiate(stream)?;
+        while let Some(request) = read_envelope(stream, negotiated_limit)? {
+            self.serve_request(stream, request, negotiated_limit)?;
+        }
+        Ok(())
+    }
+
+    fn negotiate<S>(&self, stream: &mut S) -> Result<usize, ServerError>
+    where
+        S: Read + Write,
+    {
         let hello_envelope =
             read_envelope(stream, self.max_frame_bytes)?.ok_or(ServerError::ExpectedHello)?;
         let envelope::Payload::Hello(hello) = hello_envelope
@@ -200,137 +211,167 @@ impl SessionServer {
             ),
             negotiated_limit,
         )?;
+        Ok(negotiated_limit)
+    }
 
-        while let Some(request) = read_envelope(stream, negotiated_limit)? {
-            let request_id = request.request_id;
-            match request
-                .payload
-                .ok_or(ProtocolError::MissingField("Envelope.payload"))?
-            {
-                envelope::Payload::ClientMutation(mutation) => {
-                    let mutation = wren_types::ClientMutation::try_from(mutation)?;
-                    let previous_sequence = self.authority()?.session_sequence();
-                    self.send_result(
-                        stream,
-                        request_id,
-                        &wren_types::MutationResult::Received {
-                            mutation_id: mutation.mutation_id,
-                        },
-                        negotiated_limit,
-                    )?;
-                    if self.crash_after_received.swap(false, Ordering::AcqRel) {
-                        return Err(ServerError::InjectedCrashAfterReceived);
-                    }
-                    let submission = self.authority()?.submit(mutation)?;
-                    if matches!(&submission, MutationSubmission::Accepted { .. }) {
-                        self.publish_heads()?;
-                    }
-                    match submission {
-                        MutationSubmission::Accepted { durable, .. } => {
-                            self.send_result(stream, request_id, &durable, negotiated_limit)?;
-                            for event in self.authority()?.events_after(previous_sequence) {
-                                write_envelope(
-                                    stream,
-                                    &Envelope::new(
-                                        0,
-                                        envelope::Payload::SessionEvent(
-                                            wren_proto::SessionEvent::from(&event),
-                                        ),
-                                    ),
-                                    negotiated_limit,
-                                )?;
-                            }
-                        }
-                        MutationSubmission::Rejected(result) => {
-                            self.send_result(stream, request_id, &result, negotiated_limit)?;
-                        }
-                    }
-                }
-                envelope::Payload::Resume(resume) => {
-                    let resume = wren_types::Resume::from(resume);
-                    let result = self.authority()?.resume(&resume);
-                    write_envelope(
-                        stream,
-                        &Envelope::new(
-                            request_id,
-                            envelope::Payload::ResumeResult(wren_proto::ResumeResult::from(
-                                &result,
-                            )),
-                        ),
-                        negotiated_limit,
-                    )?;
-                }
-                envelope::Payload::OpenDocument(open) => {
-                    let document_id = wren_types::DocumentId::new(open.document_id);
-                    let client_id = wren_types::ClientId::new(open.client_id);
-                    {
-                        let mut authority = self.authority()?;
-                        if authority.document(document_id).is_none() {
-                            authority.register_document(document_id, open.text, client_id)?;
-                        }
-                    }
-                    self.publish_heads()?;
-                    let authority = self.authority()?;
-                    let document = authority
-                        .document(document_id)
-                        .ok_or(AuthorityError::UnknownDocument(document_id))?;
-                    write_envelope(
-                        stream,
-                        &Envelope::new(
-                            request_id,
-                            envelope::Payload::DocumentOpened(wren_proto::DocumentOpened {
-                                document_id: document_id.get(),
-                                revision: document.revision.get(),
-                                lease_epoch: document.lease.lease_epoch.get(),
-                                session_epoch: authority.session_epoch().get(),
-                            }),
-                        ),
-                        negotiated_limit,
-                    )?;
-                }
-                envelope::Payload::RemoteCall(call) => {
-                    let call: RemoteCall = serde_json::from_slice(&call.body)?;
-                    let reply = self.handle_remote_call(call);
-                    self.send_remote_reply(stream, request_id, reply, negotiated_limit)?;
-                }
-                envelope::Payload::Hello(_) => {
-                    return Err(ServerError::UnexpectedPayload("Hello after handshake"));
-                }
-                envelope::Payload::HelloAck(_) => {
-                    return Err(ServerError::UnexpectedPayload("HelloAck from client"));
-                }
-                envelope::Payload::MutationResult(_) => {
-                    return Err(ServerError::UnexpectedPayload("MutationResult from client"));
-                }
-                envelope::Payload::SessionEvent(_) => {
-                    return Err(ServerError::UnexpectedPayload("SessionEvent from client"));
-                }
-                envelope::Payload::ResumeResult(_) => {
-                    return Err(ServerError::UnexpectedPayload("ResumeResult from client"));
-                }
-                envelope::Payload::SaveRequest(request) => {
-                    let request = wren_types::SaveRequest::try_from(request)?;
-                    let saved = self.save_remote_document(&request)?;
-                    write_envelope(
-                        stream,
-                        &Envelope::new(
-                            request_id,
-                            envelope::Payload::Saved(wren_proto::Saved::from(&saved)),
-                        ),
-                        negotiated_limit,
-                    )?;
-                }
-                envelope::Payload::Saved(_) => {
-                    return Err(ServerError::UnexpectedPayload("Saved from client"));
-                }
-                envelope::Payload::DocumentOpened(_) => {
-                    return Err(ServerError::UnexpectedPayload("DocumentOpened from client"));
-                }
-                envelope::Payload::RemoteReply(_) => {
-                    return Err(ServerError::UnexpectedPayload("RemoteReply from client"));
-                }
+    fn serve_request(
+        &self,
+        stream: &mut (impl Read + Write),
+        request: Envelope,
+        limit: usize,
+    ) -> Result<(), ServerError> {
+        let request_id = request.request_id;
+        match request
+            .payload
+            .ok_or(ProtocolError::MissingField("Envelope.payload"))?
+        {
+            envelope::Payload::ClientMutation(mutation) => {
+                self.handle_mutation(stream, request_id, mutation.try_into()?, limit)
+            }
+            envelope::Payload::Resume(resume) => {
+                self.handle_resume(stream, request_id, resume, limit)
+            }
+            envelope::Payload::OpenDocument(open) => {
+                self.handle_open_document(stream, request_id, open, limit)
+            }
+            envelope::Payload::RemoteCall(call) => {
+                let call: RemoteCall = serde_json::from_slice(&call.body)?;
+                let reply = self.handle_remote_call(call);
+                self.send_remote_reply(stream, request_id, reply, limit)
+            }
+            envelope::Payload::SaveRequest(request) => {
+                let saved = self.save_remote_document(&request.try_into()?)?;
+                self.write_payload(
+                    stream,
+                    request_id,
+                    envelope::Payload::Saved(wren_proto::Saved::from(&saved)),
+                    limit,
+                )
+            }
+            envelope::Payload::Hello(_) => {
+                Err(ServerError::UnexpectedPayload("Hello after handshake"))
+            }
+            envelope::Payload::HelloAck(_) => {
+                Err(ServerError::UnexpectedPayload("HelloAck from client"))
+            }
+            envelope::Payload::MutationResult(_) => {
+                Err(ServerError::UnexpectedPayload("MutationResult from client"))
+            }
+            envelope::Payload::SessionEvent(_) => {
+                Err(ServerError::UnexpectedPayload("SessionEvent from client"))
+            }
+            envelope::Payload::ResumeResult(_) => {
+                Err(ServerError::UnexpectedPayload("ResumeResult from client"))
+            }
+            envelope::Payload::Saved(_) => Err(ServerError::UnexpectedPayload("Saved from client")),
+            envelope::Payload::DocumentOpened(_) => {
+                Err(ServerError::UnexpectedPayload("DocumentOpened from client"))
+            }
+            envelope::Payload::RemoteReply(_) => {
+                Err(ServerError::UnexpectedPayload("RemoteReply from client"))
             }
         }
+    }
+
+    fn handle_mutation(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+        mutation: wren_types::ClientMutation,
+        limit: usize,
+    ) -> Result<(), ServerError> {
+        let previous_sequence = self.authority()?.session_sequence();
+        self.send_result(
+            stream,
+            request_id,
+            &wren_types::MutationResult::Received {
+                mutation_id: mutation.mutation_id,
+            },
+            limit,
+        )?;
+        if self.crash_after_received.swap(false, Ordering::AcqRel) {
+            return Err(ServerError::InjectedCrashAfterReceived);
+        }
+        let submission = self.authority()?.submit(mutation)?;
+        if matches!(&submission, MutationSubmission::Accepted { .. }) {
+            self.publish_heads()?;
+        }
+        match submission {
+            MutationSubmission::Accepted { durable, .. } => {
+                self.send_result(stream, request_id, &durable, limit)?;
+                for event in self.authority()?.events_after(previous_sequence) {
+                    self.write_payload(
+                        stream,
+                        0,
+                        envelope::Payload::SessionEvent(wren_proto::SessionEvent::from(&event)),
+                        limit,
+                    )?;
+                }
+                Ok(())
+            }
+            MutationSubmission::Rejected(result) => {
+                self.send_result(stream, request_id, &result, limit)
+            }
+        }
+    }
+
+    fn handle_resume(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+        resume: wren_proto::Resume,
+        limit: usize,
+    ) -> Result<(), ServerError> {
+        let result = self.authority()?.resume(&resume.into());
+        self.write_payload(
+            stream,
+            request_id,
+            envelope::Payload::ResumeResult(wren_proto::ResumeResult::from(&result)),
+            limit,
+        )
+    }
+
+    fn handle_open_document(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+        open: wren_proto::OpenDocument,
+        limit: usize,
+    ) -> Result<(), ServerError> {
+        let document_id = wren_types::DocumentId::new(open.document_id);
+        let client_id = wren_types::ClientId::new(open.client_id);
+        {
+            let mut authority = self.authority()?;
+            if authority.document(document_id).is_none() {
+                authority.register_document(document_id, open.text, client_id)?;
+            }
+        }
+        self.publish_heads()?;
+        let authority = self.authority()?;
+        let document = authority
+            .document(document_id)
+            .ok_or(AuthorityError::UnknownDocument(document_id))?;
+        self.write_payload(
+            stream,
+            request_id,
+            envelope::Payload::DocumentOpened(wren_proto::DocumentOpened {
+                document_id: document_id.get(),
+                revision: document.revision.get(),
+                lease_epoch: document.lease.lease_epoch.get(),
+                session_epoch: authority.session_epoch().get(),
+            }),
+            limit,
+        )
+    }
+
+    fn write_payload(
+        &self,
+        stream: &mut impl Write,
+        request_id: u64,
+        payload: envelope::Payload,
+        limit: usize,
+    ) -> Result<(), ServerError> {
+        write_envelope(stream, &Envelope::new(request_id, payload), limit)?;
         Ok(())
     }
 
@@ -411,72 +452,7 @@ impl SessionServer {
                 client_id,
                 path,
                 cached_hash,
-            } => {
-                let (document, opened) = {
-                    let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
-                    if workspace.lane != TransportLane::Control {
-                        return Err(ServerError::UnexpectedPayload(
-                            "open request on the bulk lane",
-                        ));
-                    }
-                    if let Some(existing) = workspace.paths.get(&document_id.get())
-                        && existing.as_ref() != path.as_ref()
-                    {
-                        return Err(ServerError::PathBindingConflict {
-                            document_id,
-                            existing: existing.clone(),
-                            requested: path,
-                        });
-                    }
-                    LocalDocument::open_or_new(workspace.storage.workspace_path(&path)?)?
-                };
-                let (text, revision, lease_epoch, session_epoch) = {
-                    let mut authority = self.authority()?;
-                    if authority.document(document_id).is_none() {
-                        authority.register_document(document_id, opened.text.clone(), client_id)?;
-                    }
-                    let session_epoch = authority.session_epoch();
-                    let authoritative = authority
-                        .document(document_id)
-                        .ok_or(AuthorityError::UnknownDocument(document_id))?;
-                    (
-                        authoritative.text.clone(),
-                        authoritative.revision,
-                        authoritative.lease.lease_epoch,
-                        session_epoch,
-                    )
-                };
-                let file_identity = document.stamp().map(remote_file_identity).unwrap_or(
-                    wren_types::FileIdentity {
-                        device: 0,
-                        file: 0,
-                        generation: 0,
-                    },
-                );
-                let content_hash = {
-                    let mut workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
-                    let content_hash = workspace.storage.cache_bytes(text.as_bytes())?;
-                    workspace.documents.insert(document_id, document);
-                    if workspace.paths.insert(document_id.get(), path).is_none() {
-                        persist_bindings(&workspace)?;
-                    }
-                    content_hash
-                };
-                self.publish_heads()?;
-                Ok(RemoteReply::Opened {
-                    opened: RemoteOpened {
-                        document_id,
-                        revision,
-                        lease_epoch,
-                        session_epoch,
-                        content_hash,
-                        file_identity,
-                        size: u64::try_from(text.len()).unwrap_or(u64::MAX),
-                        cached_hash_valid: cached_hash == Some(content_hash),
-                        read_only: opened.read_only,
-                    },
-                })
-            }
+            } => self.handle_remote_open(workspace, document_id, client_id, path, cached_hash),
             RemoteCall::Blob { hash } => {
                 let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
                 if workspace.lane != TransportLane::Bulk {
@@ -507,6 +483,82 @@ impl SessionServer {
                 })
             }
         }
+    }
+
+    fn handle_remote_open(
+        &self,
+        workspace: &Arc<Mutex<RemoteWorkspace>>,
+        document_id: wren_types::DocumentId,
+        client_id: wren_types::ClientId,
+        path: Box<str>,
+        cached_hash: Option<[u8; 32]>,
+    ) -> Result<RemoteReply, ServerError> {
+        let (document, opened) = {
+            let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
+            if workspace.lane != TransportLane::Control {
+                return Err(ServerError::UnexpectedPayload(
+                    "open request on the bulk lane",
+                ));
+            }
+            if let Some(existing) = workspace.paths.get(&document_id.get())
+                && existing.as_ref() != path.as_ref()
+            {
+                return Err(ServerError::PathBindingConflict {
+                    document_id,
+                    existing: existing.clone(),
+                    requested: path,
+                });
+            }
+            LocalDocument::open_or_new(workspace.storage.workspace_path(&path)?)?
+        };
+        let (text, revision, lease_epoch, session_epoch) = {
+            let mut authority = self.authority()?;
+            if authority.document(document_id).is_none() {
+                authority.register_document(document_id, opened.text.clone(), client_id)?;
+            }
+            let session_epoch = authority.session_epoch();
+            let authoritative = authority
+                .document(document_id)
+                .ok_or(AuthorityError::UnknownDocument(document_id))?;
+            (
+                authoritative.text.clone(),
+                authoritative.revision,
+                authoritative.lease.lease_epoch,
+                session_epoch,
+            )
+        };
+        let file_identity =
+            document
+                .stamp()
+                .map(remote_file_identity)
+                .unwrap_or(wren_types::FileIdentity {
+                    device: 0,
+                    file: 0,
+                    generation: 0,
+                });
+        let content_hash = {
+            let mut workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
+            let content_hash = workspace.storage.cache_bytes(text.as_bytes())?;
+            workspace.documents.insert(document_id, document);
+            if workspace.paths.insert(document_id.get(), path).is_none() {
+                persist_bindings(&workspace)?;
+            }
+            content_hash
+        };
+        self.publish_heads()?;
+        Ok(RemoteReply::Opened {
+            opened: RemoteOpened {
+                document_id,
+                revision,
+                lease_epoch,
+                session_epoch,
+                content_hash,
+                file_identity,
+                size: u64::try_from(text.len()).unwrap_or(u64::MAX),
+                cached_hash_valid: cached_hash == Some(content_hash),
+                read_only: opened.read_only,
+            },
+        })
     }
 
     fn save_remote_document(

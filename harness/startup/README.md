@@ -2,7 +2,7 @@
 
 Measures the architecture's startup scenarios and records speculative-frame,
 head-validated correct-frame, and interactive times separately. Scenarios A
-and B1 gate below 3,098,418ns and 385,688ns p99 respectively; B2–D are
+and B1 gate below 2,788,576ns and 347,119ns p99 respectively; B2–D are
 explicitly reported with cache-control limitations in the JSON metadata.
 
 ```sh

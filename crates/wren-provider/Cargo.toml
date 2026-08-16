@@ -13,8 +13,11 @@ default = ["gpu"]
 gpu = ["dep:pollster", "dep:wgpu"]
 
 [dependencies]
+ast-grep-core.workspace = true
 ast-grep-language.workspace = true
 nucleo-matcher.workspace = true
+regex.workspace = true
+tree-sitter.workspace = true
 pollster = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

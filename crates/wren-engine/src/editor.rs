@@ -13,7 +13,7 @@ use wren_types::{
     Anchor, Bias, DocumentRevision, Edit, SelRange, SelectionSet, Transaction, TransactionError,
 };
 
-use crate::{CaseOverride, EngineFrame, VimPattern};
+use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -300,6 +300,8 @@ pub enum EngineError {
 #[derive(Debug, Clone)]
 pub struct Editor<T: TextStore> {
     text: T,
+    clean_text: Option<T>,
+    frame_text: FrameText,
     revision: DocumentRevision,
     selections: SelectionSet,
     mode: Mode,
@@ -347,8 +349,19 @@ pub struct Editor<T: TextStore> {
 impl<T: TextStore> Editor<T> {
     #[must_use]
     pub fn new(text: T) -> Self {
+        let contents = text.slice(0..text.len_bytes()).into_owned();
+        Self::with_contents(text, contents)
+    }
+
+    #[must_use]
+    pub fn with_contents(text: T, contents: String) -> Self {
+        debug_assert_eq!(text.len_bytes(), contents.len());
+        let clean_text = text.snapshot();
+        let line_starts = clean_text.line_starts();
         Self {
             text,
+            clean_text: Some(clean_text),
+            frame_text: FrameText::from_indexed(contents.into(), line_starts),
             revision: DocumentRevision::new(0),
             selections: SelectionSet {
                 primary: 0,
@@ -535,11 +548,19 @@ impl<T: TextStore> Editor<T> {
     }
 
     pub fn mark_clean(&mut self) {
+        self.clean_text = Some(self.text.snapshot());
         self.dirty = false;
     }
 
     pub fn mark_dirty(&mut self) {
+        self.clean_text = None;
         self.dirty = true;
+    }
+
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.clean_text.as_ref().is_none_or(|clean_text| {
+            self.text.len_bytes() != clean_text.len_bytes() || !self.text.content_eq(clean_text)
+        });
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
@@ -570,19 +591,17 @@ impl<T: TextStore> Editor<T> {
 
     #[must_use]
     pub fn cursor_line_column(&self) -> (usize, usize) {
-        let text = self.contents();
-        let cursor = self.primary_cursor().min(text.len());
-        let start = line_start(&text, cursor);
-        (
-            self.text.line_of_byte(cursor),
-            text[start..cursor].chars().count(),
-        )
+        let cursor = self.primary_cursor().min(self.text.len_bytes());
+        let line = self.text.line_of_byte(cursor);
+        let start = self.text.byte_of_line(line);
+        let column = self.text.slice(start..cursor).chars().count();
+        (line, column)
     }
 
     #[must_use]
     pub fn frame(&self) -> EngineFrame {
         EngineFrame {
-            text: self.contents().into_boxed_str(),
+            text: self.frame_text.clone(),
             cursor_byte: self.primary_cursor(),
         }
     }
@@ -866,14 +885,17 @@ impl<T: TextStore> Editor<T> {
     }
 
     pub fn set_cursor(&mut self, byte: usize) {
-        let text = self.contents();
-        self.collapse_selection(floor_char_boundary(&text, byte.min(text.len())));
+        let destination = floor_char_boundary(
+            self.frame_text.as_ref(),
+            byte.min(self.frame_text.as_ref().len()),
+        );
+        self.collapse_selection(destination);
     }
 
     pub fn set_selection_range(&mut self, range: Range<usize>) {
-        let text = self.contents();
-        let start = floor_char_boundary(&text, range.start.min(text.len()));
-        let end = floor_char_boundary(&text, range.end.min(text.len()).max(start));
+        let text = self.frame_text.as_ref();
+        let start = floor_char_boundary(text, range.start.min(text.len()));
+        let end = floor_char_boundary(text, range.end.min(text.len()).max(start));
         if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
             primary.anchor = start;
             primary.head = end;
@@ -887,9 +909,9 @@ impl<T: TextStore> Editor<T> {
         self.cancel_pending();
         self.visual_region_history.clear();
         self.mode = Mode::Visual;
-        let text = self.contents();
-        let anchor = floor_char_boundary(&text, anchor.min(text.len()));
-        let head = floor_char_boundary(&text, head.min(text.len()));
+        let text = self.frame_text.as_ref();
+        let anchor = floor_char_boundary(text, anchor.min(text.len()));
+        let head = floor_char_boundary(text, head.min(text.len()));
         if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
             primary.anchor = anchor;
             primary.head = head;
@@ -1162,11 +1184,13 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn move_visual_head(&mut self, motion: Motion, count: u32) {
-        let text = self.contents();
-        let destination = normal_cursor_destination(
-            &text,
-            self.motion_destination(self.primary_cursor(), motion, count),
-        );
+        let destination = {
+            let text = self.frame_text.as_ref();
+            normal_cursor_destination(
+                text,
+                Self::motion_destination(text, self.primary_cursor(), motion, count),
+            )
+        };
         if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
             primary.head = destination;
         }
@@ -1174,16 +1198,16 @@ impl<T: TextStore> Editor<T> {
 
     #[must_use]
     pub fn selection_byte_range(&self) -> Range<usize> {
-        let text = self.contents();
+        let text = self.frame_text.as_ref();
         let Some(selection) = self.selections.ranges.get(self.selections.primary) else {
             return 0..0;
         };
         if self.mode == Mode::VisualLine {
-            line_start(&text, selection.anchor.min(selection.head))
-                ..line_end_with_newline(&text, selection.anchor.max(selection.head))
+            line_start(text, selection.anchor.min(selection.head))
+                ..line_end_with_newline(text, selection.anchor.max(selection.head))
         } else if self.mode == Mode::Visual {
             let start = selection.anchor.min(selection.head);
-            let end = next_char_boundary(&text, selection.anchor.max(selection.head));
+            let end = next_char_boundary(text, selection.anchor.max(selection.head));
             start..end
         } else {
             selection.head..selection.head
@@ -1294,7 +1318,6 @@ impl<T: TextStore> Editor<T> {
         self.selections = group.before.clone();
         self.redo.push(group);
         self.messages.push("undo change".into());
-        self.dirty = true;
         Ok(last)
     }
 
@@ -1313,7 +1336,6 @@ impl<T: TextStore> Editor<T> {
         }
         self.undo.push(group);
         self.messages.push("redo change".into());
-        self.dirty = true;
         Ok(last)
     }
 
@@ -1516,7 +1538,12 @@ impl<T: TextStore> Editor<T> {
             }
             KeyCode::Char('w') if key.modifiers == Modifiers::CONTROL => {
                 let cursor = self.primary_cursor();
-                let start = self.motion_destination(cursor, Motion::WordBackward, 1);
+                let start = Self::motion_destination(
+                    self.frame_text.as_ref(),
+                    cursor,
+                    Motion::WordBackward,
+                    1,
+                );
                 self.delete_insert_range(start, cursor)
             }
             KeyCode::Char('u') if key.modifiers == Modifiers::CONTROL => {
@@ -1778,7 +1805,7 @@ impl<T: TextStore> Editor<T> {
                 actual: transaction.base_revision.get(),
             });
         }
-        let inverse = transaction.inverted_against(&self.contents())?;
+        let inverse = self.invert_transaction(&transaction)?;
         let starts_change = if insert_group {
             self.insert_group.as_ref().is_none_or(UndoGroup::is_empty)
         } else {
@@ -1808,8 +1835,34 @@ impl<T: TextStore> Editor<T> {
         if !self.redo.is_empty() {
             self.undo_branches.push(std::mem::take(&mut self.redo));
         }
-        self.dirty = true;
         Ok(())
+    }
+
+    fn invert_transaction(&self, transaction: &Transaction) -> Result<Transaction, EngineError> {
+        transaction.validate()?;
+        let text_len = self.text.len_bytes();
+        let mut deleted = Vec::with_capacity(transaction.edits.len());
+        for edit in &transaction.edits {
+            if edit.range.end > text_len {
+                return Err(TransactionError::OutOfBounds {
+                    offset: edit.range.end,
+                    len: text_len,
+                }
+                .into());
+            }
+            for offset in [edit.range.start, edit.range.end] {
+                if !self.text.is_char_boundary(offset) {
+                    return Err(TransactionError::NotCharBoundary { offset }.into());
+                }
+            }
+            deleted.push(
+                self.text
+                    .slice(edit.range.clone())
+                    .into_owned()
+                    .into_boxed_str(),
+            );
+        }
+        transaction.invert(&deleted).map_err(Into::into)
     }
 
     fn apply_without_history(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
@@ -1819,7 +1872,10 @@ impl<T: TextStore> Editor<T> {
                 actual: transaction.base_revision.get(),
             });
         }
+        let frame_text = self.frame_text.edited(transaction)?;
         self.text.apply(transaction);
+        self.frame_text = frame_text;
+        self.refresh_dirty();
         self.selections = self.selections.map_through(transaction)?;
         for anchor in self.marks.values_mut() {
             *anchor = (*anchor).map_through(transaction)?;
@@ -1914,7 +1970,6 @@ impl<T: TextStore> Editor<T> {
         }
         self.insert_capture.pop();
         self.collapse_selection(destination);
-        self.dirty = true;
         Ok(Some(inverse))
     }
 
@@ -2044,7 +2099,7 @@ impl<T: TextStore> Editor<T> {
         if let Motion::Inside(object) | Motion::Around(object) = motion {
             return text_object_range(text, cursor, object, matches!(motion, Motion::Around(_)));
         }
-        let destination = self.motion_destination(cursor, motion, count);
+        let destination = Self::motion_destination(text, cursor, motion, count);
         if range_kind == RangeKind::LineWise {
             let first = line_start(text, cursor.min(destination));
             let last = line_end_with_newline(text, cursor.max(destination));
@@ -2343,86 +2398,87 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn move_cursor(&mut self, motion: Motion, count: u32) {
-        let text = self.contents();
-        let destination = normal_cursor_destination(
-            &text,
-            self.motion_destination(self.primary_cursor(), motion, count),
-        );
+        let destination = {
+            let text = self.frame_text.as_ref();
+            normal_cursor_destination(
+                text,
+                Self::motion_destination(text, self.primary_cursor(), motion, count),
+            )
+        };
         self.collapse_selection(destination);
     }
 
-    fn motion_destination(&self, cursor: usize, motion: Motion, count: u32) -> usize {
-        let text = self.contents();
+    fn motion_destination(text: &str, cursor: usize, motion: Motion, count: u32) -> usize {
         let mut destination = cursor.min(text.len());
         if motion == Motion::LineFirstNonBlank {
             for _ in 1..count.max(1) {
-                destination = vertical_motion(&text, destination, 1);
+                destination = vertical_motion(text, destination, 1);
             }
-            return first_non_blank(&text, destination);
+            return first_non_blank(text, destination);
         }
         if motion == Motion::Column {
-            return byte_at_line_column(&text, destination, count.saturating_sub(1) as usize);
+            return byte_at_line_column(text, destination, count.saturating_sub(1) as usize);
         }
         for _ in 0..count {
             destination = match motion {
                 Motion::Left => {
-                    previous_char_boundary(&text, destination).max(line_start(&text, destination))
+                    previous_char_boundary(text, destination).max(line_start(text, destination))
                 }
                 Motion::Right => {
-                    next_char_boundary(&text, destination).min(line_end(&text, destination))
+                    next_char_boundary(text, destination).min(line_end(text, destination))
                 }
-                Motion::WordBackward => word_backward(&text, destination),
-                Motion::WordForward => word_forward(&text, destination),
-                Motion::WordEnd => word_end(&text, destination),
-                Motion::BigWordBackward => big_word_backward(&text, destination),
-                Motion::BigWordForward => big_word_forward(&text, destination),
-                Motion::BigWordEnd => big_word_end(&text, destination),
-                Motion::WordEndBackward => word_end_backward(&text, destination),
-                Motion::LineStart => line_start(&text, destination),
-                Motion::FirstNonBlank => first_non_blank(&text, destination),
+                Motion::WordBackward => word_backward(text, destination),
+                Motion::WordForward => word_forward(text, destination),
+                Motion::WordEnd => word_end(text, destination),
+                Motion::BigWordBackward => big_word_backward(text, destination),
+                Motion::BigWordForward => big_word_forward(text, destination),
+                Motion::BigWordEnd => big_word_end(text, destination),
+                Motion::WordEndBackward => word_end_backward(text, destination),
+                Motion::LineStart => line_start(text, destination),
+                Motion::FirstNonBlank => first_non_blank(text, destination),
                 Motion::NextLineFirstNonBlank => {
-                    first_non_blank(&text, vertical_motion(&text, destination, 1))
+                    first_non_blank(text, vertical_motion(text, destination, 1))
                 }
                 Motion::PreviousLineFirstNonBlank => {
-                    first_non_blank(&text, vertical_motion(&text, destination, -1))
+                    first_non_blank(text, vertical_motion(text, destination, -1))
                 }
-                Motion::LineFirstNonBlank => first_non_blank(&text, destination),
-                Motion::LastNonBlank => last_non_blank(&text, destination),
+                Motion::LineFirstNonBlank => first_non_blank(text, destination),
+                Motion::LastNonBlank => last_non_blank(text, destination),
                 Motion::Column => {
-                    byte_at_line_column(&text, destination, count.saturating_sub(1) as usize)
+                    byte_at_line_column(text, destination, count.saturating_sub(1) as usize)
                 }
-                Motion::LineEnd => line_end(&text, destination),
-                Motion::GoToLine => byte_of_line(&text, count.saturating_sub(1) as usize),
-                Motion::DocumentEnd => first_non_blank(&text, line_start(&text, text.len())),
-                Motion::WholeLine => line_end_with_newline(&text, destination),
-                Motion::Up => vertical_motion(&text, destination, -1),
-                Motion::Down => vertical_motion(&text, destination, 1),
-                Motion::FindForward(character) => find_on_line(&text, destination, character, true),
+                Motion::LineEnd => line_end(text, destination),
+                Motion::GoToLine => byte_of_line(text, count.saturating_sub(1) as usize),
+                Motion::DocumentEnd => first_non_blank(text, line_start(text, text.len())),
+                Motion::WholeLine => line_end_with_newline(text, destination),
+                Motion::Up => vertical_motion(text, destination, -1),
+                Motion::Down => vertical_motion(text, destination, 1),
+                Motion::FindForward(character) => find_on_line(text, destination, character, true),
                 Motion::FindBackward(character) => {
-                    find_on_line(&text, destination, character, false)
+                    find_on_line(text, destination, character, false)
                 }
                 Motion::TillForward(character) => {
-                    let found = find_on_line(&text, destination, character, true);
+                    let found = find_on_line(text, destination, character, true);
                     if found == destination {
                         destination
                     } else {
-                        previous_char_boundary(&text, found)
+                        previous_char_boundary(text, found)
                     }
                 }
                 Motion::TillBackward(character) => {
-                    let found = find_on_line(&text, destination, character, false);
+                    let found = find_on_line(text, destination, character, false);
                     if found == destination {
                         destination
                     } else {
-                        next_char_boundary(&text, found)
+                        next_char_boundary(text, found)
                     }
                 }
-                Motion::ParagraphForward => paragraph_forward(&text, destination),
-                Motion::ParagraphBackward => paragraph_backward(&text, destination),
-                Motion::MatchPair => matching_pair(&text, destination),
+                Motion::ParagraphForward => paragraph_forward(text, destination),
+                Motion::ParagraphBackward => paragraph_backward(text, destination),
+                Motion::MatchPair => matching_pair(text, destination),
                 Motion::Inside(object) | Motion::Around(object) => {
                     text_object_range(
-                        &text,
+                        text,
                         destination,
                         object,
                         matches!(motion, Motion::Around(_)),
@@ -2431,7 +2487,7 @@ impl<T: TextStore> Editor<T> {
                 }
             };
         }
-        floor_char_boundary(&text, destination.min(text.len()))
+        floor_char_boundary(text, destination.min(text.len()))
     }
 
     fn write_register(&mut self, register: Option<Register>, text: &str, linewise: bool) {
@@ -3155,11 +3211,14 @@ mod tests {
     #[test]
     fn insert_group_undo_and_redo_are_transactional() {
         let mut editor = editor("ab");
+        assert!(!editor.is_dirty());
         feed(&mut editor, "i界x\u{1b}");
         assert_eq!(editor.contents(), "界xab");
+        assert!(editor.is_dirty());
         assert_eq!(editor.undo_depth(), 1);
         feed(&mut editor, "u");
         assert_eq!(editor.contents(), "ab");
+        assert!(!editor.is_dirty());
         editor
             .handle_key(KeyEvent {
                 code: KeyCode::Char('r'),
@@ -3167,6 +3226,28 @@ mod tests {
             })
             .expect("redo");
         assert_eq!(editor.contents(), "界xab");
+        assert!(editor.is_dirty());
+    }
+
+    #[test]
+    fn modified_state_tracks_saved_contents_across_history_branches() {
+        let mut editor = editor("abc");
+        feed(&mut editor, "x");
+        assert!(editor.is_dirty());
+
+        feed(&mut editor, "ia\u{1b}");
+        assert_eq!(editor.contents(), "abc");
+        assert!(!editor.is_dirty(), "identical text is not modified");
+
+        feed(&mut editor, "Ax\u{1b}");
+        editor.mark_clean();
+        assert!(!editor.is_dirty());
+        feed(&mut editor, "Ay\u{1b}u");
+        assert_eq!(editor.contents(), "abcx");
+        assert!(!editor.is_dirty(), "undo returned to the save point");
+        feed(&mut editor, "u");
+        assert_eq!(editor.contents(), "abc");
+        assert!(editor.is_dirty(), "undo before the save point is modified");
     }
 
     #[test]

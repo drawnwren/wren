@@ -117,8 +117,11 @@ jobs:
           path: system-gates.json
 
   architecture-gates:
-    if: ${{ vars.WREN_BARE_METAL_BENCHMARKS == 'true' }}
     runs-on: [self-hosted, linux, x64, wren-benchmark]
+    env:
+      WREN_BENCH_CPU: ${{ vars.WREN_BENCH_CPU || '0' }}
+      WREN_KEY_TO_PHOTON_JSON: ${{ vars.WREN_KEY_TO_PHOTON_JSON }}
+      WREN_REMOTE_BASELINE_JSON: ${{ vars.WREN_REMOTE_BASELINE_JSON }}
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
@@ -126,8 +129,8 @@ jobs:
         env:
           WREN_BARE_METAL: "1"
         run: |
-          nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --cpu 0 --gate --output latency-gate.json
-          nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --cpu 0 --gate --output startup-gate.json
+          nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --cpu "$WREN_BENCH_CPU" --gate --output latency-gate.json
+          nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --cpu "$WREN_BENCH_CPU" --gate --output startup-gate.json
       - name: Gate remote convergence and persisted save under netem
         env:
           WREN_BENCH_REMOTE_HOST: ${{ vars.WREN_BENCH_REMOTE_HOST }}
@@ -135,7 +138,13 @@ jobs:
           WREN_BENCH_REMOTE_WORKSPACE: ${{ vars.WREN_BENCH_REMOTE_WORKSPACE }}
           WREN_BENCH_REMOTE_STATE: ${{ vars.WREN_BENCH_REMOTE_STATE }}
           WREN_BENCH_REMOTE_SESSIOND: ${{ vars.WREN_BENCH_REMOTE_SESSIOND }}
-        run: sudo --preserve-env=WREN_BENCH_REMOTE_HOST,WREN_BENCH_REMOTE_USER,WREN_BENCH_REMOTE_WORKSPACE,WREN_BENCH_REMOTE_STATE,WREN_BENCH_REMOTE_SESSIOND nix develop --command scripts/netem-remote.sh
+          WREN_BENCH_REMOTE_PORT: ${{ vars.WREN_BENCH_REMOTE_PORT }}
+          WREN_BENCH_REMOTE_IDENTITY: ${{ vars.WREN_BENCH_REMOTE_IDENTITY }}
+          WREN_BENCH_SSH_OPTIONS: ${{ vars.WREN_BENCH_SSH_OPTIONS }}
+          WREN_NETEM_INTERFACE: ${{ vars.WREN_NETEM_INTERFACE || 'lo' }}
+        run: |
+          sudo --preserve-env=WREN_BENCH_CPU,WREN_BENCH_REMOTE_HOST,WREN_BENCH_REMOTE_USER,WREN_BENCH_REMOTE_WORKSPACE,WREN_BENCH_REMOTE_STATE,WREN_BENCH_REMOTE_SESSIOND,WREN_BENCH_REMOTE_PORT,WREN_BENCH_REMOTE_IDENTITY,WREN_BENCH_SSH_OPTIONS,WREN_REMOTE_BASELINE_JSON,WREN_NETEM_INTERFACE \
+            nix develop --command scripts/netem-remote.sh
       - uses: actions/upload-artifact@v4
         with:
           name: architecture-gates

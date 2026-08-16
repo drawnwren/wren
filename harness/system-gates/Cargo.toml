@@ -7,11 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-core_affinity.workspace = true
 hdrhistogram.workspace = true
 nix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
 wren-provider = { version = "0.1.0", path = "../../crates/wren-provider" }
 wren-remote = { version = "0.1.0", path = "../../crates/wren-remote" }
 wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
