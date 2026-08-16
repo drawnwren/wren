@@ -342,6 +342,58 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
             }
         }
     }
+    if app.search_highlight {
+        let previewing = app.prompt.as_ref().is_some_and(|prompt| {
+            matches!(
+                prompt.kind,
+                PromptKind::SearchForward | PromptKind::SearchBackward
+            )
+        });
+        for window in &app.views.windows {
+            if previewing && window.buffer_id != app.active.buffer_id {
+                continue;
+            }
+            let Some(buffer) = app.buffer(window.buffer_id) else {
+                continue;
+            };
+            let visible_start = buffer.editor.text().byte_of_line(window.top_line);
+            let visible_end = buffer
+                .editor
+                .text()
+                .byte_of_line(window.top_line.saturating_add(app.viewport_rows.max(1)));
+            let matches = buffer
+                .editor
+                .search_match_ranges(visible_start..visible_end, 4_096);
+            if matches.is_empty() {
+                continue;
+            }
+            let decoration_index = decorations
+                .iter()
+                .position(|(buffer_id, _)| *buffer_id == window.buffer_id)
+                .unwrap_or_else(|| {
+                    decorations.push((window.buffer_id, Vec::new()));
+                    decorations.len() - 1
+                });
+            decorations[decoration_index]
+                .1
+                .extend(matches.into_iter().map(|range| DecorationSpan {
+                    style: CellStyle {
+                        foreground: Some(CellColor::Rgb(app.theme.crust)),
+                        background: Some(CellColor::Rgb(
+                            if window.buffer_id == app.active.buffer_id
+                                && range.start == app.active.editor.primary_cursor()
+                            {
+                                app.theme.peach
+                            } else {
+                                app.theme.yellow
+                            },
+                        )),
+                        ..CellStyle::default()
+                    },
+                    range,
+                }));
+        }
+    }
     let mut line_decorations = Vec::<(BufferId, Vec<LineDecoration>)>::new();
     for buffer in std::iter::once(&app.active).chain(app.inactive.iter()) {
         let Some(path) = buffer.document.presentation_path() else {
@@ -539,6 +591,13 @@ struct Prompt {
     kind: PromptKind,
     buffer: String,
     history_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchPromptOrigin {
+    cursor: usize,
+    previous_search: Option<(Box<str>, SearchDirection)>,
+    previous_highlight: bool,
 }
 
 impl Prompt {
@@ -1021,6 +1080,8 @@ struct App {
     decorations: BTreeMap<BufferId, BufferDecorations>,
     semantic_decorations: BTreeMap<BufferId, BufferDecorations>,
     prompt: Option<Prompt>,
+    search_prompt_origin: Option<SearchPromptOrigin>,
+    search_highlight: bool,
     message: String,
     tasks: TaskRunner,
     active_task: Option<CancellationToken>,
@@ -1161,6 +1222,8 @@ impl App {
             decorations: BTreeMap::new(),
             semantic_decorations: BTreeMap::new(),
             prompt: None,
+            search_prompt_origin: None,
+            search_highlight: false,
             message,
             tasks: TaskRunner::new(1, 8)?,
             active_task: None,
@@ -1315,8 +1378,12 @@ impl App {
     fn handle_prompt_key(&mut self, key: TerminalKey) -> Result<()> {
         match key.code {
             TerminalKeyCode::Escape => {
-                self.prompt = None;
-                self.message.clear();
+                if self.search_prompt_origin.is_some() {
+                    self.cancel_search_prompt();
+                } else {
+                    self.prompt = None;
+                    self.message.clear();
+                }
             }
             TerminalKeyCode::Backspace => {
                 if self.prompt.as_ref().is_some_and(|prompt| {
@@ -1425,6 +1492,88 @@ impl App {
             .is_some_and(|prompt| prompt.kind.is_picker())
     }
 
+    fn begin_search_prompt(&mut self, kind: PromptKind) {
+        let previous_search = self
+            .active
+            .editor
+            .last_search()
+            .map(|(pattern, direction)| (pattern.into(), direction));
+        self.search_prompt_origin = Some(SearchPromptOrigin {
+            cursor: self.active.editor.primary_cursor(),
+            previous_search,
+            previous_highlight: self.search_highlight,
+        });
+        self.prompt = Some(Prompt::new(kind));
+        self.message.clear();
+    }
+
+    fn cancel_search_prompt(&mut self) {
+        if let Some(origin) = self.search_prompt_origin.take() {
+            self.active.editor.set_cursor(origin.cursor);
+            if let Some((pattern, direction)) = origin.previous_search {
+                self.active.editor.restore_search(pattern, direction);
+            } else {
+                self.active.editor.clear_search();
+            }
+            self.search_highlight = origin.previous_highlight;
+        }
+        self.prompt = None;
+        self.message.clear();
+    }
+
+    fn update_incremental_search(&mut self) {
+        let Some(prompt) = self.prompt.as_ref().filter(|prompt| {
+            matches!(
+                prompt.kind,
+                PromptKind::SearchForward | PromptKind::SearchBackward
+            )
+        }) else {
+            return;
+        };
+        let Some(origin) = self.search_prompt_origin.as_ref() else {
+            return;
+        };
+        let direction = if prompt.kind == PromptKind::SearchForward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        let query = prompt.buffer.clone();
+        let cursor = origin.cursor;
+        if query.is_empty() {
+            self.active.editor.set_cursor(cursor);
+            if let Some((pattern, direction)) = &origin.previous_search {
+                self.active
+                    .editor
+                    .restore_search(pattern.clone(), *direction);
+            } else {
+                self.active.editor.clear_search();
+            }
+            self.search_highlight = origin.previous_highlight;
+            self.message.clear();
+            return;
+        }
+        let found = match self.active.editor.preview_search(&query, direction, cursor) {
+            Ok(found) => found,
+            Err(error) => {
+                self.active.editor.set_cursor(cursor);
+                self.active.editor.restore_search(query, direction);
+                self.search_highlight = false;
+                self.message = error.to_string();
+                return;
+            }
+        };
+        self.active.editor.restore_search(query.clone(), direction);
+        self.search_highlight = true;
+        if let Some(byte) = found {
+            self.active.editor.set_cursor(byte);
+            self.message = format!("{}{}", prompt.prefix(), query);
+        } else {
+            self.active.editor.set_cursor(cursor);
+            self.message = format!("pattern not found: {query}");
+        }
+    }
+
     fn complete_prompt(&mut self) {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
@@ -1517,12 +1666,48 @@ impl App {
                 } else {
                     SearchDirection::Backward
                 };
-                self.message = if self.active.editor.search(&prompt.buffer, direction) {
-                    format!("{}{}", prompt.prefix(), prompt.buffer)
+                let origin = self.search_prompt_origin.take();
+                let pattern = if prompt.buffer.is_empty() {
+                    origin
+                        .as_ref()
+                        .and_then(|origin| origin.previous_search.as_ref())
+                        .map(|(pattern, _)| pattern.to_string())
+                        .or_else(|| {
+                            self.active
+                                .editor
+                                .last_search()
+                                .map(|(pattern, _)| pattern.to_owned())
+                        })
+                        .ok_or_else(|| anyhow!("no previous search pattern"))?
                 } else {
-                    format!("pattern not found: {}", prompt.buffer)
+                    prompt.buffer.clone()
                 };
-                self.after_effect(None, vec![StateDelta::SearchPattern(prompt.buffer.into())]);
+                if let Some(origin) = &origin {
+                    self.active.editor.set_cursor(origin.cursor);
+                }
+                let found = match self.active.editor.search(&pattern, direction) {
+                    Ok(found) => found,
+                    Err(error) => {
+                        if let Some(origin) = origin {
+                            if let Some((pattern, direction)) = origin.previous_search {
+                                self.active.editor.restore_search(pattern, direction);
+                            } else {
+                                self.active.editor.clear_search();
+                            }
+                            self.search_highlight = origin.previous_highlight;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                self.message = if found {
+                    format!("{}{pattern}", prompt.prefix())
+                } else {
+                    format!("pattern not found: {pattern}")
+                };
+                self.search_highlight = true;
+                if !prompt.buffer.is_empty() {
+                    self.after_effect(None, vec![StateDelta::SearchPattern(pattern.into())]);
+                }
                 Ok(())
             }
             PromptKind::Expression => {
@@ -1935,11 +2120,11 @@ impl App {
                     return Ok(());
                 }
                 TerminalKeyCode::Char('/') => {
-                    self.prompt = Some(Prompt::new(PromptKind::SearchForward));
+                    self.begin_search_prompt(PromptKind::SearchForward);
                     return Ok(());
                 }
                 TerminalKeyCode::Char('?') => {
-                    self.prompt = Some(Prompt::new(PromptKind::SearchBackward));
+                    self.begin_search_prompt(PromptKind::SearchBackward);
                     return Ok(());
                 }
                 _ => {}
@@ -2013,7 +2198,10 @@ impl App {
             "selection.line" => self.dispatch_key(KeyEvent::character('V')),
             "editor.quit" => self.execute_ex("q")?,
             "file.write" => self.save(None)?,
-            "search.clear" => self.message.clear(),
+            "search.clear" => {
+                self.search_highlight = false;
+                self.message.clear();
+            }
             "picker.buffers" => self.start_buffer_picker()?,
             "jump.ace" => self.start_ace_jump(),
             "format.document" => self.format_active_language()?,
@@ -2870,6 +3058,7 @@ impl App {
                 Ok(())
             }
             ExCommand::NoHighlight => {
+                self.search_highlight = false;
                 self.message.clear();
                 Ok(())
             }
@@ -5211,9 +5400,29 @@ impl App {
         if self.active_task.is_some() {
             bail!("a TaskCommand is already running");
         }
-        if substitute.needle.is_empty() {
-            self.message = "0 substitution(s)".to_owned();
-            return Ok(());
+        let reused_search = substitute.needle.is_empty();
+        let needle = if reused_search {
+            self.active
+                .editor
+                .last_search()
+                .map(|(pattern, _)| pattern.to_owned())
+                .ok_or_else(|| anyhow!("no previous search pattern"))?
+        } else {
+            substitute.needle
+        };
+        let regex = RegexBuilder::new(&needle)
+            .case_insensitive(substitute.ignore_case)
+            .build()
+            .with_context(|| format!("invalid substitution pattern {needle:?}"))?;
+        let direction = self
+            .active
+            .editor
+            .last_search()
+            .map_or(SearchDirection::Forward, |(_, direction)| direction);
+        self.active.editor.restore_search(needle.clone(), direction);
+        self.search_highlight = true;
+        if !reused_search {
+            self.after_effect(None, vec![StateDelta::SearchPattern(needle.clone().into())]);
         }
         let task_id = CommandTaskId::new(self.next_task_id);
         self.next_task_id = self
@@ -5222,14 +5431,9 @@ impl App {
             .ok_or_else(|| anyhow!("task ID overflow"))?;
         let text = self.active.editor.contents();
         let base_revision = self.active.editor.revision();
-        let needle = substitute.needle;
         let replacement = vim_regex_replacement(&substitute.replacement);
         let ranges = substitute.ranges;
         let global = substitute.global;
-        let regex = RegexBuilder::new(&needle)
-            .case_insensitive(substitute.ignore_case)
-            .build()
-            .with_context(|| format!("invalid substitution pattern {needle:?}"))?;
         let document_id = self.active.document_id;
         let cancellation = self.tasks.submit(
             CommandTask {
@@ -5667,7 +5871,14 @@ impl App {
         } else {
             SearchDirection::Forward
         };
-        self.message = if self.active.editor.search(&word, direction) {
+        let found = match self.active.editor.search(&word, direction) {
+            Ok(found) => found,
+            Err(error) => {
+                self.show_error(error);
+                return;
+            }
+        };
+        self.message = if found {
             for _ in 1..count {
                 if !self.active.editor.search_next(false) {
                     break;
@@ -7170,6 +7381,10 @@ impl App {
             }
             Some(PromptKind::Command) => {
                 self.update_inccommand_preview();
+                Ok(())
+            }
+            Some(PromptKind::SearchForward | PromptKind::SearchBackward) => {
+                self.update_incremental_search();
                 Ok(())
             }
             _ => Ok(()),
@@ -11576,6 +11791,140 @@ while True:
         app.dispatch_key(KeyEvent::character('p'));
         assert_eq!(app.active.editor.contents(), "WREN");
         assert!(evaluate_expression("read_file('x')", &app.expression_context()).is_err());
+    }
+
+    #[test]
+    fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "zero hit one hit two hit\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+
+        app.handle_editor_key(terminal_character('/'))
+            .expect("open forward search");
+        for character in "h.t".chars() {
+            app.handle_prompt_key(terminal_character(character))
+                .expect("type search");
+        }
+        assert_eq!(app.active.editor.primary_cursor(), 5, "incremental match");
+        assert!(app.search_highlight);
+        app.handle_prompt_key(TerminalKey {
+            code: TerminalKeyCode::Enter,
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        })
+        .expect("commit search");
+        assert_eq!(app.active.editor.primary_cursor(), 5);
+
+        let mut layout = ViewportLayout::new(80, 10);
+        layout.configure_dotfile_profile();
+        let frame = desired_frame(&mut layout, &app);
+        assert!(frame.rows.iter().any(|row| row.cells.iter().any(|cell| {
+            cell.grapheme.as_ref() == "h"
+                && matches!(
+                    cell.style.background,
+                    Some(CellColor::Rgb(color))
+                        if color == app.theme.yellow || color == app.theme.peach
+                )
+        })));
+
+        app.handle_editor_key(terminal_character('n'))
+            .expect("next match");
+        assert_eq!(app.active.editor.primary_cursor(), 13);
+        app.handle_editor_key(terminal_character('N'))
+            .expect("previous match");
+        assert_eq!(app.active.editor.primary_cursor(), 5);
+
+        app.active
+            .editor
+            .set_cursor(app.active.editor.text().len_bytes());
+        app.handle_editor_key(terminal_character('?'))
+            .expect("open backward search");
+        for character in "hit".chars() {
+            app.handle_prompt_key(terminal_character(character))
+                .expect("type backward search");
+        }
+        app.handle_prompt_key(TerminalKey {
+            code: TerminalKeyCode::Enter,
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        })
+        .expect("commit backward search");
+        assert_eq!(app.active.editor.primary_cursor(), 21);
+        app.handle_editor_key(terminal_character('n'))
+            .expect("repeat backward search");
+        assert_eq!(app.active.editor.primary_cursor(), 13);
+
+        app.handle_editor_key(terminal_character('/'))
+            .expect("start cancelable search");
+        for character in "zero".chars() {
+            app.handle_prompt_key(terminal_character(character))
+                .expect("type cancelable search");
+        }
+        assert_eq!(app.active.editor.primary_cursor(), 0);
+        app.handle_prompt_key(TerminalKey {
+            code: TerminalKeyCode::Escape,
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        })
+        .expect("cancel search");
+        assert_eq!(app.active.editor.primary_cursor(), 13);
+        assert_eq!(
+            app.active.editor.last_search(),
+            Some(("hit", SearchDirection::Backward))
+        );
+
+        app.execute_ex("nohlsearch").expect("clear highlights");
+        assert!(!app.search_highlight);
+        app.handle_editor_key(terminal_character('n'))
+            .expect("search remains repeatable after nohlsearch");
+        assert_eq!(app.active.editor.primary_cursor(), 5);
+    }
+
+    #[test]
+    fn command_prompt_substitution_reuses_the_last_slash_pattern() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "one one\nother one\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+
+        app.handle_editor_key(terminal_character('/'))
+            .expect("open search");
+        for character in "one".chars() {
+            app.handle_prompt_key(terminal_character(character))
+                .expect("type search");
+        }
+        app.handle_prompt_key(TerminalKey {
+            code: TerminalKeyCode::Enter,
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        })
+        .expect("commit search");
+
+        app.handle_editor_key(terminal_character(':'))
+            .expect("open command prompt");
+        for character in "%s//TWO/g".chars() {
+            app.handle_prompt_key(terminal_character(character))
+                .expect("type substitution");
+        }
+        app.handle_prompt_key(TerminalKey {
+            code: TerminalKeyCode::Enter,
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        })
+        .expect("run substitution");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "TWO TWO\nother TWO\n");
+        app.active.editor.undo().expect("undo substitution");
+        assert_eq!(app.active.editor.contents(), "one one\nother one\n");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wren_grammar::{
@@ -128,6 +129,8 @@ pub enum EngineError {
     InvalidRepeatData(Box<str>),
     #[error("durable undo state is invalid: {0}")]
     InvalidUndoState(Box<str>),
+    #[error("invalid search pattern: {0}")]
+    InvalidSearchPattern(Box<str>),
 }
 
 #[derive(Debug, Clone)]
@@ -452,10 +455,22 @@ impl<T: TextStore> Editor<T> {
     }
 
     pub fn restore_search_pattern(&mut self, pattern: impl Into<Box<str>>) {
+        let direction = self
+            .search
+            .as_ref()
+            .map_or(SearchDirection::Forward, |search| search.direction);
+        self.restore_search(pattern, direction);
+    }
+
+    pub fn restore_search(&mut self, pattern: impl Into<Box<str>>, direction: SearchDirection) {
         self.search = Some(SearchState {
             pattern: pattern.into(),
-            direction: SearchDirection::Forward,
+            direction,
         });
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = None;
     }
 
     pub fn restore_mark(&mut self, name: char, byte: usize) {
@@ -1074,15 +1089,71 @@ impl<T: TextStore> Editor<T> {
         Ok(last)
     }
 
-    pub fn search(&mut self, pattern: &str, direction: SearchDirection) -> bool {
+    pub fn search(
+        &mut self,
+        pattern: &str,
+        direction: SearchDirection,
+    ) -> Result<bool, EngineError> {
         if pattern.is_empty() {
-            return false;
+            return Ok(false);
         }
+        let regex = self.search_regex(pattern)?;
         self.search = Some(SearchState {
             pattern: Box::from(pattern),
             direction,
         });
-        self.search_next(false)
+        Ok(self.move_to_search_match(&regex, direction))
+    }
+
+    pub fn preview_search(
+        &self,
+        pattern: &str,
+        direction: SearchDirection,
+        cursor: usize,
+    ) -> Result<Option<usize>, EngineError> {
+        if pattern.is_empty() {
+            return Ok(None);
+        }
+        let regex = self.search_regex(pattern)?;
+        Ok(self.find_search_from(&regex, direction, cursor))
+    }
+
+    #[must_use]
+    pub fn search_match_ranges(&self, byte_range: Range<usize>, limit: usize) -> Vec<Range<usize>> {
+        let Some(search) = &self.search else {
+            return Vec::new();
+        };
+        if search.pattern.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let Ok(regex) = self.search_regex(search.pattern.as_ref()) else {
+            return Vec::new();
+        };
+        let text = self.contents();
+        let start = floor_char_boundary(&text, byte_range.start.min(text.len()));
+        let end = floor_char_boundary(&text, byte_range.end.min(text.len())).max(start);
+        let mut matches = Vec::new();
+        let mut cursor = start;
+        while cursor <= end && matches.len() < limit {
+            let Some(found) = regex.find_at(&text, cursor) else {
+                break;
+            };
+            if found.start() >= end || found.end() > end {
+                break;
+            }
+            if !found.is_empty() {
+                matches.push(found.range());
+            }
+            cursor = if found.is_empty() {
+                next_char_boundary(&text, found.start())
+            } else {
+                found.end()
+            };
+            if cursor == text.len() && found.is_empty() {
+                break;
+            }
+        }
+        matches
     }
 
     pub fn search_next(&mut self, reverse: bool) -> bool {
@@ -1097,29 +1168,14 @@ impl<T: TextStore> Editor<T> {
         } else {
             search.direction
         };
-        let text = self.contents();
-        let cursor = self.primary_cursor().min(text.len());
-        let case_insensitive = self.ignore_case
-            && (!self.smart_case || !search.pattern.chars().any(char::is_uppercase));
-        let found = match direction {
-            SearchDirection::Forward => {
-                let after = next_char_boundary(&text, cursor);
-                find_literal(&text[after..], search.pattern.as_ref(), case_insensitive)
-                    .map(|offset| after + offset)
-                    .or_else(|| {
-                        find_literal(&text[..after], search.pattern.as_ref(), case_insensitive)
-                    })
-            }
-            SearchDirection::Backward => {
-                rfind_literal(&text[..cursor], search.pattern.as_ref(), case_insensitive).or_else(
-                    || {
-                        rfind_literal(&text[cursor..], search.pattern.as_ref(), case_insensitive)
-                            .map(|offset| cursor + offset)
-                    },
-                )
-            }
+        let Ok(regex) = self.search_regex(search.pattern.as_ref()) else {
+            return false;
         };
-        if let Some(byte) = found {
+        self.move_to_search_match(&regex, direction)
+    }
+
+    fn move_to_search_match(&mut self, regex: &Regex, direction: SearchDirection) -> bool {
+        if let Some(byte) = self.find_search_from(regex, direction, self.primary_cursor()) {
             let previous = self.primary_cursor();
             if byte != previous {
                 self.push_jump(previous);
@@ -1129,6 +1185,52 @@ impl<T: TextStore> Editor<T> {
         } else {
             false
         }
+    }
+
+    fn find_search_from(
+        &self,
+        regex: &Regex,
+        direction: SearchDirection,
+        cursor: usize,
+    ) -> Option<usize> {
+        let text = self.contents();
+        let cursor = cursor.min(text.len());
+        match direction {
+            SearchDirection::Forward => {
+                let after = next_char_boundary(&text, cursor);
+                regex
+                    .find_at(&text, after)
+                    .map(|found| found.start())
+                    .or_else(|| {
+                        regex
+                            .find(&text)
+                            .filter(|found| found.start() < after)
+                            .map(|found| found.start())
+                    })
+            }
+            SearchDirection::Backward => {
+                let mut before = None;
+                let mut wrapped = None;
+                for found in regex.find_iter(&text) {
+                    if found.start() < cursor {
+                        before = Some(found.start());
+                    } else {
+                        wrapped = Some(found.start());
+                    }
+                }
+                before.or(wrapped)
+            }
+        }
+    }
+
+    fn search_regex(&self, pattern: &str) -> Result<Regex, EngineError> {
+        RegexBuilder::new(pattern)
+            .multi_line(true)
+            .case_insensitive(
+                self.ignore_case && (!self.smart_case || !pattern.chars().any(char::is_uppercase)),
+            )
+            .build()
+            .map_err(|error| EngineError::InvalidSearchPattern(error.to_string().into()))
     }
 
     pub fn replace_literal(
@@ -2711,26 +2813,6 @@ fn find_on_line(text: &str, byte: usize, needle: char, forward: bool) -> usize {
     }
 }
 
-fn find_literal(haystack: &str, needle: &str, ignore_ascii_case: bool) -> Option<usize> {
-    if !ignore_ascii_case || !needle.is_ascii() {
-        return haystack.find(needle);
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-fn rfind_literal(haystack: &str, needle: &str, ignore_ascii_case: bool) -> Option<usize> {
-    if !ignore_ascii_case || !needle.is_ascii() {
-        return haystack.rfind(needle);
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .rposition(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
 fn whole_line_range(text: &str, byte: usize, count: u32) -> Range<usize> {
     let start = line_start(text, byte);
     let mut end = start;
@@ -2933,7 +3015,11 @@ mod tests {
     #[test]
     fn search_wraps_and_marks_map_through_edits() {
         let mut editor = editor("one two one\n");
-        assert!(editor.search("one", SearchDirection::Forward));
+        assert!(
+            editor
+                .search("one", SearchDirection::Forward)
+                .expect("search")
+        );
         assert_eq!(editor.primary_cursor(), 8);
         feed(&mut editor, "ma0iX\u{1b}`a");
         assert_eq!(editor.primary_cursor(), 9);
@@ -2945,12 +3031,24 @@ mod tests {
     fn dotfile_search_is_ignorecase_with_smartcase_and_unnamed_uses_clipboard() {
         let mut editor = editor("Alpha alpha BETA\n");
         editor.set_search_options(true, true);
-        assert!(editor.search("alpha", SearchDirection::Forward));
+        assert!(
+            editor
+                .search("alpha", SearchDirection::Forward)
+                .expect("search")
+        );
         assert_eq!(editor.primary_cursor(), 6);
         editor.set_cursor(0);
-        assert!(editor.search("BETA", SearchDirection::Forward));
+        assert!(
+            editor
+                .search("BETA", SearchDirection::Forward)
+                .expect("search")
+        );
         assert_eq!(editor.primary_cursor(), 12);
-        assert!(!editor.search("Beta", SearchDirection::Forward));
+        assert!(
+            !editor
+                .search("Beta", SearchDirection::Forward)
+                .expect("search")
+        );
 
         editor.set_clipboard_unnamed(true);
         editor.set_cursor(0);
@@ -2959,6 +3057,22 @@ mod tests {
             editor.register('+').map(|value| value.text.as_ref()),
             Some("Alpha ")
         );
+    }
+
+    #[test]
+    fn search_patterns_are_regexes_and_invalid_patterns_are_reported() {
+        let mut editor = editor("zero beta BETA\n");
+        editor.set_search_options(true, true);
+        assert!(
+            editor
+                .search(r"b.ta", SearchDirection::Forward)
+                .expect("regex search")
+        );
+        assert_eq!(editor.primary_cursor(), 5);
+        assert!(matches!(
+            editor.search("[", SearchDirection::Forward),
+            Err(EngineError::InvalidSearchPattern(_))
+        ));
     }
 
     #[test]

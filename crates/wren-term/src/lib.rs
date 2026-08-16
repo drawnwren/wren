@@ -567,6 +567,27 @@ mod tests {
     }
 
     #[test]
+    fn slash_and_question_mark_survive_raw_and_kitty_keyboard_input() {
+        let slash = TerminalInput::Key(TerminalKey {
+            code: TerminalKeyCode::Char('/'),
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        });
+        let question = TerminalInput::Key(TerminalKey {
+            code: TerminalKeyCode::Char('?'),
+            shift: false,
+            control: false,
+            alt: false,
+            super_key: false,
+        });
+        assert_eq!(parse_one(b"/"), slash);
+        assert_eq!(parse_one(b"\x1b[47u"), slash);
+        assert_eq!(parse_one(b"\x1b[47:63;2u"), question);
+    }
+
+    #[test]
     fn bracketed_paste_and_shifted_k_keep_editor_meaning() {
         assert_eq!(
             parse_one(b"\x1b[200~fn main() {}\x1b[201~"),
