@@ -62,32 +62,25 @@ impl App {
                         .byte_of_line(target_end_line)
                         .max(start)
                         .min(text_len);
-                let context = text_store.byte_of_line(target_start_line.saturating_sub(32))
-                    ..text_store
-                        .byte_of_line(target_end_line.saturating_add(32))
-                        .max(target.end)
-                        .min(text_len);
-                Some((target, context))
+                Some(target)
             })
             .collect::<Vec<_>>();
         if targets.is_empty() {
             return;
         }
-        targets.sort_by_key(|(target, _)| target.start);
+        targets.sort_by_key(|target| target.start);
         let frame = self.active.editor.frame();
-        let language = language_bundle(self.active.document.presentation_path()).language_id;
         let mut replacement = Vec::new();
-        for (target, context) in &targets {
-            let source = frame.text.slice(context.clone());
+        for target in &targets {
+            let source = frame.text.slice(target.clone());
             replacement.extend(
-                highlight_text(&source, &language)
+                lexical_highlight_text(&source)
                     .into_iter()
                     .map(|mut span| {
-                        span.range.start = span.range.start.saturating_add(context.start);
-                        span.range.end = span.range.end.saturating_add(context.start);
+                        span.range.start = span.range.start.saturating_add(target.start);
+                        span.range.end = span.range.end.saturating_add(target.start);
                         span
                     })
-                    .filter(|span| span.range.start < target.end && target.start < span.range.end)
                     .map(|span| provider_decoration(span, self.theme)),
             );
         }
@@ -96,12 +89,8 @@ impl App {
             .decorations
             .entry(self.active.buffer_id)
             .or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
-        let target_ranges = targets
-            .into_iter()
-            .map(|(target, _)| target)
-            .collect::<Vec<_>>();
         if state.revision == transaction.base_revision {
-            state.replace_after_transaction(transaction, revision, &target_ranges, replacement);
+            state.replace_after_transaction(transaction, revision, &targets, replacement);
         } else {
             *state = BufferDecorations::new(revision, replacement);
         }
