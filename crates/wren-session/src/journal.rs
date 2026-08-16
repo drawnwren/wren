@@ -1,5 +1,16 @@
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,6 +56,15 @@ pub(crate) enum JournalEntry {
     },
 }
 
+#[derive(Serialize)]
+enum BorrowedJournalEntry<'a> {
+    MutationCommitted {
+        mutation: &'a ClientMutation,
+        durable: &'a MutationResult,
+        events: &'a [SessionEvent],
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum SessionJournalError {
     #[error("session journal operation for {path} failed: {source}")]
@@ -68,12 +88,16 @@ pub enum SessionJournalError {
 #[derive(Debug, Clone)]
 pub struct SessionJournal {
     path: PathBuf,
+    writer: Arc<Mutex<Option<File>>>,
 }
 
 impl SessionJournal {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            writer: Arc::new(Mutex::new(None)),
+        }
     }
 
     #[must_use]
@@ -87,7 +111,70 @@ impl SessionJournal {
     }
 
     pub(crate) fn append(&self, entry: &JournalEntry) -> Result<(), SessionJournalError> {
-        crate::record::append(&self.path, MAGIC, entry).map_err(|error| self.record(error))
+        self.append_value(entry)
+    }
+
+    pub(crate) fn append_mutation(
+        &self,
+        mutation: &ClientMutation,
+        durable: &MutationResult,
+        events: &[SessionEvent],
+    ) -> Result<(), SessionJournalError> {
+        self.append_value(&BorrowedJournalEntry::MutationCommitted {
+            mutation,
+            durable,
+            events,
+        })
+    }
+
+    fn append_value(&self, entry: &impl Serialize) -> Result<(), SessionJournalError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| self.io(io::Error::other("session journal writer lock poisoned")))?;
+        if writer.is_none() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
+            }
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "android",
+                target_vendor = "apple",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            options.custom_flags(nix::fcntl::OFlag::O_DSYNC.bits());
+            *writer = Some(options.open(&self.path).map_err(|error| self.io(error))?);
+        }
+        let file = writer
+            .as_mut()
+            .ok_or_else(|| self.io(io::Error::other("session journal writer unavailable")))?;
+        crate::record::write(file, MAGIC, entry).map_err(|error| self.record(error))?;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        {
+            // O_DSYNC makes completion of the record write itself the durable
+            // frontier; issuing a second sync syscall adds latency but no
+            // stronger guarantee.
+            Ok(())
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        {
+            file.sync_data().map_err(|error| self.io(error))
+        }
     }
 
     pub(crate) fn recover(&self) -> Result<Vec<JournalEntry>, SessionJournalError> {

@@ -98,7 +98,7 @@ EX COMMANDS:
     :s/old/new/g   :%s/old/new/g       literal substitution
     :undo   :redo   :normal KEYS       editing commands
     :registers   :marks                inspect durable state
-    :messages / :debuglog               view debug output
+    :messages / :debuglog               open message history buffer
     :find [QUERY]                       fuzzy file picker
     :terminal [PROGRAM]                 interactive terminal buffer
     :make PROGRAM [ARGS]                cancellable build task
@@ -108,6 +108,8 @@ EX COMMANDS:
 
 Unsaved edits use a checksummed recovery WAL; undo history and oldfiles persist.
 ";
+
+const MESSAGES_BUFFER_NAME: &str = "[Messages]";
 
 fn main() -> Result<()> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-provider-host")) {
@@ -876,6 +878,7 @@ struct BufferState {
     base_hash: [u8; 32],
     git_index_text: Option<String>,
     git_branch: Option<Box<str>>,
+    display_name: Option<Box<str>>,
 }
 
 impl BufferState {
@@ -968,15 +971,38 @@ impl BufferState {
                 base_hash,
                 git_index_text,
                 git_branch,
+                display_name: None,
             },
             message,
         ))
     }
 
+    fn virtual_buffer(
+        buffer_id: BufferId,
+        document_id: DocumentId,
+        name: &str,
+        text: String,
+    ) -> Result<Self> {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = text;
+        opened.read_only = true;
+        let (mut buffer, _) =
+            Self::from_opened(buffer_id, document_id, document, opened, None, None)?;
+        buffer.display_name = Some(name.into());
+        Ok(buffer)
+    }
+
     fn name(&self) -> String {
+        if let Some(name) = &self.display_name {
+            return name.to_string();
+        }
         self.document
             .presentation_path()
             .map_or_else(|| "[No Name]".to_owned(), |path| path.display().to_string())
+    }
+
+    fn has_display_name(&self, name: &str) -> bool {
+        self.display_name.as_deref() == Some(name)
     }
 }
 
@@ -2367,7 +2393,7 @@ impl App {
         }
     }
 
-    fn show_debug_output(&mut self) {
+    fn show_debug_output(&mut self) -> Result<()> {
         self.capture_debug_output();
         let text = if self.views.messages.entries.is_empty() {
             "No debug output has been recorded.".to_owned()
@@ -2387,14 +2413,74 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        self.popup = Some(TextPopup {
-            title: "Messages · debug output".into(),
-            text: text.into(),
-            scroll: 0,
-            decorations: Vec::new(),
-        });
+        self.open_messages_buffer(text)?;
+        self.popup = None;
         self.popup_deadline = None;
         self.message.clear();
+        Ok(())
+    }
+
+    fn open_messages_buffer(&mut self, text: String) -> Result<()> {
+        let document_id = virtual_document_id(MESSAGES_BUFFER_NAME, &text);
+        let active_is_messages = self.active.has_display_name(MESSAGES_BUFFER_NAME);
+        let inactive_index = self
+            .inactive
+            .iter()
+            .position(|buffer| buffer.has_display_name(MESSAGES_BUFFER_NAME));
+        let is_new = !active_is_messages && inactive_index.is_none();
+        let buffer_id = if active_is_messages {
+            self.active.buffer_id
+        } else if let Some(index) = inactive_index {
+            self.inactive[index].buffer_id
+        } else {
+            self.views.add_buffer(document_id, MESSAGES_BUFFER_NAME)
+        };
+        let mut messages =
+            match BufferState::virtual_buffer(buffer_id, document_id, MESSAGES_BUFFER_NAME, text) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    if is_new {
+                        self.views.buffers.retain(|buffer| buffer.id != buffer_id);
+                    }
+                    return Err(error);
+                }
+            };
+        restore_client_state(&mut messages, &self.client_state)?;
+        if let Err(error) = self
+            .mutations
+            .register(document_id, messages.editor.contents())
+        {
+            if is_new {
+                self.views.buffers.retain(|buffer| buffer.id != buffer_id);
+            }
+            return Err(error);
+        }
+
+        if active_is_messages {
+            self.active = messages;
+        } else {
+            self.autosave_active_if_named()?;
+            let previous = std::mem::replace(&mut self.active, messages);
+            if let Some(index) = inactive_index {
+                self.inactive[index] = previous;
+            } else {
+                self.inactive.push(previous);
+            }
+            self.views.set_active_buffer(buffer_id)?;
+        }
+        let view = self
+            .views
+            .buffers
+            .iter_mut()
+            .find(|buffer| buffer.id == buffer_id)
+            .ok_or_else(|| anyhow!("messages buffer view disappeared"))?;
+        view.document_id = document_id;
+        view.name = MESSAGES_BUFFER_NAME.into();
+        self.decorations.remove(&buffer_id);
+        self.semantic_decorations.remove(&buffer_id);
+        self.prime_active_syntax();
+        self.begin_lsp_start();
+        Ok(())
     }
 
     fn poll_popup_timeout(&mut self) -> bool {
@@ -2794,10 +2880,7 @@ impl App {
                 );
                 Ok(())
             }
-            ExCommand::Messages => {
-                self.show_debug_output();
-                Ok(())
-            }
+            ExCommand::Messages => self.show_debug_output(),
             ExCommand::Grep { pattern, paths } => self.grep(&pattern, &paths),
             ExCommand::Cdo { command } => self.execute_cdo(*command),
             ExCommand::ConvertUtf8 => {
@@ -4934,11 +5017,7 @@ impl App {
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
         };
-        let path = self
-            .active
-            .document
-            .presentation_path()
-            .map_or_else(|| "[No Name]".to_owned(), |path| path.display().to_string());
+        let path = self.active.name();
         let changed = if self.active.editor.is_dirty() {
             " [+]"
         } else {
@@ -5006,11 +5085,7 @@ impl App {
             background: Some(CellColor::Rgb(self.theme.mantle)),
             ..CellStyle::default()
         };
-        let path = self
-            .active
-            .document
-            .presentation_path()
-            .map_or_else(|| "[No Name]".to_owned(), |path| path.display().to_string());
+        let path = self.active.name();
         let flags = format!(
             "{}{}{}",
             if self.active.editor.is_dirty() {
@@ -9429,6 +9504,21 @@ fn stable_document_id(path: Option<&Path>) -> DocumentId {
     DocumentId::new(hash.max(2))
 }
 
+fn virtual_document_id(name: &str, text: &str) -> DocumentId {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in b"wren:virtual-buffer\0"
+        .iter()
+        .copied()
+        .chain(name.bytes())
+        .chain(std::iter::once(0))
+        .chain(text.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    DocumentId::new(hash.max(2))
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -10996,20 +11086,46 @@ while True:
     }
 
     #[test]
-    fn messages_command_opens_bounded_severity_tagged_debug_output() {
+    fn messages_command_opens_bounded_severity_tagged_history_buffer() {
         let mut app = App::open(None, None).expect("app");
         app.message = "language server starting".to_owned();
         app.capture_debug_output();
         app.show_error("provider worker disconnected");
+        assert!(app.popup.as_ref().is_some_and(|popup| {
+            popup.title.as_ref() == "Error" && popup.text.as_ref() == "provider worker disconnected"
+        }));
 
         app.execute_ex("messages").expect("show messages");
 
-        let popup = app.popup.as_ref().expect("debug output popup");
-        assert_eq!(popup.title.as_ref(), "Messages · debug output");
-        assert!(popup.text.contains("[INFO] language server starting"));
-        assert!(popup.text.contains("[ERROR] provider worker disconnected"));
+        assert!(app.popup.is_none());
         assert!(app.popup_deadline.is_none());
         assert!(app.message.is_empty());
+        assert_eq!(app.active.name(), MESSAGES_BUFFER_NAME);
+        assert!(app.active.editor.is_read_only());
+        assert!(
+            app.active
+                .editor
+                .contents()
+                .contains("[INFO] language server starting")
+        );
+        assert!(
+            app.active
+                .editor
+                .contents()
+                .contains("[ERROR] provider worker disconnected")
+        );
+        assert!(app.status().contains("[Messages] [RO]"));
+
+        let messages_buffer_id = app.active.buffer_id;
+        app.execute_ex("bprevious")
+            .expect("return to source buffer");
+        assert_ne!(app.active.buffer_id, messages_buffer_id);
+        app.show_info("formatter complete");
+        app.execute_ex("debuglog").expect("refresh messages");
+        assert_eq!(app.views.buffers.len(), 2);
+        assert_eq!(app.inactive.len(), 1);
+        assert_eq!(app.active.buffer_id, messages_buffer_id);
+        assert!(app.active.editor.contents().contains("formatter complete"));
     }
 
     #[test]

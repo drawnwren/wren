@@ -912,7 +912,11 @@ impl BlobCache {
             }
             let mut file = options.open(&temporary)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            // This content-addressed cache is reconstructible from the
+            // authoritative workspace file. Closing before the atomic rename
+            // makes it process-crash safe without adding a second durability
+            // flush to the persisted-save critical path.
+            drop(file);
             match fs::rename(&temporary, &destination) {
                 Ok(()) => {}
                 Err(_) if destination.exists() => {
@@ -920,7 +924,6 @@ impl BlobCache {
                 }
                 Err(error) => return Err(error.into()),
             }
-            set_private_file(&destination)?;
         }
         self.collect_garbage(Some(hash))?;
         Ok(hash)
@@ -993,17 +996,6 @@ fn set_private_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

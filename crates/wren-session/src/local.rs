@@ -254,10 +254,11 @@ impl LocalDocument {
         temporary
             .write_all(&bytes)
             .and_then(|()| temporary.flush())
-            .and_then(|()| temporary.as_file().sync_all())
             .map_err(|source| io_error(&path, source))?;
         filetime::set_file_handle_times(temporary.as_file(), self.accessed, None)
             .map_err(|source| io_error(&path, source))?;
+        // One sync after all data and metadata updates establishes the same
+        // durable file frontier without paying for an intermediate flush.
         temporary
             .as_file()
             .sync_all()

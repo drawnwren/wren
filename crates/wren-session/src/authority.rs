@@ -25,6 +25,12 @@ pub struct AuthorityDocument {
     history: Vec<Transaction>,
 }
 
+struct StagedDocumentUpdate {
+    text: String,
+    revision: DocumentRevision,
+    transactions: Vec<Transaction>,
+}
+
 impl AuthorityDocument {
     #[must_use]
     pub fn delta_since(&self, base: DocumentRevision) -> Vec<Transaction> {
@@ -323,9 +329,9 @@ impl SessionAuthority {
             });
         }
 
-        let mut staged_documents = self.documents.clone();
+        let mut staged_documents = BTreeMap::new();
         for document_mutation in &mutation.documents {
-            let Some(document) = staged_documents.get_mut(&document_mutation.document_id) else {
+            let Some(document) = self.documents.get(&document_mutation.document_id) else {
                 return Ok(MutationSubmission::Rejected(MutationResult::Conflict {
                     document_id: document_mutation.document_id,
                     reason: "document is not registered in this session".into(),
@@ -350,21 +356,27 @@ impl SessionAuthority {
                     },
                 ));
             }
+            let mut text = document.text.clone();
+            let mut revision = document.revision;
+            let mut transactions = Vec::with_capacity(document_mutation.transactions.len());
             for transaction in &document_mutation.transactions {
-                document.text = transaction
-                    .apply_to_string(&document.text)
-                    .map_err(|error| {
-                        AuthorityError::Replay(format!(
-                            "transaction for {:?} could not apply: {error}",
-                            document_mutation.document_id
-                        ))
-                    })?;
-                document.revision = document
-                    .revision
-                    .next()
-                    .ok_or(AuthorityError::CounterOverflow)?;
-                document.history.push(transaction.clone());
+                text = transaction.apply_to_string(&text).map_err(|error| {
+                    AuthorityError::Replay(format!(
+                        "transaction for {:?} could not apply: {error}",
+                        document_mutation.document_id
+                    ))
+                })?;
+                revision = revision.next().ok_or(AuthorityError::CounterOverflow)?;
+                transactions.push(transaction.clone());
             }
+            staged_documents.insert(
+                document_mutation.document_id,
+                StagedDocumentUpdate {
+                    text,
+                    revision,
+                    transactions,
+                },
+            );
         }
 
         let (events, final_sequence) = self.events_for(&mutation)?;
@@ -388,12 +400,14 @@ impl SessionAuthority {
 
         // The append includes sync_data. Only after it succeeds may memory
         // expose the accepted state or the client receive `Durable`.
-        self.journal.append(&JournalEntry::MutationCommitted {
-            mutation: mutation.clone(),
-            durable: durable.clone(),
-            events: events.clone(),
-        })?;
-        self.documents = staged_documents;
+        self.journal.append_mutation(&mutation, &durable, &events)?;
+        for document in self.documents.values_mut() {
+            if let Some(staged) = staged_documents.remove(&document.document_id) {
+                document.text = staged.text;
+                document.revision = staged.revision;
+                document.history.extend(staged.transactions);
+            }
+        }
         self.install_committed(&mutation, durable.clone(), events, mutation_hash)?;
         self.enforce_event_retention()?;
         Ok(MutationSubmission::Accepted {

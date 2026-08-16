@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -988,9 +988,80 @@ pub struct LineDecoration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
-    pub grapheme: Box<str>,
+    pub grapheme: CellGrapheme,
     pub width: u8,
     pub style: CellStyle,
+}
+
+const INLINE_GRAPHEME_BYTES: usize = 15;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellGrapheme {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_GRAPHEME_BYTES],
+    },
+    Heap(Box<str>),
+}
+
+impl From<&str> for CellGrapheme {
+    fn from(grapheme: &str) -> Self {
+        if grapheme.len() <= INLINE_GRAPHEME_BYTES {
+            let mut bytes = [0; INLINE_GRAPHEME_BYTES];
+            bytes[..grapheme.len()].copy_from_slice(grapheme.as_bytes());
+            return Self::Inline {
+                len: u8::try_from(grapheme.len()).unwrap_or(0),
+                bytes,
+            };
+        }
+        Self::Heap(Box::from(grapheme))
+    }
+}
+
+impl From<String> for CellGrapheme {
+    fn from(grapheme: String) -> Self {
+        if grapheme.len() <= INLINE_GRAPHEME_BYTES {
+            return Self::from(grapheme.as_str());
+        }
+        Self::Heap(grapheme.into_boxed_str())
+    }
+}
+
+impl AsRef<str> for CellGrapheme {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Inline { len, bytes } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
+            }
+            Self::Heap(grapheme) => grapheme,
+        }
+    }
+}
+
+impl std::ops::Deref for CellGrapheme {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl Serialize for CellGrapheme {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for CellGrapheme {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -2919,9 +2990,15 @@ impl GridBuilder {
                 }
                 continue;
             }
-            for escaped in escape_grapheme(grapheme) {
-                if !self.push_cell(&escaped, style) {
+            if grapheme.chars().all(|character| !character.is_control()) {
+                if !self.push_cell(grapheme, style) {
                     return;
+                }
+            } else {
+                for escaped in escape_grapheme(grapheme) {
+                    if !self.push_cell(&escaped, style) {
+                        return;
+                    }
                 }
             }
         }
@@ -2940,7 +3017,7 @@ impl GridBuilder {
         }
         if let Some(row) = self.rows.get_mut(self.row) {
             row.cells.push(Cell {
-                grapheme: Box::from(grapheme),
+                grapheme: grapheme.into(),
                 width: u8::try_from(width).unwrap_or(u8::MAX),
                 style,
             });
@@ -3042,6 +3119,19 @@ fn row_from_text(text: &str, width: usize, style: CellStyle, tab_width: usize) -
     let mut row = CellRow::default();
     let mut column = 0;
     for grapheme in text.graphemes(true) {
+        if grapheme != "\t" && grapheme.chars().all(|character| !character.is_control()) {
+            let cell_width = UnicodeWidthStr::width(grapheme).max(1);
+            if column + cell_width > width {
+                return row;
+            }
+            row.cells.push(Cell {
+                grapheme: grapheme.into(),
+                width: u8::try_from(cell_width).unwrap_or(u8::MAX),
+                style,
+            });
+            column += cell_width;
+            continue;
+        }
         let representations = if grapheme == "\t" {
             vec![" ".to_owned(); tab_width - (column % tab_width)]
         } else {
@@ -3053,7 +3143,7 @@ fn row_from_text(text: &str, width: usize, style: CellStyle, tab_width: usize) -
                 return row;
             }
             row.cells.push(Cell {
-                grapheme: representation.into_boxed_str(),
+                grapheme: representation.into(),
                 width: u8::try_from(cell_width).unwrap_or(u8::MAX),
                 style,
             });

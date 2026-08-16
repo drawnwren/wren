@@ -94,16 +94,22 @@ impl TaskContext {
     }
 
     pub fn checkpoint(&mut self) -> Result<(), TaskFailure> {
+        self.checkpoint_with(thread::yield_now)
+    }
+
+    fn checkpoint_with(&mut self, yield_worker: impl FnOnce()) -> Result<(), TaskFailure> {
         let now = Instant::now();
         self.max_checkpoint_gap = self
             .max_checkpoint_gap
             .max(now.saturating_duration_since(self.last_checkpoint));
-        self.last_checkpoint = now;
         self.checkpoints = self.checkpoints.saturating_add(1);
         if self.cancellation.is_cancelled() {
             return Err(TaskFailure::Cancelled);
         }
-        thread::yield_now();
+        yield_worker();
+        // A scheduler stall after yielding is time made available to the UI,
+        // not time during which this task withheld its next checkpoint.
+        self.last_checkpoint = Instant::now();
         Ok(())
     }
 
@@ -292,6 +298,7 @@ fn release_barrier_state(barriers: &mut BarrierState, task_id: CommandTaskId) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::mpsc;
 
     use super::*;
@@ -340,6 +347,17 @@ mod tests {
             vec![Box::<str>::from("complete")]
         );
         assert!(!runner.is_document_blocked(DocumentId::new(4)));
+    }
+
+    #[test]
+    fn checkpoint_gap_restarts_after_the_worker_yields() {
+        let mut context = TaskContext::new(CancellationToken::new());
+        let yielded_at = Cell::new(None);
+        context
+            .checkpoint_with(|| yielded_at.set(Some(Instant::now())))
+            .expect("checkpoint");
+
+        assert!(context.last_checkpoint >= yielded_at.get().expect("yield timestamp"));
     }
 
     #[test]

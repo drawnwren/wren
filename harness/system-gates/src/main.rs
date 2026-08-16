@@ -20,11 +20,18 @@ use wren_types::{
     SaveRequest, SemanticGroupId, SemanticGroupKind, Transaction, WorkspaceGeneration,
 };
 
+const PROVIDER_NORMAL_P99_GATE_NANOS: u64 = 102_066;
+const PROVIDER_LARGE_P99_GATE_NANOS: u64 = 192_613;
+const PROVIDER_PATHOLOGICAL_P99_GATE_NANOS: u64 = 225;
+const LOOPBACK_REMOTE_CONVERGENCE_BASELINE_NANOS: u64 = 4_886_527;
+const LOOPBACK_REMOTE_PERSISTED_SAVE_BASELINE_NANOS: u64 = 19_759_103;
+
 #[derive(Debug)]
 struct Arguments {
     iterations: u64,
     cpu: Option<usize>,
     output: Option<PathBuf>,
+    remote_baseline_output: Option<PathBuf>,
     gate: bool,
 }
 
@@ -32,6 +39,7 @@ fn arguments() -> Result<Arguments> {
     let values = env::args().skip(1).collect::<Vec<_>>();
     let mut iterations = 1_000;
     let mut output = None;
+    let mut remote_baseline_output = None;
     let mut cpu = None;
     let mut gate = false;
     let mut index = 0;
@@ -50,6 +58,14 @@ fn arguments() -> Result<Arguments> {
                     values.get(index).context("--output needs a value")?,
                 ));
             }
+            "--capture-remote-baseline" => {
+                index += 1;
+                remote_baseline_output = Some(PathBuf::from(
+                    values
+                        .get(index)
+                        .context("--capture-remote-baseline needs a path")?,
+                ));
+            }
             "--cpu" => {
                 index += 1;
                 cpu = Some(values.get(index).context("--cpu needs a value")?.parse()?);
@@ -64,6 +80,7 @@ fn arguments() -> Result<Arguments> {
         iterations,
         cpu,
         output,
+        remote_baseline_output,
         gate,
     })
 }
@@ -74,31 +91,122 @@ fn pin_cpu(index: usize) -> bool {
         .is_some_and(core_affinity::set_for_current)
 }
 
-fn validate_gate_environment(arguments: &Arguments, pinned: bool, has_remote: bool) -> Result<()> {
-    if !arguments.gate {
+fn validate_gate_environment(
+    arguments: &Arguments,
+    pinned: bool,
+    has_remote: bool,
+    has_remote_baseline: bool,
+) -> Result<()> {
+    if !arguments.gate && arguments.remote_baseline_output.is_none() {
         return Ok(());
     }
     anyhow::ensure!(
         env::var("WREN_BARE_METAL").as_deref() == Ok("1"),
-        "--gate requires WREN_BARE_METAL=1 on the dedicated benchmark runner"
+        "authoritative gate/baseline capture requires WREN_BARE_METAL=1 on the dedicated benchmark runner"
     );
-    anyhow::ensure!(arguments.cpu.is_some(), "--gate requires --cpu");
+    anyhow::ensure!(
+        arguments.cpu.is_some(),
+        "authoritative gate/baseline capture requires --cpu"
+    );
     anyhow::ensure!(pinned, "requested benchmark CPU could not be pinned");
     anyhow::ensure!(
         env::var("WREN_NETEM_ACTIVE").as_deref() == Ok("1"),
-        "--gate requires WREN_NETEM_ACTIVE=1 with tc netem installed"
+        "authoritative gate/baseline capture requires WREN_NETEM_ACTIVE=1 with tc netem installed"
     );
     anyhow::ensure!(
         has_remote,
-        "--gate requires WREN_BENCH_REMOTE_HOST, WREN_BENCH_REMOTE_WORKSPACE, and WREN_BENCH_REMOTE_STATE"
+        "authoritative gate/baseline capture requires WREN_BENCH_REMOTE_HOST, WREN_BENCH_REMOTE_WORKSPACE, and WREN_BENCH_REMOTE_STATE"
     );
+    if arguments.gate {
+        anyhow::ensure!(
+            has_remote_baseline,
+            "--gate requires WREN_REMOTE_BASELINE_JSON for the active SSH/netem profile"
+        );
+    }
     Ok(())
+}
+
+#[derive(Debug)]
+struct RemoteGateProfile {
+    profile_id: Box<str>,
+    source: Option<PathBuf>,
+    convergence_baseline_nanos: u64,
+    persisted_save_baseline_nanos: u64,
+    convergence_gate_nanos: u64,
+    persisted_save_gate_nanos: u64,
+}
+
+const fn ten_percent_cut(baseline_nanos: u64) -> u64 {
+    baseline_nanos.saturating_mul(9) / 10
+}
+
+fn remote_gate_profile_from_path(path: Option<PathBuf>) -> Result<RemoteGateProfile> {
+    let Some(path) = path else {
+        return Ok(RemoteGateProfile {
+            profile_id: "local-dual-openssh-loopback".into(),
+            source: None,
+            convergence_baseline_nanos: LOOPBACK_REMOTE_CONVERGENCE_BASELINE_NANOS,
+            persisted_save_baseline_nanos: LOOPBACK_REMOTE_PERSISTED_SAVE_BASELINE_NANOS,
+            convergence_gate_nanos: ten_percent_cut(LOOPBACK_REMOTE_CONVERGENCE_BASELINE_NANOS),
+            persisted_save_gate_nanos: ten_percent_cut(
+                LOOPBACK_REMOTE_PERSISTED_SAVE_BASELINE_NANOS,
+            ),
+        });
+    };
+    let source = fs::read_to_string(&path)
+        .with_context(|| format!("read remote baseline {}", path.display()))?;
+    let report: Value = serde_json::from_str(&source)
+        .with_context(|| format!("parse remote baseline {}", path.display()))?;
+    let schema = report.get("schema").and_then(Value::as_u64);
+    let profile_id = report
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .filter(|profile_id| !profile_id.is_empty());
+    let convergence_baseline_nanos = report
+        .get("convergence_baseline_p99_nanos")
+        .and_then(Value::as_u64)
+        .filter(|baseline| *baseline > 0);
+    let persisted_save_baseline_nanos = report
+        .get("persisted_save_baseline_p99_nanos")
+        .and_then(Value::as_u64)
+        .filter(|baseline| *baseline > 0);
+    anyhow::ensure!(
+        schema == Some(1)
+            && profile_id.is_some()
+            && convergence_baseline_nanos.is_some()
+            && persisted_save_baseline_nanos.is_some(),
+        "remote baseline must be schema 1 with profile_id, convergence_baseline_p99_nanos, and persisted_save_baseline_p99_nanos"
+    );
+    let convergence_baseline_nanos = convergence_baseline_nanos.unwrap_or_default();
+    let persisted_save_baseline_nanos = persisted_save_baseline_nanos.unwrap_or_default();
+    Ok(RemoteGateProfile {
+        profile_id: profile_id.unwrap_or_default().into(),
+        source: Some(path),
+        convergence_baseline_nanos,
+        persisted_save_baseline_nanos,
+        convergence_gate_nanos: ten_percent_cut(convergence_baseline_nanos),
+        persisted_save_gate_nanos: ten_percent_cut(persisted_save_baseline_nanos),
+    })
 }
 
 fn remote_spec_from_environment() -> Option<OpenSshSpec> {
     let host = env::var("WREN_BENCH_REMOTE_HOST").ok()?;
     let workspace = env::var_os("WREN_BENCH_REMOTE_WORKSPACE").map(PathBuf::from)?;
     let state = env::var_os("WREN_BENCH_REMOTE_STATE").map(PathBuf::from)?;
+    let mut extra_options = vec!["BatchMode=yes".into()];
+    extra_options.extend(
+        env::var("WREN_BENCH_SSH_OPTIONS")
+            .ok()
+            .into_iter()
+            .flat_map(|options| {
+                options
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|option| !option.is_empty())
+                    .map(Box::<str>::from)
+                    .collect::<Vec<_>>()
+            }),
+    );
     Some(OpenSshSpec {
         executable: env::var_os("WREN_BENCH_SSH")
             .map(PathBuf::from)
@@ -111,7 +219,7 @@ fn remote_spec_from_environment() -> Option<OpenSshSpec> {
             .ok()
             .and_then(|value| value.parse().ok()),
         identity_file: env::var_os("WREN_BENCH_REMOTE_IDENTITY").map(PathBuf::from),
-        extra_options: vec!["BatchMode=yes".into()],
+        extra_options,
         remote_session_program: env::var("WREN_BENCH_REMOTE_SESSIOND")
             .unwrap_or_else(|_| "wren-sessiond".to_owned())
             .into_boxed_str(),
@@ -155,7 +263,19 @@ fn bundle() -> LanguageBundle {
     }
 }
 
+const fn provider_p99_gate_nanos(class: DocumentClass) -> u64 {
+    match class {
+        DocumentClass::Normal => PROVIDER_NORMAL_P99_GATE_NANOS,
+        DocumentClass::Large => PROVIDER_LARGE_P99_GATE_NANOS,
+        DocumentClass::Pathological => PROVIDER_PATHOLOGICAL_P99_GATE_NANOS,
+    }
+}
+
 fn provider_metrics(iterations: u64) -> Result<(Value, bool)> {
+    // The remote portion caps costly SSH round trips at 100, but a p99 from
+    // 100 samples degenerates into the single maximum. Keep provider tails
+    // statistically meaningful even when the combined harness uses that cap.
+    let provider_iterations = iterations.clamp(1_000, 10_000);
     let mut reports = serde_json::Map::new();
     let mut all_pass = true;
     for (name, class, text) in [
@@ -186,7 +306,7 @@ fn provider_metrics(iterations: u64) -> Result<(Value, bool)> {
         let mut latency = histogram()?;
         let mut queue = LatestDemandQueue::new(8);
         let mut maximum_depth = 0;
-        for sample in 0..iterations.clamp(1, 1_000) {
+        for sample in 0..provider_iterations {
             for revision in 1..=16 {
                 queue.push(
                     document_id,
@@ -203,26 +323,24 @@ fn provider_metrics(iterations: u64) -> Result<(Value, bool)> {
             }
             let queued = queue.pop().context("latest provider demand missing")?;
             let started = Instant::now();
-            actor.handle(ProviderRequest::Demand {
+            std::hint::black_box(actor.handle(ProviderRequest::Demand {
                 document_id,
                 demand: ProviderDemand {
                     revision: DocumentRevision::new(1),
                     ..queued.demand
                 },
-            })?;
+            })?);
             latency.record(elapsed_nanos(started))?;
         }
-        let budget_nanos = class
-            .policy()
-            .syntax_cpu_budget_micros
-            .saturating_mul(1_000);
-        let passed = latency.value_at_quantile(0.99) <= budget_nanos && maximum_depth <= 8;
+        let gate_nanos = provider_p99_gate_nanos(class);
+        let passed = latency.value_at_quantile(0.99) < gate_nanos && maximum_depth <= 8;
         all_pass &= passed;
         reports.insert(
             name.to_owned(),
             json!({
                 "document_class": name,
-                "freshness_budget_nanos": budget_nanos,
+                "hard_gate": true,
+                "p99_gate_nanos": gate_nanos,
                 "passed": passed,
                 "queue_capacity": 8,
                 "maximum_queue_depth": maximum_depth,
@@ -324,7 +442,11 @@ fn simulated_remote_metrics(iterations: u64) -> Result<Value> {
     }))
 }
 
-fn remote_metrics(iterations: u64, spec: &OpenSshSpec) -> Result<(Value, bool)> {
+fn remote_metrics(
+    iterations: u64,
+    spec: &OpenSshSpec,
+    gates: &RemoteGateProfile,
+) -> Result<(Value, bool)> {
     let nonce = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -394,17 +516,40 @@ fn remote_metrics(iterations: u64, spec: &OpenSshSpec) -> Result<(Value, bool)> 
     }
     client.heartbeat(nonce.wrapping_add(iterations))?;
     client.close()?;
+    let convergence_pass = convergence.value_at_quantile(0.99) < gates.convergence_gate_nanos;
+    let persisted_save_pass =
+        persisted_save.value_at_quantile(0.99) < gates.persisted_save_gate_nanos;
+    let passed = convergence_pass && persisted_save_pass;
     Ok((
         json!({
-            "authoritative_gate": true,
-            "passed": true,
+            "hard_gate": true,
+            "authoritative_gate": env::var("WREN_BARE_METAL").as_deref() == Ok("1")
+                && env::var("WREN_NETEM_ACTIVE").as_deref() == Ok("1")
+                && gates.source.is_some(),
+            "passed": passed,
             "transport": "dual OpenSSH control/bulk",
             "netem_declared": env::var("WREN_NETEM_ACTIVE").as_deref() == Ok("1"),
+            "gate_profile": {
+                "profile_id": gates.profile_id,
+                "source": gates.source,
+            },
             "bytes": text.len(),
-            "remote_convergence": distribution(&convergence),
-            "persisted_save": distribution(&persisted_save),
+            "remote_convergence": {
+                "hard_gate": true,
+                "baseline_p99_nanos": gates.convergence_baseline_nanos,
+                "p99_gate_nanos": gates.convergence_gate_nanos,
+                "passed": convergence_pass,
+                "distribution": distribution(&convergence),
+            },
+            "persisted_save": {
+                "hard_gate": true,
+                "baseline_p99_nanos": gates.persisted_save_baseline_nanos,
+                "p99_gate_nanos": gates.persisted_save_gate_nanos,
+                "passed": persisted_save_pass,
+                "distribution": distribution(&persisted_save),
+            },
         }),
-        true,
+        passed,
     ))
 }
 
@@ -449,18 +594,27 @@ fn main() -> Result<()> {
     let arguments = arguments()?;
     let cpu_pinned = arguments.cpu.is_some_and(pin_cpu);
     let remote_spec = remote_spec_from_environment();
-    validate_gate_environment(&arguments, cpu_pinned, remote_spec.is_some())?;
+    let remote_gate_profile =
+        remote_gate_profile_from_path(env::var_os("WREN_REMOTE_BASELINE_JSON").map(PathBuf::from))?;
+    validate_gate_environment(
+        &arguments,
+        cpu_pinned,
+        remote_spec.is_some(),
+        remote_gate_profile.source.is_some(),
+    )?;
     let memory_before = resident_memory_bytes();
     let (providers, providers_pass) = provider_metrics(arguments.iterations)?;
     let snapshots = snapshot_metrics()?;
     let (remote, remote_pass) = if let Some(spec) = &remote_spec {
-        remote_metrics(arguments.iterations, spec)?
+        remote_metrics(arguments.iterations, spec, &remote_gate_profile)?
     } else {
         (
             json!({
                 "available": false,
+                "hard_gate": true,
+                "passed": false,
                 "authoritative_gate": false,
-                "reason": "remote OpenSSH target not configured",
+                "reason": "hard gate requires a real dual-OpenSSH target",
                 "local_algorithm_smoke": simulated_remote_metrics(arguments.iterations)?,
             }),
             false,
@@ -469,14 +623,42 @@ fn main() -> Result<()> {
     let memory_after = resident_memory_bytes();
     let memory_peak = peak_memory_bytes();
     let passed = providers_pass && remote_pass;
+    if let Some(path) = &arguments.remote_baseline_output {
+        let convergence_p99_nanos = remote
+            .pointer("/remote_convergence/distribution/p99")
+            .and_then(Value::as_u64)
+            .context("captured remote convergence p99 is missing")?;
+        let persisted_save_p99_nanos = remote
+            .pointer("/persisted_save/distribution/p99")
+            .and_then(Value::as_u64)
+            .context("captured persisted-save p99 is missing")?;
+        let profile_id = env::var("WREN_REMOTE_PROFILE_ID")
+            .context("baseline capture requires WREN_REMOTE_PROFILE_ID")?;
+        anyhow::ensure!(
+            !profile_id.is_empty(),
+            "WREN_REMOTE_PROFILE_ID cannot be empty"
+        );
+        let baseline = json!({
+            "schema": 1,
+            "profile_id": profile_id,
+            "convergence_baseline_p99_nanos": convergence_p99_nanos,
+            "persisted_save_baseline_p99_nanos": persisted_save_p99_nanos,
+        });
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&baseline)?),
+        )
+        .with_context(|| format!("write remote baseline {}", path.display()))?;
+    }
     let report = json!({
-        "schema": 1,
+        "schema": 3,
         "runner_contract": {
             "cpu_requested": arguments.cpu,
             "cpu_pinned": cpu_pinned,
             "bare_metal_declared": env::var("WREN_BARE_METAL").as_deref() == Ok("1"),
             "netem_declared": env::var("WREN_NETEM_ACTIVE").as_deref() == Ok("1"),
             "gate_authoritative": arguments.gate,
+            "baseline_capture_authoritative": arguments.remote_baseline_output.is_some(),
         },
         "provider_freshness_and_queue_depth": providers,
         "snapshot_retention": snapshots,
@@ -503,4 +685,40 @@ fn main() -> Result<()> {
         anyhow::ensure!(passed, "system architecture gate failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_profile_uses_a_strict_ten_percent_cut() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("remote-baseline.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema": 1,
+                "profile_id": "netem-test",
+                "convergence_baseline_p99_nanos": 1_001,
+                "persisted_save_baseline_p99_nanos": 2_001,
+            }))
+            .expect("serialize baseline"),
+        )
+        .expect("write baseline");
+
+        let profile = remote_gate_profile_from_path(Some(path)).expect("load baseline");
+        assert_eq!(profile.convergence_gate_nanos, 900);
+        assert_eq!(profile.persisted_save_gate_nanos, 1_800);
+        assert_eq!(profile.profile_id.as_ref(), "netem-test");
+        assert!(profile.source.is_some());
+    }
+
+    #[test]
+    fn loopback_profile_is_hard_but_not_authoritative() {
+        let profile = remote_gate_profile_from_path(None).expect("loopback profile");
+        assert_eq!(profile.convergence_gate_nanos, 4_397_874);
+        assert_eq!(profile.persisted_save_gate_nanos, 17_783_192);
+        assert!(profile.source.is_none());
+    }
 }

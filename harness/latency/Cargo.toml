@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 core_affinity.workspace = true
 hdrhistogram.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 wren-command = { version = "0.1.0", path = "../../crates/wren-command" }
 wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
@@ -21,3 +22,6 @@ wren-view = { version = "0.1.0", path = "../../crates/wren-view" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

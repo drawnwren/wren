@@ -14,6 +14,9 @@ thiserror.workspace = true
 xattr.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 loom = "0.7"
 

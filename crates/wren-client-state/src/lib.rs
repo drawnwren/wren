@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use wren_shmem::{SharedDocumentHeadReader, SharedHeadError};
@@ -182,6 +183,13 @@ struct Stored<T> {
     value: T,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawStored<'a> {
+    checksum: [u8; 32],
+    #[serde(borrow)]
+    value: &'a RawValue,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientViewStateStore {
     directory: PathBuf,
@@ -294,7 +302,7 @@ impl ClientViewStateStore {
 
     fn load<T>(&self, path: &Path) -> Result<Option<T>, ClientStateError>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
+        T: for<'de> Deserialize<'de>,
     {
         let mut bytes = Vec::new();
         match File::open(path) {
@@ -304,14 +312,13 @@ impl ClientViewStateStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(path, error)),
         };
-        let stored: Stored<T> = serde_json::from_slice(&bytes)?;
-        let value_bytes = serde_json::to_vec(&stored.value)?;
-        if blake3::hash(&value_bytes).as_bytes() != &stored.checksum {
+        let stored: RawStored<'_> = serde_json::from_slice(&bytes)?;
+        if blake3::hash(stored.value.get().as_bytes()).as_bytes() != &stored.checksum {
             return Err(ClientStateError::Checksum {
                 path: path.to_path_buf(),
             });
         }
-        Ok(Some(stored.value))
+        Ok(Some(serde_json::from_str(stored.value.get())?))
     }
 
     fn resume_path(&self, client: u64) -> PathBuf {
@@ -485,5 +492,43 @@ mod tests {
             store.load_durable(ClientId::new(7)).expect("load durable"),
             Some(state)
         );
+    }
+
+    #[test]
+    fn durable_state_loads_after_adding_defaulted_fields() {
+        #[derive(Serialize)]
+        struct LegacyDurableClientState {
+            client_id: ClientId,
+            registers: BTreeMap<char, DurableRegister>,
+            search_history: Vec<Box<str>>,
+            command_history: Vec<Box<str>>,
+            global_marks: BTreeMap<char, DurableGlobalMark>,
+            undo_branch_heads: BTreeMap<DocumentId, Option<SemanticGroupId>>,
+            repeat_data: Option<Vec<u8>>,
+        }
+
+        let directory = tempdir().expect("directory");
+        let store = ClientViewStateStore::new(directory.path());
+        let legacy = LegacyDurableClientState {
+            client_id: ClientId::new(7),
+            registers: BTreeMap::new(),
+            search_history: vec!["needle".into()],
+            command_history: Vec::new(),
+            global_marks: BTreeMap::new(),
+            undo_branch_heads: BTreeMap::new(),
+            repeat_data: None,
+        };
+        store
+            .save(&directory.path().join("durable-7.json"), &legacy)
+            .expect("save legacy durable state");
+
+        let loaded = store
+            .load_durable(ClientId::new(7))
+            .expect("load legacy durable state")
+            .expect("durable state");
+        assert_eq!(loaded.search_history, vec![Box::<str>::from("needle")]);
+        assert!(loaded.macro_recordings.is_empty());
+        assert!(loaded.jump_list.is_empty());
+        assert_eq!(loaded.jump_index, None);
     }
 }

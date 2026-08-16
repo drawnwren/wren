@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::time::Instant;
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Pattern};
@@ -54,7 +55,7 @@ pub enum ProviderResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HighlightSpan {
     pub range: Range<usize>,
-    pub kind: Box<str>,
+    pub kind: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +114,7 @@ struct ProviderDocument {
     text: Box<str>,
     generation: ProviderGeneration,
     syntax_spans: Vec<HighlightSpan>,
+    syntax_prefix_max_end: Vec<usize>,
     grammar_backend: GrammarBackend,
 }
 
@@ -220,11 +222,20 @@ impl ProviderActor {
                 bundle,
             } => {
                 let generation = bundle.provider_generation();
-                let (grammar_backend, syntax_spans) =
+                let (grammar_backend, mut syntax_spans) =
                     native_tree_sitter_spans(&text, &bundle.language_id).map_or_else(
                         || (GrammarBackend::DynamicWasmFallback, Vec::new()),
                         |spans| (GrammarBackend::BundledNative, spans),
                     );
+                syntax_spans.sort_by_key(|span| (span.range.start, span.range.end));
+                let mut maximum_end = 0;
+                let syntax_prefix_max_end = syntax_spans
+                    .iter()
+                    .map(|span| {
+                        maximum_end = maximum_end.max(span.range.end);
+                        maximum_end
+                    })
+                    .collect();
                 self.documents.insert(
                     document_id,
                     ProviderDocument {
@@ -232,6 +243,7 @@ impl ProviderActor {
                         text,
                         generation,
                         syntax_spans,
+                        syntax_prefix_max_end,
                         grammar_backend,
                     },
                 );
@@ -270,16 +282,21 @@ impl ProviderActor {
         let mut requested_ranges = demand.visible;
         requested_ranges.extend(demand.near_viewport);
         requested_ranges = coalesce_ranges(requested_ranges, document.text.len());
-        let mut spans = document
-            .syntax_spans
-            .iter()
-            .filter(|span| {
-                requested_ranges
+        let mut spans = Vec::new();
+        for range in &requested_ranges {
+            let first = document
+                .syntax_prefix_max_end
+                .partition_point(|maximum_end| *maximum_end <= range.start);
+            let last = document
+                .syntax_spans
+                .partition_point(|span| span.range.start < range.end);
+            spans.extend(
+                document.syntax_spans[first..last]
                     .iter()
-                    .any(|range| span.range.start < range.end && range.start < span.range.end)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+                    .filter(|span| span.range.start < range.end && range.start < span.range.end)
+                    .cloned(),
+            );
+        }
         if document.grammar_backend == GrammarBackend::DynamicWasmFallback || spans.is_empty() {
             for range in &requested_ranges {
                 lexical_spans(&document.text[range.clone()], range.start, &mut spans);
@@ -907,18 +924,20 @@ fn coalesce_ranges(mut ranges: Vec<Range<usize>>, text_len: usize) -> Vec<Range<
         range.start = range.start.min(text_len);
         range.end = range.end.min(text_len).max(range.start);
     }
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::new();
-    for range in ranges {
-        if let Some(previous) = merged.last_mut()
-            && range.start <= previous.end
-        {
-            previous.end = previous.end.max(range.end);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut written = 0;
+    for current in 0..ranges.len() {
+        if written > 0 && ranges[current].start <= ranges[written - 1].end {
+            ranges[written - 1].end = ranges[written - 1].end.max(ranges[current].end);
         } else {
-            merged.push(range);
+            if written != current {
+                ranges.swap(written, current);
+            }
+            written += 1;
         }
     }
-    merged
+    ranges.truncate(written);
+    ranges
 }
 
 fn lexical_spans(text: &str, base: usize, output: &mut Vec<HighlightSpan>) {

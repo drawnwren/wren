@@ -43,12 +43,12 @@ pub(crate) fn write<T: Serialize>(
         offset: 0,
         reason: "record length exceeds u64".into(),
     })?;
-    writer
-        .write_all(magic)
-        .and_then(|()| writer.write_all(&length.to_le_bytes()))
-        .and_then(|()| writer.write_all(blake3::hash(&payload).as_bytes()))
-        .and_then(|()| writer.write_all(&payload))
-        .map_err(RecordError::Io)
+    let mut record = Vec::with_capacity(magic.len() + LENGTH_LEN + CHECKSUM_LEN + payload.len());
+    record.extend_from_slice(magic);
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(blake3::hash(&payload).as_bytes());
+    record.extend_from_slice(&payload);
+    writer.write_all(&record).map_err(RecordError::Io)
 }
 
 pub(crate) fn recover<T: DeserializeOwned>(

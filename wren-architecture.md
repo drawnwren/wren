@@ -31,8 +31,8 @@ WORKSPACE AUTHORITY          DERIVED / EXTENSION STATE
 
    | scenario | session | document | target |
    |---|---|---|---|
-   | A  | warm | warm (snapshot published, head-validated) | ≤ 10ms, gated |
-   | B1 | warm | unopened, page-cache-hot local fs, initial viewport at known byte range | ≤ 10ms, gated |
+   | A  | warm | warm (snapshot published, head-validated) | p99 < 3,098,418ns, gated |
+   | B1 | warm | unopened, page-cache-hot local fs, initial viewport at known byte range | p99 < 385,688ns, gated |
    | B2 | warm | unopened, uncached local fs | reported |
    | B3 | warm | network/FUSE filesystem | reported |
    | C  | cold session | warm fs | reported |
@@ -43,12 +43,15 @@ WORKSPACE AUTHORITY          DERIVED / EXTENSION STATE
    deep in a never-indexed file is B2, not B1. `time_to_speculative_frame`,
    `time_to_correct_frame`, `time_to_interactive` reported separately.
 3. **Latency.** All `RealtimeCommand`s (see Command execution) satisfy
-   `physical-input-read → desired-frame-ready` p99 < 4ms on a pinned bare-metal
-   runner with fixed workloads. Long-running native commands must yield to the
-   UI within 4ms and execute as cancellable tasks. Soft metric:
-   `input → terminal-write-completed`; backpressure reported separately.
-   Freshness SLOs gate alongside latency per `DocumentClass`. Hardware
-   key-to-photon rig: reported, never gated.
+   `physical-input-read → desired-frame-ready` aggregate p99 < 86,283ns on a
+   pinned bare-metal runner with fixed workloads, with tighter per-command
+   gates recorded by the harness. Long-running native commands gate at
+   69,176ns p99 and 71,077ns maximum yield gaps and execute as cancellable
+   tasks. `input → terminal-write-completed` is a hard p99 < 115,141ns gate
+   with zero dropped or missing samples. Freshness SLOs gate alongside latency
+   per `DocumentClass`. The hardware key-to-photon rig is a mandatory hard
+   gate at 90% of its recorded baseline; absence fails rather than degrading
+   to a software proxy.
 4. **Vim.** Full native modal grammar (operators × counts × registers × text
    objects × marks × macros; operator-pending as real parser state) plus a
    **published Ex v1 scope**, validated by a model-based differential suite
@@ -117,11 +120,11 @@ EitherProvider     extension-declared; instantiated independently on either
 
 ## Command execution
 
-Not every native Vim command can be constant-time; the classes make the 4ms
-claim honest and keep unbounded work off the input thread:
+Not every native Vim command can be constant-time; the classes make the
+per-command p99 gates honest and keep unbounded work off the input thread:
 
 ```
-RealtimeCommand   DesiredGrid within 4ms: insert/delete, local motions,
+RealtimeCommand   DesiredGrid within its checked-in p99 gate: insert/delete, local motions,
                   operators on bounded ranges, selection change, viewport
                   navigation, completion acceptance
 BoundedCommand    explicit CPU budget: syntax-aware navigation, moderate search
@@ -619,14 +622,17 @@ events**; macro-replayed keys are excluded. Recorded:
 
 1. physical input → transaction commit
 2. physical input → desired-frame-ready — **hard gate, RealtimeCommands only**
-3. TaskCommand yield-to-UI latency (must be < 4ms) + cancellation latency
-4. input → terminal-write-completed (soft; backpressure separate)
+3. TaskCommand yield-to-UI latency (p99 < 69,176ns; max < 71,077ns) + cancellation latency
+4. input → terminal-write-completed (hard p99 < 115,141ns; no drops)
 5. provider freshness + queue depth (gated per DocumentClass)
 6. snapshot retention (`oldest_live_revision`, bytes)
 7. memory peak/steady
 8. startup scenarios A–D (A/B1 gated)
-9. remote convergence + persisted-save latency
-10. crash-recovery matrix (protocol section) as CI-run fault-injection tests
+9. hardware key-to-photon (hard; measured p99 < 90% of rig baseline)
+10. remote convergence + persisted-save latency (hard loopback p99 <
+    4,397,874ns/17,783,192ns; authoritative netem p99 < 90% of its
+    profile-bound baseline)
+11. crash-recovery matrix (protocol section) as CI-run fault-injection tests
 
 ## Phasing
 

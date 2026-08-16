@@ -21,7 +21,8 @@ use wren_types::{
 };
 use wren_view::ViewportLayout;
 
-const GATE_NANOS: u64 = 5_000_000;
+const SCENARIO_A_P99_GATE_NANOS: u64 = 3_098_418;
+const SCENARIO_B1_P99_GATE_NANOS: u64 = 385_688;
 const VIEWPORT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -486,11 +487,10 @@ fn main() -> Result<()> {
         .map(|path| scenario_full_read(b2_iterations, path))
         .transpose()?;
 
-    let a_pass = scenario_a.correct.value_at_quantile(0.99) <= GATE_NANOS;
-    let b1_pass = scenario_b1.correct.value_at_quantile(0.99) <= GATE_NANOS;
+    let a_pass = scenario_a.correct.value_at_quantile(0.99) < SCENARIO_A_P99_GATE_NANOS;
+    let b1_pass = scenario_b1.correct.value_at_quantile(0.99) < SCENARIO_B1_P99_GATE_NANOS;
     let report = json!({
-        "schema": 1,
-        "gate_nanos": GATE_NANOS,
+        "schema": 2,
         "cpu_requested": arguments.cpu,
         "cpu_pinned": cpu_pinned,
         "runner_contract": {
@@ -501,12 +501,14 @@ fn main() -> Result<()> {
         "scenario_a": {
             "contract": "warm session + warm published viewport + local head validation",
             "gated": true,
+            "p99_gate_nanos": SCENARIO_A_P99_GATE_NANOS,
             "passed": a_pass,
             "metrics": scenario_a.report(),
         },
         "scenario_b1": {
             "contract": "unopened page-cache-hot local file + known byte range + head validation",
             "gated": true,
+            "p99_gate_nanos": SCENARIO_B1_P99_GATE_NANOS,
             "passed": b1_pass,
             "metrics": scenario_b1.report(),
         },
@@ -546,8 +548,8 @@ fn main() -> Result<()> {
     }
     println!("{rendered}");
     if arguments.gate {
-        anyhow::ensure!(a_pass, "scenario A p99 exceeded 5ms");
-        anyhow::ensure!(b1_pass, "scenario B1 p99 exceeded 5ms");
+        anyhow::ensure!(a_pass, "scenario A p99 exceeded its 90%-of-baseline gate");
+        anyhow::ensure!(b1_pass, "scenario B1 p99 exceeded its 90%-of-baseline gate");
     }
     Ok(())
 }
