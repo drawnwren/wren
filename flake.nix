@@ -51,8 +51,11 @@
           });
           package = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
-            doCheck = true;
+            # The dedicated cargoNextest check below owns the test suite so a
+            # package build does not compile and execute every test twice.
+            doCheck = false;
             nativeBuildInputs = [
+              pkgs.installShellFiles
               pkgs.makeWrapper
             ];
             postFixup = ''
@@ -76,16 +79,42 @@
             '';
             doCheck = false;
           });
+          fuzzCargoVendorDir = fuzzCraneLib.vendorCargoDeps {
+            src = self;
+            cargoLock = ./fuzz/Cargo.lock;
+          };
           fuzzArgs = {
             pname = "wren-fuzz-smoke-check";
             version = "0.1.0";
             src = self;
             strictDeps = true;
+            CARGO_TARGET_DIR = "target";
+            cargoToml = ./Cargo.toml;
             cargoLock = ./fuzz/Cargo.lock;
+            cargoVendorDir = fuzzCargoVendorDir;
             cargoExtraArgs = "--locked --manifest-path fuzz/Cargo.toml";
+            # Crane installs an overridden lockfile at the source root. Mirror
+            # it beside the nested fuzz manifest before invoking Cargo there.
+            postConfigure = ''
+              cp Cargo.lock fuzz/Cargo.lock
+            '';
           };
-          fuzzCargoArtifacts = fuzzCraneLib.buildDepsOnly (fuzzArgs // {
+          fuzzDummySrc = fuzzCraneLib.mkDummySrc {
+            src = self;
+            cargoLock = ./fuzz/Cargo.lock;
+            cleanCargoTomlFilter = path:
+              pkgs.lib.lists.hasPrefix [ "package" "metadata" ] path
+              || fuzzCraneLib.filters.cargoTomlDefault path;
+          };
+          fuzzCargoArtifacts = fuzzCraneLib.buildDepsOnly ((builtins.removeAttrs fuzzArgs [ "src" ]) // {
             pname = "wren-fuzz-dependencies";
+            dummySrc = fuzzDummySrc;
+            nativeBuildInputs = [ pkgs.cargo-fuzz ];
+            doCheck = false;
+            buildPhaseCargoCommand = ''
+              cargo fuzz build --fuzz-dir fuzz ex_parse
+              cargo fuzz build --fuzz-dir fuzz protocol_decode
+            '';
           });
           fuzzCheck = fuzzCraneLib.mkCargoDerivation (fuzzArgs // {
             cargoArtifacts = fuzzCargoArtifacts;
@@ -176,6 +205,13 @@
           layer = scope.mkCargoCheck "layer" "python3 scripts/layer-check.py";
           nextest = scope.craneLib.cargoNextest (scope.commonArgs // {
             cargoArtifacts = scope.cargoArtifacts;
+            cargoNextestExtraArgs = "--test-threads=1";
+            nativeBuildInputs = scope.developmentInputs;
+            # Keep the fake-LSP latency assertion focused on the client by
+            # taking Nix's cold Python/module load out of the measurement.
+            preCheck = ''
+              python3 -c 'import json, sys, time'
+            '';
           });
           conformance = scope.mkCargoCheck "conformance" ''
             cargo run -p wren-conformance --locked -- --check-determinism
