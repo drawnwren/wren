@@ -4023,6 +4023,8 @@ dependencies = [
 name = "wren-term"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "rustix",
  "termina",
  "thiserror 2.0.20",
  "wren-view",
@@ -4047,7 +4049,6 @@ name = "wren-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "regex",
  "serde",
  "serde_json",
  "tempfile",

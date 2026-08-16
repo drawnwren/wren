@@ -777,6 +777,9 @@ pub enum StateDelta {
         linewise: bool,
     },
     SearchPattern(Box<str>),
+    SearchDirection {
+        backward: bool,
+    },
     CommandHistory(Box<str>),
     GlobalMark {
         name: char,

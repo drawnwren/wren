@@ -535,6 +535,10 @@ fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<Highlig
 
                 let highlight = if kind.contains("comment") {
                     "comment"
+                } else if kind.contains("heading") {
+                    "markup.heading"
+                } else if kind.contains("code_span") || kind.contains("fenced_code") {
+                    "markup.raw"
                 } else if kind.contains("preproc") || matches!(kind, "shebang" | "directive") {
                     "preproc"
                 } else if in_attribute {
@@ -671,11 +675,24 @@ fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<Highlig
                     if parent_kind.contains("macro") {
                         "function.macro"
                     } else if parent_kind.contains("parameter")
+                        || parent_kind == "formal"
                         || grandparent_kind.contains("parameter")
                     {
                         "parameter"
+                    } else if parent_kind == "attrpath" && grandparent_kind == "binding" {
+                        "property"
+                    } else if parent_kind == "attrpath"
+                        && grandparent_kind == "select_expression"
+                        && node
+                            .ancestors()
+                            .take(5)
+                            .any(|ancestor| ancestor.kind().as_ref() == "apply_expression")
+                    {
+                        "function"
+                    } else if parent_kind == "attrpath" && grandparent_kind == "select_expression" {
+                        "property"
                     } else if (parent_kind.contains("function") || parent_kind.contains("method"))
-                        && is_parent_field("name")
+                        && (is_parent_field("name") || is_parent_field("declarator"))
                     {
                         if in_method_declaration {
                             "method"
@@ -726,12 +743,15 @@ fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<Highlig
                         | "do"
                         | "fn"
                         | "func"
+                        | "inherit"
                         | "lambda"
                         | "new"
                         | "private"
                         | "pub"
                         | "public"
+                        | "rec"
                         | "return"
+                        | "assert"
                         | "yield"
                         | "with"
                 ) {
@@ -1242,6 +1262,116 @@ mod tests {
                 }),
                 "missing {kind} for {needle:?} occurrence {occurrence}: {spans:?}"
             );
+        }
+    }
+
+    #[test]
+    fn every_bundled_tree_sitter_language_parses_and_highlights_real_source() {
+        let samples = [
+            ("bash", "if true; then echo \"hi\"; fi # note\n"),
+            ("c", "int main(void) { return 0; }\n"),
+            ("cpp", "class Widget { public: int value; };\n"),
+            ("csharp", "class Widget { static int Main() => 0; }\n"),
+            ("css", ".item { color: red; }\n"),
+            ("dart", "void main() { print(\"hi\"); }\n"),
+            ("elixir", "defmodule Demo do\n  def run, do: :ok\nend\n"),
+            ("go", "package main\nfunc main() {}\n"),
+            (
+                "haskell",
+                "module Main where\nimport Data.Text\nanswer :: Int\nanswer = 42\n",
+            ),
+            ("hcl", "resource \"x\" \"y\" { enabled = true }\n"),
+            ("html", "<main class=\"x\">hi</main>\n"),
+            (
+                "java",
+                "class Main { static int answer() { return 42; } }\n",
+            ),
+            ("javascript", "export const answer = () => 42;\n"),
+            ("json", "{\"answer\": 42}\n"),
+            ("kotlin", "fun answer(): Int = 42\n"),
+            ("lua", "local function answer() return 42 end\n"),
+            ("markdown", "# Heading\n\n`code`\n"),
+            (
+                "nix",
+                "{ lib, ... }: let greeting = \"hello\"; in { programs.wren.enable = lib.mkDefault true; } # note\n",
+            ),
+            ("php", "<?php function answer(): int { return 42; }\n"),
+            ("python", "def answer() -> int:\n    return 42\n"),
+            ("ruby", "def answer\n  42\nend\n"),
+            ("rust", "fn answer() -> i32 { 42 }\n"),
+            ("scala", "def answer: Int = 42\n"),
+            ("solidity", "pragma solidity ^0.8.0; contract Demo {}\n"),
+            ("swift", "func answer() -> Int { 42 }\n"),
+            (
+                "tsx",
+                "const App = (): JSX.Element => <main>Hello</main>;\n",
+            ),
+            ("typescript", "interface User { name: string }\n"),
+            ("yaml", "answer: 42\nenabled: true\n"),
+        ];
+        for (language, source) in samples {
+            let spans = native_tree_sitter_spans(source, language)
+                .unwrap_or_else(|| panic!("bundled {language} grammar was not resolved"));
+            assert!(
+                !spans.is_empty(),
+                "bundled {language} grammar emitted no highlights"
+            );
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.range.start < span.range.end && span.range.end <= source.len()),
+                "bundled {language} emitted an invalid range: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_haskell_typescript_and_c_have_tree_sitter_semantic_baselines() {
+        let cases = [
+            (
+                "nix",
+                "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n",
+                [
+                    ("lib", "parameter"),
+                    ("enabled", "property"),
+                    ("mkDefault", "function"),
+                ],
+            ),
+            (
+                "haskell",
+                "module Main where\nanswer :: Int\nanswer = 42\n",
+                [("module", "include"), ("Int", "type"), ("42", "number")],
+            ),
+            (
+                "typescript",
+                "interface User { name: string }\nconst answer = 42;\n",
+                [
+                    ("interface", "type.definition"),
+                    ("User", "type"),
+                    ("42", "number"),
+                ],
+            ),
+            (
+                "c",
+                "struct User { int value; }; int answer(void) { return 42; }\n",
+                [
+                    ("struct", "type.definition"),
+                    ("answer", "function"),
+                    ("42", "number"),
+                ],
+            ),
+        ];
+        for (language, source, expected) in cases {
+            let spans = native_tree_sitter_spans(source, language).expect("bundled grammar");
+            for (needle, kind) in expected {
+                let start = source.find(needle).expect("sample token");
+                assert!(
+                    spans.iter().any(|span| {
+                        span.range == (start..start + needle.len()) && span.kind.as_ref() == kind
+                    }),
+                    "{language} did not classify {needle:?} as {kind}: {spans:?}"
+                );
+            }
         }
     }
 

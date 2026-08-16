@@ -9,15 +9,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use wren_client_state::{ClientViewStateStore, DurableClientState};
 use wren_command::{CancellationToken, TaskFailure, TaskRunner};
 use wren_config::{CommandRegistry, WorkspaceTrust, executable_hash, parse_and_validate};
-use wren_engine::{DurableUndoState, Editor, EngineError, Mode, SearchDirection};
+use wren_engine::{
+    CaseOverride, DurableUndoState, Editor, EngineError, Mode, SearchDirection, VimPattern,
+    VimReplacement, resolve_previous_replacement,
+};
 use wren_grammar::{
     BufferAction, ExAddress, ExCommand, ExRange, ExpressionContext, KeyCode, KeyEvent, Modifiers,
-    ParseState, TabAction, Value, evaluate_expression, parse_ex,
+    ParseState, SubstituteFlags, TabAction, Value, evaluate_expression, parse_ex,
 };
 use wren_presenter::Presenter;
 #[cfg(test)]
@@ -33,7 +35,8 @@ use wren_session::{
     RecoveredState, SaveWarning, SessionAuthority, SessionJournal,
 };
 use wren_term::{
-    SystemTerminalBackend, TerminaBackend, TerminalInput, TerminalKey, TerminalKeyCode,
+    ClipboardSelection, SystemTerminalBackend, TerminaBackend, TerminalInput, TerminalKey,
+    TerminalKeyCode,
 };
 use wren_text::{DefaultText, TextStore};
 use wren_types::{
@@ -95,7 +98,8 @@ INSERT COMPLETION:
 EX COMMANDS:
     :w [FILE]   :q[!]   :wq   :x       save and quit
     :e[!] FILE                         edit another file
-    :s/old/new/g   :%s/old/new/g       literal substitution
+    :s/old/new/[gciIp]  :%s/old/new/g  Vim-regex substitution
+    :s   :&   :~                         repeat previous replacement
     :undo   :redo   :normal KEYS       editing commands
     :registers   :marks                inspect durable state
     :messages / :debuglog               open message history buffer
@@ -169,14 +173,37 @@ fn main() -> Result<()> {
                 event => {
                     let should_render = input_requires_render(&event);
                     if should_render {
-                        let clipboard_before = app
-                            .active
-                            .editor
-                            .register('+')
-                            .map(|value| value.text.clone());
+                        if let Some(register) = app.clipboard_register_for_paste(&event) {
+                            let selection = if register == '*' {
+                                ClipboardSelection::Primary
+                            } else {
+                                ClipboardSelection::Clipboard
+                            };
+                            let clipboard =
+                                match terminal.paste_osc52(selection, Duration::from_secs(1)) {
+                                    Ok(Some(text)) => Some(text),
+                                    Ok(None) => system_clipboard_text(register),
+                                    Err(error) => {
+                                        let fallback = system_clipboard_text(register);
+                                        if fallback.is_none() {
+                                            app.show_error(format!("clipboard: {error}"));
+                                        }
+                                        fallback
+                                    }
+                                };
+                            if let Some(text) = clipboard {
+                                app.restore_clipboard_register(register, text);
+                            }
+                        }
                         let result = match event {
                             TerminalInput::MouseClick { column, row } => {
                                 app.handle_mouse_click(&layout, column, row)
+                            }
+                            TerminalInput::MouseDrag { column, row } => {
+                                app.handle_mouse_drag(&layout, column, row)
+                            }
+                            TerminalInput::MouseRelease { column, row } => {
+                                app.handle_mouse_release(&layout, column, row)
                             }
                             event => app.handle_input(event),
                         };
@@ -185,19 +212,19 @@ fn main() -> Result<()> {
                         }
                         app.capture_debug_output();
                         needs_render = true;
-                        let clipboard_after = app
-                            .active
-                            .editor
-                            .register('+')
-                            .map(|value| value.text.clone());
-                        if clipboard_after != clipboard_before
-                            && let Some(text) = clipboard_after
-                            && let Err(error) = output
+                        for (register, text) in app.take_clipboard_writes() {
+                            let selection = if register == '*' {
+                                ClipboardSelection::Primary
+                            } else {
+                                ClipboardSelection::Clipboard
+                            };
+                            if let Err(error) = output
                                 .lock()
                                 .map_err(|_| anyhow!("presenter backend lock is poisoned"))?
-                                .copy_osc52(&text)
-                        {
-                            app.show_error(format!("clipboard: {error}"));
+                                .copy_osc52(selection, &text)
+                            {
+                                app.show_error(format!("clipboard: {error}"));
+                            }
                         }
                     }
                 }
@@ -493,6 +520,30 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
                     },
                 });
             }
+        }
+    }
+    if matches!(app.active.editor.mode(), Mode::Visual | Mode::VisualLine) {
+        let selection = app.active.editor.selection_byte_range();
+        if !selection.is_empty() {
+            let decoration_index = decorations
+                .iter()
+                .position(|(buffer_id, _)| *buffer_id == app.active.buffer_id)
+                .unwrap_or_else(|| {
+                    decorations.push((app.active.buffer_id, Vec::new()));
+                    decorations.len() - 1
+                });
+            decorations[decoration_index].1.push(DecorationSpan {
+                range: selection,
+                style: CellStyle {
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    reverse: false,
+                    foreground: None,
+                    background: Some(CellColor::Rgb(app.theme.surface1)),
+                },
+            });
         }
     }
     let grid = layout.desired_workspace_grid_with_line_decorations(
@@ -940,6 +991,13 @@ struct BufferState {
     display_name: Option<Box<str>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MouseSelection {
+    buffer_id: BufferId,
+    anchor: usize,
+    dragged: bool,
+}
+
 impl BufferState {
     fn open(
         buffer_id: BufferId,
@@ -1081,7 +1139,10 @@ struct App {
     semantic_decorations: BTreeMap<BufferId, BufferDecorations>,
     prompt: Option<Prompt>,
     search_prompt_origin: Option<SearchPromptOrigin>,
+    last_search_direction: SearchDirection,
     search_highlight: bool,
+    last_substitute: Option<LastSubstitute>,
+    substitute_confirmation: Option<SubstituteConfirmation>,
     message: String,
     tasks: TaskRunner,
     active_task: Option<CancellationToken>,
@@ -1089,6 +1150,7 @@ struct App {
     terminal: Option<PtySession>,
     terminal_focused: bool,
     terminal_escape_pending: bool,
+    mouse_selection: Option<MouseSelection>,
     picker_files: Vec<String>,
     picker_matches: Vec<PathBuf>,
     picker_index: usize,
@@ -1207,6 +1269,11 @@ impl App {
             }
             message.push_str(&keymap_message);
         }
+        let last_search_direction = if client_state.search_backward {
+            SearchDirection::Backward
+        } else {
+            SearchDirection::Forward
+        };
         let mut app = Self {
             active,
             inactive: Vec::new(),
@@ -1223,7 +1290,10 @@ impl App {
             semantic_decorations: BTreeMap::new(),
             prompt: None,
             search_prompt_origin: None,
+            last_search_direction,
             search_highlight: false,
+            last_substitute: None,
+            substitute_confirmation: None,
             message,
             tasks: TaskRunner::new(1, 8)?,
             active_task: None,
@@ -1231,6 +1301,7 @@ impl App {
             terminal: None,
             terminal_focused: false,
             terminal_escape_pending: false,
+            mouse_selection: None,
             picker_files: Vec::new(),
             picker_matches: Vec::new(),
             picker_index: 0,
@@ -1295,6 +1366,18 @@ impl App {
         if self.terminal_focused {
             return self.handle_terminal_input(input);
         }
+        if self.substitute_confirmation.is_some() {
+            return match input {
+                TerminalInput::Key(key) => self.handle_substitution_confirmation(key),
+                TerminalInput::Paste(_)
+                | TerminalInput::MouseScroll { .. }
+                | TerminalInput::MouseClick { .. }
+                | TerminalInput::MouseDrag { .. }
+                | TerminalInput::MouseRelease { .. }
+                | TerminalInput::Ignored
+                | TerminalInput::Resized { .. } => Ok(()),
+            };
+        }
         match input {
             TerminalInput::Key(key) if self.prompt.is_some() => self.handle_prompt_key(key),
             TerminalInput::Paste(text) if self.prompt.is_some() => {
@@ -1316,6 +1399,7 @@ impl App {
                 Ok(())
             }
             TerminalInput::MouseScroll { lines, .. } => {
+                self.mouse_selection = None;
                 self.ace_jump = None;
                 if let Some(popup) = &mut self.popup {
                     if lines < 0 {
@@ -1335,7 +1419,9 @@ impl App {
             }
             // The application loop owns rendered geometry and handles clicks
             // through `handle_mouse_click` before generic input dispatch.
-            TerminalInput::MouseClick { .. } => Ok(()),
+            TerminalInput::MouseClick { .. }
+            | TerminalInput::MouseDrag { .. }
+            | TerminalInput::MouseRelease { .. } => Ok(()),
             TerminalInput::Ignored | TerminalInput::Resized { .. } => Ok(()),
         }
     }
@@ -1346,6 +1432,7 @@ impl App {
         column: usize,
         row: usize,
     ) -> Result<()> {
+        self.mouse_selection = None;
         if self.terminal_focused
             || self.prompt.is_some()
             || self.popup.is_some()
@@ -1368,6 +1455,11 @@ impl App {
         self.activate_view_buffer()?;
         self.active.editor.set_cursor(hit.byte);
         self.views.active_window_mut().cursor_byte = hit.byte;
+        self.mouse_selection = Some(MouseSelection {
+            buffer_id: hit.buffer_id,
+            anchor: hit.byte,
+            dragged: false,
+        });
         self.ace_jump = None;
         self.normal_prefix = None;
         self.leader_keys = None;
@@ -1375,11 +1467,103 @@ impl App {
         Ok(())
     }
 
+    fn handle_mouse_drag(
+        &mut self,
+        layout: &ViewportLayout,
+        column: usize,
+        row: usize,
+    ) -> Result<()> {
+        let Some(origin) = self.mouse_selection else {
+            return Ok(());
+        };
+        if self.terminal_focused
+            || self.prompt.is_some()
+            || self.popup.is_some()
+            || self.completion.is_some()
+            || self.debug_ui_visible
+        {
+            self.mouse_selection = None;
+            return Ok(());
+        }
+        let mut frames = Vec::with_capacity(self.inactive.len() + 1);
+        frames.push((self.active.buffer_id, self.active.editor.frame()));
+        frames.extend(
+            self.inactive
+                .iter()
+                .map(|buffer| (buffer.buffer_id, buffer.editor.frame())),
+        );
+        let Some(hit) = layout.hit_test_workspace(&self.views, &frames, column, row, 1) else {
+            return Ok(());
+        };
+        if hit.buffer_id != origin.buffer_id || hit.buffer_id != self.active.buffer_id {
+            return Ok(());
+        }
+        self.active
+            .editor
+            .set_visual_selection(origin.anchor, hit.byte);
+        if let Some(selection) = &mut self.mouse_selection {
+            selection.dragged = true;
+        }
+        self.views.active_window_mut().cursor_byte = hit.byte;
+        self.ace_jump = None;
+        self.normal_prefix = None;
+        self.leader_keys = None;
+        self.message.clear();
+        Ok(())
+    }
+
+    fn handle_mouse_release(
+        &mut self,
+        layout: &ViewportLayout,
+        column: usize,
+        row: usize,
+    ) -> Result<()> {
+        if self
+            .mouse_selection
+            .is_some_and(|selection| selection.dragged)
+        {
+            self.handle_mouse_drag(layout, column, row)?;
+        }
+        self.mouse_selection = None;
+        Ok(())
+    }
+
+    fn take_clipboard_writes(&mut self) -> Vec<(char, Box<str>)> {
+        let mut writes = self.active.editor.take_clipboard_writes();
+        for buffer in &mut self.inactive {
+            writes.extend(buffer.editor.take_clipboard_writes());
+        }
+        writes
+    }
+
+    fn clipboard_register_for_paste(&self, input: &TerminalInput) -> Option<char> {
+        let TerminalInput::Key(key) = input else {
+            return None;
+        };
+        if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace)
+            || key.control
+            || key.alt
+            || key.super_key
+            || !matches!(key.code, TerminalKeyCode::Char('p' | 'P'))
+        {
+            return None;
+        }
+        match self.active.editor.pending_register_name() {
+            Some(register @ ('+' | '*')) => Some(register),
+            Some(_) => None,
+            None => Some('+'),
+        }
+    }
+
+    fn restore_clipboard_register(&mut self, register: char, text: String) {
+        self.active.editor.restore_register(register, text, false);
+    }
+
     fn handle_prompt_key(&mut self, key: TerminalKey) -> Result<()> {
         match key.code {
             TerminalKeyCode::Escape => {
                 if self.search_prompt_origin.is_some() {
-                    self.cancel_search_prompt();
+                    self.cancel_search_prompt()?;
                 } else {
                     self.prompt = None;
                     self.message.clear();
@@ -1507,11 +1691,34 @@ impl App {
         self.message.clear();
     }
 
-    fn cancel_search_prompt(&mut self) {
+    fn synchronize_search(
+        &mut self,
+        pattern: &str,
+        direction: SearchDirection,
+        persist: bool,
+    ) -> Result<()> {
+        self.active.editor.restore_search(pattern, direction)?;
+        for buffer in &mut self.inactive {
+            buffer.editor.restore_search(pattern, direction)?;
+        }
+        self.last_search_direction = direction;
+        self.search_highlight = true;
+        let mut deltas = Vec::with_capacity(2);
+        if persist {
+            deltas.push(StateDelta::SearchPattern(pattern.to_owned().into()));
+        }
+        deltas.push(StateDelta::SearchDirection {
+            backward: direction == SearchDirection::Backward,
+        });
+        self.after_effect(None, deltas);
+        Ok(())
+    }
+
+    fn cancel_search_prompt(&mut self) -> Result<()> {
         if let Some(origin) = self.search_prompt_origin.take() {
             self.active.editor.set_cursor(origin.cursor);
             if let Some((pattern, direction)) = origin.previous_search {
-                self.active.editor.restore_search(pattern, direction);
+                self.active.editor.restore_search(pattern, direction)?;
             } else {
                 self.active.editor.clear_search();
             }
@@ -1519,19 +1726,20 @@ impl App {
         }
         self.prompt = None;
         self.message.clear();
+        Ok(())
     }
 
-    fn update_incremental_search(&mut self) {
+    fn update_incremental_search(&mut self) -> Result<()> {
         let Some(prompt) = self.prompt.as_ref().filter(|prompt| {
             matches!(
                 prompt.kind,
                 PromptKind::SearchForward | PromptKind::SearchBackward
             )
         }) else {
-            return;
+            return Ok(());
         };
         let Some(origin) = self.search_prompt_origin.as_ref() else {
-            return;
+            return Ok(());
         };
         let direction = if prompt.kind == PromptKind::SearchForward {
             SearchDirection::Forward
@@ -1545,25 +1753,27 @@ impl App {
             if let Some((pattern, direction)) = &origin.previous_search {
                 self.active
                     .editor
-                    .restore_search(pattern.clone(), *direction);
+                    .restore_search(pattern.clone(), *direction)?;
             } else {
                 self.active.editor.clear_search();
             }
             self.search_highlight = origin.previous_highlight;
             self.message.clear();
-            return;
+            return Ok(());
         }
         let found = match self.active.editor.preview_search(&query, direction, cursor) {
             Ok(found) => found,
             Err(error) => {
                 self.active.editor.set_cursor(cursor);
-                self.active.editor.restore_search(query, direction);
+                let _ = self.active.editor.restore_search(query, direction);
                 self.search_highlight = false;
                 self.message = error.to_string();
-                return;
+                return Ok(());
             }
         };
-        self.active.editor.restore_search(query.clone(), direction);
+        self.active
+            .editor
+            .restore_search(query.clone(), direction)?;
         self.search_highlight = true;
         if let Some(byte) = found {
             self.active.editor.set_cursor(byte);
@@ -1572,6 +1782,7 @@ impl App {
             self.active.editor.set_cursor(cursor);
             self.message = format!("pattern not found: {query}");
         }
+        Ok(())
     }
 
     fn complete_prompt(&mut self) {
@@ -1690,7 +1901,7 @@ impl App {
                     Err(error) => {
                         if let Some(origin) = origin {
                             if let Some((pattern, direction)) = origin.previous_search {
-                                self.active.editor.restore_search(pattern, direction);
+                                let _ = self.active.editor.restore_search(pattern, direction);
                             } else {
                                 self.active.editor.clear_search();
                             }
@@ -1704,10 +1915,7 @@ impl App {
                 } else {
                     format!("pattern not found: {pattern}")
                 };
-                self.search_highlight = true;
-                if !prompt.buffer.is_empty() {
-                    self.after_effect(None, vec![StateDelta::SearchPattern(pattern.into())]);
-                }
+                self.synchronize_search(&pattern, direction, !prompt.buffer.is_empty())?;
                 Ok(())
             }
             PromptKind::Expression => {
@@ -2055,11 +2263,6 @@ impl App {
             return Ok(());
         }
         if self.active.editor.mode() == Mode::Normal && !key.control && !key.alt && !key.super_key {
-            if matches!(key.code, TerminalKeyCode::Char('p' | 'P'))
-                && let Some(clipboard) = system_clipboard_text()
-            {
-                self.active.editor.set_register('+', clipboard, false);
-            }
             if key.code == TerminalKeyCode::Char('=')
                 && matches!(
                     self.active.editor.pending_parse_state(),
@@ -2634,6 +2837,11 @@ impl App {
                 }
             };
         restore_client_state(&mut messages, &self.client_state)?;
+        if let Some(pattern) = self.client_state.search_history.last() {
+            messages
+                .editor
+                .restore_search(pattern.clone(), self.last_search_direction)?;
+        }
         if let Err(error) = self
             .mutations
             .register(document_id, messages.editor.contents())
@@ -2916,6 +3124,11 @@ impl App {
                 self.active
                     .editor
                     .set_cursor(self.active.editor.text().byte_of_line(line));
+                if let Some((pattern, direction)) = address_search_pattern(&address) {
+                    let persist = !pattern.is_empty();
+                    let pattern = self.effective_search_pattern(pattern)?;
+                    self.synchronize_search(&pattern, direction, persist)?;
+                }
                 Ok(())
             }
             ExCommand::Substitute {
@@ -2925,13 +3138,19 @@ impl App {
                 flags,
             } => {
                 let range = self.resolve_byte_range(range.as_ref())?;
-                self.start_substitution_task(Substitute {
-                    needle: pattern.into(),
-                    replacement: replacement.into(),
-                    ranges: vec![range],
-                    global: flags.global,
-                    ignore_case: flags.ignore_case,
-                })
+                let substitute =
+                    self.resolve_substitute(&pattern, &replacement, flags, vec![range])?;
+                self.start_substitution(substitute)
+            }
+            ExCommand::SubstituteRepeat {
+                range,
+                use_search_pattern,
+                flags,
+            } => {
+                let range = self.resolve_byte_range(range.as_ref())?;
+                let substitute =
+                    self.resolve_repeated_substitute(use_search_pattern, flags, vec![range])?;
+                self.start_substitution(substitute)
             }
             ExCommand::Global {
                 range,
@@ -3102,6 +3321,18 @@ impl App {
         }
     }
 
+    fn effective_search_pattern(&self, pattern: &str) -> Result<String> {
+        if pattern.is_empty() {
+            self.active
+                .editor
+                .last_search()
+                .map(|(pattern, _)| pattern.to_owned())
+                .ok_or_else(|| anyhow!("no previous search pattern"))
+        } else {
+            Ok(pattern.to_owned())
+        }
+    }
+
     fn resolve_address(&self, address: &ExAddress) -> Result<usize> {
         let text = self.active.editor.contents();
         let current = self.active.editor.cursor_line_column().0;
@@ -3118,26 +3349,20 @@ impl App {
                 .ok_or_else(|| anyhow!("mark '{name} is not set"))?,
             ExAddress::SearchForward(pattern) => {
                 let cursor = self.active.editor.primary_cursor().min(text.len());
-                text[cursor..]
-                    .find(pattern.as_ref())
-                    .map(|offset| self.active.editor.text().line_of_byte(cursor + offset))
-                    .or_else(|| {
-                        text[..cursor]
-                            .find(pattern.as_ref())
-                            .map(|offset| self.active.editor.text().line_of_byte(offset))
-                    })
+                let pattern = self.effective_search_pattern(pattern)?;
+                self.active
+                    .editor
+                    .preview_search(&pattern, SearchDirection::Forward, cursor)?
+                    .map(|byte| self.active.editor.text().line_of_byte(byte))
                     .ok_or_else(|| anyhow!("pattern not found: {pattern}"))?
             }
             ExAddress::SearchBackward(pattern) => {
                 let cursor = self.active.editor.primary_cursor().min(text.len());
-                text[..cursor]
-                    .rfind(pattern.as_ref())
-                    .map(|offset| self.active.editor.text().line_of_byte(offset))
-                    .or_else(|| {
-                        text[cursor..]
-                            .rfind(pattern.as_ref())
-                            .map(|offset| self.active.editor.text().line_of_byte(cursor + offset))
-                    })
+                let pattern = self.effective_search_pattern(pattern)?;
+                self.active
+                    .editor
+                    .preview_search(&pattern, SearchDirection::Backward, cursor)?
+                    .map(|byte| self.active.editor.text().line_of_byte(byte))
                     .ok_or_else(|| anyhow!("pattern not found: {pattern}"))?
             }
             ExAddress::Offset { base, delta } => {
@@ -3204,6 +3429,12 @@ impl App {
                 .line_of_byte(self.active.editor.text().len_bytes())
                 .saturating_add(1)
         };
+        let persist_pattern = !pattern.is_empty();
+        let pattern = self.effective_search_pattern(pattern)?;
+        let compiled = self
+            .active
+            .editor
+            .compile_search_pattern(&pattern, CaseOverride::Default)?;
         let text = self.active.editor.contents();
         let mut selected = Vec::new();
         for line in lines {
@@ -3213,24 +3444,36 @@ impl App {
                 .editor
                 .text()
                 .byte_of_line(line.saturating_add(1));
-            if text[start..end].contains(pattern) != invert {
+            if compiled.is_match(&text[start..end]) != invert {
                 selected.push((line, start..end));
             }
         }
-        if let ExCommand::Substitute {
-            pattern,
-            replacement,
-            flags,
-            ..
-        } = command
-        {
-            return self.start_substitution_task(Substitute {
-                needle: pattern.into(),
-                replacement: replacement.into(),
-                ranges: selected.into_iter().map(|(_, range)| range).collect(),
-                global: flags.global,
-                ignore_case: flags.ignore_case,
-            });
+        self.synchronize_search(&pattern, SearchDirection::Forward, persist_pattern)?;
+        let selected_ranges = || selected.iter().map(|(_, range)| range.clone()).collect();
+        match &command {
+            ExCommand::Substitute {
+                pattern,
+                replacement,
+                flags,
+                ..
+            } => {
+                let substitute =
+                    self.resolve_substitute(pattern, replacement, *flags, selected_ranges())?;
+                return self.start_substitution(substitute);
+            }
+            ExCommand::SubstituteRepeat {
+                use_search_pattern,
+                flags,
+                ..
+            } => {
+                let substitute = self.resolve_repeated_substitute(
+                    *use_search_pattern,
+                    *flags,
+                    selected_ranges(),
+                )?;
+                return self.start_substitution(substitute);
+            }
+            _ => {}
         }
         for (line, _) in selected.into_iter().rev() {
             self.active
@@ -3276,6 +3519,11 @@ impl App {
         let (mut buffer, message) =
             BufferState::open(buffer_id, document_id, Some(&resolved), None)?;
         restore_client_state(&mut buffer, &self.client_state)?;
+        if let Some(pattern) = self.client_state.search_history.last() {
+            buffer
+                .editor
+                .restore_search(pattern.clone(), self.last_search_direction)?;
+        }
         self.mutations
             .register(document_id, buffer.editor.contents())?;
         self.autosave_active_if_named()?;
@@ -5396,34 +5644,215 @@ impl App {
         Ok(())
     }
 
-    fn start_substitution_task(&mut self, substitute: Substitute) -> Result<()> {
+    fn resolve_substitute(
+        &self,
+        pattern: &str,
+        replacement: &str,
+        flags: SubstituteFlags,
+        ranges: Vec<Range<usize>>,
+    ) -> Result<Substitute> {
+        let persist_pattern = !pattern.is_empty();
+        let needle = self.effective_search_pattern(pattern)?;
+        if self.last_substitute.is_none() && has_unescaped_tilde(replacement) {
+            bail!("no previous substitute replacement for ~");
+        }
+        let replacement = resolve_previous_replacement(
+            replacement,
+            self.last_substitute
+                .as_ref()
+                .map(|substitute| substitute.replacement.as_str()),
+        );
+        Ok(Substitute {
+            needle,
+            replacement,
+            ranges,
+            global: flags.global,
+            case_override: substitute_case_override(flags),
+            confirm: flags.confirm,
+            print: flags.print,
+            persist_pattern,
+        })
+    }
+
+    fn resolve_repeated_substitute(
+        &self,
+        use_search_pattern: bool,
+        flags: Option<SubstituteFlags>,
+        ranges: Vec<Range<usize>>,
+    ) -> Result<Substitute> {
+        let previous = self
+            .last_substitute
+            .as_ref()
+            .ok_or_else(|| anyhow!("no previous substitute command"))?;
+        let flags = flags.unwrap_or(previous.flags);
+        let needle = if use_search_pattern {
+            self.effective_search_pattern("")?
+        } else {
+            previous.needle.clone()
+        };
+        Ok(Substitute {
+            needle,
+            replacement: previous.replacement.clone(),
+            ranges,
+            global: flags.global,
+            case_override: substitute_case_override(flags),
+            confirm: flags.confirm,
+            print: flags.print,
+            persist_pattern: use_search_pattern,
+        })
+    }
+
+    fn start_substitution(&mut self, substitute: Substitute) -> Result<()> {
         if self.active_task.is_some() {
             bail!("a TaskCommand is already running");
         }
-        let reused_search = substitute.needle.is_empty();
-        let needle = if reused_search {
-            self.active
-                .editor
-                .last_search()
-                .map(|(pattern, _)| pattern.to_owned())
-                .ok_or_else(|| anyhow!("no previous search pattern"))?
-        } else {
-            substitute.needle
-        };
-        let regex = RegexBuilder::new(&needle)
-            .case_insensitive(substitute.ignore_case)
-            .build()
-            .with_context(|| format!("invalid substitution pattern {needle:?}"))?;
-        let direction = self
+        let pattern = self
             .active
             .editor
-            .last_search()
-            .map_or(SearchDirection::Forward, |(_, direction)| direction);
-        self.active.editor.restore_search(needle.clone(), direction);
-        self.search_highlight = true;
-        if !reused_search {
-            self.after_effect(None, vec![StateDelta::SearchPattern(needle.clone().into())]);
+            .compile_search_pattern(&substitute.needle, substitute.case_override)
+            .with_context(|| format!("invalid substitution pattern {:?}", substitute.needle))?;
+        self.synchronize_search(
+            &substitute.needle,
+            self.last_search_direction,
+            substitute.persist_pattern,
+        )?;
+        self.last_substitute = Some(LastSubstitute {
+            needle: substitute.needle.clone(),
+            replacement: substitute.replacement.clone(),
+            flags: SubstituteFlags {
+                global: substitute.global,
+                confirm: substitute.confirm,
+                case_sensitive: match substitute.case_override {
+                    CaseOverride::Default => None,
+                    CaseOverride::Ignore => Some(false),
+                    CaseOverride::Sensitive => Some(true),
+                },
+                print: substitute.print,
+            },
+        });
+        if substitute.confirm {
+            return self.begin_substitution_confirmation(substitute, pattern);
         }
+        self.start_substitution_task(substitute, pattern)
+    }
+
+    fn begin_substitution_confirmation(
+        &mut self,
+        substitute: Substitute,
+        pattern: VimPattern,
+    ) -> Result<()> {
+        let text = self.active.editor.contents();
+        let replacement = VimReplacement::new(substitute.replacement);
+        let candidates = plan_substitution_edits(
+            &text,
+            &pattern,
+            &replacement,
+            &substitute.ranges,
+            substitute.global,
+            || Ok(()),
+        )
+        .map_err(|error| anyhow!(error.to_string()))?;
+        self.substitute_confirmation = Some(SubstituteConfirmation {
+            base_revision: self.active.editor.revision(),
+            original_text: text,
+            candidates,
+            accepted: Vec::new(),
+            index: 0,
+            print: substitute.print,
+        });
+        self.advance_substitution_confirmation()
+    }
+
+    fn advance_substitution_confirmation(&mut self) -> Result<()> {
+        let Some(confirmation) = self.substitute_confirmation.as_ref() else {
+            return Ok(());
+        };
+        if confirmation.index >= confirmation.candidates.len() {
+            return self.finish_substitution_confirmation();
+        }
+        let candidate = &confirmation.candidates[confirmation.index];
+        self.active.editor.set_cursor(candidate.range.start);
+        self.message = format!(
+            "replace with {:?}? (y/n/a/q/l) [{}/{}]",
+            compact(&candidate.insert, 40),
+            confirmation.index + 1,
+            confirmation.candidates.len()
+        );
+        Ok(())
+    }
+
+    fn handle_substitution_confirmation(&mut self, key: TerminalKey) -> Result<()> {
+        let Some(mut confirmation) = self.substitute_confirmation.take() else {
+            return Ok(());
+        };
+        let finish = match key.code {
+            TerminalKeyCode::Char('y' | 'Y') => {
+                confirmation
+                    .accepted
+                    .push(confirmation.candidates[confirmation.index].clone());
+                confirmation.index += 1;
+                false
+            }
+            TerminalKeyCode::Char('n' | 'N') => {
+                confirmation.index += 1;
+                false
+            }
+            TerminalKeyCode::Char('a' | 'A') => {
+                confirmation
+                    .accepted
+                    .extend_from_slice(&confirmation.candidates[confirmation.index..]);
+                confirmation.index = confirmation.candidates.len();
+                true
+            }
+            TerminalKeyCode::Char('l' | 'L') => {
+                confirmation
+                    .accepted
+                    .push(confirmation.candidates[confirmation.index].clone());
+                confirmation.index = confirmation.candidates.len();
+                true
+            }
+            TerminalKeyCode::Char('q' | 'Q') | TerminalKeyCode::Escape => true,
+            _ => {
+                self.message = "substitute confirmation: y=yes n=no a=all q=quit l=last".to_owned();
+                self.substitute_confirmation = Some(confirmation);
+                return Ok(());
+            }
+        };
+        self.substitute_confirmation = Some(confirmation);
+        if finish {
+            self.finish_substitution_confirmation()
+        } else {
+            self.advance_substitution_confirmation()
+        }
+    }
+
+    fn finish_substitution_confirmation(&mut self) -> Result<()> {
+        let Some(confirmation) = self.substitute_confirmation.take() else {
+            return Ok(());
+        };
+        let count = confirmation.accepted.len();
+        if count == 0 {
+            self.message = "0 substitutions".to_owned();
+            return Ok(());
+        }
+        let transaction = Transaction::new(confirmation.base_revision, confirmation.accepted)?;
+        let message = substitution_message(
+            count,
+            confirmation.print,
+            &confirmation.original_text,
+            &transaction,
+        );
+        self.active.editor.apply_transaction(transaction.clone())?;
+        self.after_transaction(Some(transaction));
+        self.message = message;
+        Ok(())
+    }
+
+    fn start_substitution_task(
+        &mut self,
+        substitute: Substitute,
+        pattern: VimPattern,
+    ) -> Result<()> {
         let task_id = CommandTaskId::new(self.next_task_id);
         self.next_task_id = self
             .next_task_id
@@ -5431,9 +5860,10 @@ impl App {
             .ok_or_else(|| anyhow!("task ID overflow"))?;
         let text = self.active.editor.contents();
         let base_revision = self.active.editor.revision();
-        let replacement = vim_regex_replacement(&substitute.replacement);
+        let replacement = VimReplacement::new(substitute.replacement);
         let ranges = substitute.ranges;
         let global = substitute.global;
+        let print = substitute.print;
         let document_id = self.active.document_id;
         let cancellation = self.tasks.submit(
             CommandTask {
@@ -5442,51 +5872,34 @@ impl App {
                 label: "range substitution".into(),
             },
             move |context| {
-                let mut edits = Vec::new();
-                let mut bytes_since_checkpoint = 0;
-                for range in ranges {
-                    let start = range.start.min(text.len());
-                    let end = range.end.min(text.len()).max(start);
-                    let mut line_start = start;
-                    for line in text[start..end].split_inclusive('\n') {
-                        for captures in regex.captures_iter(line) {
-                            let Some(found) = captures.get(0) else {
-                                continue;
-                            };
-                            let mut insert = String::new();
-                            captures.expand(&replacement, &mut insert);
-                            edits.push(Edit::new(
-                                line_start + found.start()..line_start + found.end(),
-                                insert,
-                            ));
-                            if !global {
-                                break;
-                            }
-                        }
-                        line_start += line.len();
-                        bytes_since_checkpoint += line.len();
-                        if bytes_since_checkpoint >= 4096 {
-                            context.checkpoint()?;
-                            bytes_since_checkpoint = 0;
-                        }
-                    }
-                }
+                let edits = plan_substitution_edits(
+                    &text,
+                    &pattern,
+                    &replacement,
+                    &ranges,
+                    global,
+                    || context.checkpoint(),
+                )?;
                 context.checkpoint()?;
                 let count = edits.len();
                 let mut effects = Effects {
-                    messages: vec![format!("{count} substitution(s)").into_boxed_str()],
+                    messages: Vec::new(),
                     ..Effects::default()
                 };
                 if count > 0 {
+                    let transaction = Transaction::new(base_revision, edits)
+                        .map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
+                    effects.messages.push(
+                        substitution_message(count, print, &text, &transaction).into_boxed_str(),
+                    );
                     effects.edit_proposals.push(EditProposal {
                         document_id,
                         base_revision,
-                        transactions: vec![
-                            Transaction::new(base_revision, edits)
-                                .map_err(|error| TaskFailure::Failed(error.to_string().into()))?,
-                        ],
+                        transactions: vec![transaction],
                         label: "regex substitution".into(),
                     });
+                } else {
+                    effects.messages.push("0 substitutions".into());
                 }
                 Ok(effects)
             },
@@ -5620,7 +6033,9 @@ impl App {
                 }
             }
             TerminalInput::MouseScroll { .. } => {}
-            TerminalInput::MouseClick { .. } => {}
+            TerminalInput::MouseClick { .. }
+            | TerminalInput::MouseDrag { .. }
+            | TerminalInput::MouseRelease { .. } => {}
             TerminalInput::Ignored => {}
         }
         Ok(())
@@ -5871,7 +6286,8 @@ impl App {
         } else {
             SearchDirection::Forward
         };
-        let found = match self.active.editor.search(&word, direction) {
+        let pattern = format!(r"\<{word}\>");
+        let found = match self.active.editor.search(&pattern, direction) {
             Ok(found) => found,
             Err(error) => {
                 self.show_error(error);
@@ -5888,7 +6304,9 @@ impl App {
         } else {
             format!("pattern not found: {word}")
         };
-        self.after_effect(None, vec![StateDelta::SearchPattern(word.into())]);
+        if let Err(error) = self.synchronize_search(&pattern, direction, true) {
+            self.show_error(error);
+        }
     }
 
     fn show_file_info(&mut self) {
@@ -7384,8 +7802,7 @@ impl App {
                 Ok(())
             }
             Some(PromptKind::SearchForward | PromptKind::SearchBackward) => {
-                self.update_incremental_search();
-                Ok(())
+                self.update_incremental_search()
             }
             _ => Ok(()),
         }
@@ -7400,35 +7817,64 @@ impl App {
         else {
             return;
         };
-        let command = command
-            .strip_prefix('%')
-            .unwrap_or(&command)
-            .strip_prefix('s');
-        let Some(command) = command else {
+        let Some(parsed) = parse_inccommand_substitute(&command) else {
             self.message.clear();
             return;
         };
-        let Some(delimiter) = command.chars().next() else {
+        let substitute = match parsed {
+            ExCommand::Substitute {
+                range,
+                pattern,
+                replacement,
+                flags,
+            } => self.resolve_byte_range(range.as_ref()).and_then(|range| {
+                self.resolve_substitute(&pattern, &replacement, flags, vec![range])
+            }),
+            ExCommand::SubstituteRepeat {
+                range,
+                use_search_pattern,
+                flags,
+            } => self.resolve_byte_range(range.as_ref()).and_then(|range| {
+                self.resolve_repeated_substitute(use_search_pattern, flags, vec![range])
+            }),
+            _ => return,
+        };
+        let Ok(substitute) = substitute else {
             self.message.clear();
             return;
         };
-        let fields = command[delimiter.len_utf8()..]
-            .split(delimiter)
-            .collect::<Vec<_>>();
-        let Some(pattern) = fields.first().filter(|pattern| !pattern.is_empty()) else {
-            self.message.clear();
-            return;
-        };
-        let replacement = fields.get(1).copied().unwrap_or_default();
         let text = self.active.editor.contents();
-        let count = text.match_indices(pattern).count();
-        let preview = text
-            .lines()
-            .find(|line| line.contains(pattern))
-            .map(|line| line.replacen(pattern, replacement, 1));
-        self.message = preview.map_or_else(
-            || format!("inccommand: {count} match(es)"),
-            |preview| format!("inccommand: {count} match(es) │ {}", compact(&preview, 80)),
+        let Ok(pattern) = self
+            .active
+            .editor
+            .compile_search_pattern(&substitute.needle, substitute.case_override)
+        else {
+            self.message = "inccommand: invalid pattern".to_owned();
+            return;
+        };
+        let replacement = VimReplacement::new(substitute.replacement);
+        let Ok(edits) = plan_substitution_edits(
+            &text,
+            &pattern,
+            &replacement,
+            &substitute.ranges,
+            substitute.global,
+            || Ok(()),
+        ) else {
+            self.message.clear();
+            return;
+        };
+        if edits.is_empty() {
+            self.message = "inccommand: 0 substitutions".to_owned();
+            return;
+        }
+        let Ok(transaction) = Transaction::new(self.active.editor.revision(), edits) else {
+            self.message.clear();
+            return;
+        };
+        self.message = format!(
+            "inccommand: {}",
+            substitution_message(transaction.edits.len(), true, &text, &transaction,)
         );
     }
 
@@ -8292,6 +8738,16 @@ fn provider_decoration(span: HighlightSpan, theme: CatppuccinPalette) -> Decorat
             foreground: Some(CellColor::Rgb(theme.pink)),
             ..CellStyle::default()
         },
+        "markup.heading" => CellStyle {
+            bold: true,
+            foreground: Some(CellColor::Rgb(theme.mauve)),
+            ..CellStyle::default()
+        },
+        "markup.raw" => CellStyle {
+            foreground: Some(CellColor::Rgb(theme.green)),
+            background: Some(CellColor::Rgb(theme.surface0)),
+            ..CellStyle::default()
+        },
         "variable" => CellStyle {
             foreground: Some(CellColor::Rgb(theme.text)),
             ..CellStyle::default()
@@ -8423,10 +8879,13 @@ fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (String, Vec<
 fn normalized_fence_language(language: &str) -> &str {
     match language.trim().to_ascii_lowercase().as_str() {
         "rs" => "rust",
-        "js" | "jsx" | "ts" | "tsx" => "javascript",
+        "js" | "jsx" => "javascript",
+        "ts" => "typescript",
+        "tsx" => "tsx",
         "py" => "python",
         "sh" | "shell" | "zsh" => "bash",
         "hs" => "haskell",
+        "tf" | "terraform" => "hcl",
         _ => language.trim(),
     }
 }
@@ -8437,21 +8896,33 @@ fn language_bundle(path: Option<&Path>) -> LanguageBundle {
         .and_then(std::ffi::OsStr::to_str)
         .map_or("text", |extension| match extension {
             "rs" => "rust",
-            "py" => "python",
-            "js" | "mjs" | "cjs" => "javascript",
-            "ts" | "tsx" => "typescript",
+            "py" | "pyi" => "python",
+            "js" | "mjs" | "cjs" | "jsx" => "javascript",
+            "ts" | "mts" | "cts" => "typescript",
+            "tsx" => "tsx",
             "go" => "go",
             "c" | "h" => "c",
-            "cc" | "cpp" | "cxx" | "hpp" | "msg" => "cpp",
+            "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "msg" => "cpp",
+            "cs" => "csharp",
+            "css" => "css",
+            "dart" => "dart",
+            "ex" | "exs" => "elixir",
+            "hcl" | "tf" | "tfvars" => "hcl",
+            "html" | "htm" => "html",
             "java" => "java",
+            "kt" | "kts" => "kotlin",
             "rb" => "ruby",
             "sh" | "bash" | "zsh" => "bash",
             "json" => "json",
             "hs" | "lhs" => "haskell",
             "lua" => "lua",
             "nix" => "nix",
-            "tf" | "tfvars" => "terraform",
             "md" | "markdown" => "markdown",
+            "php" | "phtml" => "php",
+            "scala" | "sc" => "scala",
+            "sol" => "solidity",
+            "swift" => "swift",
+            "yaml" | "yml" => "yaml",
             _ => "text",
         });
     let mut identity = [0_u8; 32];
@@ -8967,6 +9438,7 @@ struct LanguageServerInvocation {
     program: String,
     arguments: Vec<String>,
     language_id: String,
+    initialization_options: serde_json::Value,
     settings: serde_json::Value,
 }
 
@@ -8992,7 +9464,7 @@ fn spawn_lsp_client(
         max_output_bytes: 16 * 1024 * 1024,
     };
     let mut client = LspClient::spawn(&spec, true, 16 * 1024 * 1024)?;
-    let initialize = client.initialize(
+    let initialize = client.initialize_with_options(
         &file_uri(root),
         serde_json::json!({
             "workspace": {"workspaceFolders": true},
@@ -9022,6 +9494,7 @@ fn spawn_lsp_client(
                 }
             }
         }),
+        server.initialization_options.clone(),
     )?;
     if !server.settings.is_null() {
         client.notify(
@@ -9187,14 +9660,15 @@ fn lsp_position_byte(text: &str, line: u32, character: u32) -> Option<usize> {
 fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvocation> {
     let path = path?;
     let extension = path.extension()?.to_str()?;
-    let (program, arguments, language_id, settings) = match extension {
+    let (program, arguments, language_id, initialization_options, settings) = match extension {
         "rs" => (
             "rust-analyzer",
             Vec::new(),
             "rust",
+            serde_json::Value::Null,
             serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}}),
         ),
-        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" => (
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => (
             "pnpm",
             vec![
                 "exec".to_owned(),
@@ -9202,64 +9676,69 @@ fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvoc
                 "--stdio".to_owned(),
             ],
             match extension {
-                "ts" => "typescript",
+                "ts" | "mts" | "cts" => "typescript",
                 "tsx" => "typescriptreact",
                 "jsx" => "javascriptreact",
                 _ => "javascript",
             },
+            serde_json::json!({"jsx": {"enabled": true}}),
             serde_json::json!({
                 "typescript": {
-                    "suggest": {"completeFunctionCalls": true},
+                    "suggestionActions": {"enabled": true},
                     "updateImportsOnFileMove": {"enabled": "always"}
                 },
                 "javascript": {
-                    "suggest": {"completeFunctionCalls": true},
                     "updateImportsOnFileMove": {"enabled": "always"}
                 }
             }),
         ),
-        "py" => {
+        "py" | "pyi" => {
             let interpreter = python_interpreter(path);
             (
                 "basedpyright-langserver",
                 vec!["--stdio".to_owned()],
                 "python",
+                serde_json::Value::Null,
                 serde_json::json!({
+                    "python": {"pythonPath": interpreter},
                     "basedpyright": {
-                        "pythonPath": interpreter,
                         "analysis": {
+                            "autoSearchPaths": true,
+                            "useLibraryCodeForTypes": true,
                             "diagnosticMode": "workspace",
                             "inlayHints": {
                                 "variableTypes": true,
                                 "callArgumentNames": true,
                                 "functionReturnTypes": true,
-                                "genericTypes": true
+                                "parameterNames": true
                             }
-                        },
-                        "disableOrganizeImports": true
+                        }
                     }
                 }),
             )
         }
-        "go" => ("gopls", Vec::new(), "go", serde_json::json!({})),
+        "go" => (
+            "gopls",
+            Vec::new(),
+            "go",
+            serde_json::Value::Null,
+            serde_json::json!({}),
+        ),
         "tf" | "tfvars" => (
             "terraform-ls",
             vec!["serve".to_owned()],
             "terraform",
+            serde_json::Value::Null,
             serde_json::json!({}),
         ),
         "nix" => {
             let input = env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned());
-            let expression = nixd_expression_path().map(|config| {
-                format!(
-                    "let ctx = import {} {{ self = \"dummy\"; }}; in if ctx.local != null then ctx.local.inputs.{input} else import <nixpkgs> {{ }}",
-                    config.display()
-                )
-            });
+            let expression = nixd_nixpkgs_expression(nixd_expression_path().as_deref(), &input);
             (
                 "nixd",
                 Vec::new(),
                 "nix",
+                serde_json::Value::Null,
                 serde_json::json!({
                     "nixd": {
                         "nixpkgs": {"expr": expression},
@@ -9272,9 +9751,13 @@ fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvoc
             "haskell-language-server-wrapper",
             vec!["--lsp".to_owned()],
             "haskell",
+            serde_json::Value::Null,
             serde_json::json!({
                 "haskell": {
-                    "plugin": {"hlint": {"diagnosticsOn": true, "codeActionsOn": true}},
+                    "plugin": {
+                        "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
+                        "fourmolu": {"config": {"external": true}}
+                    },
                     "formattingProvider": "fourmolu"
                 }
             }),
@@ -9283,6 +9766,7 @@ fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvoc
             "lua-language-server",
             Vec::new(),
             "lua",
+            serde_json::Value::Null,
             serde_json::json!({
                 "Lua": {
                     "runtime": {"version": "LuaJIT"},
@@ -9294,19 +9778,44 @@ fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvoc
             "bash-language-server",
             vec!["start".to_owned()],
             "shellscript",
+            serde_json::Value::Null,
             serde_json::json!({}),
         ),
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "msg" => {
-            ("clangd", Vec::new(), "cpp", serde_json::json!({}))
-        }
+        "c" | "h" => (
+            "clangd",
+            Vec::new(),
+            "c",
+            serde_json::Value::Null,
+            serde_json::json!({}),
+        ),
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "msg" => (
+            "clangd",
+            Vec::new(),
+            "cpp",
+            serde_json::Value::Null,
+            serde_json::json!({}),
+        ),
         _ => return None,
     };
     Some(LanguageServerInvocation {
         program: program.to_owned(),
         arguments,
         language_id: language_id.to_owned(),
+        initialization_options,
         settings,
     })
+}
+
+fn nixd_nixpkgs_expression(config: Option<&Path>, input: &str) -> String {
+    config.map_or_else(
+        || "import <nixpkgs> { }".to_owned(),
+        |config| {
+            format!(
+                "let ctx = import {} {{ self = \"dummy\"; }}; in if ctx.local != null then ctx.local.inputs.{input} else import <nixpkgs> {{ }}",
+                config.display()
+            )
+        },
+    )
 }
 
 fn python_interpreter(path: &Path) -> Option<String> {
@@ -9516,13 +10025,33 @@ fn expand_lsp_snippet_with_stops(snippet: &str) -> (String, Vec<Range<usize>>) {
     (output, stops.into_iter().map(|(_, range)| range).collect())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Substitute {
     needle: String,
     replacement: String,
     ranges: Vec<Range<usize>>,
     global: bool,
-    ignore_case: bool,
+    case_override: CaseOverride,
+    confirm: bool,
+    print: bool,
+    persist_pattern: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LastSubstitute {
+    needle: String,
+    replacement: String,
+    flags: SubstituteFlags,
+}
+
+#[derive(Debug)]
+struct SubstituteConfirmation {
+    base_revision: DocumentRevision,
+    original_text: String,
+    candidates: Vec<Edit>,
+    accepted: Vec<Edit>,
+    index: usize,
+    print: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9640,31 +10169,150 @@ fn terminal_key_bytes(key: TerminalKey) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn vim_regex_replacement(input: &str) -> String {
-    let mut output = String::new();
-    let mut characters = input.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '&' => output.push_str("$0"),
-            '\\' if characters.peek().is_some_and(char::is_ascii_digit) => {
-                if let Some(group) = characters.next() {
-                    output.push_str("${");
-                    output.push(group);
-                    output.push('}');
-                }
-            }
-            '\\' => {
-                if let Some(next) = characters.next() {
-                    output.push(next);
-                } else {
-                    output.push('\\');
-                }
-            }
-            '$' => output.push_str("$$"),
-            _ => output.push(character),
+const fn substitute_case_override(flags: SubstituteFlags) -> CaseOverride {
+    match flags.case_sensitive {
+        None => CaseOverride::Default,
+        Some(false) => CaseOverride::Ignore,
+        Some(true) => CaseOverride::Sensitive,
+    }
+}
+
+fn address_search_pattern(address: &ExAddress) -> Option<(&str, SearchDirection)> {
+    match address {
+        ExAddress::SearchForward(pattern) => Some((pattern, SearchDirection::Forward)),
+        ExAddress::SearchBackward(pattern) => Some((pattern, SearchDirection::Backward)),
+        ExAddress::Offset { base, .. } => address_search_pattern(base),
+        ExAddress::Current | ExAddress::Last | ExAddress::Line(_) | ExAddress::Mark(_) => None,
+    }
+}
+
+fn parse_inccommand_substitute(input: &str) -> Option<ExCommand> {
+    let is_substitute = |command: &ExCommand| {
+        matches!(
+            command,
+            ExCommand::Substitute { .. } | ExCommand::SubstituteRepeat { .. }
+        )
+    };
+    if let Ok(command) = parse_ex(input)
+        && is_substitute(&command)
+    {
+        return Some(command);
+    }
+    let command_byte = input.char_indices().find_map(|(index, character)| {
+        if character != 's' {
+            return None;
+        }
+        let before = &input[..index];
+        before
+            .chars()
+            .all(|value| value.is_ascii_digit() || matches!(value, '%' | ',' | ';' | '.' | '$'))
+            .then_some(index)
+    })?;
+    let tail = &input[command_byte + 1..];
+    let delimiter = tail
+        .chars()
+        .next()
+        .filter(|value| !value.is_alphanumeric() && !value.is_whitespace())?;
+    for missing in 1..=2 {
+        let mut candidate = input.to_owned();
+        candidate.extend(std::iter::repeat_n(delimiter, missing));
+        if let Ok(command) = parse_ex(&candidate)
+            && is_substitute(&command)
+        {
+            return Some(command);
         }
     }
-    output
+    None
+}
+
+fn has_unescaped_tilde(input: &str) -> bool {
+    let mut escaped = false;
+    for character in input.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '~' {
+            return true;
+        }
+    }
+    false
+}
+
+fn plan_substitution_edits(
+    text: &str,
+    pattern: &VimPattern,
+    replacement: &VimReplacement,
+    ranges: &[Range<usize>],
+    global: bool,
+    mut checkpoint: impl FnMut() -> Result<(), TaskFailure>,
+) -> Result<Vec<Edit>, TaskFailure> {
+    let mut ranges = ranges.to_vec();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut edits = Vec::new();
+    let mut processed_bytes = 0_usize;
+    for range in ranges {
+        let start = range.start.min(text.len());
+        let end = range.end.min(text.len()).max(start);
+        let slice = &text[start..end];
+        let mut scan_cursor = 0_usize;
+        let mut line = 0_usize;
+        let mut replaced_line = None;
+        for captures in pattern.captures_iter(slice) {
+            let Some(found) = captures.get(0) else {
+                continue;
+            };
+            line += slice[scan_cursor..found.start()]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            scan_cursor = found.start();
+            if global || replaced_line != Some(line) {
+                edits.push(Edit::new(
+                    start + found.start()..start + found.end(),
+                    replacement.expand(&captures),
+                ));
+                replaced_line = Some(line);
+            }
+            let absolute = start + found.end();
+            if absolute.saturating_sub(processed_bytes) >= 4_096 {
+                checkpoint()?;
+                processed_bytes = absolute;
+            }
+        }
+        checkpoint()?;
+        processed_bytes = end;
+    }
+    edits.sort_by_key(|edit| (edit.range.start, edit.range.end));
+    edits.dedup_by(|left, right| left.range == right.range && left.insert == right.insert);
+    Ok(edits)
+}
+
+fn substitution_message(
+    count: usize,
+    print: bool,
+    original: &str,
+    transaction: &Transaction,
+) -> String {
+    let summary = format!("{count} substitution(s)");
+    if !print {
+        return summary;
+    }
+    let Ok(changed) = transaction.apply_to_string(original) else {
+        return summary;
+    };
+    let Some(last) = transaction.edits.last() else {
+        return summary;
+    };
+    let anchor = transaction
+        .map_offset(last.range.start, Bias::Left)
+        .unwrap_or(last.range.start)
+        .min(changed.len());
+    let start = changed[..anchor].rfind('\n').map_or(0, |byte| byte + 1);
+    let end = changed[anchor..]
+        .find('\n')
+        .map_or(changed.len(), |byte| anchor + byte);
+    format!("{summary} │ {}", compact(&changed[start..end], 120))
 }
 
 fn ex_normal_keys(input: &str) -> Vec<KeyEvent> {
@@ -9775,9 +10423,14 @@ fn complete_path(fragment: &str) -> Option<String> {
     Some(completed)
 }
 
-fn system_clipboard_text() -> Option<String> {
+fn system_clipboard_text(register: char) -> Option<String> {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbpaste", &[])]
+    } else if register == '*' {
+        &[
+            ("wl-paste", &["--primary", "--no-newline"]),
+            ("xclip", &["-selection", "primary", "-o"]),
+        ]
     } else {
         &[
             ("wl-paste", &["--no-newline"]),
@@ -9983,7 +10636,14 @@ fn restore_client_state(buffer: &mut BufferState, state: &DurableClientState) ->
             .restore_register(*name, register.text.clone(), register.linewise);
     }
     if let Some(pattern) = state.search_history.last() {
-        buffer.editor.restore_search_pattern(pattern.clone());
+        buffer.editor.restore_search(
+            pattern.clone(),
+            if state.search_backward {
+                SearchDirection::Backward
+            } else {
+                SearchDirection::Forward
+            },
+        )?;
     }
     for (name, mark) in &state.global_marks {
         if mark.document_id == buffer.document_id {
@@ -10650,6 +11310,7 @@ while True:
                     log.to_string_lossy().into_owned(),
                 ],
                 language_id: "rust".to_owned(),
+                initialization_options: serde_json::Value::Null,
                 settings: serde_json::Value::Null,
             },
             log,
@@ -11694,6 +12355,89 @@ while True:
     }
 
     #[test]
+    fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "fn main() {}\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+        let mut layout = ViewportLayout::new(30, 5);
+        layout.configure_dotfile_profile();
+        let normal = desired_frame(&mut layout, &app);
+        let normal_foregrounds = normal.rows[0]
+            .cells
+            .iter()
+            .filter(|cell| matches!(cell.grapheme.as_ref(), "f" | "n"))
+            .take(2)
+            .map(|cell| cell.style.foreground)
+            .collect::<Vec<_>>();
+        app.handle_editor_key(terminal_character('v'))
+            .expect("Visual mode");
+        app.handle_editor_key(terminal_character('l'))
+            .expect("extend");
+        let grid = desired_frame(&mut layout, &app);
+        let selected = grid
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface1)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>(),
+            "fn"
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|cell| cell.style.foreground)
+                .collect::<Vec<_>>(),
+            normal_foregrounds,
+            "Visual background must compose with the Tree-sitter keyword color"
+        );
+    }
+
+    #[test]
+    fn click_drag_enters_visual_mode_and_selects_rendered_cells() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "abcdef\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+        let mut layout = ViewportLayout::new(30, 5);
+        layout.configure_dotfile_profile();
+        let frames = [(app.active.buffer_id, app.active.editor.frame())];
+        let coordinate_for = |wanted| {
+            (0..5)
+                .flat_map(|row| (0..30).map(move |column| (column, row)))
+                .find(|(column, row)| {
+                    layout
+                        .hit_test_workspace(&app.views, &frames, *column, *row, 1)
+                        .is_some_and(|hit| hit.byte == wanted)
+                })
+                .expect("rendered byte coordinate")
+        };
+        let start = coordinate_for(1);
+        let end = coordinate_for(4);
+        app.handle_mouse_click(&layout, start.0, start.1)
+            .expect("mouse down");
+        app.handle_mouse_drag(&layout, end.0, end.1)
+            .expect("mouse drag");
+        app.handle_mouse_release(&layout, end.0, end.1)
+            .expect("mouse release");
+        assert_eq!(app.active.editor.mode(), Mode::Visual);
+        assert_eq!(app.active.editor.selection_byte_range(), 1..5);
+
+        let grid = desired_frame(&mut layout, &app);
+        let selected = grid
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface1)))
+            .map(|cell| cell.grapheme.as_ref())
+            .collect::<String>();
+        assert_eq!(selected, "bcde");
+    }
+
+    #[test]
     fn space_jj_labels_every_visible_match_and_jumps_by_label() {
         let (document, mut opened) = LocalDocument::unnamed();
         opened.text = "x first\nx second\nx third\n".to_owned();
@@ -11791,6 +12535,25 @@ while True:
         app.dispatch_key(KeyEvent::character('p'));
         assert_eq!(app.active.editor.contents(), "WREN");
         assert!(evaluate_expression("read_file('x')", &app.expression_context()).is_err());
+    }
+
+    #[test]
+    fn terminal_clipboard_paste_targets_unnamedplus_and_explicit_star() {
+        let mut app = App::open(None, None).expect("unnamed editor");
+        let paste = TerminalInput::Key(terminal_character('p'));
+        assert_eq!(app.clipboard_register_for_paste(&paste), Some('+'));
+
+        app.dispatch_key(KeyEvent::character('"'));
+        app.dispatch_key(KeyEvent::character('*'));
+        assert_eq!(app.clipboard_register_for_paste(&paste), Some('*'));
+        app.restore_clipboard_register('*', "primary".to_owned());
+        assert!(app.take_clipboard_writes().is_empty());
+        app.dispatch_key(KeyEvent::character('p'));
+        assert_eq!(app.active.editor.contents(), "primary");
+
+        app.dispatch_key(KeyEvent::character('"'));
+        app.dispatch_key(KeyEvent::character('a'));
+        assert_eq!(app.clipboard_register_for_paste(&paste), None);
     }
 
     #[test]
@@ -11956,6 +12719,158 @@ while True:
         assert_eq!(app.active.editor.contents(), "one one\ntwo one");
     }
 
+    #[test]
+    fn substitute_case_confirm_and_print_flags_have_real_editor_behavior() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "Foo foo FOO\nfoo foo\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+
+        app.execute_ex("%s/foo/x/g")
+            .expect("default smart-case substitution");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "x x x\nx x\n");
+        app.active.editor.undo().expect("undo default case");
+
+        app.execute_ex("%s/Foo/x/gI")
+            .expect("forced case-sensitive substitution");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "x foo FOO\nfoo foo\n");
+        app.active.editor.undo().expect("undo sensitive case");
+
+        app.execute_ex("%s/foo/X/gc").expect("begin confirmation");
+        assert!(app.substitute_confirmation.is_some());
+        app.handle_input(TerminalInput::Key(terminal_character('n')))
+            .expect("skip first");
+        app.handle_input(TerminalInput::Key(terminal_character('y')))
+            .expect("accept second");
+        app.handle_input(TerminalInput::Key(terminal_character('a')))
+            .expect("accept remaining");
+        assert!(app.substitute_confirmation.is_none());
+        assert_eq!(app.active.editor.contents(), "Foo X X\nX X\n");
+        app.active.editor.undo().expect("confirmation is one undo");
+        assert_eq!(app.active.editor.contents(), "Foo foo FOO\nfoo foo\n");
+
+        app.execute_ex("%s/foo/Z/gp").expect("printed substitution");
+        wait_for_task(&mut app);
+        assert!(app.message.contains("5 substitution(s)"));
+        assert!(app.message.contains("Z Z"), "message was {}", app.message);
+    }
+
+    #[test]
+    fn vim_patterns_replacements_repeats_and_multiline_edits_are_transactional() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "cat cat\nfoo\nbar\ncat\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+
+        app.execute_ex(r"%s/\<cat\>/\U&\E/g")
+            .expect("Vim word and case atoms");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "CAT CAT\nfoo\nbar\nCAT\n");
+
+        app.execute_ex(r"%s/foo\nbar/joined/")
+            .expect("multiline pattern");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "CAT CAT\njoined\nCAT\n");
+        app.execute_ex(r"%s/joined/one\rTWO/")
+            .expect("newline replacement");
+        wait_for_task(&mut app);
+        assert_eq!(app.active.editor.contents(), "CAT CAT\none\nTWO\nCAT\n");
+
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "cat\ncat\ncat\n".to_owned();
+        let mut repeat = App::from_opened(document, opened, None, None).expect("repeat app");
+        repeat.execute_ex("1s/cat/DOG/").expect("first substitute");
+        wait_for_task(&mut repeat);
+        repeat.execute_ex("2s").expect("bare substitute repeat");
+        wait_for_task(&mut repeat);
+        repeat.execute_ex("3&").expect("ampersand repeat");
+        wait_for_task(&mut repeat);
+        assert_eq!(repeat.active.editor.contents(), "DOG\nDOG\nDOG\n");
+
+        repeat.active.editor.set_cursor(0);
+        repeat
+            .active
+            .editor
+            .search("DOG", SearchDirection::Forward)
+            .expect("search DOG");
+        repeat
+            .synchronize_search("DOG", SearchDirection::Forward, true)
+            .expect("share search");
+        repeat.execute_ex("1~").expect("tilde repeat");
+        wait_for_task(&mut repeat);
+        assert_eq!(repeat.active.editor.contents(), "DOG\nDOG\nDOG\n");
+
+        repeat.execute_ex("2s/DOG/cat/").expect("new replacement");
+        wait_for_task(&mut repeat);
+        repeat.execute_ex("3s/DOG/~/").expect("replacement tilde");
+        wait_for_task(&mut repeat);
+        assert_eq!(repeat.active.editor.contents(), "DOG\ncat\ncat\n");
+    }
+
+    #[test]
+    fn ex_addresses_global_and_inccommand_share_the_vim_regex_engine() {
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "foo1\nfooX\nbar\n".to_owned();
+        let mut app = App::from_opened(document, opened, None, None).expect("app");
+
+        app.execute_ex(r"/foo./").expect("regex Ex address");
+        assert_eq!(app.active.editor.cursor_line_column().0, 1);
+        assert_eq!(
+            app.active.editor.last_search(),
+            Some(("foo.", SearchDirection::Forward))
+        );
+        app.execute_ex(r"g/foo\d/normal A!").expect("regex global");
+        assert_eq!(app.active.editor.contents(), "foo1!\nfooX\nbar\n");
+
+        app.prompt = Some(Prompt {
+            kind: PromptKind::Command,
+            buffer: r"%s/\(foo\)\d/\U\1".to_owned(),
+            history_index: None,
+        });
+        app.update_inccommand_preview();
+        assert!(app.message.contains("1 substitution(s)"));
+        assert!(app.message.contains("FOO!"), "preview was {}", app.message);
+    }
+
+    #[test]
+    fn search_direction_is_shared_across_buffers_and_star_uses_word_boundaries() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        fs::write(&first, "hit one hit\n").expect("first");
+        fs::write(&second, "hit one hit\n").expect("second");
+        let mut app = App::open(Some(&first), None).expect("app");
+        app.active
+            .editor
+            .set_cursor(app.active.editor.text().len_bytes());
+        app.execute_prompt(Prompt {
+            kind: PromptKind::SearchBackward,
+            buffer: "hit".to_owned(),
+            history_index: None,
+        })
+        .expect("backward search");
+        assert!(app.client_state.search_backward);
+        app.open_buffer(&second).expect("open second");
+        assert_eq!(
+            app.active.editor.last_search(),
+            Some(("hit", SearchDirection::Backward))
+        );
+        app.handle_editor_key(terminal_character('n'))
+            .expect("repeat shared backward search");
+        assert_eq!(app.active.editor.primary_cursor(), 8);
+
+        let (document, mut opened) = LocalDocument::unnamed();
+        opened.text = "cat catalog cat\n".to_owned();
+        let mut words = App::from_opened(document, opened, None, None).expect("word app");
+        words.search_word_under_cursor(false, 1);
+        assert_eq!(words.active.editor.primary_cursor(), 12);
+        assert_eq!(
+            words.active.editor.last_search(),
+            Some((r"\<cat\>", SearchDirection::Forward))
+        );
+        assert!(words.search_highlight);
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminal_and_make_are_live_editor_workflows() {
@@ -12105,6 +13020,124 @@ while True:
                 .program,
             "fourmolu"
         );
+        let bundled = [
+            ("script.sh", "bash"),
+            ("source.c", "c"),
+            ("source.cpp", "cpp"),
+            ("source.cs", "csharp"),
+            ("style.css", "css"),
+            ("main.dart", "dart"),
+            ("demo.exs", "elixir"),
+            ("main.go", "go"),
+            ("Main.hs", "haskell"),
+            ("main.hcl", "hcl"),
+            ("main.tf", "hcl"),
+            ("index.html", "html"),
+            ("Main.java", "java"),
+            ("main.jsx", "javascript"),
+            ("main.json", "json"),
+            ("Main.kt", "kotlin"),
+            ("main.lua", "lua"),
+            ("README.md", "markdown"),
+            ("flake.nix", "nix"),
+            ("index.php", "php"),
+            ("main.py", "python"),
+            ("main.rb", "ruby"),
+            ("main.rs", "rust"),
+            ("Main.scala", "scala"),
+            ("main.sol", "solidity"),
+            ("main.swift", "swift"),
+            ("main.tsx", "tsx"),
+            ("main.ts", "typescript"),
+            ("main.yaml", "yaml"),
+        ];
+        for (path, expected) in bundled {
+            assert_eq!(
+                language_bundle(Some(Path::new(path))).language_id.as_ref(),
+                expected,
+                "wrong bundled grammar for {path}"
+            );
+        }
+
+        let c = language_server_invocation(Some(Path::new("main.c"))).expect("C LSP");
+        assert_eq!(
+            (c.program.as_str(), c.language_id.as_str()),
+            ("clangd", "c")
+        );
+        let rust = language_server_invocation(Some(Path::new("main.rs"))).expect("Rust LSP");
+        assert_eq!(rust.settings["rust-analyzer"]["check"]["command"], "clippy");
+        let typescript =
+            language_server_invocation(Some(Path::new("main.tsx"))).expect("TypeScript LSP");
+        assert_eq!(typescript.initialization_options["jsx"]["enabled"], true);
+        assert_eq!(
+            typescript.settings["typescript"]["suggestionActions"]["enabled"],
+            true
+        );
+        let haskell = language_server_invocation(Some(Path::new("Main.hs"))).expect("Haskell LSP");
+        assert_eq!(
+            haskell.settings["haskell"]["plugin"]["fourmolu"]["config"]["external"],
+            true
+        );
+        let nix = language_server_invocation(Some(Path::new("flake.nix"))).expect("Nix LSP");
+        assert_eq!(nix.program, "nixd");
+        assert!(nix.settings["nixd"]["nixpkgs"]["expr"].is_string());
+        assert_eq!(
+            nixd_nixpkgs_expression(None, "nixpkgs"),
+            "import <nixpkgs> { }"
+        );
+        let lsp_profiles = [
+            ("main.rs", "rust-analyzer", "rust"),
+            ("main.js", "pnpm", "javascript"),
+            ("main.jsx", "pnpm", "javascriptreact"),
+            ("main.ts", "pnpm", "typescript"),
+            ("main.tsx", "pnpm", "typescriptreact"),
+            ("main.py", "basedpyright-langserver", "python"),
+            ("main.go", "gopls", "go"),
+            ("main.tf", "terraform-ls", "terraform"),
+            ("flake.nix", "nixd", "nix"),
+            ("Main.hs", "haskell-language-server-wrapper", "haskell"),
+            ("main.lua", "lua-language-server", "lua"),
+            ("main.sh", "bash-language-server", "shellscript"),
+            ("main.c", "clangd", "c"),
+            ("main.cpp", "clangd", "cpp"),
+        ];
+        for (path, program, language_id) in lsp_profiles {
+            let invocation = language_server_invocation(Some(Path::new(path)))
+                .unwrap_or_else(|| panic!("missing LSP profile for {path}"));
+            assert_eq!(invocation.program, program, "wrong LSP program for {path}");
+            assert_eq!(
+                invocation.language_id, language_id,
+                "wrong LSP language ID for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn nix_file_has_tree_sitter_decorations_before_its_first_frame() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("flake.nix");
+        fs::write(
+            &path,
+            "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n",
+        )
+        .expect("Nix source");
+        let app = App::open(Some(&path), None).expect("open Nix file");
+        let decorations = app
+            .decorations
+            .get(&app.active.buffer_id)
+            .expect("first-frame syntax decorations");
+        assert_eq!(decorations.revision, app.active.editor.revision());
+        let text = app.active.editor.contents();
+        for needle in ["\"hello\"", "true", "# note"] {
+            let start = text.find(needle).expect("Nix token");
+            assert!(
+                decorations
+                    .spans
+                    .iter()
+                    .any(|span| span.range == (start..start + needle.len())),
+                "missing first-frame Nix decoration for {needle:?}"
+            );
+        }
     }
 
     #[test]

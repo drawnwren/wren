@@ -30,6 +30,7 @@ regex = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 anyhow = "1"
+base64 = "0.22"
 bitflags = { version = "2", features = ["serde"] }
 blake3 = "1"
 core_affinity = "0.8"
@@ -38,6 +39,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tempfile = "3"
 termina = "0.3.3"
+rustix = { version = "1", features = ["fs"] }
 toml = "0.8"
 unicode-segmentation = "1"
 unicode-width = "0.2"

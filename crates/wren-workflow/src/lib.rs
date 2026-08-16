@@ -847,12 +847,22 @@ impl LspClient {
         root_uri: &str,
         capabilities: serde_json::Value,
     ) -> Result<serde_json::Value, WorkflowError> {
+        self.initialize_with_options(root_uri, capabilities, serde_json::Value::Null)
+    }
+
+    pub fn initialize_with_options(
+        &mut self,
+        root_uri: &str,
+        capabilities: serde_json::Value,
+        initialization_options: serde_json::Value,
+    ) -> Result<serde_json::Value, WorkflowError> {
         let result = self.request(
             "initialize",
             serde_json::json!({
                 "processId": std::process::id(),
                 "rootUri": root_uri,
                 "capabilities": capabilities,
+                "initializationOptions": initialization_options,
             }),
         )?;
         self.notify("initialized", serde_json::json!({}))?;

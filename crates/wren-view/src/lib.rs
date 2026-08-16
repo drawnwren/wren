@@ -3084,9 +3084,12 @@ fn prepend_line_numbers(
 fn decoration_style(decorations: &[DecorationSpan], range: Range<usize>) -> CellStyle {
     decorations
         .iter()
-        .rev()
-        .find(|decoration| decoration.range.start < range.end && range.start < decoration.range.end)
-        .map_or_else(CellStyle::default, |decoration| decoration.style)
+        .filter(|decoration| {
+            decoration.range.start < range.end && range.start < decoration.range.end
+        })
+        .fold(CellStyle::default(), |style, decoration| {
+            merge_styles(style, decoration.style)
+        })
 }
 
 fn escape_grapheme(grapheme: &str) -> Vec<String> {

@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod editor;
+mod search;
 
 pub use editor::{
     DurableUndoState, Editor, EngineError, InsertStyle, Mode, RegisterValue, SearchDirection,
     UndoGroup, VisualSelection,
 };
+pub use search::{CaseOverride, VimPattern, VimReplacement, resolve_previous_replacement};
 
 /// Minimal deterministic hot-path engine used to validate latency plumbing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

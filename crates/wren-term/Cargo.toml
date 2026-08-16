@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64.workspace = true
+rustix.workspace = true
 termina.workspace = true
 thiserror.workspace = true
 wren-view = { version = "0.1.0", path = "../wren-view" }

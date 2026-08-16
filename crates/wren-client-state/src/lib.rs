@@ -59,6 +59,8 @@ pub struct DurableClientState {
     pub client_id: ClientId,
     pub registers: BTreeMap<char, DurableRegister>,
     pub search_history: Vec<Box<str>>,
+    #[serde(default)]
+    pub search_backward: bool,
     pub command_history: Vec<Box<str>>,
     pub global_marks: BTreeMap<char, DurableGlobalMark>,
     pub undo_branch_heads: BTreeMap<DocumentId, Option<SemanticGroupId>>,
@@ -78,6 +80,7 @@ impl DurableClientState {
             client_id,
             registers: BTreeMap::new(),
             search_history: Vec::new(),
+            search_backward: false,
             command_history: Vec::new(),
             global_marks: BTreeMap::new(),
             undo_branch_heads: BTreeMap::new(),
@@ -106,6 +109,7 @@ impl DurableClientState {
             StateDelta::SearchPattern(pattern) => {
                 push_history(&mut self.search_history, pattern.clone());
             }
+            StateDelta::SearchDirection { backward } => self.search_backward = *backward,
             StateDelta::CommandHistory(command) => {
                 push_history(&mut self.command_history, command.clone());
             }
@@ -454,6 +458,7 @@ mod tests {
                 linewise: true,
             },
             StateDelta::SearchPattern("needle".into()),
+            StateDelta::SearchDirection { backward: true },
             StateDelta::CommandHistory("write".into()),
             StateDelta::GlobalMark {
                 name: 'A',
@@ -527,6 +532,7 @@ mod tests {
             .expect("load legacy durable state")
             .expect("durable state");
         assert_eq!(loaded.search_history, vec![Box::<str>::from("needle")]);
+        assert!(!loaded.search_backward);
         assert!(loaded.macro_recordings.is_empty());
         assert!(loaded.jump_list.is_empty());
         assert_eq!(loaded.jump_index, None);

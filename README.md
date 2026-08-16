@@ -36,7 +36,7 @@ named buffer.
 
 ## Editor workflows
 
-- Unicode-aware motions, counts, operators, text objects, visual selections,
+- Unicode-aware motions, counts, operators, text objects, keyboard and mouse visual selections,
   registers, marks, raw-key macros, dot-repeat, and branching undo/redo
 - Search, Ex v1 ranges, substitute/global/normal, buffers, splits, tabs,
   native grep/quickfix/cdo, and ranged writes
@@ -44,7 +44,10 @@ named buffer.
   oldfiles, jumplist, and diagnostic pickers, including picker resume
 - Revision-validated word/LSP/snippet completion with `Ctrl-Space`,
   `Ctrl-N`/`Ctrl-P`, explicit `Enter` acceptance, and `Ctrl-E` cancellation
-- Tree-sitter syntax decorations, Catppuccin semantic groups, rendered Markdown,
+- Bundled Tree-sitter syntax for Bash, C/C++, C#, CSS, Dart, Elixir, Go,
+  Haskell, HCL/Terraform, HTML, Java, JavaScript/TypeScript/TSX, JSON, Kotlin,
+  Lua, Markdown, Nix, PHP, Python, Ruby, Rust, Scala, Solidity, Swift, and YAML;
+  Catppuccin semantic groups; rendered Markdown,
   diagnostics, Git hunk signs, and breakpoint/conditional-breakpoint marks
 - Lazy cross-platform GPU compute for parallel provider classification when
   suitable, with transparent CPU fallback when an adapter or workload is unsupported
@@ -58,7 +61,8 @@ named buffer.
 - Debug breakpoints/UI controls and debugger REPL workflows; Hoogle, Haskell
   package/file REPL, and selection evaluation; `:Codex`/Avante command aliases
 - `:terminal`, cancellable `:make`, and revision-safe `:format`
-- Local clipboard routing for register `+` through bounded OSC 52
+- `unnamedplus` clipboard routing with bounded OSC 52 copy and paste for both
+  `+` and `*`, plus platform-command fallback when a terminal declines queries
 - UTF-8/invalid-byte policy, mixed-EOL preservation, symlink-aware atomic saves,
   metadata preservation, external-change fencing, and hard-link warnings
 - Checksummed recovery WAL and durable registers/history/marks/repeat state,

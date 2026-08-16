@@ -232,7 +232,7 @@ pub struct JumpListDelta {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct StateDelta {
-    #[prost(oneof = "state_delta::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "state_delta::Value", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub value: Option<state_delta::Value>,
 }
 
@@ -257,6 +257,8 @@ pub mod state_delta {
         MacroRecording(MacroRecordingDelta),
         #[prost(message, tag = "8")]
         JumpList(JumpListDelta),
+        #[prost(bool, tag = "9")]
+        SearchBackward(bool),
     }
 }
 
@@ -785,6 +787,9 @@ impl From<&semantic::StateDelta> for StateDelta {
             semantic::StateDelta::SearchPattern(pattern) => {
                 state_delta::Value::SearchPattern(pattern.to_string())
             }
+            semantic::StateDelta::SearchDirection { backward } => {
+                state_delta::Value::SearchBackward(*backward)
+            }
             semantic::StateDelta::CommandHistory(command) => {
                 state_delta::Value::CommandHistory(command.to_string())
             }
@@ -847,6 +852,7 @@ impl TryFrom<StateDelta> for semantic::StateDelta {
             state_delta::Value::SearchPattern(pattern) => {
                 Ok(Self::SearchPattern(pattern.into_boxed_str()))
             }
+            state_delta::Value::SearchBackward(backward) => Ok(Self::SearchDirection { backward }),
             state_delta::Value::CommandHistory(command) => {
                 Ok(Self::CommandHistory(command.into_boxed_str()))
             }
@@ -1457,6 +1463,7 @@ mod tests {
                     text: "copied".into(),
                     linewise: false,
                 },
+                semantic::StateDelta::SearchDirection { backward: true },
                 semantic::StateDelta::MacroRecording {
                     name: 'q',
                     raw_keys: vec![1, 2],

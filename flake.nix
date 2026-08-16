@@ -27,6 +27,38 @@
           fuzzRust = pkgs.rust-bin.nightly."2026-08-14".minimal;
           fuzzCraneLib = (crane.mkLib pkgs).overrideToolchain fuzzRust;
           oracle = pkgs.neovim;
+          # Wren's language profiles are expected to work from the installed
+          # package, not only from a project dev shell. Keep every configured
+          # server and its external formatter on the wrapper PATH. Project-local
+          # tools still win because wrapProgram appends this fallback PATH after
+          # the caller's existing PATH.
+          languageRuntimeInputs = [
+            pkgs.astyle
+            pkgs.basedpyright
+            pkgs.bash-language-server
+            pkgs.cargo
+            pkgs.clang-tools
+            pkgs.clippy
+            pkgs.fourmolu
+            pkgs.gopls
+            pkgs.haskell-language-server
+            pkgs.lua-language-server
+            pkgs.nixd
+            pkgs.nixfmt
+            pkgs.pnpm
+            pkgs.python3
+            pkgs.ruff
+            pkgs.rust-analyzer
+            pkgs.rustfmt
+            pkgs.terraform-ls
+            pkgs.typescript-language-server
+          ];
+          runtimeInputs = [
+            pkgs.openssh
+            pkgs.git
+            pkgs.ripgrep
+            pkgs.bashInteractive
+          ] ++ languageRuntimeInputs;
           developmentInputs = [
             pkgs.cargo-deny
             pkgs.cargo-fuzz
@@ -60,7 +92,7 @@
             ];
             postFixup = ''
               wrapProgram "$out/bin/wren" \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.openssh pkgs.git pkgs.ripgrep pkgs.bashInteractive ]}
+                --suffix PATH : ${pkgs.lib.makeBinPath runtimeInputs}
             '';
           });
           mkCargoCheck = name: command: craneLib.mkCargoDerivation (commonArgs // {
@@ -145,6 +177,8 @@
             package
             mkCargoCheck
             fuzzCheck
+            languageRuntimeInputs
+            runtimeInputs
             developmentInputs
             commonArgs
             cargoArtifacts

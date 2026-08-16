@@ -22,7 +22,7 @@ pub struct ExRange {
 pub struct SubstituteFlags {
     pub global: bool,
     pub confirm: bool,
-    pub ignore_case: bool,
+    pub case_sensitive: Option<bool>,
     pub print: bool,
 }
 
@@ -56,6 +56,11 @@ pub enum ExCommand {
         pattern: Box<str>,
         replacement: Box<str>,
         flags: SubstituteFlags,
+    },
+    SubstituteRepeat {
+        range: Option<ExRange>,
+        use_search_pattern: bool,
+        flags: Option<SubstituteFlags>,
     },
     Global {
         range: Option<ExRange>,
@@ -178,6 +183,12 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
                 address: range.end.unwrap_or(range.start),
             })
             .ok_or(ExError::Empty);
+    }
+    if let Some(argument) = rest.strip_prefix('&') {
+        return parse_substitute_repeat(range, false, argument);
+    }
+    if let Some(argument) = rest.strip_prefix('~') {
+        return parse_substitute_repeat(range, true, argument);
     }
     let name_end = rest
         .char_indices()
@@ -421,6 +432,13 @@ fn parse_address(input: &str, offset: usize) -> Result<Option<(ExAddress, usize)
 }
 
 fn parse_substitute(range: Option<ExRange>, argument: &str) -> Result<ExCommand, ExError> {
+    if argument.is_empty() {
+        return Ok(ExCommand::SubstituteRepeat {
+            range,
+            use_search_pattern: false,
+            flags: None,
+        });
+    }
     let delimiter = argument
         .chars()
         .next()
@@ -431,23 +449,44 @@ fn parse_substitute(range: Option<ExRange>, argument: &str) -> Result<ExCommand,
     let replacement_input = &argument[pattern_bytes..];
     let (replacement, replacement_bytes) = delimited_tail(replacement_input, delimiter)?;
     let flags_input = replacement_input[replacement_bytes..].trim();
-    let mut flags = SubstituteFlags::default();
-    for flag in flags_input.chars() {
-        match flag {
-            'g' => flags.global = true,
-            'c' => flags.confirm = true,
-            'i' | 'I' => flags.ignore_case = flag == 'i',
-            'p' => flags.print = true,
-            character if character.is_whitespace() => {}
-            flag => return Err(ExError::InvalidSubstituteFlag { flag }),
-        }
-    }
+    let flags = parse_substitute_flags(flags_input)?;
     Ok(ExCommand::Substitute {
         range,
         pattern: pattern.into(),
         replacement: replacement.into(),
         flags,
     })
+}
+
+fn parse_substitute_repeat(
+    range: Option<ExRange>,
+    use_search_pattern: bool,
+    argument: &str,
+) -> Result<ExCommand, ExError> {
+    let argument = argument.trim();
+    Ok(ExCommand::SubstituteRepeat {
+        range,
+        use_search_pattern,
+        flags: (!argument.is_empty())
+            .then(|| parse_substitute_flags(argument))
+            .transpose()?,
+    })
+}
+
+fn parse_substitute_flags(input: &str) -> Result<SubstituteFlags, ExError> {
+    let mut flags = SubstituteFlags::default();
+    for flag in input.chars() {
+        match flag {
+            'g' => flags.global = true,
+            'c' => flags.confirm = true,
+            'i' => flags.case_sensitive = Some(false),
+            'I' => flags.case_sensitive = Some(true),
+            'p' => flags.print = true,
+            character if character.is_whitespace() => {}
+            flag => return Err(ExError::InvalidSubstituteFlag { flag }),
+        }
+    }
+    Ok(flags)
 }
 
 fn parse_global(
@@ -517,7 +556,7 @@ fn delimited_tail(input: &str, delimiter: char) -> Result<(String, usize), ExErr
     let mut escaped = false;
     for (index, character) in input.char_indices() {
         if escaped {
-            if character != delimiter && character != '\\' {
+            if character != delimiter {
                 value.push('\\');
             }
             value.push(character);
@@ -599,11 +638,53 @@ mod tests {
                 flags: SubstituteFlags {
                     global: true,
                     confirm: false,
-                    ignore_case: true,
+                    case_sensitive: Some(false),
                     print: true,
                 },
             }
         );
+        assert_eq!(
+            parse_ex("s").expect("repeat substitute"),
+            ExCommand::SubstituteRepeat {
+                range: None,
+                use_search_pattern: false,
+                flags: None,
+            }
+        );
+        assert_eq!(
+            parse_ex("%&gI").expect("ampersand repeat"),
+            ExCommand::SubstituteRepeat {
+                range: Some(ExRange {
+                    start: ExAddress::Line(1),
+                    end: Some(ExAddress::Last),
+                    semicolon: false,
+                }),
+                use_search_pattern: false,
+                flags: Some(SubstituteFlags {
+                    global: true,
+                    confirm: false,
+                    case_sensitive: Some(true),
+                    print: false,
+                }),
+            }
+        );
+        assert!(matches!(
+            parse_ex("~"),
+            Ok(ExCommand::SubstituteRepeat {
+                use_search_pattern: true,
+                ..
+            })
+        ));
+        let ExCommand::Substitute {
+            pattern,
+            replacement,
+            ..
+        } = parse_ex(r"s/\\/\\/").expect("literal backslashes")
+        else {
+            panic!("expected substitute");
+        };
+        assert_eq!(pattern.as_ref(), r"\\");
+        assert_eq!(replacement.as_ref(), r"\\");
     }
 
     #[test]

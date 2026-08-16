@@ -1,7 +1,7 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wren_grammar::{
@@ -13,7 +13,7 @@ use wren_types::{
     Anchor, Bias, DocumentRevision, Edit, SelRange, SelectionSet, Transaction, TransactionError,
 };
 
-use crate::EngineFrame;
+use crate::{CaseOverride, EngineFrame, VimPattern};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -86,10 +86,174 @@ impl UndoGroup {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct SearchState {
     pattern: Box<str>,
     direction: SearchDirection,
+    compiled: VimPattern,
+    cache: RefCell<SearchMatchCache>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchMatchCache {
+    revision: Option<DocumentRevision>,
+    all: Option<Vec<Range<usize>>>,
+    windows: BTreeMap<(usize, usize), Vec<Range<usize>>>,
+    #[cfg(test)]
+    window_scans: usize,
+    #[cfg(test)]
+    full_scans: usize,
+}
+
+impl SearchState {
+    fn find_from(
+        &self,
+        text: &str,
+        revision: DocumentRevision,
+        direction: SearchDirection,
+        cursor: usize,
+    ) -> Option<usize> {
+        let cursor = cursor.min(text.len());
+        let after = next_char_boundary(text, cursor);
+        let mut cache = self.cache.borrow_mut();
+        cache.prepare_revision(revision);
+        if direction == SearchDirection::Backward && cache.all.is_none() {
+            cache.all = Some(
+                self.compiled
+                    .find_iter(text)
+                    .map(|found| found.range())
+                    .collect(),
+            );
+            #[cfg(test)]
+            {
+                cache.full_scans += 1;
+            }
+        }
+        if let Some(ranges) = &cache.all {
+            return match direction {
+                SearchDirection::Forward => {
+                    let index = ranges.partition_point(|range| range.start < after);
+                    ranges
+                        .get(index)
+                        .or_else(|| ranges.first())
+                        .map(|range| range.start)
+                }
+                SearchDirection::Backward => {
+                    let index = ranges.partition_point(|range| range.start < cursor);
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| ranges.get(index))
+                        .or_else(|| ranges.last())
+                        .map(|range| range.start)
+                }
+            };
+        }
+        drop(cache);
+        find_search_from(&self.compiled, text, direction, cursor)
+    }
+
+    fn match_ranges(
+        &self,
+        text: &str,
+        revision: DocumentRevision,
+        byte_range: Range<usize>,
+        limit: usize,
+    ) -> Vec<Range<usize>> {
+        let key = (byte_range.start, byte_range.end);
+        let mut cache = self.cache.borrow_mut();
+        cache.prepare_revision(revision);
+        if let Some(all) = &cache.all {
+            let start = all.partition_point(|range| range.start < byte_range.start);
+            return all[start..]
+                .iter()
+                .take_while(|range| range.start < byte_range.end)
+                .filter(|range| !range.is_empty() && range.end <= byte_range.end)
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        if let Some(ranges) = cache.windows.get(&key) {
+            return ranges.iter().take(limit).cloned().collect();
+        }
+        let mut ranges = Vec::new();
+        let mut cursor = byte_range.start;
+        while cursor <= byte_range.end && ranges.len() < limit {
+            let Some(found) = self.compiled.find_at(text, cursor) else {
+                break;
+            };
+            if found.start() >= byte_range.end || found.end() > byte_range.end {
+                break;
+            }
+            if !found.is_empty() {
+                ranges.push(found.range());
+            }
+            cursor = if found.is_empty() {
+                next_char_boundary(text, found.start())
+            } else {
+                found.end()
+            };
+            if cursor == text.len() && found.is_empty() {
+                break;
+            }
+        }
+        const MAX_CACHED_WINDOWS: usize = 32;
+        if cache.windows.len() >= MAX_CACHED_WINDOWS
+            && let Some(oldest) = cache.windows.keys().next().copied()
+        {
+            cache.windows.remove(&oldest);
+        }
+        #[cfg(test)]
+        {
+            cache.window_scans += 1;
+        }
+        cache.windows.insert(key, ranges.clone());
+        ranges
+    }
+}
+
+impl SearchMatchCache {
+    fn prepare_revision(&mut self, revision: DocumentRevision) {
+        if self.revision != Some(revision) {
+            self.revision = Some(revision);
+            self.all = None;
+            self.windows.clear();
+        }
+    }
+}
+
+fn find_search_from(
+    pattern: &VimPattern,
+    text: &str,
+    direction: SearchDirection,
+    cursor: usize,
+) -> Option<usize> {
+    let cursor = cursor.min(text.len());
+    match direction {
+        SearchDirection::Forward => {
+            let after = next_char_boundary(text, cursor);
+            pattern
+                .find_at(text, after)
+                .map(|found| found.start())
+                .or_else(|| {
+                    pattern
+                        .find_at(text, 0)
+                        .filter(|found| found.start() < after)
+                        .map(|found| found.start())
+                })
+        }
+        SearchDirection::Backward => {
+            let mut before = None;
+            let mut wrapped = None;
+            for found in pattern.find_iter(text) {
+                if found.start() < cursor {
+                    before = Some(found.start());
+                } else {
+                    wrapped = Some(found.start());
+                }
+            }
+            before.or(wrapped)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +312,7 @@ pub struct Editor<T: TextStore> {
     insert_style: InsertStyle,
     insert_capture: String,
     registers: BTreeMap<char, RegisterValue>,
+    pending_clipboard_writes: Vec<(char, Box<str>)>,
     marks: BTreeMap<char, Anchor>,
     macros: BTreeMap<char, Vec<KeyEvent>>,
     recording_macro: Option<char>,
@@ -199,6 +364,7 @@ impl<T: TextStore> Editor<T> {
             insert_style: InsertStyle::Insert,
             insert_capture: String::new(),
             registers: BTreeMap::new(),
+            pending_clipboard_writes: Vec::new(),
             marks: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -231,9 +397,20 @@ impl<T: TextStore> Editor<T> {
         }
     }
 
-    pub const fn set_search_options(&mut self, ignore_case: bool, smart_case: bool) {
+    pub fn set_search_options(&mut self, ignore_case: bool, smart_case: bool) {
         self.ignore_case = ignore_case;
         self.smart_case = smart_case;
+        if let Some(search) = &mut self.search
+            && let Ok(compiled) = VimPattern::compile(
+                &search.pattern,
+                ignore_case,
+                smart_case,
+                CaseOverride::Default,
+            )
+        {
+            search.compiled = compiled;
+            search.cache = RefCell::default();
+        }
     }
 
     pub const fn set_clipboard_unnamed(&mut self, enabled: bool) {
@@ -275,6 +452,19 @@ impl<T: TextStore> Editor<T> {
     #[must_use]
     pub fn pending_parse_state(&self) -> Option<&ParseState> {
         self.parse_state.as_ref()
+    }
+
+    #[must_use]
+    pub fn pending_register_name(&self) -> Option<char> {
+        self.pending_keys.windows(2).find_map(|keys| {
+            (keys[0].modifiers.is_empty() && keys[0].code == KeyCode::Char('"'))
+                .then_some(keys[1])
+                .filter(|key| key.modifiers.is_empty())
+                .and_then(|key| match key.code {
+                    KeyCode::Char(name) => Some(name),
+                    _ => None,
+                })
+        })
     }
 
     #[must_use]
@@ -412,7 +602,17 @@ impl<T: TextStore> Editor<T> {
             linewise,
         };
         self.registers.insert(name, value.clone());
-        self.registers.insert('"', value);
+        self.registers.insert('"', value.clone());
+        if self.clipboard_unnamed {
+            self.registers.insert('+', value);
+        }
+    }
+
+    /// Returns clipboard register writes produced by editor commands since the
+    /// previous drain. Restoring a register from the terminal clipboard does
+    /// not create an echoing write.
+    pub fn take_clipboard_writes(&mut self) -> Vec<(char, Box<str>)> {
+        std::mem::take(&mut self.pending_clipboard_writes)
     }
 
     /// Restores one durable register without applying interactive unnamed-
@@ -454,19 +654,31 @@ impl<T: TextStore> Editor<T> {
         Ok(())
     }
 
-    pub fn restore_search_pattern(&mut self, pattern: impl Into<Box<str>>) {
+    pub fn restore_search_pattern(
+        &mut self,
+        pattern: impl Into<Box<str>>,
+    ) -> Result<(), EngineError> {
         let direction = self
             .search
             .as_ref()
             .map_or(SearchDirection::Forward, |search| search.direction);
-        self.restore_search(pattern, direction);
+        self.restore_search(pattern, direction)
     }
 
-    pub fn restore_search(&mut self, pattern: impl Into<Box<str>>, direction: SearchDirection) {
+    pub fn restore_search(
+        &mut self,
+        pattern: impl Into<Box<str>>,
+        direction: SearchDirection,
+    ) -> Result<(), EngineError> {
+        let pattern = pattern.into();
+        let compiled = self.compile_search_pattern(&pattern, CaseOverride::Default)?;
         self.search = Some(SearchState {
-            pattern: pattern.into(),
+            pattern,
             direction,
+            compiled,
+            cache: RefCell::default(),
         });
+        Ok(())
     }
 
     pub fn clear_search(&mut self) {
@@ -665,6 +877,22 @@ impl<T: TextStore> Editor<T> {
         if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
             primary.anchor = start;
             primary.head = end;
+        }
+    }
+
+    /// Enters characterwise Visual mode with an explicit anchor and head.
+    /// Pointer selection uses the same selection state as keyboard Visual mode,
+    /// so every operator and register observes one canonical range.
+    pub fn set_visual_selection(&mut self, anchor: usize, head: usize) {
+        self.cancel_pending();
+        self.visual_region_history.clear();
+        self.mode = Mode::Visual;
+        let text = self.contents();
+        let anchor = floor_char_boundary(&text, anchor.min(text.len()));
+        let head = floor_char_boundary(&text, head.min(text.len()));
+        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
+            primary.anchor = anchor;
+            primary.head = head;
         }
     }
 
@@ -1097,12 +1325,14 @@ impl<T: TextStore> Editor<T> {
         if pattern.is_empty() {
             return Ok(false);
         }
-        let regex = self.search_regex(pattern)?;
+        let compiled = self.compile_search_pattern(pattern, CaseOverride::Default)?;
         self.search = Some(SearchState {
             pattern: Box::from(pattern),
             direction,
+            compiled,
+            cache: RefCell::default(),
         });
-        Ok(self.move_to_search_match(&regex, direction))
+        Ok(self.move_to_search_match(direction))
     }
 
     pub fn preview_search(
@@ -1114,8 +1344,13 @@ impl<T: TextStore> Editor<T> {
         if pattern.is_empty() {
             return Ok(None);
         }
-        let regex = self.search_regex(pattern)?;
-        Ok(self.find_search_from(&regex, direction, cursor))
+        let compiled = self.compile_search_pattern(pattern, CaseOverride::Default)?;
+        Ok(find_search_from(
+            &compiled,
+            &self.contents(),
+            direction,
+            cursor,
+        ))
     }
 
     #[must_use]
@@ -1126,34 +1361,10 @@ impl<T: TextStore> Editor<T> {
         if search.pattern.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let Ok(regex) = self.search_regex(search.pattern.as_ref()) else {
-            return Vec::new();
-        };
         let text = self.contents();
         let start = floor_char_boundary(&text, byte_range.start.min(text.len()));
         let end = floor_char_boundary(&text, byte_range.end.min(text.len())).max(start);
-        let mut matches = Vec::new();
-        let mut cursor = start;
-        while cursor <= end && matches.len() < limit {
-            let Some(found) = regex.find_at(&text, cursor) else {
-                break;
-            };
-            if found.start() >= end || found.end() > end {
-                break;
-            }
-            if !found.is_empty() {
-                matches.push(found.range());
-            }
-            cursor = if found.is_empty() {
-                next_char_boundary(&text, found.start())
-            } else {
-                found.end()
-            };
-            if cursor == text.len() && found.is_empty() {
-                break;
-            }
-        }
-        matches
+        search.match_ranges(&text, self.revision, start..end, limit)
     }
 
     pub fn search_next(&mut self, reverse: bool) -> bool {
@@ -1168,14 +1379,19 @@ impl<T: TextStore> Editor<T> {
         } else {
             search.direction
         };
-        let Ok(regex) = self.search_regex(search.pattern.as_ref()) else {
-            return false;
-        };
-        self.move_to_search_match(&regex, direction)
+        self.move_to_search_match(direction)
     }
 
-    fn move_to_search_match(&mut self, regex: &Regex, direction: SearchDirection) -> bool {
-        if let Some(byte) = self.find_search_from(regex, direction, self.primary_cursor()) {
+    fn move_to_search_match(&mut self, direction: SearchDirection) -> bool {
+        let byte = self.search.as_ref().and_then(|search| {
+            search.find_from(
+                &self.contents(),
+                self.revision,
+                direction,
+                self.primary_cursor(),
+            )
+        });
+        if let Some(byte) = byte {
             let previous = self.primary_cursor();
             if byte != previous {
                 self.push_jump(previous);
@@ -1187,50 +1403,21 @@ impl<T: TextStore> Editor<T> {
         }
     }
 
-    fn find_search_from(
+    pub fn compile_search_pattern(
         &self,
-        regex: &Regex,
-        direction: SearchDirection,
-        cursor: usize,
-    ) -> Option<usize> {
-        let text = self.contents();
-        let cursor = cursor.min(text.len());
-        match direction {
-            SearchDirection::Forward => {
-                let after = next_char_boundary(&text, cursor);
-                regex
-                    .find_at(&text, after)
-                    .map(|found| found.start())
-                    .or_else(|| {
-                        regex
-                            .find(&text)
-                            .filter(|found| found.start() < after)
-                            .map(|found| found.start())
-                    })
-            }
-            SearchDirection::Backward => {
-                let mut before = None;
-                let mut wrapped = None;
-                for found in regex.find_iter(&text) {
-                    if found.start() < cursor {
-                        before = Some(found.start());
-                    } else {
-                        wrapped = Some(found.start());
-                    }
-                }
-                before.or(wrapped)
-            }
-        }
+        pattern: &str,
+        case_override: CaseOverride,
+    ) -> Result<VimPattern, EngineError> {
+        VimPattern::compile(pattern, self.ignore_case, self.smart_case, case_override)
+            .map_err(EngineError::InvalidSearchPattern)
     }
 
-    fn search_regex(&self, pattern: &str) -> Result<Regex, EngineError> {
-        RegexBuilder::new(pattern)
-            .multi_line(true)
-            .case_insensitive(
-                self.ignore_case && (!self.smart_case || !pattern.chars().any(char::is_uppercase)),
-            )
-            .build()
-            .map_err(|error| EngineError::InvalidSearchPattern(error.to_string().into()))
+    #[cfg(test)]
+    fn search_scan_counts(&self) -> (usize, usize) {
+        self.search.as_ref().map_or((0, 0), |search| {
+            let cache = search.cache.borrow();
+            (cache.window_scans, cache.full_scans)
+        })
     }
 
     pub fn replace_literal(
@@ -2256,8 +2443,10 @@ impl<T: TextStore> Editor<T> {
             linewise,
         };
         self.registers.insert('"', value.clone());
-        if self.clipboard_unnamed && (register.is_none() || register == Some(Register::Unnamed)) {
+        if self.clipboard_unnamed {
             self.registers.insert('+', value.clone());
+            self.pending_clipboard_writes
+                .push(('+', value.text.clone()));
         }
         if let Some(name) = register_key(register) {
             if name.is_ascii_uppercase() {
@@ -2271,7 +2460,15 @@ impl<T: TextStore> Editor<T> {
                     })
                     .or_insert(value);
             } else {
-                self.registers.insert(name, value);
+                self.registers.insert(name, value.clone());
+                if matches!(name, '+' | '*')
+                    && !self
+                        .pending_clipboard_writes
+                        .iter()
+                        .any(|(pending, _)| *pending == name)
+                {
+                    self.pending_clipboard_writes.push((name, value.text));
+                }
             }
         }
     }
@@ -2315,7 +2512,13 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn read_register(&self, register: Option<Register>) -> Option<&RegisterValue> {
-        let key = register_key(register).unwrap_or('"').to_ascii_lowercase();
+        let key = if self.clipboard_unnamed
+            && (register.is_none() || register == Some(Register::Unnamed))
+        {
+            '+'
+        } else {
+            register_key(register).unwrap_or('"').to_ascii_lowercase()
+        };
         self.registers.get(&key)
     }
 
@@ -3057,6 +3260,61 @@ mod tests {
             editor.register('+').map(|value| value.text.as_ref()),
             Some("Alpha ")
         );
+
+        editor.restore_register('+', "system", false);
+        editor.set_cursor(0);
+        feed(&mut editor, "p");
+        assert_eq!(editor.contents(), "Asystemlpha alpha BETA\n");
+
+        editor.set_cursor(0);
+        feed(&mut editor, "\"ayw");
+        assert_eq!(
+            editor.register('+').map(|value| value.text.as_ref()),
+            Some("Asystemlpha "),
+            "a named yank still updates the unnamedplus register"
+        );
+    }
+
+    #[test]
+    fn pointer_selection_uses_characterwise_visual_semantics() {
+        let mut editor = editor("zero 界 tail\n");
+        editor.set_visual_selection(5, 5 + '界'.len_utf8());
+        assert_eq!(editor.mode(), Mode::Visual);
+        assert_eq!(
+            &editor.contents()[editor.selection_byte_range()],
+            "界 ",
+            "Visual mode includes the character under the selection head"
+        );
+        feed(&mut editor, "y");
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(
+            editor.register('"').map(|value| value.text.as_ref()),
+            Some("界 ")
+        );
+    }
+
+    #[test]
+    fn unnamedplus_and_star_emit_distinct_terminal_clipboard_writes() {
+        let mut editor = editor("alpha beta\n");
+        editor.set_clipboard_unnamed(true);
+        feed(&mut editor, "\"*yw");
+        assert_eq!(
+            editor.take_clipboard_writes(),
+            vec![
+                ('+', Box::<str>::from("alpha ")),
+                ('*', Box::<str>::from("alpha "))
+            ]
+        );
+        assert!(editor.take_clipboard_writes().is_empty());
+
+        editor.restore_register('+', "clipboard", false);
+        editor.set_cursor(0);
+        feed(&mut editor, "p");
+        assert_eq!(editor.contents(), "aclipboardlpha beta\n");
+        assert!(
+            editor.take_clipboard_writes().is_empty(),
+            "pasting a terminal register must not echo it back through OSC 52"
+        );
     }
 
     #[test]
@@ -3073,6 +3331,51 @@ mod tests {
             editor.search("[", SearchDirection::Forward),
             Err(EngineError::InvalidSearchPattern(_))
         ));
+    }
+
+    #[test]
+    fn visible_search_matches_are_cached_until_the_document_revision_changes() {
+        let mut editor = editor("one two one\n");
+        editor
+            .search("one", SearchDirection::Forward)
+            .expect("search");
+        let end = editor.text().len_bytes();
+        assert_eq!(editor.search_match_ranges(0..end, 16).len(), 2);
+        assert_eq!(editor.search_match_ranges(0..end, 16).len(), 2);
+        assert_eq!(editor.search_scan_counts().0, 1);
+
+        editor
+            .apply_transaction(
+                Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")])
+                    .expect("transaction"),
+            )
+            .expect("edit");
+        let new_end = editor.text().len_bytes();
+        assert_eq!(editor.search_match_ranges(0..new_end, 16).len(), 3);
+        assert_eq!(editor.search_scan_counts().0, 2);
+    }
+
+    #[test]
+    fn backward_search_reuses_its_revision_indexed_match_offsets() {
+        let mut editor = editor("one two one three one\n");
+        editor.set_cursor(editor.text().len_bytes());
+        editor
+            .search("one", SearchDirection::Backward)
+            .expect("backward search");
+        assert_eq!(editor.search_scan_counts().1, 1);
+        assert!(editor.search_next(false));
+        assert!(editor.search_next(false));
+        assert_eq!(editor.search_scan_counts().1, 1);
+
+        let end = editor.text().len_bytes();
+        editor
+            .apply_transaction(
+                Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")])
+                    .expect("transaction"),
+            )
+            .expect("edit");
+        assert!(editor.search_next(false));
+        assert_eq!(editor.search_scan_counts().1, 2);
     }
 
     #[test]

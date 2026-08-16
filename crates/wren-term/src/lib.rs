@@ -1,8 +1,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::time::Duration;
 
+use base64::Engine as _;
 use termina::escape::csi::{
     Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Edit, EraseInDisplay, EraseInLine, Keyboard,
     KittyKeyboardFlags, Mode, Sgr, SgrAttributes, SgrModifiers,
@@ -12,7 +14,7 @@ use termina::event::{
     KeyCode as TermKeyCode, KeyEventKind, Modifiers as TermModifiers, MouseButton, MouseEventKind,
 };
 use termina::style::{ColorSpec, RgbColor};
-use termina::{Event, OneBased, PlatformTerminal, Terminal};
+use termina::{Event, OneBased, Parser, PlatformTerminal, Terminal};
 use thiserror::Error;
 use wren_view::{CellColor, CellStyle, TerminalPatch};
 
@@ -68,7 +70,21 @@ pub enum TerminalInput {
         column: usize,
         row: usize,
     },
+    MouseDrag {
+        column: usize,
+        row: usize,
+    },
+    MouseRelease {
+        column: usize,
+        row: usize,
+    },
     Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardSelection {
+    Clipboard,
+    Primary,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +104,8 @@ pub enum TerminalError {
 pub struct SystemTerminalBackend {
     terminal: PlatformTerminal,
     true_color: bool,
+    deferred_parser: Parser,
+    deferred_input: VecDeque<TerminalInput>,
 }
 
 impl SystemTerminalBackend {
@@ -109,6 +127,8 @@ impl SystemTerminalBackend {
         Ok(Self {
             terminal,
             true_color: supports_true_color(),
+            deferred_parser: Parser::default(),
+            deferred_input: VecDeque::new(),
         })
     }
 
@@ -123,6 +143,9 @@ impl SystemTerminalBackend {
         &mut self,
         timeout: Option<Duration>,
     ) -> Result<Option<TerminalInput>, TerminalError> {
+        if let Some(input) = self.deferred_input.pop_front() {
+            return Ok(Some(input));
+        }
         let available = self
             .terminal
             .poll(|_| true, timeout)
@@ -136,6 +159,138 @@ impl SystemTerminalBackend {
             .map(Some)
             .map_err(|error| TerminalError::Input(error.to_string()))
     }
+
+    /// Reads a clipboard selection from the client terminal using OSC 52.
+    /// This deliberately operates on `/dev/tty`: stdout may be forwarded over
+    /// SSH, while the terminal device remains the client-services boundary.
+    /// Bytes typed during the bounded query are parsed and replayed afterward.
+    #[cfg(unix)]
+    pub fn paste_osc52(
+        &mut self,
+        selection: ClipboardSelection,
+        timeout: Duration,
+    ) -> Result<Option<String>, TerminalError> {
+        use std::fs::OpenOptions;
+        use std::io::{ErrorKind, Read};
+        use std::thread;
+        use std::time::Instant;
+
+        const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024 / 3 + 64;
+        let mut tty = match OpenOptions::new().read(true).open("/dev/tty") {
+            Ok(tty) => tty,
+            Err(_) => return Ok(None),
+        };
+        let flags = rustix::fs::fcntl_getfl(&tty)
+            .map_err(|error| TerminalError::Input(error.to_string()))?;
+        rustix::fs::fcntl_setfl(&tty, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(|error| TerminalError::Input(error.to_string()))?;
+        let terminal_selection = match selection {
+            ClipboardSelection::Clipboard => Selection::CLIPBOARD,
+            ClipboardSelection::Primary => Selection::PRIMARY,
+        };
+        write!(self.terminal, "{}", Osc::QuerySelection(terminal_selection))?;
+        self.terminal.flush()?;
+
+        let started = Instant::now();
+        let mut response = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 4096];
+        while started.elapsed() < timeout {
+            match tty.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&chunk[..read]);
+                    if response.len() > MAX_RESPONSE_BYTES {
+                        return Err(TerminalError::Input(
+                            "OSC 52 clipboard response exceeds 1 MiB".to_owned(),
+                        ));
+                    }
+                    if let Some((text, range)) = decode_osc52_response(&response, selection)? {
+                        self.defer_terminal_bytes(&response[..range.start]);
+                        self.defer_terminal_bytes(&response[range.end..]);
+                        return Ok(Some(text));
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(TerminalError::Io(error)),
+            }
+        }
+        self.defer_terminal_bytes(&response);
+        Ok(None)
+    }
+
+    #[cfg(not(unix))]
+    pub fn paste_osc52(
+        &mut self,
+        _selection: ClipboardSelection,
+        _timeout: Duration,
+    ) -> Result<Option<String>, TerminalError> {
+        Ok(None)
+    }
+
+    fn defer_terminal_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.deferred_parser.parse(bytes, false);
+        while let Some(event) = self.deferred_parser.pop() {
+            let input = map_input(event);
+            if input != TerminalInput::Ignored {
+                self.deferred_input.push_back(input);
+            }
+        }
+    }
+}
+
+fn decode_osc52_response(
+    bytes: &[u8],
+    wanted: ClipboardSelection,
+) -> Result<Option<(String, std::ops::Range<usize>)>, TerminalError> {
+    const PREFIX: &[u8] = b"\x1b]52;";
+    let Some(start) = bytes
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    else {
+        return Ok(None);
+    };
+    let fields = start + PREFIX.len();
+    let Some(selection_end) = bytes[fields..].iter().position(|byte| *byte == b';') else {
+        return Ok(None);
+    };
+    let selection_end = fields + selection_end;
+    let wanted = match wanted {
+        ClipboardSelection::Clipboard => b'c',
+        ClipboardSelection::Primary => b'p',
+    };
+    if !bytes[fields..selection_end].contains(&wanted) {
+        return Ok(None);
+    }
+    let payload_start = selection_end + 1;
+    let terminator = bytes[payload_start..]
+        .iter()
+        .position(|byte| *byte == 0x07)
+        .map(|offset| (payload_start + offset, 1))
+        .or_else(|| {
+            bytes[payload_start..]
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .map(|offset| (payload_start + offset, 2))
+        });
+    let Some((payload_end, terminator_len)) = terminator else {
+        return Ok(None);
+    };
+    let payload = &bytes[payload_start..payload_end];
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
+        .map_err(|error| {
+            TerminalError::Input(format!("invalid OSC 52 clipboard response: {error}"))
+        })?;
+    let text = String::from_utf8(decoded)
+        .map_err(|error| TerminalError::Input(format!("OSC 52 clipboard is not UTF-8: {error}")))?;
+    Ok(Some((text, start..payload_end + terminator_len)))
 }
 
 impl Drop for SystemTerminalBackend {
@@ -181,7 +336,11 @@ impl<W: Write> TerminaBackend<W> {
     /// Copies through the client terminal, so workspace-side code never gains
     /// access to the local clipboard. OSC 52 is bounded to avoid turning a
     /// register into an unbounded terminal escape.
-    pub fn copy_osc52(&mut self, text: &str) -> Result<(), TerminalError> {
+    pub fn copy_osc52(
+        &mut self,
+        selection: ClipboardSelection,
+        text: &str,
+    ) -> Result<(), TerminalError> {
         const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
         if text.len() > MAX_CLIPBOARD_BYTES {
             return Err(TerminalError::Io(io::Error::new(
@@ -189,11 +348,11 @@ impl<W: Write> TerminaBackend<W> {
                 "clipboard register exceeds the 1 MiB OSC 52 limit",
             )));
         }
-        write!(
-            self.writer,
-            "{}",
-            Osc::SetSelection(Selection::CLIPBOARD, text)
-        )?;
+        let selection = match selection {
+            ClipboardSelection::Clipboard => Selection::CLIPBOARD,
+            ClipboardSelection::Primary => Selection::PRIMARY,
+        };
+        write!(self.writer, "{}", Osc::SetSelection(selection, text))?;
         self.writer.flush()?;
         Ok(())
     }
@@ -215,12 +374,12 @@ fn dec_mode(code: DecPrivateModeCode) -> DecPrivateMode {
 }
 
 fn initialize_terminal(output: &mut impl Write) -> io::Result<()> {
-    // Wren consumes wheel reports but has no pointer-motion bindings. Mode
-    // 1000 keeps wheel/button input without the unbounded motion stream that
-    // mode 1003 produces while a trackpad or mouse is moving.
+    // Button-event tracking reports motion only while a button is held. That
+    // is enough for selection without the unbounded idle pointer stream from
+    // any-event mode 1003.
     write!(
         output,
-        "{}{}{}{}{}",
+        "{}{}{}{}{}{}",
         Csi::Mode(Mode::SetDecPrivateMode(dec_mode(
             DecPrivateModeCode::ClearAndEnableAlternateScreen
         ))),
@@ -229,6 +388,9 @@ fn initialize_terminal(output: &mut impl Write) -> io::Result<()> {
         ))),
         Csi::Mode(Mode::SetDecPrivateMode(dec_mode(
             DecPrivateModeCode::MouseTracking
+        ))),
+        Csi::Mode(Mode::SetDecPrivateMode(dec_mode(
+            DecPrivateModeCode::ButtonEventMouse
         ))),
         Csi::Mode(Mode::SetDecPrivateMode(dec_mode(
             DecPrivateModeCode::SGRMouse
@@ -244,7 +406,7 @@ fn initialize_terminal(output: &mut impl Write) -> io::Result<()> {
 fn cleanup_terminal(output: &mut impl Write) -> io::Result<()> {
     write!(
         output,
-        "{}{}{}{}{}{}{}",
+        "{}{}{}{}{}{}{}{}",
         Csi::Sgr(Sgr::Reset),
         Csi::Mode(Mode::SetDecPrivateMode(dec_mode(
             DecPrivateModeCode::ShowCursor
@@ -252,6 +414,9 @@ fn cleanup_terminal(output: &mut impl Write) -> io::Result<()> {
         Csi::Keyboard(Keyboard::PopFlags(1)),
         Csi::Mode(Mode::ResetDecPrivateMode(dec_mode(
             DecPrivateModeCode::SGRMouse
+        ))),
+        Csi::Mode(Mode::ResetDecPrivateMode(dec_mode(
+            DecPrivateModeCode::ButtonEventMouse
         ))),
         Csi::Mode(Mode::ResetDecPrivateMode(dec_mode(
             DecPrivateModeCode::MouseTracking
@@ -437,24 +602,30 @@ fn map_input(input: Event) -> TerminalInput {
             columns: usize::from(size.cols.max(1)),
             rows: usize::from(size.rows.max(1)),
         },
-        Event::Mouse(event) => {
-            if event.kind == MouseEventKind::Down(MouseButton::Left) {
-                return TerminalInput::MouseClick {
-                    column: usize::from(event.column),
-                    row: usize::from(event.row),
-                };
-            }
-            let lines = match event.kind {
-                MouseEventKind::ScrollUp => -3,
-                MouseEventKind::ScrollDown => 3,
-                _ => return TerminalInput::Ignored,
-            };
-            TerminalInput::MouseScroll {
-                lines,
+        Event::Mouse(event) => match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => TerminalInput::MouseClick {
                 column: usize::from(event.column),
                 row: usize::from(event.row),
-            }
-        }
+            },
+            MouseEventKind::Drag(MouseButton::Left) => TerminalInput::MouseDrag {
+                column: usize::from(event.column),
+                row: usize::from(event.row),
+            },
+            MouseEventKind::Up(MouseButton::Left) => TerminalInput::MouseRelease {
+                column: usize::from(event.column),
+                row: usize::from(event.row),
+            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => TerminalInput::MouseScroll {
+                lines: if event.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                },
+                column: usize::from(event.column),
+                row: usize::from(event.row),
+            },
+            _ => TerminalInput::Ignored,
+        },
         Event::FocusIn | Event::FocusOut | Event::Csi(_) | Event::Osc(_) | Event::Dcs(_) => {
             TerminalInput::Ignored
         }
@@ -486,7 +657,6 @@ fn map_key_code(code: TermKeyCode) -> Option<(TerminalKeyCode, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use termina::Parser;
 
     fn parse_one(bytes: &[u8]) -> TerminalInput {
         let mut parser = Parser::default();
@@ -499,7 +669,9 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut backend = TerminaBackend::new(&mut output, 80, 24).expect("backend");
-            backend.copy_osc52("wren β").expect("clipboard copy");
+            backend
+                .copy_osc52(ClipboardSelection::Clipboard, "wren β")
+                .expect("clipboard copy");
         }
         assert_eq!(output, b"\x1b]52;c;d3JlbiDOsg==\x1b\\");
     }
@@ -530,7 +702,61 @@ mod tests {
             parse_one(b"\x1b[<0;15;10M"),
             TerminalInput::MouseClick { column: 14, row: 9 }
         );
-        assert_eq!(parse_one(b"\x1b[<0;15;10m"), TerminalInput::Ignored);
+        assert_eq!(
+            parse_one(b"\x1b[<32;17;11M"),
+            TerminalInput::MouseDrag {
+                column: 16,
+                row: 10
+            }
+        );
+        assert_eq!(
+            parse_one(b"\x1b[<0;17;11m"),
+            TerminalInput::MouseRelease {
+                column: 16,
+                row: 10
+            }
+        );
+    }
+
+    #[test]
+    fn osc52_primary_copy_targets_the_star_register_selection() {
+        let mut output = Vec::new();
+        {
+            let mut backend = TerminaBackend::new(&mut output, 80, 24).expect("backend");
+            backend
+                .copy_osc52(ClipboardSelection::Primary, "primary")
+                .expect("primary clipboard copy");
+        }
+        assert_eq!(output, b"\x1b]52;p;cHJpbWFyeQ==\x1b\\");
+    }
+
+    #[test]
+    fn osc52_clipboard_responses_decode_bel_st_and_wrapped_streams() {
+        assert_eq!(
+            decode_osc52_response(
+                b"\x1b]52;c;d3JlbiDOsg==\x1b\\",
+                ClipboardSelection::Clipboard
+            )
+            .expect("valid response")
+            .map(|(text, _)| text),
+            Some("wren β".to_owned())
+        );
+        assert_eq!(
+            decode_osc52_response(
+                b"prefix\x1b]52;p;cHJpbWFyeQ==\x07suffix",
+                ClipboardSelection::Primary
+            )
+            .expect("valid primary response"),
+            Some(("primary".to_owned(), 6..26))
+        );
+        assert_eq!(
+            decode_osc52_response(
+                b"\x1b]52;p;cHJpbWFyeQ==\x1b\\",
+                ClipboardSelection::Clipboard
+            )
+            .expect("different selection"),
+            None
+        );
     }
 
     #[test]
@@ -611,7 +837,7 @@ mod tests {
         cleanup_terminal(&mut output).expect("cleanup");
         assert_eq!(
             output,
-            b"\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[>5u\x1b[m\x1b[?25h\x1b[<1u\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?1049l"
+            b"\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[>5u\x1b[m\x1b[?25h\x1b[<1u\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l"
         );
     }
 
