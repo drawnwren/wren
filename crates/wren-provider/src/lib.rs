@@ -563,20 +563,111 @@ fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<Highlig
 }
 
 fn query_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
+    const BYTES_PER_QUERY_WORKER: usize = 256 * 1024;
+    const MAX_QUERY_WORKERS: usize = 4;
+
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let workers = text
+        .len()
+        .div_ceil(BYTES_PER_QUERY_WORKER)
+        .clamp(1, MAX_QUERY_WORKERS)
+        .min(available);
+    query_tree_sitter_spans_with_workers(text, language_id, workers)
+}
+
+fn query_tree_sitter_spans_with_workers(
+    text: &str,
+    language_id: &str,
+    workers: usize,
+) -> Option<Vec<HighlightSpan>> {
     use ast_grep_language::{LanguageExt, SupportLang};
 
     let supported = language_id.parse::<SupportLang>().ok()?;
     let language = supported.get_ts_language();
     let query = cached_highlight_query(language_id, &language)?;
+    let capture_kinds = query
+        .capture_names()
+        .iter()
+        .map(|kind| Arc::<str>::from(*kind))
+        .collect::<Vec<_>>();
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).ok()?;
     let tree = parser.parse(text, None)?;
+    let root = tree.root_node();
+    let ranges = query_worker_ranges(root, text.len(), workers);
+    let mut spans = if let [range] = ranges.as_slice() {
+        collect_query_spans(&query, root, text, &capture_kinds, range.clone())
+    } else {
+        std::thread::scope(|scope| {
+            let handles = ranges.into_iter().map(|range| {
+                let query = &query;
+                let capture_kinds = &capture_kinds;
+                scope.spawn(move || collect_query_spans(query, root, text, capture_kinds, range))
+            });
+            handles
+                .map(|handle| handle.join().ok())
+                .collect::<Option<Vec<_>>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    spans.sort_unstable_by(|left, right| {
+        (
+            left.range.start,
+            std::cmp::Reverse(left.range.end),
+            left.priority,
+            left.kind.as_ref(),
+        )
+            .cmp(&(
+                right.range.start,
+                std::cmp::Reverse(right.range.end),
+                right.priority,
+                right.kind.as_ref(),
+            ))
+    });
+    spans.dedup();
+    Some(spans)
+}
+
+fn query_worker_ranges(
+    root: tree_sitter::Node<'_>,
+    text_len: usize,
+    workers: usize,
+) -> Vec<Range<usize>> {
+    let child_count = root.named_child_count();
+    let workers = workers.clamp(1, child_count.max(1));
+    let mut boundaries = Vec::with_capacity(workers.saturating_add(1));
+    boundaries.push(0);
+    boundaries.extend((1..workers).filter_map(|worker| {
+        u32::try_from(child_count.saturating_mul(worker) / workers)
+            .ok()
+            .and_then(|index| root.named_child(index))
+            .map(|child| child.start_byte())
+            .filter(|boundary| *boundary > 0 && *boundary < text_len)
+    }));
+    boundaries.push(text_len);
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .map(|range| range[0]..range[1])
+        .collect()
+}
+
+fn collect_query_spans(
+    query: &Query,
+    root: tree_sitter::Node<'_>,
+    text: &str,
+    capture_kinds: &[Arc<str>],
+    range: Range<usize>,
+) -> Vec<HighlightSpan> {
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    cursor.set_byte_range(range);
+    let mut matches = cursor.matches(query, root, text.as_bytes());
     let mut lua_patterns = BTreeMap::<Box<str>, Regex>::new();
     let mut spans = Vec::new();
     while let Some(query_match) = matches.next() {
-        if !satisfies_neovim_predicates(&query, query_match, text, &mut lua_patterns) {
+        if !satisfies_neovim_predicates(query, query_match, text, &mut lua_patterns) {
             continue;
         }
         let base_priority = query
@@ -591,26 +682,24 @@ fn query_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<Highligh
             .saturating_mul(10_000)
             .saturating_add(u32::try_from(query_match.pattern_index).unwrap_or(u32::MAX));
         for capture in query_match.captures {
-            let Some(kind) = query.capture_names().get(capture.index as usize) else {
+            let Some(kind) = capture_kinds.get(capture.index as usize) else {
                 continue;
             };
-            if kind.starts_with('_') || matches!(*kind, "spell" | "nospell" | "none") {
+            if kind.starts_with('_') || matches!(kind.as_ref(), "spell" | "nospell" | "none") {
                 continue;
             }
-            let range = neovim_capture_range(&query, query_match, capture.index, text)
+            let range = neovim_capture_range(query, query_match, capture.index, text)
                 .unwrap_or_else(|| capture.node.byte_range());
             if range.start < range.end && range.end <= text.len() {
                 spans.push(HighlightSpan {
                     range,
-                    kind: Arc::from(*kind),
+                    kind: Arc::clone(kind),
                     priority,
                 });
             }
         }
     }
-    spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
-    spans.dedup();
-    Some(spans)
+    spans
 }
 
 fn cached_highlight_query(
@@ -1567,6 +1656,22 @@ mod tests {
                 "missing {kind} for {needle:?}: {spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn parallel_tree_sitter_query_matches_serial_highlighting_exactly() {
+        let source = (0..512)
+            .map(|line| {
+                format!(
+                    "/// item {line}\npub fn item_{line}() -> usize {{ let value_{line}: usize = {line}; value_{line} }}\n"
+                )
+            })
+            .collect::<String>();
+        let serial = query_tree_sitter_spans_with_workers(&source, "rust", 1)
+            .expect("serial tree-sitter query");
+        let parallel = query_tree_sitter_spans_with_workers(&source, "rust", 4)
+            .expect("parallel tree-sitter query");
+        assert_eq!(parallel, serial);
     }
 
     #[test]
