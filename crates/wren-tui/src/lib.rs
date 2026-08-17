@@ -165,6 +165,7 @@ type SharedPresenterBackend = Arc<Mutex<PresenterBackend>>;
 
 pub fn main_entry() -> Result<()> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-provider-host")) {
+        wren_scheduling::mark_background();
         wren_provider::serve(std::io::stdin().lock(), std::io::stdout().lock())?;
         return Ok(());
     }

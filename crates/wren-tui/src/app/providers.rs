@@ -20,15 +20,7 @@ impl App {
         let language_id = bundle.language_id.clone();
         let frame = self.active.editor.frame();
         let text = frame.text.as_ref();
-        let spans = self
-            .provider
-            .highlight_now(
-                self.active.document_id,
-                revision,
-                frame.text.shared(),
-                bundle,
-            )
-            .unwrap_or_else(|_| highlight_text(text, &language_id))
+        let spans = highlight_text(text, &language_id)
             .into_iter()
             .map(|span| provider_decoration(span, self.theme))
             .collect::<Vec<_>>();

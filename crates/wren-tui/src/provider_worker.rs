@@ -241,6 +241,7 @@ impl ProviderWorker {
         let join = thread::Builder::new()
             .name("wren-provider-supervisor".to_owned())
             .spawn(move || {
+                wren_scheduling::mark_background();
                 #[cfg(test)]
                 provider_actor_loop(requests, immediate_requests, results);
                 #[cfg(not(test))]
@@ -301,7 +302,7 @@ impl ProviderWorker {
         }
         response
             .recv_timeout(Duration::from_millis(200))
-            .map_err(|_| anyhow!("provider first-frame highlight timed out"))?
+            .map_err(|_| anyhow!("immediate provider highlight timed out"))?
             .map_err(anyhow::Error::msg)
     }
 }
