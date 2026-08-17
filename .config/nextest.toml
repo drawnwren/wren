@@ -1,0 +1,3 @@
+[[profile.default.overrides]]
+filter = 'test(/large_rust_open_navigation_and_edit_stay_within_frame_budgets|real_terminal_large_rust_file_opens_navigates_and_edits_responsively/)'
+threads-required = "num-test-threads"
