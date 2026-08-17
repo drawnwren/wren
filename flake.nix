@@ -14,7 +14,7 @@
 
   outputs = { self, nixpkgs, crane, rust-overlay }:
     let
-      systems = [ "x86_64-linux" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" ""aarch64-linux" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       perSystem = system:
         let
