@@ -114,7 +114,7 @@ impl App {
         })
     }
 
-    pub(super) fn selected_picker_target(&self) -> Option<(PathBuf, Option<usize>)> {
+    fn selected_picker_target(&self) -> Option<(PathBuf, Option<QuickfixEntry>)> {
         let prompt = self.prompt.as_ref()?;
         match prompt.kind {
             PromptKind::FilePicker | PromptKind::FileBrowser => self
@@ -122,14 +122,21 @@ impl App {
                 .get(self.picker_index)
                 .cloned()
                 .map(|path| (path, None)),
-            PromptKind::Grep => self
-                .quickfix
-                .get(self.picker_index)
-                .map(|entry| (entry.path.clone(), Some(entry.line))),
+            PromptKind::Grep | PromptKind::Location => self
+                .selected_picker_entry()
+                .map(|entry| (entry.path.clone(), Some(entry))),
+            _ => None,
+        }
+    }
+
+    fn selected_picker_entry(&self) -> Option<QuickfixEntry> {
+        let prompt = self.prompt.as_ref()?;
+        match prompt.kind {
+            PromptKind::Grep => self.quickfix.get(self.picker_index).cloned(),
             PromptKind::Location => self
                 .filtered_locations(&prompt.buffer)
                 .get(self.picker_index)
-                .map(|entry| (entry.path.clone(), Some(entry.line))),
+                .cloned(),
             _ => None,
         }
     }
@@ -138,7 +145,7 @@ impl App {
         self.picker_preview_scroll = 0;
         self.picker_preview_highlight_line = None;
         self.picker_preview_decorations.clear();
-        let Some((path, line)) = self.selected_picker_target() else {
+        let Some((path, selected_entry)) = self.selected_picker_target() else {
             self.picker_preview_title = "No preview".to_owned();
             self.picker_preview = "No matching entries".to_owned();
             return;
@@ -213,10 +220,22 @@ impl App {
             .into_iter()
             .map(|span| provider_decoration(span, self.theme))
             .collect();
-        if let Some(line) = line {
-            let line = line.saturating_sub(1);
-            self.picker_preview_highlight_line = Some(line);
+        if let Some(entry) = selected_entry {
+            let line = entry.line.saturating_sub(1);
             self.picker_preview_scroll = line.saturating_sub(5);
+            if let Some(range) = entry.selection_byte_range(&self.picker_preview) {
+                self.picker_preview_decorations.push(DecorationSpan {
+                    range,
+                    style: CellStyle {
+                        foreground: None,
+                        background: Some(CellColor::Rgb(self.theme.surface0)),
+                        ..CellStyle::default()
+                    },
+                    priority: u32::MAX,
+                });
+            } else {
+                self.picker_preview_highlight_line = Some(line);
+            }
         }
     }
 
@@ -311,6 +330,7 @@ impl App {
                         path: path.clone(),
                         line: line + 1,
                         column: byte.saturating_sub(line_start) + 1,
+                        selection_end: None,
                         column_utf16: false,
                         text: format!("jump {}", index + 1),
                     }
@@ -342,6 +362,7 @@ impl App {
                         path: jump.path.clone(),
                         line: line + 1,
                         column: jump.byte.saturating_sub(line_start) + 1,
+                        selection_end: None,
                         column_utf16: false,
                         text: format!("jump {}", index + 1),
                     })
@@ -495,7 +516,7 @@ impl App {
         };
         self.message = format!(
             "inccommand: {}",
-            substitution_message(transaction.edits.len(), true, &text, &transaction,)
+            substitution_message(transaction.edit_count(), true, &text, &transaction)
         );
     }
 

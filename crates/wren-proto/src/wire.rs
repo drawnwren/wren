@@ -739,9 +739,9 @@ fn hash32(value: Vec<u8>, field: &'static str) -> Result<[u8; 32], ProtocolError
 impl From<&semantic::Transaction> for Transaction {
     fn from(value: &semantic::Transaction) -> Self {
         Self {
-            base_revision: value.base_revision.get(),
+            base_revision: value.base_revision().get(),
             edits: value
-                .edits
+                .edits()
                 .iter()
                 .map(|edit| Edit {
                     start: edit.range.start as u64,

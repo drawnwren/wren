@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 
-use wren_remote::{OpenSshSpec, RemoteWorkspaceClient};
+use wren_remote::{OpenSshSpec, RemoteOpened, RemoteWorkspaceClient};
 use wren_types::{
     ClientId, ClientMutation, ClientSequence, DocumentId, DocumentMutation, DocumentRevision, Edit,
     LeaseEpoch, MutationId, MutationResult, SaveRequest, SemanticGroupId, SemanticGroupKind,
@@ -19,7 +20,16 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
     fs::write(workspace.join("main.rs"), "fn main() {}\n").expect("seed source");
     fs::write(workspace.join("other.rs"), "fn other() {}\n").expect("second source");
 
-    let fake_ssh = temporary.path().join("ssh");
+    let spec = test_ssh_spec(temporary.path(), &workspace, &state);
+    let mut client = RemoteWorkspaceClient::connect(&spec).expect("connect both lanes");
+    let opened = assert_remote_open_semantics(&mut client);
+    let session_sequence = submit_and_save(&mut client, &opened, &workspace);
+    assert_search_and_resume(&mut client, &opened, session_sequence);
+    client.close().expect("close both lanes");
+}
+
+fn test_ssh_spec(temporary: &Path, workspace: &Path, state: &Path) -> OpenSshSpec {
+    let fake_ssh = temporary.join("ssh");
     fs::write(
         &fake_ssh,
         "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -T) shift ;;\n    -o|-p|-i) shift 2 ;;\n    --) shift ;;\n    *) shift; break ;;\n  esac\ndone\nexec \"$@\"\n",
@@ -27,8 +37,7 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
     .expect("write fake ssh");
     fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700))
         .expect("make fake ssh executable");
-
-    let spec = OpenSshSpec {
+    OpenSshSpec {
         executable: fake_ssh,
         host: "test-host".into(),
         user: None,
@@ -36,10 +45,12 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
         identity_file: None,
         extra_options: Vec::new(),
         remote_session_program: env!("CARGO_BIN_EXE_wren-sessiond").into(),
-        remote_workspace: Some(workspace.clone()),
-        remote_state_dir: Some(state),
-    };
-    let mut client = RemoteWorkspaceClient::connect(&spec).expect("connect both lanes");
+        remote_workspace: Some(workspace.to_path_buf()),
+        remote_state_dir: Some(state.to_path_buf()),
+    }
+}
+
+fn assert_remote_open_semantics(client: &mut RemoteWorkspaceClient) -> RemoteOpened {
     let manifest = client
         .manifest(WorkspaceGeneration::new(1))
         .expect("remote manifest");
@@ -66,8 +77,11 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
         client.open(DocumentId::new(9), ClientId::new(7), "other.rs", None),
         Err(wren_remote::RemoteError::Peer(_))
     ));
+    opened
+}
 
-    let mutation = ClientMutation {
+fn test_mutation() -> ClientMutation {
+    ClientMutation {
         mutation_id: MutationId::new(1),
         client_id: ClientId::new(7),
         client_sequence: ClientSequence::new(1),
@@ -87,10 +101,17 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
                 .expect("transaction"),
             ],
         }],
-    };
+    }
+}
+
+fn submit_and_save(
+    client: &mut RemoteWorkspaceClient,
+    opened: &RemoteOpened,
+    workspace: &Path,
+) -> SessionSequence {
     let MutationResult::Durable {
         session_sequence, ..
-    } = client.submit(&mutation).expect("durable mutation")
+    } = client.submit(&test_mutation()).expect("durable mutation")
     else {
         panic!("mutation was not durable");
     };
@@ -98,7 +119,7 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
         .save(&SaveRequest {
             document_id: DocumentId::new(9),
             required_frontier: DocumentRevision::new(1),
-            expected_file_identity: opened.file_identity,
+            expected_file_identity: opened.file_identity.clone(),
             expected_content_hash: opened.content_hash,
         })
         .expect("persist remote frontier");
@@ -107,6 +128,14 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
         fs::read_to_string(workspace.join("main.rs")).expect("saved source"),
         "fn main() {}\n// remote\n"
     );
+    session_sequence
+}
+
+fn assert_search_and_resume(
+    client: &mut RemoteWorkspaceClient,
+    opened: &RemoteOpened,
+    session_sequence: SessionSequence,
+) {
     let hits = client.search("remote", 10).expect("bulk remote search");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path.as_ref(), "main.rs");
@@ -130,5 +159,4 @@ fn real_dual_stdio_agent_opens_mutates_saves_and_searches() {
     client
         .heartbeat(SessionSequence::new(42).get())
         .expect("heartbeat after reconnect");
-    client.close().expect("close both lanes");
 }

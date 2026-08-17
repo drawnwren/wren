@@ -35,6 +35,16 @@ fn terminal_key(code: TerminalKeyCode) -> TerminalKey {
     }
 }
 
+fn terminal_control(character: char) -> TerminalKey {
+    TerminalKey {
+        code: TerminalKeyCode::Char(character),
+        shift: false,
+        control: true,
+        alt: false,
+        super_key: false,
+    }
+}
+
 fn type_prompt(app: &mut App, text: &str) {
     for character in text.chars() {
         app.handle_prompt_key(terminal_character(character))
@@ -76,9 +86,15 @@ while True:
     if "id" not in message:
         continue
     if method == "initialize":
-        result = {"capabilities": {"semanticTokensProvider": {"legend": {
-            "tokenTypes": ["variable"], "tokenModifiers": []
-        }, "full": True}}}
+        result = {"capabilities": {
+            "semanticTokensProvider": {"legend": {
+                "tokenTypes": ["variable"], "tokenModifiers": []
+            }, "full": True},
+            "declarationProvider": True,
+            "definitionProvider": True,
+            "implementationProvider": True,
+            "referencesProvider": True
+        }}
     elif method == "textDocument/definition":
         time.sleep(0.2)
         result = None
@@ -211,6 +227,30 @@ fn app_opens_edits_and_safely_saves_a_real_file() {
 }
 
 #[test]
+fn realtime_path_preparation_cannot_mutate_the_live_buffer() {
+    let (document, mut opened) = LocalDocument::unnamed();
+    opened.text = "fn live() { let untouched = 1; }\n".to_owned();
+    let mut app = App::from_opened(document, opened, None, None).expect("app");
+    app.active.editor.set_cursor(8);
+    app.message = "preserve me".to_owned();
+    let contents = app.active.editor.contents();
+    let revision = app.active.editor.revision();
+    let undo = app.active.editor.durable_undo_state();
+    let cursor = app.active.editor.primary_cursor();
+    let mode = app.active.editor.mode();
+
+    app.prepare_realtime_paths().expect("prepare paths");
+
+    assert_eq!(app.active.editor.contents(), contents);
+    assert_eq!(app.active.editor.revision(), revision);
+    assert_eq!(app.active.editor.durable_undo_state(), undo);
+    assert_eq!(app.active.editor.primary_cursor(), cursor);
+    assert_eq!(app.active.editor.mode(), mode);
+    assert!(!app.active.editor.is_dirty());
+    assert_eq!(app.message, "preserve me");
+}
+
+#[test]
 fn quit_requires_force_when_changes_are_unsaved() {
     let mut app = App::open(None, None).expect("unnamed editor");
     app.dispatch_key(KeyEvent::character('i'));
@@ -296,6 +336,60 @@ fn dotfile_leader_q_and_ff_are_exact_native_sequences() {
 }
 
 #[test]
+fn normal_prefixes_open_which_key_hints_without_consuming_the_next_key() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("motions.txt");
+    fs::write(&path, "first\nsecond\n").expect("write source");
+    let mut app = App::open(Some(&path), Some(2)).expect("open source");
+
+    app.handle_editor_key(terminal_character('g'))
+        .expect("open goto hints");
+
+    assert_eq!(app.normal_prefix, Some('g'));
+    assert!(app.popup.as_ref().is_some_and(|popup| {
+        popup.title.as_ref() == " goto "
+            && popup.text.contains("g  first line / [count] line")
+            && popup.text.contains("q  format to text width")
+            && !popup.text.contains("definition")
+            && !popup.text.contains("references")
+    }));
+
+    app.handle_editor_key(terminal_character('g'))
+        .expect("execute gg through hint");
+
+    assert!(app.popup.is_none());
+    assert_eq!(app.normal_prefix, None);
+    assert_eq!(app.active.editor.primary_cursor(), 0);
+
+    app.handle_editor_key(terminal_character('['))
+        .expect("open previous hints");
+    assert!(app.popup.as_ref().is_some_and(|popup| {
+        popup.title.as_ref() == " previous "
+            && popup.text.contains("previous diagnostic")
+            && popup.text.contains("previous Git hunk")
+    }));
+}
+
+#[test]
+fn goto_hints_include_only_advertised_lsp_navigation() {
+    let entries = app_interaction::normal_prefix_hint_entries(
+        'g',
+        Some(LspNavigationCapabilities {
+            declaration: false,
+            definition: true,
+            implementation: false,
+            references: true,
+        }),
+    );
+
+    assert_eq!(entries.get("d").map(String::as_str), Some("definition"));
+    assert_eq!(entries.get("r").map(String::as_str), Some("references"));
+    assert!(!entries.contains_key("D"));
+    assert!(!entries.contains_key("i"));
+    assert!(entries.contains_key("g"));
+}
+
+#[test]
 fn file_picker_is_a_telescope_surface_with_results_and_preview() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let source = directory.path().join("main.rs");
@@ -356,23 +450,20 @@ fn ctrl_d_u_f_b_are_native_vim_viewport_commands() {
         .collect::<String>();
     let mut app = App::from_opened(document, opened, None, None).expect("app");
     app.viewport_rows = 10;
-    let control = |character| TerminalKey {
-        code: TerminalKeyCode::Char(character),
-        shift: false,
-        control: true,
-        alt: false,
-        super_key: false,
-    };
-    app.handle_editor_key(control('d')).expect("half page down");
+    app.handle_editor_key(terminal_control('d'))
+        .expect("half page down");
     assert_eq!(app.active.editor.cursor_line_column().0, 4);
     assert_eq!(app.views.active_window().top_line, 4);
     assert!(!app.message.contains("grammar"));
-    app.handle_editor_key(control('u')).expect("half page up");
+    app.handle_editor_key(terminal_control('u'))
+        .expect("half page up");
     assert_eq!(app.active.editor.cursor_line_column().0, 0);
     assert_eq!(app.views.active_window().top_line, 0);
-    app.handle_editor_key(control('f')).expect("page down");
+    app.handle_editor_key(terminal_control('f'))
+        .expect("page down");
     assert_eq!(app.active.editor.cursor_line_column().0, 7);
-    app.handle_editor_key(control('b')).expect("page up");
+    app.handle_editor_key(terminal_control('b'))
+        .expect("page up");
     assert_eq!(app.active.editor.cursor_line_column().0, 0);
 }
 
@@ -384,23 +475,21 @@ fn counted_vim_view_commands_replace_numbers_and_ctrl_w_are_native() {
         .collect::<String>();
     let mut app = App::from_opened(document, opened, None, None).expect("app");
     app.viewport_rows = 10;
-    let control = |character| TerminalKey {
-        code: TerminalKeyCode::Char(character),
-        shift: false,
-        control: true,
-        alt: false,
-        super_key: false,
-    };
+    assert_counted_view_navigation(&mut app);
+    assert_window_commands(&mut app);
+    assert_number_and_replace_commands(&mut app);
+}
 
+fn assert_counted_view_navigation(app: &mut App) {
     app.handle_editor_key(terminal_character('2'))
         .expect("count");
-    app.handle_editor_key(control('d'))
+    app.handle_editor_key(terminal_control('d'))
         .expect("counted half page");
     assert_eq!(app.active.editor.cursor_line_column().0, 2);
     assert_eq!(app.views.active_window().top_line, 2);
     app.handle_editor_key(terminal_character('3'))
         .expect("count");
-    app.handle_editor_key(control('e'))
+    app.handle_editor_key(terminal_control('e'))
         .expect("counted line scroll");
     assert_eq!(app.views.active_window().top_line, 5);
     app.handle_editor_key(terminal_character('2'))
@@ -408,21 +497,29 @@ fn counted_vim_view_commands_replace_numbers_and_ctrl_w_are_native() {
     app.handle_editor_key(terminal_character('H'))
         .expect("second from top");
     assert_eq!(app.active.editor.cursor_line_column().0, 6);
+}
 
-    app.handle_editor_key(control('w')).expect("window prefix");
+fn assert_window_commands(app: &mut App) {
+    app.handle_editor_key(terminal_control('w'))
+        .expect("window prefix");
     app.handle_editor_key(terminal_character('v'))
         .expect("vertical split");
     assert_eq!(app.views.windows.len(), 2);
-    app.handle_editor_key(control('w')).expect("window prefix");
+    app.handle_editor_key(terminal_control('w'))
+        .expect("window prefix");
     app.handle_editor_key(terminal_character('h'))
         .expect("focus left");
     assert_eq!(app.views.windows.len(), 2);
     assert!(!app.message.contains("grammar"));
+}
 
+fn assert_number_and_replace_commands(app: &mut App) {
     app.active.editor.set_cursor(0);
-    app.handle_editor_key(control('a')).expect("increment");
+    app.handle_editor_key(terminal_control('a'))
+        .expect("increment");
     assert!(app.active.editor.contents().starts_with("line 001"));
-    app.handle_editor_key(control('x')).expect("decrement");
+    app.handle_editor_key(terminal_control('x'))
+        .expect("decrement");
     assert!(app.active.editor.contents().starts_with("line 000"));
     app.handle_editor_key(terminal_character('R'))
         .expect("replace mode");
@@ -993,6 +1090,7 @@ fn hover_text_renders_as_a_rounded_float_not_status_text() {
         title: "".into(),
         text: text.into(),
         scroll: 0,
+        cursor: None,
         decorations,
     });
     let mut layout = ViewportLayout::new(100, 30);
@@ -1027,6 +1125,7 @@ fn hover_popup_expires_after_its_deadline() {
         title: "".into(),
         text: "hover".into(),
         scroll: 0,
+        cursor: None,
         decorations: Vec::new(),
     });
     app.popup_deadline = Instant::now().checked_sub(Duration::from_millis(1));
@@ -1037,22 +1136,97 @@ fn hover_popup_expires_after_its_deadline() {
 }
 
 #[test]
-fn k_closes_an_open_popup_instead_of_requesting_another_hover() {
+fn k_focuses_an_open_popup_instead_of_requesting_another_hover() {
     let mut app = App::open(None, None).expect("app");
     app.popup = Some(TextPopup {
         title: "Documentation".into(),
-        text: "hover details".into(),
+        text: "first line\nsecond line\nthird line".into(),
         scroll: 0,
+        cursor: None,
         decorations: Vec::new(),
     });
     app.popup_deadline = Some(Instant::now() + Duration::from_secs(6));
 
     app.handle_editor_key(terminal_character('K'))
-        .expect("dismiss popup");
+        .expect("focus popup");
+
+    assert_eq!(
+        app.popup.as_ref().and_then(|popup| popup.cursor),
+        Some((0, 0))
+    );
+    assert!(app.popup_deadline.is_none());
+    assert!(app.pending_lsp_hover.is_none());
+
+    app.handle_editor_key(terminal_character('j'))
+        .expect("navigate popup");
+    assert_eq!(
+        app.popup.as_ref().and_then(|popup| popup.cursor),
+        Some((1, 0))
+    );
+
+    app.handle_editor_key(terminal_character('q'))
+        .expect("close focused popup");
+    assert!(app.popup.is_none());
+}
+
+#[test]
+fn editor_movement_closes_an_unfocused_popup_and_still_moves_the_cursor() {
+    let mut source = tempfile::NamedTempFile::new().expect("source");
+    source.write_all(b"abc\n").expect("write source");
+    let mut app = App::open(Some(source.path()), None).expect("app");
+    app.popup = Some(TextPopup {
+        title: "Documentation".into(),
+        text: "hover details".into(),
+        scroll: 0,
+        cursor: None,
+        decorations: Vec::new(),
+    });
+    app.popup_deadline = Some(Instant::now() + Duration::from_secs(6));
+
+    app.handle_editor_key(terminal_character('l'))
+        .expect("move through popup dismissal");
 
     assert!(app.popup.is_none());
     assert!(app.popup_deadline.is_none());
-    assert!(app.pending_lsp_hover.is_none());
+    assert_eq!(app.active.editor.primary_cursor(), 1);
+}
+
+#[test]
+fn mouse_wheel_navigates_only_a_focused_popup() {
+    let mut app = App::open(None, None).expect("app");
+    app.popup = Some(TextPopup {
+        title: "Documentation".into(),
+        text: (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
+        scroll: 0,
+        cursor: None,
+        decorations: Vec::new(),
+    });
+
+    app.handle_editor_key(terminal_character('K'))
+        .expect("focus popup");
+    app.handle_input(TerminalInput::MouseScroll {
+        lines: 4,
+        column: 10,
+        row: 10,
+    })
+    .expect("scroll focused popup");
+    assert_eq!(
+        app.popup.as_ref().and_then(|popup| popup.cursor),
+        Some((4, 0))
+    );
+
+    app.popup.as_mut().expect("popup").cursor = None;
+    app.handle_input(TerminalInput::MouseScroll {
+        lines: 1,
+        column: 10,
+        row: 10,
+    })
+    .expect("scroll enclosing buffer");
+    assert!(app.popup.is_none());
 }
 
 #[test]
@@ -1094,6 +1268,20 @@ fn messages_command_opens_bounded_severity_tagged_history_buffer() {
 
     app.execute_ex("messages").expect("show messages");
 
+    assert_messages_buffer(&app);
+    let messages_buffer_id = app.active.buffer_id;
+    app.execute_ex("bprevious")
+        .expect("return to source buffer");
+    assert_ne!(app.active.buffer_id, messages_buffer_id);
+    app.show_info("formatter complete");
+    app.execute_ex("debuglog").expect("refresh messages");
+    assert_eq!(app.views.buffers.len(), 2);
+    assert_eq!(app.inactive.len(), 1);
+    assert_eq!(app.active.buffer_id, messages_buffer_id);
+    assert!(app.active.editor.contents().contains("formatter complete"));
+}
+
+fn assert_messages_buffer(app: &App) {
     assert!(app.popup.is_none());
     assert!(app.popup_deadline.is_none());
     assert!(app.message.is_empty());
@@ -1112,17 +1300,6 @@ fn messages_command_opens_bounded_severity_tagged_history_buffer() {
             .contains("[ERROR] provider worker disconnected")
     );
     assert!(app.status().contains("[Messages] [RO]"));
-
-    let messages_buffer_id = app.active.buffer_id;
-    app.execute_ex("bprevious")
-        .expect("return to source buffer");
-    assert_ne!(app.active.buffer_id, messages_buffer_id);
-    app.show_info("formatter complete");
-    app.execute_ex("debuglog").expect("refresh messages");
-    assert_eq!(app.views.buffers.len(), 2);
-    assert_eq!(app.inactive.len(), 1);
-    assert_eq!(app.active.buffer_id, messages_buffer_id);
-    assert!(app.active.editor.contents().contains("formatter complete"));
 }
 
 #[test]
@@ -1157,12 +1334,35 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     let mut app = App::open(Some(&source), None).expect("app");
     let workspace_root = app.lsp_root();
     let revision = attach_fake_root_lsp(&mut app, directory.path(), &source, &workspace_root);
+    exercise_lsp_prefix_hints(&mut app);
     exercise_async_lsp_requests(&mut app);
     let (outside_workspace, second) = open_outside_rust(&mut app, &workspace_root);
     exercise_cross_workspace_jumps(&mut app, &source, &second, &workspace_root);
     exercise_non_lsp_jump(&mut app, outside_workspace.path(), &second, &workspace_root);
     exercise_language_server_parking(&mut app, &second, &workspace_root, revision);
     exercise_malformed_definition_recovery(&mut app);
+}
+
+#[cfg(unix)]
+fn exercise_lsp_prefix_hints(app: &mut App) {
+    app.handle_editor_key(terminal_character('g'))
+        .expect("open LSP goto hints");
+    assert!(app.popup.as_ref().is_some_and(|popup| {
+        popup.text.contains("d  definition")
+            && popup.text.contains("D  declaration")
+            && popup.text.contains("i  implementation")
+            && popup.text.contains("r  references")
+    }));
+    app.handle_editor_key(TerminalKey {
+        code: TerminalKeyCode::Escape,
+        shift: false,
+        control: false,
+        alt: false,
+        super_key: false,
+    })
+    .expect("close goto hints");
+    assert!(app.popup.is_none());
+    assert!(app.normal_prefix.is_none());
 }
 
 #[cfg(unix)]
@@ -1178,7 +1378,7 @@ fn attach_fake_root_lsp(
         .collect();
     let revision = DocumentRevision::new(1);
     let started = Instant::now();
-    let (client, uri, legend) = spawn_lsp_client(
+    let (client, uri, capabilities) = spawn_lsp_client(
         &server,
         source,
         workspace_root,
@@ -1207,9 +1407,14 @@ fn attach_fake_root_lsp(
         server: language_server_invocation(Some(source)).expect("Rust profile"),
         root: workspace_root.to_path_buf(),
         open_documents: BTreeMap::from([(document_id, LspOpenDocument { uri, revision })]),
-        semantic_legend: legend,
+        capabilities,
         semantic_due: None,
     });
+    let lsp = app.lsp.as_ref().expect("attached LSP");
+    app.lsp_navigation_capabilities.insert(
+        lsp.server.language_id.clone().into_boxed_str(),
+        lsp.capabilities.navigation,
+    );
     revision
 }
 
@@ -1265,6 +1470,13 @@ fn exercise_async_lsp_requests(app: &mut App) {
         "gd blocked the input loop",
     );
     assert!(app.lsp_background.is_some());
+    app.handle_editor_key(terminal_character('g'))
+        .expect("show goto hints while LSP request runs");
+    assert!(app.popup.as_ref().is_some_and(|popup| {
+        popup.text.contains("d  definition") && popup.text.contains("r  references")
+    }));
+    app.handle_editor_key(terminal_key(TerminalKeyCode::Escape))
+        .expect("close busy LSP hints");
     poll_lsp_until_complete(app, "definition");
     assert!(app.message.contains("no location"));
 
@@ -1312,6 +1524,7 @@ fn open_outside_rust(app: &mut App, workspace_root: &Path) -> (tempfile::TempDir
         path: second.clone(),
         line: 1,
         column: 1,
+        selection_end: None,
         column_utf16: true,
         text: "outside definition".to_owned(),
     })
@@ -1372,6 +1585,7 @@ fn exercise_non_lsp_jump(app: &mut App, outside: &Path, second: &Path, workspace
         path: notes.clone(),
         line: 1,
         column: 1,
+        selection_end: None,
         column_utf16: true,
         text: "notes".to_owned(),
     })
@@ -1406,7 +1620,7 @@ fn exercise_language_server_parking(
     let python_source = python_workspace.path().join("tool.py");
     fs::write(&python_source, "def tool():\n  pass\n").expect("Python source");
     let (python_fake, _) = fake_lsp_server(python_workspace.path());
-    let (python_client, python_uri, python_legend) = spawn_lsp_client(
+    let (python_client, python_uri, python_capabilities) = spawn_lsp_client(
         &python_fake,
         &python_source,
         workspace_root,
@@ -1425,7 +1639,7 @@ fn exercise_language_server_parking(
         server: language_server_invocation(Some(&python_source)).expect("Python profile"),
         root: workspace_root.to_path_buf(),
         open_documents: BTreeMap::new(),
-        semantic_legend: python_legend,
+        capabilities: python_capabilities,
         semantic_due: None,
     });
     app.open_buffer(&python_source).expect("activate Python");
@@ -1492,6 +1706,23 @@ fn gd_queues_behind_in_progress_startup_instead_of_starting_a_second_server() {
         Some("textDocument/definition")
     );
     assert!(app.message.contains("queued"));
+}
+
+#[test]
+fn first_hover_queues_behind_workspace_startup_without_starting_another_server() {
+    let mut app = App::open(None, None).expect("app");
+    let (_sender, receiver) = mpsc::channel::<Result<PersistentLsp, String>>();
+    app.lsp_start = Some(receiver);
+
+    let dispatched = Instant::now();
+    app.lsp_hover("textDocument/hover")
+        .expect("queue first hover");
+
+    assert!(dispatched.elapsed() < Duration::from_millis(10));
+    assert_eq!(app.pending_lsp_hover.as_deref(), Some("textDocument/hover"));
+    assert!(app.lsp_start.is_some());
+    assert!(app.lsp_background.is_none());
+    assert!(app.message.is_empty());
 }
 
 #[test]
@@ -1846,14 +2077,25 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
     opened.text = "zero hit one hit two hit\n".to_owned();
     let mut app = App::from_opened(document, opened, None, None).expect("app");
 
+    assert_forward_search(&mut app);
+    assert_backward_search(&mut app);
+    assert_search_cancel_restores_origin(&mut app);
+    app.execute_ex("nohlsearch").expect("clear highlights");
+    assert!(!app.search_highlight);
+    app.handle_editor_key(terminal_character('n'))
+        .expect("search remains repeatable after nohlsearch");
+    assert_eq!(app.active.editor.primary_cursor(), 5);
+}
+
+fn assert_forward_search(app: &mut App) {
     app.handle_editor_key(terminal_character('/'))
         .expect("open forward search");
-    type_prompt(&mut app, "h.t");
+    type_prompt(app, "h.t");
     assert_eq!(app.active.editor.primary_cursor(), 5, "incremental match");
     assert!(app.search_highlight);
-    submit_prompt(&mut app);
+    submit_prompt(app);
     assert_eq!(app.active.editor.primary_cursor(), 5);
-    assert_search_highlight_rendered(&app);
+    assert_search_highlight_rendered(app);
 
     app.handle_editor_key(terminal_character('n'))
         .expect("next match");
@@ -1861,22 +2103,26 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
     app.handle_editor_key(terminal_character('N'))
         .expect("previous match");
     assert_eq!(app.active.editor.primary_cursor(), 5);
+}
 
+fn assert_backward_search(app: &mut App) {
     app.active
         .editor
         .set_cursor(app.active.editor.text().len_bytes());
     app.handle_editor_key(terminal_character('?'))
         .expect("open backward search");
-    type_prompt(&mut app, "hit");
-    submit_prompt(&mut app);
+    type_prompt(app, "hit");
+    submit_prompt(app);
     assert_eq!(app.active.editor.primary_cursor(), 21);
     app.handle_editor_key(terminal_character('n'))
         .expect("repeat backward search");
     assert_eq!(app.active.editor.primary_cursor(), 13);
+}
 
+fn assert_search_cancel_restores_origin(app: &mut App) {
     app.handle_editor_key(terminal_character('/'))
         .expect("start cancelable search");
-    type_prompt(&mut app, "zero");
+    type_prompt(app, "zero");
     assert_eq!(app.active.editor.primary_cursor(), 0);
     app.handle_prompt_key(terminal_key(TerminalKeyCode::Escape))
         .expect("cancel search");
@@ -1885,12 +2131,6 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
         app.active.editor.last_search(),
         Some(("hit", SearchDirection::Backward))
     );
-
-    app.execute_ex("nohlsearch").expect("clear highlights");
-    assert!(!app.search_highlight);
-    app.handle_editor_key(terminal_character('n'))
-        .expect("search remains repeatable after nohlsearch");
-    assert_eq!(app.active.editor.primary_cursor(), 5);
 }
 
 fn assert_search_highlight_rendered(app: &App) {
@@ -2559,6 +2799,10 @@ fn lsp_location_links_use_target_selection_and_utf16_columns() {
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].path, PathBuf::from("/tmp/wren-target.rs"));
     assert_eq!((locations[0].line, locations[0].column), (3, 3));
+    assert_eq!(
+        locations[0].selection_end,
+        Some(QuickfixPosition { line: 3, column: 9 })
+    );
     assert!(locations[0].column_utf16);
 
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -2569,10 +2813,100 @@ fn lsp_location_links_use_target_selection_and_utf16_columns() {
         path,
         line: 1,
         column: 3,
+        selection_end: Some(QuickfixPosition { line: 1, column: 9 }),
         column_utf16: true,
         text: String::new(),
     };
     assert_eq!(app.entry_cursor_byte(&entry), "😀".len());
+    assert_eq!(entry.selection_byte_range("😀target\n"), Some(4..10));
+}
+
+#[test]
+fn lsp_navigation_capabilities_follow_initialize_provider_advertisements() {
+    let capabilities = lsp_capabilities(&serde_json::json!({
+        "capabilities": {
+            "declarationProvider": false,
+            "definitionProvider": true,
+            "implementationProvider": {"workDoneProgress": true},
+            "referencesProvider": null,
+            "semanticTokensProvider": {
+                "legend": {"tokenTypes": ["function"], "tokenModifiers": []}
+            }
+        }
+    }));
+
+    assert_eq!(
+        capabilities.navigation,
+        LspNavigationCapabilities {
+            declaration: false,
+            definition: true,
+            implementation: true,
+            references: false,
+        }
+    );
+    assert!(capabilities.semantic_legend.is_some());
+}
+
+#[test]
+fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("references.rs");
+    let second_path = directory.path().join("second.rs");
+    let source = "// 😀 target and other\n";
+    let second_source = "fn other_reference() {}\n";
+    fs::write(&path, source).expect("write source");
+    fs::write(&second_path, second_source).expect("write second source");
+    let mut app = App::open(Some(&path), None).expect("open app");
+    app.quickfix = vec![
+        QuickfixEntry {
+            path,
+            line: 1,
+            column: 7,
+            selection_end: Some(QuickfixPosition {
+                line: 1,
+                column: 13,
+            }),
+            column_utf16: true,
+            text: "language-server location".to_owned(),
+        },
+        QuickfixEntry {
+            path: second_path,
+            line: 1,
+            column: 4,
+            selection_end: Some(QuickfixPosition {
+                line: 1,
+                column: 19,
+            }),
+            column_utf16: true,
+            text: "language-server location".to_owned(),
+        },
+    ];
+
+    app.start_location_picker(PickerSource::Jumps, "")
+        .expect("open reference picker");
+
+    assert_eq!(app.picker_preview, source);
+    assert_eq!(app.picker_preview_highlight_line, None);
+    assert!(app.picker_preview_decorations.iter().any(|decoration| {
+        decoration.range == (8..14)
+            && decoration.style.foreground.is_none()
+            && decoration.style.background == Some(CellColor::Rgb(app.theme.surface0))
+            && decoration.priority == u32::MAX
+    }));
+
+    app.move_picker(1);
+
+    assert_eq!(app.picker_preview, second_source);
+    assert_eq!(app.picker_preview_highlight_line, None);
+    assert!(app.picker_preview_decorations.iter().any(|decoration| {
+        decoration.range == (3..18)
+            && decoration.style.background == Some(CellColor::Rgb(app.theme.surface0))
+    }));
+    assert!(
+        !app.picker_preview_decorations
+            .iter()
+            .any(|decoration| decoration.range == (8..14) && decoration.priority == u32::MAX)
+    );
 }
 
 #[test]
@@ -2824,6 +3158,7 @@ fn lsp_navigation_mouse_scroll_and_cross_buffer_jumplist_round_trip() {
         path: second.clone(),
         line: 1,
         column: 4,
+        selection_end: None,
         column_utf16: true,
         text: "definition".to_owned(),
     };

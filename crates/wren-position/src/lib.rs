@@ -71,7 +71,7 @@ impl LazyLinePositionIndex {
 
     pub fn invalidate_transaction<T: TextStore>(&mut self, store: &T, transaction: &Transaction) {
         let first_changed_line = transaction
-            .edits
+            .edits()
             .iter()
             .map(|edit| store.line_of_byte(edit.range.start.min(store.len_bytes())))
             .min();
@@ -210,7 +210,12 @@ impl DisplayIndex {
     }
 
     pub fn invalidate_transaction(&mut self, transaction: &Transaction) {
-        if let Some(first) = transaction.edits.iter().map(|edit| edit.range.start).min() {
+        if let Some(first) = transaction
+            .edits()
+            .iter()
+            .map(|edit| edit.range.start)
+            .min()
+        {
             self.checkpoints.retain(|offset, _| *offset < first);
             if !self.checkpoints.contains_key(&0) {
                 self.checkpoints.insert(

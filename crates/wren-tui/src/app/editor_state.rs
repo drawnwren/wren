@@ -530,67 +530,94 @@ impl App {
         let mut changed = false;
         while let Some(result) = self.tasks.try_result()? {
             changed = true;
-            self.active_task = None;
-            let ai_result = self.active_ai_task == Some(result.task.task_id);
-            if ai_result {
-                self.active_ai_task = None;
-            }
-            match result.outcome {
-                Ok(effects) => {
-                    if ai_result {
-                        self.ai_transcript = effects
-                            .messages
-                            .iter()
-                            .map(AsRef::as_ref)
-                            .collect::<Vec<&str>>()
-                            .join("\n");
-                        if self.ai_transcript.trim().is_empty() {
-                            self.ai_transcript = "Codex returned no text.".to_owned();
-                        }
-                        self.show_ai_transcript();
-                        self.message =
-                            format!("Codex finished in {:.1}s", result.elapsed.as_secs_f32());
-                        continue;
-                    }
-                    for proposal in effects.edit_proposals {
-                        if proposal.document_id != self.active.document_id {
-                            continue;
-                        }
-                        if proposal.base_revision != self.active.editor.revision() {
-                            self.message = format!(
-                                "task {} is stale at revision {}",
-                                result.task.task_id.get(),
-                                self.active.editor.revision().get()
-                            );
-                            continue;
-                        }
-                        for transaction in proposal.transactions {
-                            self.active.editor.apply_transaction(transaction.clone())?;
-                            self.after_transaction(Some(transaction));
-                        }
-                    }
-                    if let Some(message) = effects.messages.last() {
-                        self.message = message.to_string();
-                    }
-                }
-                Err(TaskFailure::Cancelled) => {
-                    self.message = if ai_result {
-                        "Codex cancelled".to_owned()
-                    } else {
-                        "task cancelled".to_owned()
-                    };
-                }
-                Err(error) => {
-                    if ai_result {
-                        self.ai_transcript = error.to_string();
-                        self.show_ai_transcript();
-                        self.message = error.to_string();
-                    } else {
-                        self.show_error(error);
-                    }
-                }
-            }
+            self.apply_task_result(result)?;
         }
         Ok(changed)
+    }
+
+    fn apply_task_result(&mut self, result: TaskResult) -> Result<()> {
+        self.active_task = None;
+        let ai_result = self
+            .active_ai_task
+            .take_if(|task_id| *task_id == result.task.task_id)
+            .is_some();
+        if ai_result {
+            self.apply_ai_task_result(result.outcome, result.elapsed);
+        } else {
+            self.apply_editor_task_result(result.task.task_id, result.outcome)?;
+        }
+        Ok(())
+    }
+
+    fn apply_ai_task_result(&mut self, outcome: Result<Effects, TaskFailure>, elapsed: Duration) {
+        match outcome {
+            Ok(effects) => {
+                self.ai_transcript = effects
+                    .messages
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                if self.ai_transcript.trim().is_empty() {
+                    self.ai_transcript = "Codex returned no text.".to_owned();
+                }
+                self.show_ai_transcript();
+                self.message = format!("Codex finished in {:.1}s", elapsed.as_secs_f32());
+            }
+            Err(TaskFailure::Cancelled) => self.message = "Codex cancelled".to_owned(),
+            Err(error) => {
+                self.ai_transcript = error.to_string();
+                self.show_ai_transcript();
+                self.message = error.to_string();
+            }
+        }
+    }
+
+    fn apply_editor_task_result(
+        &mut self,
+        task_id: CommandTaskId,
+        outcome: Result<Effects, TaskFailure>,
+    ) -> Result<()> {
+        match outcome {
+            Ok(effects) => self.apply_editor_task_effects(task_id, effects),
+            Err(TaskFailure::Cancelled) => {
+                self.message = "task cancelled".to_owned();
+                Ok(())
+            }
+            Err(error) => {
+                self.show_error(error);
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_editor_task_effects(
+        &mut self,
+        task_id: CommandTaskId,
+        effects: Effects,
+    ) -> Result<()> {
+        let active_document = self.active.document_id;
+        for proposal in effects
+            .edit_proposals
+            .into_iter()
+            .filter(|proposal| proposal.document_id == active_document)
+        {
+            if proposal.base_revision != self.active.editor.revision() {
+                self.message = format!(
+                    "task {} is stale at revision {}",
+                    task_id.get(),
+                    self.active.editor.revision().get()
+                );
+                continue;
+            }
+            for transaction in proposal.transactions {
+                self.active.editor.apply_transaction(transaction.clone())?;
+                self.after_transaction(Some(transaction));
+            }
+        }
+        if let Some(message) = effects.messages.last() {
+            self.message = message.to_string();
+        }
+        Ok(())
     }
 }

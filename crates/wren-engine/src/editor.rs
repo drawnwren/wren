@@ -10,7 +10,8 @@ use wren_grammar::{
 };
 use wren_text::TextStore;
 use wren_types::{
-    Anchor, Bias, DocumentRevision, Edit, SelRange, SelectionSet, Transaction, TransactionError,
+    Anchor, Bias, DocumentRevision, Edit, OffsetMapping, SelRange, SelectionSet, Transaction,
+    TransactionError,
 };
 
 use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
@@ -98,8 +99,8 @@ pub struct DurableUndoState {
 impl UndoGroup {
     fn new(before: SelectionSet) -> Self {
         Self {
-            forward: Vec::new(),
-            inverse: Vec::new(),
+            forward: Vec::with_capacity(8),
+            inverse: Vec::with_capacity(8),
             before: before.clone(),
             after: before,
         }
@@ -239,6 +240,75 @@ impl SearchState {
         cache.windows.insert(key, ranges.clone());
         ranges
     }
+
+    fn map_literal_cache_through(
+        &self,
+        mapping: &OffsetMapping<'_>,
+        text: &FrameText,
+        revision: DocumentRevision,
+    ) {
+        let Some(context) = self
+            .compiled
+            .literal_width()
+            .map(|width| width.saturating_sub(1))
+        else {
+            return;
+        };
+        let mut cache = self.cache.borrow_mut();
+        if cache.revision != Some(mapping.base_revision()) {
+            return;
+        }
+        let mut affected = mapping
+            .edits()
+            .iter()
+            .filter_map(|edit| {
+                let range = mapping
+                    .map_range(edit.range.clone(), Bias::Left, Bias::Right)
+                    .ok()?;
+                Some(expand_literal_context(text, range, context))
+            })
+            .collect::<Vec<_>>();
+        merge_search_ranges(&mut affected);
+        let mut windows = BTreeMap::new();
+        for ((start, end), ranges) in std::mem::take(&mut cache.windows) {
+            let Ok(window) = mapping.map_range(start..end, Bias::Left, Bias::Right) else {
+                continue;
+            };
+            let impacts = affected
+                .iter()
+                .filter_map(|range| intersect_ranges(range, &window))
+                .collect::<Vec<_>>();
+            let mut mapped = ranges
+                .into_iter()
+                .filter(|range| {
+                    !mapping.edits().iter().any(|edit| {
+                        if edit.range.is_empty() {
+                            range.start < edit.range.start && edit.range.start < range.end
+                        } else {
+                            ranges_overlap(range, &edit.range)
+                        }
+                    })
+                })
+                .filter_map(|range| {
+                    let range = mapping.map_range(range, Bias::Left, Bias::Right).ok()?;
+                    (!range.is_empty()).then_some(range)
+                })
+                .collect::<Vec<_>>();
+            for impact in impacts {
+                let source = text.slice(impact.clone());
+                mapped.extend(self.compiled.find_iter(&source).map(|found| {
+                    impact.start.saturating_add(found.start())
+                        ..impact.start.saturating_add(found.end())
+                }));
+            }
+            mapped.sort_by_key(|range| (range.start, range.end));
+            mapped.dedup();
+            windows.insert((window.start, window.end), mapped);
+        }
+        cache.revision = Some(revision);
+        cache.all = None;
+        cache.windows = windows;
+    }
 }
 
 impl SearchMatchCache {
@@ -249,6 +319,42 @@ impl SearchMatchCache {
             self.windows.clear();
         }
     }
+}
+
+fn expand_literal_context(text: &FrameText, range: Range<usize>, context: usize) -> Range<usize> {
+    let mut start = range.start.saturating_sub(context).min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = range.end.saturating_add(context).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    start..end
+}
+
+fn intersect_ranges(left: &Range<usize>, right: &Range<usize>) -> Option<Range<usize>> {
+    let intersection = left.start.max(right.start)..left.end.min(right.end);
+    (!intersection.is_empty()).then_some(intersection)
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn merge_search_ranges(ranges: &mut Vec<Range<usize>>) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged = Vec::<Range<usize>>::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
 }
 
 fn find_search_from(
@@ -403,14 +509,14 @@ impl<T: TextStore> Editor<T> {
             mode: Mode::Normal,
             pending_keys: Vec::with_capacity(8),
             parse_state: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            undo_branches: Vec::new(),
+            undo: Vec::with_capacity(64),
+            redo: Vec::with_capacity(64),
+            undo_branches: Vec::with_capacity(8),
             insert_group: None,
             insert_style: InsertStyle::Insert,
             insert_capture: String::with_capacity(64),
             registers: BTreeMap::new(),
-            pending_clipboard_writes: Vec::new(),
+            pending_clipboard_writes: Vec::with_capacity(4),
             marks: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -425,10 +531,14 @@ impl<T: TextStore> Editor<T> {
             last_visual: None,
             jumplist: Vec::with_capacity(64),
             jump_index: 0,
-            changelist: vec![0],
+            changelist: {
+                let mut changes = Vec::with_capacity(64);
+                changes.push(0);
+                changes
+            },
             change_index: 1,
             last_find: None,
-            messages: Vec::new(),
+            messages: Vec::with_capacity(8),
             dirty: false,
             read_only: false,
             ignore_case: false,
@@ -439,7 +549,7 @@ impl<T: TextStore> Editor<T> {
             shift_width: 4,
             smart_indent: false,
             expand_region_keys: false,
-            visual_region_history: Vec::new(),
+            visual_region_history: Vec::with_capacity(16),
         }
     }
 
@@ -787,43 +897,22 @@ impl<T: TextStore> Editor<T> {
             self.push_jump(self.primary_cursor());
             self.jump_index = self.jumplist.len().saturating_sub(1);
         }
-        let next = if backward {
-            self.jump_index.checked_sub(1)
-        } else {
-            self.jump_index
-                .checked_add(1)
-                .filter(|index| *index < self.jumplist.len())
-        };
-        let Some(next) = next else {
+        let Some((next, byte)) = history_target(&self.jumplist, self.jump_index, backward) else {
             return false;
         };
         self.jump_index = next;
-        if let Some(byte) = self.jumplist.get(next).copied() {
-            self.set_cursor(byte);
-            true
-        } else {
-            false
-        }
+        self.set_cursor(byte);
+        true
     }
 
     pub fn navigate_change(&mut self, backward: bool) -> bool {
-        let next = if backward {
-            self.change_index.checked_sub(1)
-        } else {
-            self.change_index
-                .checked_add(1)
-                .filter(|index| *index < self.changelist.len())
-        };
-        let Some(next) = next else {
+        let Some((next, byte)) = history_target(&self.changelist, self.change_index, backward)
+        else {
             return false;
         };
         self.change_index = next;
-        if let Some(byte) = self.changelist.get(next).copied() {
-            self.set_cursor(byte);
-            true
-        } else {
-            false
-        }
+        self.set_cursor(byte);
+        true
     }
 
     pub fn repeat_find(&mut self, reverse: bool, count: u32) -> bool {
@@ -1380,7 +1469,7 @@ impl<T: TextStore> Editor<T> {
         let mut last = None;
         for stored in group.inverse.iter().rev() {
             let mut inverse = stored.clone();
-            inverse.base_revision = self.revision;
+            inverse.rebase(self.revision);
             self.apply_without_history(&inverse)?;
             last = Some(inverse);
         }
@@ -1399,7 +1488,7 @@ impl<T: TextStore> Editor<T> {
         let mut last = None;
         for stored in &group.forward {
             let mut forward = stored.clone();
-            forward.base_revision = self.revision;
+            forward.rebase(self.revision);
             self.apply_without_history(&forward)?;
             last = Some(forward);
         }
@@ -1488,16 +1577,15 @@ impl<T: TextStore> Editor<T> {
                 self.primary_cursor(),
             )
         });
-        if let Some(byte) = byte {
-            let previous = self.primary_cursor();
-            if byte != previous {
-                self.push_jump(previous);
-            }
-            self.collapse_selection(byte);
-            true
-        } else {
-            false
+        let Some(byte) = byte else {
+            return false;
+        };
+        let previous = self.primary_cursor();
+        if byte != previous {
+            self.push_jump(previous);
         }
+        self.collapse_selection(byte);
+        true
     }
 
     pub fn compile_search_pattern(
@@ -1891,10 +1979,10 @@ impl<T: TextStore> Editor<T> {
         insert_group: bool,
     ) -> Result<(), EngineError> {
         self.ensure_writable()?;
-        if transaction.base_revision != self.revision {
+        if transaction.base_revision() != self.revision {
             return Err(EngineError::RevisionMismatch {
                 expected: self.revision.get(),
-                actual: transaction.base_revision.get(),
+                actual: transaction.base_revision().get(),
             });
         }
         let inverse = self.invert_transaction(&transaction)?;
@@ -1903,8 +1991,8 @@ impl<T: TextStore> Editor<T> {
         } else {
             true
         };
-        if starts_change && !transaction.edits.is_empty() {
-            self.push_change(transaction.edits[0].range.start);
+        if starts_change && !transaction.is_empty() {
+            self.push_change(transaction.edits()[0].range.start);
         }
         let before = self.selections.clone();
         self.apply_without_history(&transaction)?;
@@ -1931,10 +2019,9 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn invert_transaction(&self, transaction: &Transaction) -> Result<Transaction, EngineError> {
-        transaction.validate()?;
         let text_len = self.text.len_bytes();
-        let mut deleted = Vec::with_capacity(transaction.edits.len());
-        for edit in &transaction.edits {
+        let mut deleted = Vec::with_capacity(transaction.edit_count());
+        for edit in transaction.edits() {
             if edit.range.end > text_len {
                 return Err(TransactionError::OutOfBounds {
                     offset: edit.range.end,
@@ -1958,27 +2045,32 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn apply_without_history(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
-        if transaction.base_revision != self.revision {
+        if transaction.base_revision() != self.revision {
             return Err(EngineError::RevisionMismatch {
                 expected: self.revision.get(),
-                actual: transaction.base_revision.get(),
+                actual: transaction.base_revision().get(),
             });
         }
+        let revision = self.revision.next().ok_or(EngineError::RevisionOverflow)?;
+        let mapping = transaction.offset_mapping();
         let frame_text = self.frame_text.edited(transaction)?;
+        if let Some(search) = &self.search {
+            search.map_literal_cache_through(&mapping, &frame_text, revision);
+        }
         self.text.apply(transaction);
         self.frame_text = frame_text;
         self.refresh_dirty();
-        self.selections = self.selections.map_through(transaction)?;
+        self.selections = self.selections.map_with(&mapping)?;
         for anchor in self.marks.values_mut() {
-            *anchor = (*anchor).map_through(transaction)?;
+            *anchor = (*anchor).map_with(&mapping)?;
         }
         for jump in &mut self.jumplist {
-            *jump = transaction.map_offset(*jump, Bias::Left)?;
+            *jump = mapping.map_offset(*jump, Bias::Left)?;
         }
         for change in &mut self.changelist {
-            *change = transaction.map_offset(*change, Bias::Left)?;
+            *change = mapping.map_offset(*change, Bias::Left)?;
         }
-        self.revision = self.revision.next().ok_or(EngineError::RevisionOverflow)?;
+        self.revision = revision;
         Ok(())
     }
 
@@ -2047,7 +2139,7 @@ impl<T: TextStore> Editor<T> {
         }) else {
             return Ok(None);
         };
-        let Some(edit) = forward.edits.first() else {
+        let Some(edit) = forward.edits().first() else {
             return Ok(None);
         };
         if edit.range.start.saturating_add(edit.insert.len()) != cursor {
@@ -2055,7 +2147,7 @@ impl<T: TextStore> Editor<T> {
         }
         let destination = edit.range.start;
         let mut inverse = stored_inverse;
-        inverse.base_revision = self.revision;
+        inverse.rebase(self.revision);
         self.apply_without_history(&inverse)?;
         if let Some(group) = &mut self.insert_group {
             group.forward.pop();
@@ -2395,7 +2487,7 @@ impl<T: TextStore> Editor<T> {
                     RepeatAction::Insert { style, text } => {
                         let transaction = self.repeated_insert(*style, text)?;
                         self.apply_recorded(transaction.clone(), false)?;
-                        if let Some(edit) = transaction.edits.first() {
+                        if let Some(edit) = transaction.edits().first() {
                             let current = self.contents();
                             let destination = match style {
                                 InsertStyle::OpenAbove | InsertStyle::OpenBelow => {
@@ -2809,6 +2901,17 @@ impl<T: TextStore> Editor<T> {
             Ok(())
         }
     }
+}
+
+fn history_target(history: &[usize], current: usize, backward: bool) -> Option<(usize, usize)> {
+    let index = if backward {
+        current.checked_sub(1)?
+    } else {
+        current
+            .checked_add(1)
+            .filter(|index| *index < history.len())?
+    };
+    Some((index, *history.get(index)?))
 }
 
 fn register_key(register: Option<Register>) -> Option<char> {
@@ -3528,24 +3631,59 @@ mod tests {
     }
 
     #[test]
-    fn visible_search_matches_are_cached_until_the_document_revision_changes() {
-        let mut editor = editor("one two one\n");
-        editor
+    fn literal_search_cache_maps_through_edits_and_repairs_changed_context() {
+        let mut cached = editor("one two one\n");
+        cached
             .search("one", SearchDirection::Forward)
             .expect("search");
+        let end = cached.text().len_bytes();
+        assert_eq!(cached.search_match_ranges(0..end, 16).len(), 2);
+        assert_eq!(cached.search_match_ranges(0..end, 16).len(), 2);
+        assert_eq!(cached.search_scan_counts().0, 1);
+
+        cached
+            .apply_transaction(
+                Transaction::new(cached.revision(), vec![Edit::new(end..end, "one")])
+                    .expect("transaction"),
+            )
+            .expect("edit");
+        let new_end = cached.text().len_bytes();
+        assert_eq!(cached.search_match_ranges(0..new_end, 16).len(), 3);
+        assert_eq!(cached.search_scan_counts().0, 1);
+
+        let mut crossing = editor("val_ tail");
+        crossing
+            .restore_search("value_", SearchDirection::Forward)
+            .expect("literal search");
+        let end = crossing.text().len_bytes();
+        assert!(crossing.search_match_ranges(0..end, 16).is_empty());
+        crossing
+            .apply_transaction(
+                Transaction::new(crossing.revision(), vec![Edit::new(3..3, "ue")])
+                    .expect("crossing transaction"),
+            )
+            .expect("crossing edit");
+        let end = crossing.text().len_bytes();
+        assert_eq!(crossing.search_match_ranges(0..end, 16), vec![0..6]);
+        assert_eq!(crossing.search_scan_counts().0, 1);
+    }
+
+    #[test]
+    fn regex_search_windows_are_invalidated_after_edits() {
+        let mut editor = editor("one two one\n");
+        editor
+            .restore_search("o.e", SearchDirection::Forward)
+            .expect("regex search");
         let end = editor.text().len_bytes();
         assert_eq!(editor.search_match_ranges(0..end, 16).len(), 2);
-        assert_eq!(editor.search_match_ranges(0..end, 16).len(), 2);
-        assert_eq!(editor.search_scan_counts().0, 1);
-
         editor
             .apply_transaction(
                 Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")])
                     .expect("transaction"),
             )
             .expect("edit");
-        let new_end = editor.text().len_bytes();
-        assert_eq!(editor.search_match_ranges(0..new_end, 16).len(), 3);
+        let end = editor.text().len_bytes();
+        assert_eq!(editor.search_match_ranges(0..end, 16).len(), 3);
         assert_eq!(editor.search_scan_counts().0, 2);
     }
 

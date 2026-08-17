@@ -201,12 +201,6 @@ impl WorkspaceExecutor {
             let mut text = document.text.clone();
             let mut revision = document.revision;
             for semantic in &edit.transactions {
-                semantic.validate_for_text(&text).map_err(|source| {
-                    WorkspaceError::Transaction {
-                        document_id: edit.document_id,
-                        source,
-                    }
-                })?;
                 text = semantic.apply_to_string(&text).map_err(|source| {
                     WorkspaceError::Transaction {
                         document_id: edit.document_id,

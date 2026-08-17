@@ -62,6 +62,18 @@ impl VimPattern {
     pub fn captures_iter<'text>(&'text self, text: &'text str) -> CaptureMatches<'text, 'text> {
         self.regex.captures_iter(text)
     }
+
+    /// Exact byte width for the common plain-ASCII search form. Regex-shaped
+    /// patterns deliberately return `None`; only fixed-width literals can be
+    /// repaired locally after an edit without changing search semantics.
+    pub(crate) fn literal_width(&self) -> Option<usize> {
+        (!self.source.is_empty()
+            && self
+                .source
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b' ')))
+        .then_some(self.source.len())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,77 +229,116 @@ struct TranslatedPattern {
 }
 
 fn translate_vim_pattern(pattern: &str) -> Result<TranslatedPattern, Box<str>> {
-    let mut output = String::new();
+    let mut translator = PatternTranslator::default();
     let mut characters = pattern.chars().peekable();
-    let mut magic = PatternMode::Default;
-    let mut case_override = None;
     while let Some(character) = characters.next() {
         if character == '\\' {
-            let Some(escaped) = characters.next() else {
-                return Err("pattern ends with an incomplete escape".into());
-            };
-            match escaped {
-                'v' => magic = PatternMode::Very,
-                'm' => magic = PatternMode::Default,
-                'M' => magic = PatternMode::Nomagic,
-                'V' => magic = PatternMode::Literal,
-                'c' => case_override = Some(CaseOverride::Ignore),
-                'C' => case_override = Some(CaseOverride::Sensitive),
-                '<' | '>' => output.push_str(r"\b"),
-                'z' if matches!(characters.peek(), Some('s' | 'e')) => {
-                    let suffix = characters.next().unwrap_or_default();
-                    return Err(format!(
-                        "Vim atom \\z{suffix} is not supported by the bounded search engine"
-                    )
-                    .into_boxed_str());
-                }
-                '1'..='9' => {
-                    return Err(
-                        "Vim pattern backreferences are not supported by the bounded search engine"
-                            .into(),
-                    );
-                }
-                '(' | ')' | '|' | '+' | '?' | '{' | '}' | '='
-                    if matches!(magic, PatternMode::Default | PatternMode::Nomagic) =>
-                {
-                    output.push(if escaped == '=' { '?' } else { escaped });
-                }
-                '.' | '*' | '[' | ']' | '^' | '$' if magic == PatternMode::Default => {
-                    push_escaped_literal(&mut output, escaped);
-                }
-                '.' | '*' | '[' | ']' if magic == PatternMode::Nomagic => output.push(escaped),
-                '^' | '$' if magic == PatternMode::Nomagic => {
-                    push_escaped_literal(&mut output, escaped);
-                }
-                'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | 'b' | 'B' => {
-                    output.push('\\');
-                    output.push(escaped);
-                }
-                _ if magic == PatternMode::Literal => push_escaped_literal(&mut output, escaped),
-                _ if !escaped.is_alphanumeric() && escaped != '_' => {
-                    push_escaped_literal(&mut output, escaped);
-                }
-                _ => return Err(format!("unsupported Vim atom \\{escaped}").into_boxed_str()),
-            }
-            continue;
-        }
-
-        let magic_character = match magic {
-            PatternMode::Very => !character.is_alphanumeric() && character != '_',
-            PatternMode::Default => matches!(character, '.' | '*' | '[' | ']' | '^' | '$'),
-            PatternMode::Nomagic => matches!(character, '^' | '$'),
-            PatternMode::Literal => false,
-        };
-        if magic_character {
-            output.push(character);
+            translator.push_escape(&mut characters)?;
         } else {
-            push_escaped_literal(&mut output, character);
+            translator.push_source(character);
         }
     }
-    Ok(TranslatedPattern {
-        regex: output,
-        case_override,
-    })
+    Ok(translator.finish())
+}
+
+struct PatternTranslator {
+    output: String,
+    magic: PatternMode,
+    case_override: Option<CaseOverride>,
+}
+
+impl Default for PatternTranslator {
+    fn default() -> Self {
+        Self {
+            output: String::new(),
+            magic: PatternMode::Default,
+            case_override: None,
+        }
+    }
+}
+
+impl PatternTranslator {
+    fn push_source(&mut self, character: char) {
+        if self.magic.is_magic(character) {
+            self.output.push(character);
+        } else {
+            push_escaped_literal(&mut self.output, character);
+        }
+    }
+
+    fn push_escape(
+        &mut self,
+        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> Result<(), Box<str>> {
+        let escaped = characters
+            .next()
+            .ok_or_else(|| Box::<str>::from("pattern ends with an incomplete escape"))?;
+        match escaped {
+            'v' => self.magic = PatternMode::Very,
+            'm' => self.magic = PatternMode::Default,
+            'M' => self.magic = PatternMode::Nomagic,
+            'V' => self.magic = PatternMode::Literal,
+            'c' => self.case_override = Some(CaseOverride::Ignore),
+            'C' => self.case_override = Some(CaseOverride::Sensitive),
+            '<' | '>' => self.output.push_str(r"\b"),
+            'z' if matches!(characters.peek(), Some('s' | 'e')) => {
+                let suffix = characters.next().unwrap_or_default();
+                return Err(format!(
+                    "Vim atom \\z{suffix} is not supported by the bounded search engine"
+                )
+                .into_boxed_str());
+            }
+            '1'..='9' => {
+                return Err(
+                    "Vim pattern backreferences are not supported by the bounded search engine"
+                        .into(),
+                );
+            }
+            '(' | ')' | '|' | '+' | '?' | '{' | '}' | '='
+                if matches!(self.magic, PatternMode::Default | PatternMode::Nomagic) =>
+            {
+                self.output.push(if escaped == '=' { '?' } else { escaped });
+            }
+            '.' | '*' | '[' | ']' | '^' | '$' if self.magic == PatternMode::Default => {
+                push_escaped_literal(&mut self.output, escaped);
+            }
+            '.' | '*' | '[' | ']' if self.magic == PatternMode::Nomagic => {
+                self.output.push(escaped);
+            }
+            '^' | '$' if self.magic == PatternMode::Nomagic => {
+                push_escaped_literal(&mut self.output, escaped);
+            }
+            'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | 'b' | 'B' => {
+                self.output.push('\\');
+                self.output.push(escaped);
+            }
+            _ if self.magic == PatternMode::Literal
+                || (!escaped.is_alphanumeric() && escaped != '_') =>
+            {
+                push_escaped_literal(&mut self.output, escaped);
+            }
+            _ => return Err(format!("unsupported Vim atom \\{escaped}").into_boxed_str()),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> TranslatedPattern {
+        TranslatedPattern {
+            regex: self.output,
+            case_override: self.case_override,
+        }
+    }
+}
+
+impl PatternMode {
+    fn is_magic(self, character: char) -> bool {
+        match self {
+            Self::Very => !character.is_alphanumeric() && character != '_',
+            Self::Default => matches!(character, '.' | '*' | '[' | ']' | '^' | '$'),
+            Self::Nomagic => matches!(character, '^' | '$'),
+            Self::Literal => false,
+        }
+    }
 }
 
 fn push_escaped_literal(output: &mut String, character: char) {

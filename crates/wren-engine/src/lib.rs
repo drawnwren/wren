@@ -43,6 +43,12 @@ struct LineStartShift {
     delta: i128,
 }
 
+struct EditedLineIndex {
+    text_len: usize,
+    starts: Arc<[usize]>,
+    shift: Option<LineStartShift>,
+}
+
 #[derive(Debug)]
 struct FrameStorage {
     source: FrameSource,
@@ -107,7 +113,10 @@ impl FrameText {
         }
     }
 
-    fn edited(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
+    /// Build an immutable preview of this snapshot after `transaction`.
+    /// The returned value shares unchanged storage and never mutates the text
+    /// store that originally produced this frame.
+    pub fn edited(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
         self.validate_edit_boundaries(transaction)?;
         let single_line_change = self.single_line_change(transaction);
         if let Some(previous) = self.previous_if_inverse(transaction) {
@@ -119,28 +128,26 @@ impl FrameText {
                 single_line_change,
             });
         }
-        let (capacity, line_starts, line_start_shift) =
-            self.edited_line_starts(transaction, single_line_change)?;
+        let index = self.edited_line_starts(transaction, single_line_change)?;
         Ok(Self {
             storage: Arc::new(FrameStorage {
                 source: FrameSource::Edited {
                     previous: self.clone(),
-                    edits: transaction.edits.clone().into(),
+                    edits: transaction.edits().to_vec().into(),
                 },
                 materialized: OnceLock::new(),
-                len: capacity,
+                len: index.text_len,
             }),
-            line_starts,
-            line_start_shift,
+            line_starts: index.starts,
+            line_start_shift: index.shift,
             previous_storage: Some(Arc::downgrade(&self.storage)),
             single_line_change,
         })
     }
 
     fn validate_edit_boundaries(&self, transaction: &Transaction) -> Result<(), TransactionError> {
-        transaction.validate()?;
         for offset in transaction
-            .edits
+            .edits()
             .iter()
             .flat_map(|edit| [edit.range.start, edit.range.end])
         {
@@ -158,7 +165,7 @@ impl FrameText {
     }
 
     fn single_line_change(&self, transaction: &Transaction) -> Option<FrameTextChange> {
-        let [edit] = transaction.edits.as_slice() else {
+        let [edit] = transaction.edits() else {
             return None;
         };
         if edit.insert.contains('\n') || self.slice(edit.range.clone()).contains('\n') {
@@ -188,14 +195,14 @@ impl FrameText {
         &self,
         transaction: &Transaction,
         single_line_change: Option<FrameTextChange>,
-    ) -> Result<(usize, Arc<[usize]>, Option<LineStartShift>), TransactionError> {
+    ) -> Result<EditedLineIndex, TransactionError> {
         let inserted_bytes = transaction
-            .edits
+            .edits()
             .iter()
             .map(|edit| edit.insert.len())
             .sum::<usize>();
         let deleted_bytes = transaction
-            .edits
+            .edits()
             .iter()
             .map(|edit| edit.range.len())
             .sum::<usize>();
@@ -212,11 +219,11 @@ impl FrameText {
             let delta = inserted - deleted;
             let from_line = change.line.saturating_add(1);
             if delta == 0 || from_line >= self.line_starts.len() {
-                return Ok((
-                    capacity,
-                    Arc::clone(&self.line_starts),
-                    self.line_start_shift,
-                ));
+                return Ok(EditedLineIndex {
+                    text_len: capacity,
+                    starts: Arc::clone(&self.line_starts),
+                    shift: self.line_start_shift,
+                });
             }
             if self
                 .line_start_shift
@@ -225,11 +232,11 @@ impl FrameText {
                 let delta = self
                     .line_start_shift
                     .map_or(delta, |shift| shift.delta.saturating_add(delta));
-                return Ok((
-                    capacity,
-                    Arc::clone(&self.line_starts),
-                    (delta != 0).then_some(LineStartShift { from_line, delta }),
-                ));
+                return Ok(EditedLineIndex {
+                    text_len: capacity,
+                    starts: Arc::clone(&self.line_starts),
+                    shift: (delta != 0).then_some(LineStartShift { from_line, delta }),
+                });
             }
         }
         let mut line_starts = Vec::with_capacity(self.line_starts.len());
@@ -238,7 +245,7 @@ impl FrameText {
         let mut source_cursor = 0;
         let mut target_len = 0;
 
-        for edit in &transaction.edits {
+        for edit in transaction.edits() {
             let target_start = target_len + (edit.range.start - source_cursor);
             while self
                 .line_start(old_line)
@@ -269,7 +276,11 @@ impl FrameText {
             old_line += 1;
         }
         debug_assert_eq!(target_start + (self.len() - source_cursor), capacity);
-        Ok((capacity, line_starts.into(), None))
+        Ok(EditedLineIndex {
+            text_len: capacity,
+            starts: line_starts.into(),
+            shift: None,
+        })
     }
 
     fn line_start(&self, line: usize) -> Option<usize> {
@@ -404,11 +415,11 @@ impl FrameText {
         let FrameSource::Edited { previous, edits } = &self.storage.source else {
             return None;
         };
-        if edits.len() != transaction.edits.len() {
+        if edits.len() != transaction.edit_count() {
             return None;
         }
         let mut delta = 0_i128;
-        for (forward, inverse) in edits.iter().zip(&transaction.edits) {
+        for (forward, inverse) in edits.iter().zip(transaction.edits()) {
             let start = i128::try_from(forward.range.start)
                 .ok()?
                 .checked_add(delta)?;

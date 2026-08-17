@@ -1,28 +1,47 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum InputLayer {
+    Terminal,
+    SubstituteConfirmation,
+    Prompt,
+    Editor,
+}
+
 impl App {
     pub(super) fn handle_input(&mut self, input: TerminalInput) -> Result<()> {
-        if !matches!(&input, TerminalInput::Ignored) {
-            self.defer_lsp_start_until_idle();
+        self.foreground_frame_pending = true;
+        match self.input_layer() {
+            InputLayer::Terminal => self.handle_terminal_input(input),
+            InputLayer::SubstituteConfirmation => self.handle_confirmation_input(input),
+            InputLayer::Prompt => self.handle_prompt_input(input),
+            InputLayer::Editor => self.handle_editor_input(input),
         }
+    }
+
+    fn input_layer(&self) -> InputLayer {
         if self.terminal_focused {
-            return self.handle_terminal_input(input);
+            InputLayer::Terminal
+        } else if self.substitute_confirmation.is_some() {
+            InputLayer::SubstituteConfirmation
+        } else if self.prompt.is_some() {
+            InputLayer::Prompt
+        } else {
+            InputLayer::Editor
         }
-        if self.substitute_confirmation.is_some() {
-            return match input {
-                TerminalInput::Key(key) => self.handle_substitution_confirmation(key),
-                TerminalInput::Paste(_)
-                | TerminalInput::MouseScroll { .. }
-                | TerminalInput::MouseClick { .. }
-                | TerminalInput::MouseDrag { .. }
-                | TerminalInput::MouseRelease { .. }
-                | TerminalInput::Ignored
-                | TerminalInput::Resized { .. } => Ok(()),
-            };
-        }
+    }
+
+    fn handle_confirmation_input(&mut self, input: TerminalInput) -> Result<()> {
+        let TerminalInput::Key(key) = input else {
+            return Ok(());
+        };
+        self.handle_substitution_confirmation(key)
+    }
+
+    fn handle_prompt_input(&mut self, input: TerminalInput) -> Result<()> {
         match input {
-            TerminalInput::Key(key) if self.prompt.is_some() => self.handle_prompt_key(key),
-            TerminalInput::Paste(text) if self.prompt.is_some() => {
+            TerminalInput::Key(key) => self.handle_prompt_key(key),
+            TerminalInput::Paste(text) => {
                 if let Some(prompt) = &mut self.prompt {
                     prompt
                         .buffer
@@ -30,6 +49,17 @@ impl App {
                 }
                 self.update_prompt_picker()
             }
+            TerminalInput::MouseScroll { lines, .. } => self.handle_mouse_scroll(lines),
+            TerminalInput::MouseClick { .. }
+            | TerminalInput::MouseDrag { .. }
+            | TerminalInput::MouseRelease { .. }
+            | TerminalInput::Ignored
+            | TerminalInput::Resized { .. } => Ok(()),
+        }
+    }
+
+    fn handle_editor_input(&mut self, input: TerminalInput) -> Result<()> {
+        match input {
             TerminalInput::Key(key) => self.handle_editor_key(key),
             TerminalInput::Paste(text) => {
                 if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace) {
@@ -40,25 +70,7 @@ impl App {
                 }
                 Ok(())
             }
-            TerminalInput::MouseScroll { lines, .. } => {
-                self.mouse_selection = None;
-                self.ace_jump = None;
-                if let Some(popup) = &mut self.popup {
-                    if lines < 0 {
-                        popup.scroll = popup.scroll.saturating_sub(lines.unsigned_abs());
-                    } else {
-                        popup.scroll = popup
-                            .scroll
-                            .saturating_add(lines.unsigned_abs())
-                            .min(popup.text.lines().count().saturating_sub(1));
-                    }
-                } else if self.prompt_kind_is_picker() {
-                    self.move_picker(lines);
-                } else {
-                    self.scroll_view_line(lines.signum(), lines.unsigned_abs());
-                }
-                Ok(())
-            }
+            TerminalInput::MouseScroll { lines, .. } => self.handle_mouse_scroll(lines),
             // The application loop owns rendered geometry and handles clicks
             // through `handle_mouse_click` before generic input dispatch.
             TerminalInput::MouseClick { .. }
@@ -69,6 +81,25 @@ impl App {
         }
     }
 
+    fn handle_mouse_scroll(&mut self, lines: isize) -> Result<()> {
+        self.mouse_selection = None;
+        self.ace_jump = None;
+        if self
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.cursor.is_some())
+        {
+            self.move_popup_cursor_rows(lines);
+        } else if self.prompt_kind_is_picker() {
+            self.close_editor_popup();
+            self.move_picker(lines);
+        } else {
+            self.close_editor_popup();
+            self.scroll_view_line(lines.signum(), lines.unsigned_abs());
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_mouse_click(
         &mut self,
         layout: &ViewportLayout,
@@ -76,9 +107,16 @@ impl App {
         row: usize,
     ) -> Result<()> {
         self.mouse_selection = None;
+        if self
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.cursor.is_some())
+        {
+            return Ok(());
+        }
+        self.close_editor_popup();
         if self.terminal_focused
             || self.prompt.is_some()
-            || self.popup.is_some()
             || self.completion.is_some()
             || self.debug_ui_visible
         {
@@ -215,32 +253,16 @@ impl App {
     }
 
     pub(super) fn handle_prompt_key(&mut self, key: TerminalKey) -> Result<()> {
+        if self.prompt_kind_is_picker() && self.handle_picker_prompt_key(key)? {
+            return Ok(());
+        }
         match key.code {
             TerminalKeyCode::Escape => self.cancel_prompt()?,
             TerminalKeyCode::Backspace => self.backspace_prompt()?,
             TerminalKeyCode::Enter => self.submit_prompt()?,
             TerminalKeyCode::Up => self.navigate_prompt(-1),
             TerminalKeyCode::Down => self.navigate_prompt(1),
-            TerminalKeyCode::PageUp if self.prompt_kind_is_picker() => self.move_picker(-10),
-            TerminalKeyCode::PageDown if self.prompt_kind_is_picker() => self.move_picker(10),
-            TerminalKeyCode::Char('u' | 'U') if key.control && self.prompt_kind_is_picker() => {
-                self.scroll_picker_preview(-4);
-            }
-            TerminalKeyCode::Char('d' | 'D') if key.control && self.prompt_kind_is_picker() => {
-                self.scroll_picker_preview(4);
-            }
-            TerminalKeyCode::Char('n' | 'N' | 'j' | 'J')
-                if key.control && self.prompt_kind_is_picker() =>
-            {
-                self.move_picker(1)
-            }
-            TerminalKeyCode::Char('p' | 'P' | 'k' | 'K')
-                if key.control && self.prompt_kind_is_picker() =>
-            {
-                self.move_picker(-1)
-            }
             TerminalKeyCode::Left if self.empty_file_browser_prompt() => self.browse_parent()?,
-            TerminalKeyCode::Right if self.prompt_kind_is_picker() => self.submit_prompt()?,
             TerminalKeyCode::Tab => self.complete_prompt(),
             TerminalKeyCode::Char('n' | 'N' | 'p' | 'P') if key.control => self.complete_prompt(),
             TerminalKeyCode::Char(character) if !key.control && !key.super_key => {
@@ -252,6 +274,20 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_picker_prompt_key(&mut self, key: TerminalKey) -> Result<bool> {
+        match (key.control, key.code) {
+            (_, TerminalKeyCode::PageUp) => self.move_picker(-10),
+            (_, TerminalKeyCode::PageDown) => self.move_picker(10),
+            (_, TerminalKeyCode::Right) => self.submit_prompt()?,
+            (true, TerminalKeyCode::Char('u' | 'U')) => self.scroll_picker_preview(-4),
+            (true, TerminalKeyCode::Char('d' | 'D')) => self.scroll_picker_preview(4),
+            (true, TerminalKeyCode::Char('n' | 'N' | 'j' | 'J')) => self.move_picker(1),
+            (true, TerminalKeyCode::Char('p' | 'P' | 'k' | 'K')) => self.move_picker(-1),
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     fn cancel_prompt(&mut self) -> Result<()> {
@@ -616,14 +652,19 @@ impl App {
         if self.ace_jump.is_some() {
             return self.handle_ace_jump_key(key);
         }
-        if self.dismiss_editor_popup(key)
+        // The which-key surface is represented as a popup, but its next key
+        // belongs to the leader grammar rather than popup navigation.
+        if self.handle_pending_leader(key)? {
+            return Ok(());
+        }
+        if self.handle_editor_popup_key(key)
             || self.cancel_normal_input(key)
             || self.handle_insert_completion_key(key)?
         {
             return Ok(());
         }
         self.clear_completion();
-        if self.handle_pending_leader(key)? || self.handle_normal_prefix(key)? {
+        if self.handle_normal_prefix(key)? {
             return Ok(());
         }
         if self.handle_control_key(key)? || self.handle_jump_key(key)? {
@@ -642,19 +683,133 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn dismiss_editor_popup(&mut self, key: TerminalKey) -> bool {
-        let dismisses_popup = key.code == TerminalKeyCode::Escape
-            || (key.code == TerminalKeyCode::Char('K')
+    pub(super) fn handle_editor_popup_key(&mut self, key: TerminalKey) -> bool {
+        let Some(focused) = self.popup.as_ref().map(|popup| popup.cursor.is_some()) else {
+            return false;
+        };
+        let plain_k =
+            key.code == TerminalKeyCode::Char('K') && !key.control && !key.alt && !key.super_key;
+        if !focused && plain_k && self.active.editor.mode() == Mode::Normal {
+            if let Some(popup) = &mut self.popup {
+                popup.cursor = Some((popup.scroll, 0));
+            }
+            self.popup_deadline = None;
+            self.normal_prefix = None;
+            self.leader_keys = None;
+            self.leader_deadline = None;
+            return true;
+        }
+        if !focused {
+            let escape = key.code == TerminalKeyCode::Escape;
+            self.close_editor_popup();
+            if escape {
+                self.normal_prefix = None;
+                self.leader_keys = None;
+                self.leader_deadline = None;
+            }
+            return escape;
+        }
+        if key.code == TerminalKeyCode::Escape
+            || (key.code == TerminalKeyCode::Char('q')
                 && !key.control
                 && !key.alt
-                && !key.super_key);
-        if !dismisses_popup || self.popup.take().is_none() {
-            return false;
+                && !key.super_key)
+        {
+            self.close_editor_popup();
+            self.normal_prefix = None;
+            self.leader_keys = None;
+            self.leader_deadline = None;
+            return true;
+        }
+        self.navigate_focused_popup(key);
+        true
+    }
+
+    fn close_editor_popup(&mut self) {
+        if self.popup.take().is_none() {
+            return;
         }
         self.popup_deadline = None;
-        self.leader_keys = None;
-        self.leader_deadline = None;
-        true
+    }
+
+    fn navigate_focused_popup(&mut self, key: TerminalKey) {
+        const POPUP_TAB_WIDTH: usize = 2;
+        let terminal_width = self.viewport_columns;
+        let visible_rows = self.viewport_rows.saturating_sub(3).max(1);
+        let Some(popup) = &mut self.popup else {
+            return;
+        };
+        let widths = popup.navigation_line_widths(terminal_width, POPUP_TAB_WIDTH);
+        let maximum_row = widths.len().saturating_sub(1);
+        let (mut row, mut column) = popup.cursor.unwrap_or((popup.scroll, 0));
+        row = row.min(maximum_row);
+
+        if key.alt || key.super_key {
+            return;
+        }
+        let control_character = if key.control {
+            match key.code {
+                TerminalKeyCode::Char(character) => Some(character.to_ascii_lowercase()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match (key.code, control_character) {
+            (TerminalKeyCode::Up | TerminalKeyCode::Char('k' | 'K'), None) => {
+                row = row.saturating_sub(1);
+            }
+            (TerminalKeyCode::Down | TerminalKeyCode::Char('j' | 'J'), None) => {
+                row = row.saturating_add(1).min(maximum_row);
+            }
+            (TerminalKeyCode::Left | TerminalKeyCode::Char('h' | 'H'), None) => {
+                column = column.saturating_sub(1);
+            }
+            (TerminalKeyCode::Right | TerminalKeyCode::Char('l' | 'L'), None) => {
+                column = column.saturating_add(1);
+            }
+            (TerminalKeyCode::PageUp, None) | (_, Some('b' | 'u')) => {
+                let amount = if control_character == Some('u') {
+                    visible_rows.saturating_add(1) / 2
+                } else {
+                    visible_rows
+                };
+                row = row.saturating_sub(amount);
+            }
+            (TerminalKeyCode::PageDown, None) | (_, Some('d' | 'f')) => {
+                let amount = if control_character == Some('d') {
+                    visible_rows.saturating_add(1) / 2
+                } else {
+                    visible_rows
+                };
+                row = row.saturating_add(amount).min(maximum_row);
+            }
+            (TerminalKeyCode::Char('g'), None) => row = 0,
+            (TerminalKeyCode::Char('G'), None) => row = maximum_row,
+            (TerminalKeyCode::Home | TerminalKeyCode::Char('0'), None) => column = 0,
+            (TerminalKeyCode::End | TerminalKeyCode::Char('$'), None) => {
+                column = widths[row].saturating_sub(1);
+            }
+            _ => return,
+        }
+        position_popup_cursor(popup, &widths, visible_rows, row, column);
+    }
+
+    fn move_popup_cursor_rows(&mut self, lines: isize) {
+        const POPUP_TAB_WIDTH: usize = 2;
+        let visible_rows = self.viewport_rows.saturating_sub(3).max(1);
+        let Some(popup) = &mut self.popup else {
+            return;
+        };
+        let widths = popup.navigation_line_widths(self.viewport_columns, POPUP_TAB_WIDTH);
+        let maximum_row = widths.len().saturating_sub(1);
+        let (row, column) = popup.cursor.unwrap_or((popup.scroll, 0));
+        let row = if lines < 0 {
+            row.saturating_sub(lines.unsigned_abs())
+        } else {
+            row.saturating_add(lines.unsigned_abs()).min(maximum_row)
+        };
+        position_popup_cursor(popup, &widths, visible_rows, row, column);
     }
 
     pub(super) fn cancel_normal_input(&mut self, key: TerminalKey) -> bool {
@@ -878,8 +1033,8 @@ impl App {
         match character {
             'w' => {
                 self.normal_prefix = Some('\u{17}');
-                self.message =
-                    "window: h/j/k/l focus · s/v split · c close · o only · w next".to_owned();
+                self.message.clear();
+                self.show_normal_prefix_hints('\u{17}');
             }
             'o' => {
                 let count = self.take_normal_count().unwrap_or(1);
@@ -967,6 +1122,8 @@ impl App {
         match key.code {
             TerminalKeyCode::Char(prefix @ ('g' | '[' | ']' | 'z' | 'Z')) => {
                 self.normal_prefix = Some(prefix);
+                self.message.clear();
+                self.show_normal_prefix_hints(prefix);
             }
             TerminalKeyCode::Char('K') => {
                 let _ = self.take_normal_count();
@@ -1145,4 +1302,31 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn position_popup_cursor(
+    popup: &mut TextPopup,
+    line_widths: &[usize],
+    visible_rows: usize,
+    row: usize,
+    column: usize,
+) {
+    let maximum_row = line_widths.len().saturating_sub(1);
+    let row = row.min(maximum_row);
+    let column = column.min(
+        line_widths
+            .get(row)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(1),
+    );
+    if row < popup.scroll {
+        popup.scroll = row;
+    } else if row >= popup.scroll.saturating_add(visible_rows) {
+        popup.scroll = row.saturating_add(1).saturating_sub(visible_rows);
+    }
+    popup.scroll = popup
+        .scroll
+        .min(line_widths.len().saturating_sub(visible_rows));
+    popup.cursor = Some((row, column));
 }

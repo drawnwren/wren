@@ -16,7 +16,7 @@ pub(super) fn spawn_lsp_client(
     revision: DocumentRevision,
     text: &str,
     environment: BTreeMap<Box<str>, Box<str>>,
-) -> Result<(LspClient, String, Option<SemanticTokenLegend>)> {
+) -> Result<(LspClient, String, LspCapabilities)> {
     let spec = WorkflowTaskSpec {
         program: server.program.clone().into(),
         arguments: server
@@ -76,13 +76,45 @@ pub(super) fn spawn_lsp_client(
         i64::try_from(revision.get()).unwrap_or(i64::MAX),
         text,
     )?;
-    Ok((client, uri, semantic_token_legend(&initialize)))
+    Ok((client, uri, lsp_capabilities(&initialize)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SemanticTokenLegend {
     pub(super) token_types: Vec<String>,
     pub(super) token_modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct LspNavigationCapabilities {
+    pub(super) declaration: bool,
+    pub(super) definition: bool,
+    pub(super) implementation: bool,
+    pub(super) references: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct LspCapabilities {
+    pub(super) semantic_legend: Option<SemanticTokenLegend>,
+    pub(super) navigation: LspNavigationCapabilities,
+}
+
+pub(super) fn lsp_capabilities(initialize: &serde_json::Value) -> LspCapabilities {
+    let provider_enabled = |name: &str| {
+        initialize
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get(name))
+            .is_some_and(|provider| provider.as_bool().unwrap_or_else(|| provider.is_object()))
+    };
+    LspCapabilities {
+        semantic_legend: semantic_token_legend(initialize),
+        navigation: LspNavigationCapabilities {
+            declaration: provider_enabled("declarationProvider"),
+            definition: provider_enabled("definitionProvider"),
+            implementation: provider_enabled("implementationProvider"),
+            references: provider_enabled("referencesProvider"),
+        },
+    }
 }
 
 pub(super) fn semantic_token_legend(initialize: &serde_json::Value) -> Option<SemanticTokenLegend> {
@@ -581,10 +613,25 @@ pub(super) fn parse_lsp_locations(value: &serde_json::Value) -> Result<Vec<Quick
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(0)
                 + 1;
+            let selection_end = range
+                .pointer("/end/line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .zip(
+                    range
+                        .pointer("/end/character")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok()),
+                )
+                .map(|(line, column)| QuickfixPosition {
+                    line: line + 1,
+                    column: column + 1,
+                });
             Ok(QuickfixEntry {
                 path: path_from_file_uri(uri)?,
                 line,
                 column,
+                selection_end,
                 column_utf16: true,
                 text: "language-server location".to_owned(),
             })

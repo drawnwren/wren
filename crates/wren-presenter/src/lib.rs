@@ -70,11 +70,7 @@ impl LatestFrameQueue {
                 .wait(state)
                 .map_err(|_| PresenterError::Poisoned)?;
         }
-        if let Some(frame) = state.slot.take() {
-            Ok(Some(frame))
-        } else {
-            Ok(None)
-        }
+        Ok(state.slot.take())
     }
 
     fn stop(&self) {
@@ -129,6 +125,7 @@ where
         let join = thread::Builder::new()
             .name("wren-presenter".to_owned())
             .spawn(move || {
+                wren_scheduling::mark_interactive();
                 presenter_loop(
                     &thread_backend,
                     &thread_queue,

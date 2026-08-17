@@ -180,9 +180,8 @@ impl SystemTerminalBackend {
         use std::time::Instant;
 
         const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024 / 3 + 64;
-        let mut tty = match OpenOptions::new().read(true).open("/dev/tty") {
-            Ok(tty) => tty,
-            Err(_) => return Ok(None),
+        let Ok(mut tty) = OpenOptions::new().read(true).open("/dev/tty") else {
+            return Ok(None);
         };
         let flags = rustix::fs::fcntl_getfl(&tty)
             .map_err(|error| TerminalError::Input(error.to_string()))?;
@@ -644,9 +643,8 @@ fn rgb_to_ansi256(red: u8, green: u8, blue: u8) -> u8 {
 fn map_input(input: Event) -> TerminalInput {
     match input {
         Event::Key(event) if event.kind != KeyEventKind::Release => {
-            let (code, forced_shift) = match map_key_code(event.code) {
-                Some(mapped) => mapped,
-                None => return TerminalInput::Ignored,
+            let Some((code, forced_shift)) = map_key_code(event.code) else {
+                return TerminalInput::Ignored;
             };
             let printable = matches!(code, TerminalKeyCode::Char(_));
             TerminalInput::Key(TerminalKey {

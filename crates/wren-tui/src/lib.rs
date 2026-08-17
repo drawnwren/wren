@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use wren_client_state::{ClientViewStateStore, DurableClientState};
-use wren_command::{CancellationToken, TaskFailure, TaskRunner};
+use wren_command::{CancellationToken, TaskFailure, TaskResult, TaskRunner};
 use wren_config::{CommandRegistry, WorkspaceTrust, executable_hash, parse_and_validate};
 use wren_engine::{
     CaseOverride, DurableUndoState, Editor, EngineError, FrameText, Mode, SearchDirection,
@@ -43,15 +43,15 @@ use wren_types::{
     Anchor, Bias, BufferId, ClientId, ClientMutation, ClientSequence, CommandClass,
     CommandInvocation, CommandSchema, CommandTask, CommandTaskId, DocumentClass, DocumentId,
     DocumentMutation, DocumentRevision, DurableJumpEntry, Edit, EditProposal, Effects, Freshness,
-    FreshnessKey, LanguageBundle, MutationId, Priority, ProviderDemand, SemanticGroupId,
-    SemanticGroupKind, SessionId, StateDelta, Transaction,
+    FreshnessKey, LanguageBundle, MutationId, OffsetMapping, Priority, ProviderDemand,
+    SemanticGroupId, SemanticGroupKind, SessionId, StateDelta, Transaction,
 };
 use wren_view::{
     AceJumpOverlay, AceJumpTarget, CatppuccinFlavor, CatppuccinPalette, Cell as ViewCell,
     CellColor, CellRow, CellStyle, ClientViewModel, CompletionOverlay, CompletionOverlayRow,
     DebugOverlay, DecorationSpan, DesiredGrid, LineDecoration, MessageEntry, MessageSeverity,
-    PickerOverlay, PickerOverlayRow, RgbColor, SplitAxis, StatusOverlay, StatusSegment, TextPopup,
-    ViewportLayout, WindowDirection,
+    PickerOverlay, PickerOverlayRow, RgbColor, SharedDecorations, SplitAxis, StatusOverlay,
+    StatusSegment, TextPopup, ViewportLayout, WindowDirection,
 };
 use wren_workflow::{
     DocumentVisibility, GitHunk, LspClient, LspPosition, LspTextEdit, PtySession, SavePolicy,
@@ -126,6 +126,7 @@ DOTFILE KEYS:
     Space e               diagnostic    [d / ]d      diagnostic nav
     [c / ]c               Git hunk nav  Space g…     Git hunk actions
     gd/gD/gi/gr/K         LSP navigation, refs, hover
+    K on open float       focus float   hjkl/Ctrl-d/u navigate; q/Esc close
     Space rn/ca/D         rename/action/type definition
     Space f               format        :FormatToggle[!] on-save toggle
     Space d…              debug/REPL     Space h…/r…  Haskell/Hoogle/REPL
@@ -156,6 +157,7 @@ Unsaved edits use a checksummed recovery WAL; undo history and oldfiles persist.
 ";
 
 const MESSAGES_BUFFER_NAME: &str = "[Messages]";
+const GIT_HUNK_IDLE_PERIOD: Duration = Duration::from_millis(50);
 const LSP_START_IDLE_PERIOD: Duration = Duration::from_millis(750);
 const LSP_SEMANTIC_IDLE_PERIOD: Duration = Duration::from_millis(750);
 type PresenterBackend = TerminaBackend<std::io::Stdout>;
@@ -267,6 +269,7 @@ fn restore_clipboard_for_input(
 }
 
 fn dispatch_terminal_event(app: &mut App, layout: &ViewportLayout, event: TerminalInput) {
+    app.foreground_frame_pending = true;
     let result = match event {
         TerminalInput::MouseClick { column, row } => app.handle_mouse_click(layout, column, row),
         TerminalInput::MouseDrag { column, row } => app.handle_mouse_drag(layout, column, row),
@@ -320,6 +323,9 @@ fn handle_terminal_event(
 }
 
 fn poll_app_work(app: &mut App) -> Result<bool> {
+    if std::mem::take(&mut app.foreground_frame_pending) {
+        return Ok(false);
+    }
     let mut changed = app.poll_task_results()?;
     changed |= app.poll_provider_results();
     changed |= app.poll_git_hunk_results();
@@ -390,7 +396,8 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     add_search_decorations(app, &mut decorations);
     let line_decorations = add_buffer_decorations(app, &mut decorations);
     add_selection_decoration(app, &mut decorations);
-    let grid = layout.desired_workspace_grid_with_line_decorations(
+    let decorations = decorations.finish();
+    let grid = layout.desired_workspace_grid_with_shared_decorations(
         &app.views,
         &frames,
         &decorations,
@@ -398,8 +405,34 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
         " ",
         prompt.as_deref(),
     );
+    prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     prefetch_document_end(layout, app, &frames, &line_decorations);
     Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()))
+}
+
+fn prepare_realtime_view_updates(
+    layout: &mut ViewportLayout,
+    app: &App,
+    frames: &[(BufferId, wren_engine::EngineFrame)],
+    decorations: &[(BufferId, SharedDecorations)],
+    line_decorations: &[(BufferId, Vec<LineDecoration>)],
+) {
+    let window = app.views.active_window();
+    let Some(frame) = frames
+        .iter()
+        .find_map(|(buffer_id, frame)| (*buffer_id == window.buffer_id).then_some(frame))
+    else {
+        return;
+    };
+    let spans = decorations
+        .iter()
+        .find_map(|(buffer_id, spans)| (*buffer_id == window.buffer_id).then_some(spans.as_slice()))
+        .unwrap_or_default();
+    let lines = line_decorations
+        .iter()
+        .find_map(|(buffer_id, lines)| (*buffer_id == window.buffer_id).then_some(lines.as_slice()))
+        .unwrap_or_default();
+    layout.prepare_workspace_realtime_updates(window.id, frame, spans, lines);
 }
 
 fn prefetch_document_end(
@@ -439,40 +472,39 @@ fn prefetch_document_end(
         .byte_of_line(top_line.saturating_add(rows).saturating_add(1))
         .max(start);
     let range = start..syntax_end;
-    let mut spans = app
-        .decorations
-        .get(&app.active.buffer_id)
-        .filter(|state| state.revision == app.active.editor.revision())
-        .map_or_else(Vec::new, |state| state.spans_in(range.clone()));
-    if let Some(state) = app
-        .semantic_decorations
-        .get(&app.active.buffer_id)
-        .filter(|state| state.revision == app.active.editor.revision())
+    let mut decorations = DecorationSetBuilder::default();
+    for state in [
+        app.decorations.get(&app.active.buffer_id),
+        app.semantic_decorations.get(&app.active.buffer_id),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|state| state.revision == app.active.editor.revision())
     {
-        spans.extend(state.spans_in(range));
+        decorations.push(app.active.buffer_id, state.spans_in(range.clone()));
     }
     if app.search_highlight {
         let search_end = text.byte_of_line(top_line.saturating_add(rows));
-        spans.extend(
-            app.active
-                .editor
-                .search_match_ranges(start..search_end, 4_096)
-                .into_iter()
-                .map(|range| DecorationSpan {
-                    range,
-                    priority: 3_000_000,
-                    style: CellStyle {
-                        foreground: Some(CellColor::Rgb(app.theme.crust)),
-                        background: Some(CellColor::Rgb(app.theme.yellow)),
-                        ..CellStyle::default()
-                    },
-                }),
+        decorations.push(
+            app.active.buffer_id,
+            search_decorations(app, &app.active, start..search_end),
         );
     }
     if let Some(path) = app.active.document.presentation_path() {
+        let mut spans = Vec::new();
         let mut ignored_lines = Vec::new();
         add_diagnostic_decorations(app, &app.active, path, &mut spans, &mut ignored_lines);
+        spans.sort_by(decoration_order);
+        spans.dedup();
+        decorations.push(app.active.buffer_id, spans);
     }
+    let decorations = decorations.finish();
+    let spans = decorations
+        .iter()
+        .find_map(|(buffer_id, spans)| {
+            (*buffer_id == app.active.buffer_id).then_some(spans.as_slice())
+        })
+        .unwrap_or_default();
     let Some(frame) = frames
         .iter()
         .find_map(|(buffer_id, frame)| (*buffer_id == app.active.buffer_id).then_some(frame))
@@ -489,7 +521,7 @@ fn prefetch_document_end(
             (*buffer_id == app.active.buffer_id).then_some(lines.as_slice())
         })
         .unwrap_or_default();
-    layout.prefetch_workspace_viewport(window.id, &frame, top_line, &spans, lines);
+    layout.prefetch_workspace_viewport(window.id, &frame, top_line, spans, lines);
 }
 
 #[cfg(test)]
@@ -500,6 +532,7 @@ struct DesiredFrameTimings {
     search: Duration,
     buffer_decorations: Duration,
     selection: Duration,
+    decoration_merge: Duration,
     render: Duration,
     overlays: Duration,
     total: Duration,
@@ -510,13 +543,14 @@ impl std::fmt::Display for DesiredFrameTimings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "total={:?} inputs={:?} syntax={:?} search={:?} buffer_decorations={:?} selection={:?} render={:?} overlays={:?}",
+            "total={:?} inputs={:?} syntax={:?} search={:?} buffer_decorations={:?} selection={:?} decoration_merge={:?} render={:?} overlays={:?}",
             self.total,
             self.inputs,
             self.syntax,
             self.search,
             self.buffer_decorations,
             self.selection,
+            self.decoration_merge,
             self.render,
             self.overlays,
         )
@@ -549,9 +583,12 @@ fn desired_frame_profiled(
     let selection_at = Instant::now();
     add_selection_decoration(app, &mut decorations);
     let selection = selection_at.elapsed();
+    let decoration_merge_at = Instant::now();
+    let decorations = decorations.finish();
+    let decoration_merge = decoration_merge_at.elapsed();
 
     let render_at = Instant::now();
-    let grid = layout.desired_workspace_grid_with_line_decorations(
+    let grid = layout.desired_workspace_grid_with_shared_decorations(
         &app.views,
         &frames,
         &decorations,
@@ -560,6 +597,7 @@ fn desired_frame_profiled(
         prompt.as_deref(),
     );
     let render = render_at.elapsed();
+    prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     let overlays_at = Instant::now();
     let grid = Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()));
     let overlays = overlays_at.elapsed();
@@ -571,6 +609,7 @@ fn desired_frame_profiled(
             search,
             buffer_decorations,
             selection,
+            decoration_merge,
             render,
             overlays,
             total: total_at.elapsed(),
@@ -619,29 +658,49 @@ fn decoration_bucket<T>(
     &mut decorations[index].1
 }
 
-fn syntax_decorations(app: &App) -> Vec<(BufferId, Vec<DecorationSpan>)> {
-    let mut decorations = app
-        .decorations
-        .iter()
-        .filter_map(|(buffer_id, state)| {
-            let buffer = app.buffer(*buffer_id)?;
+#[derive(Default)]
+struct DecorationSetBuilder {
+    buffers: Vec<(BufferId, Vec<Vec<DecorationSpan>>)>,
+}
+
+impl DecorationSetBuilder {
+    fn push(&mut self, buffer_id: BufferId, spans: Vec<DecorationSpan>) {
+        if spans.is_empty() {
+            return;
+        }
+        let layers = decoration_bucket(&mut self.buffers, buffer_id);
+        layers.push(spans);
+    }
+
+    fn finish(self) -> Vec<(BufferId, SharedDecorations)> {
+        self.buffers
+            .into_iter()
+            .map(|(buffer_id, layers)| (buffer_id, Arc::new(merge_decoration_layers(layers))))
+            .collect()
+    }
+}
+
+fn syntax_decorations(app: &App) -> DecorationSetBuilder {
+    let mut decorations = DecorationSetBuilder::default();
+    for (buffer_id, state) in &app.decorations {
+        if let Some(spans) = app.buffer(*buffer_id).and_then(|buffer| {
             (buffer.editor.revision() == state.revision)
                 .then(|| visible_byte_range(app, *buffer_id))
                 .flatten()
-                .map(|range| (*buffer_id, state.spans_in(range)))
-        })
-        .collect::<Vec<_>>();
+                .map(|range| state.spans_in(range))
+        }) {
+            decorations.push(*buffer_id, spans);
+        }
+    }
     for (buffer_id, state) in &app.semantic_decorations {
-        let Some(buffer) = app.buffer(*buffer_id) else {
-            continue;
-        };
-        let Some(range) = (buffer.editor.revision() == state.revision)
-            .then(|| visible_byte_range(app, *buffer_id))
-            .flatten()
-        else {
-            continue;
-        };
-        decoration_bucket(&mut decorations, *buffer_id).extend(state.spans_in(range));
+        if let Some(spans) = app.buffer(*buffer_id).and_then(|buffer| {
+            (buffer.editor.revision() == state.revision)
+                .then(|| visible_byte_range(app, *buffer_id))
+                .flatten()
+                .map(|range| state.spans_in(range))
+        }) {
+            decorations.push(*buffer_id, spans);
+        }
     }
     decorations
 }
@@ -670,7 +729,7 @@ fn visible_byte_range(app: &App, buffer_id: BufferId) -> Option<Range<usize>> {
         .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
 }
 
-fn add_search_decorations(app: &App, decorations: &mut Vec<(BufferId, Vec<DecorationSpan>)>) {
+fn add_search_decorations(app: &App, decorations: &mut DecorationSetBuilder) {
     if !app.search_highlight {
         return;
     }
@@ -692,11 +751,18 @@ fn add_search_decorations(app: &App, decorations: &mut Vec<(BufferId, Vec<Decora
             .editor
             .text()
             .byte_of_line(window.top_line.saturating_add(app.viewport_rows.max(1)));
-        let matches = buffer
-            .editor
-            .search_match_ranges(visible_start..visible_end, 4_096);
-        decoration_bucket(decorations, window.buffer_id).extend(matches.into_iter().map(|range| {
-            let current = window.buffer_id == app.active.buffer_id
+        let spans = search_decorations(app, buffer, visible_start..visible_end);
+        decorations.push(window.buffer_id, spans);
+    }
+}
+
+fn search_decorations(app: &App, buffer: &BufferState, range: Range<usize>) -> Vec<DecorationSpan> {
+    buffer
+        .editor
+        .search_match_ranges(range, 4_096)
+        .into_iter()
+        .map(|range| {
+            let current = buffer.buffer_id == app.active.buffer_id
                 && range.start == app.active.editor.primary_cursor();
             DecorationSpan {
                 priority: 3_000_000,
@@ -711,8 +777,8 @@ fn add_search_decorations(app: &App, decorations: &mut Vec<(BufferId, Vec<Decora
                 },
                 range,
             }
-        }));
-    }
+        })
+        .collect()
 }
 
 fn add_git_decorations(
@@ -810,26 +876,29 @@ fn add_breakpoint_decorations(app: &App, path: &Path, lines: &mut Vec<LineDecora
 
 fn add_buffer_decorations(
     app: &App,
-    decorations: &mut Vec<(BufferId, Vec<DecorationSpan>)>,
+    decorations: &mut DecorationSetBuilder,
 ) -> Vec<(BufferId, Vec<LineDecoration>)> {
     let mut line_decorations = Vec::new();
     for buffer in std::iter::once(&app.active).chain(app.inactive.iter()) {
         let Some(path) = buffer.document.presentation_path() else {
             continue;
         };
-        let spans = decoration_bucket(decorations, buffer.buffer_id);
         let lines = decoration_bucket(&mut line_decorations, buffer.buffer_id);
+        let mut added = Vec::new();
         if language_bundle(Some(path)).language_id.as_ref() == "markdown" {
-            spans.extend(markdown_decorations(&buffer.editor.contents(), app.theme));
+            added.extend(markdown_decorations(&buffer.editor.contents(), app.theme));
         }
         add_git_decorations(buffer, app.theme, lines);
-        add_diagnostic_decorations(app, buffer, path, spans, lines);
+        add_diagnostic_decorations(app, buffer, path, &mut added, lines);
         add_breakpoint_decorations(app, path, lines);
+        added.sort_by(decoration_order);
+        added.dedup();
+        decorations.push(buffer.buffer_id, added);
     }
     line_decorations
 }
 
-fn add_selection_decoration(app: &App, decorations: &mut Vec<(BufferId, Vec<DecorationSpan>)>) {
+fn add_selection_decoration(app: &App, decorations: &mut DecorationSetBuilder) {
     if !matches!(app.active.editor.mode(), Mode::Visual | Mode::VisualLine) {
         return;
     }
@@ -837,22 +906,25 @@ fn add_selection_decoration(app: &App, decorations: &mut Vec<(BufferId, Vec<Deco
     if selection.is_empty() {
         return;
     }
-    decoration_bucket(decorations, app.active.buffer_id).push(DecorationSpan {
-        range: selection,
-        // Selection is appended after syntax and semantic decorations, so
-        // tying their maximum priority lets it own the background while
-        // retaining the highlighter's foreground and text attributes.
-        priority: u32::MAX,
-        style: CellStyle {
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            reverse: false,
-            foreground: None,
-            background: Some(CellColor::Rgb(app.theme.surface1)),
-        },
-    });
+    decorations.push(
+        app.active.buffer_id,
+        vec![DecorationSpan {
+            range: selection,
+            // Selection is appended after syntax and semantic decorations, so
+            // tying their maximum priority lets it own the background while
+            // retaining the highlighter's foreground and text attributes.
+            priority: u32::MAX,
+            style: CellStyle {
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                reverse: false,
+                foreground: None,
+                background: Some(CellColor::Rgb(app.theme.surface1)),
+            },
+        }],
+    );
 }
 
 fn apply_editor_overlays(
@@ -1453,6 +1525,7 @@ struct App {
     client_state_worker: ClientStateWorker,
     provider: ProviderWorker,
     git_worker: GitHunkWorker,
+    pending_git_refreshes: Vec<PendingGitHunkRefresh>,
     provider_submitted: BTreeMap<DocumentId, ProviderDemandKey>,
     provider_refresh_due: BTreeMap<DocumentId, Instant>,
     provider_refresh_ranges: BTreeMap<DocumentId, Vec<Range<usize>>>,
@@ -1493,6 +1566,7 @@ struct App {
     lsp_completion: Option<LspCompletion>,
     lsp: Option<PersistentLsp>,
     parked_lsps: Vec<PersistentLsp>,
+    lsp_navigation_capabilities: BTreeMap<Box<str>, LspNavigationCapabilities>,
     lsp_start_due: Option<Instant>,
     lsp_start: Option<mpsc::Receiver<Result<PersistentLsp, String>>>,
     lsp_background: Option<mpsc::Receiver<LspBackgroundResult>>,
@@ -1520,6 +1594,7 @@ struct App {
     theme: CatppuccinPalette,
     viewport_rows: usize,
     viewport_columns: usize,
+    foreground_frame_pending: bool,
     quit: bool,
 }
 
@@ -1544,9 +1619,9 @@ impl BufferDecorations {
             revision,
             spans,
             prefix_max_end: Vec::new(),
-            transforms: Vec::new(),
-            overrides: Vec::new(),
-            invalidated: Vec::new(),
+            transforms: Vec::with_capacity(4),
+            overrides: Vec::with_capacity(64),
+            invalidated: Vec::with_capacity(4),
         };
         decorations.rebuild_index();
         decorations
@@ -1609,7 +1684,7 @@ impl BufferDecorations {
             .transforms
             .last()
             .and_then(|previous| previous.then(transaction).ok())
-            .is_some_and(|composed| composed.edits.is_empty());
+            .is_some_and(|composed| composed.is_empty());
         if cancels_previous {
             self.transforms.pop();
         } else {
@@ -1649,13 +1724,16 @@ impl BufferDecorations {
         let last = self
             .spans
             .partition_point(|span| span.range.start < base_range.end);
-        let mut spans = self.spans[first..last]
+        let mappings = self
+            .transforms
+            .iter()
+            .map(Transaction::offset_mapping)
+            .collect::<Vec<_>>();
+        let spans = self.spans[first..last]
             .iter()
             .cloned()
             .filter_map(|span| {
-                let span = self.transforms.iter().try_fold(span, |span, transaction| {
-                    map_decoration_span(span, transaction)
-                })?;
+                let span = mappings.iter().try_fold(span, map_decoration_span_with)?;
                 (ranges_overlap(&span.range, &range)
                     && !self
                         .invalidated
@@ -1664,41 +1742,52 @@ impl BufferDecorations {
                 .then_some(span)
             })
             .collect::<Vec<_>>();
-        spans.extend(
+        merge_sorted_decorations(
+            spans.into_iter(),
             self.overrides
                 .iter()
                 .filter(|span| ranges_overlap(&span.range, &range))
                 .cloned(),
-        );
-        spans.sort_by(decoration_order);
-        spans.dedup();
-        spans
+        )
     }
 }
 
-fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Option<DecorationSpan> {
-    let start = transaction.map_offset(span.range.start, Bias::Left).ok()?;
-    let end = transaction.map_offset(span.range.end, Bias::Right).ok()?;
-    (start < end).then_some(DecorationSpan {
-        range: start..end,
+fn map_decoration_span_with(
+    span: DecorationSpan,
+    mapping: &OffsetMapping<'_>,
+) -> Option<DecorationSpan> {
+    let range = mapping
+        .map_range(span.range, Bias::Left, Bias::Right)
+        .ok()?;
+    (!range.is_empty()).then_some(DecorationSpan {
+        range,
         style: span.style,
         priority: span.priority,
     })
 }
 
+fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Option<DecorationSpan> {
+    map_decoration_span_with(span, &transaction.offset_mapping())
+}
+
 fn map_range(range: Range<usize>, transaction: &Transaction) -> Option<Range<usize>> {
-    let start = transaction.map_offset(range.start, Bias::Left).ok()?;
-    let end = transaction.map_offset(range.end, Bias::Right).ok()?;
+    map_range_with(range, &transaction.offset_mapping())
+}
+
+fn map_range_with(range: Range<usize>, mapping: &OffsetMapping<'_>) -> Option<Range<usize>> {
+    let start = mapping.map_offset(range.start, Bias::Left).ok()?;
+    let end = mapping.map_offset(range.end, Bias::Right).ok()?;
     (start < end).then_some(start..end)
 }
 
 fn transaction_current_edit_ranges(transaction: &Transaction) -> Vec<Range<usize>> {
+    let mapping = transaction.offset_mapping();
     transaction
-        .edits
+        .edits()
         .iter()
         .filter_map(|edit| {
-            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
-            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
+            let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
+            let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
             (start < end).then_some(start..end)
         })
         .collect()
@@ -1713,7 +1802,7 @@ fn unmap_range(range: Range<usize>, transaction: &Transaction) -> Range<usize> {
 fn unmap_offset(transaction: &Transaction, offset: usize, bias: Bias) -> usize {
     let mut old_cursor = 0_usize;
     let mut new_cursor = 0_usize;
-    for edit in &transaction.edits {
+    for edit in transaction.edits() {
         let unchanged = edit.range.start.saturating_sub(old_cursor);
         let unchanged_end = new_cursor.saturating_add(unchanged);
         if offset < unchanged_end {
@@ -1789,6 +1878,22 @@ fn merge_sorted_decorations(
     merged
 }
 
+fn merge_decoration_layers(layers: Vec<Vec<DecorationSpan>>) -> Vec<DecorationSpan> {
+    let capacity: usize = layers.iter().map(Vec::len).sum();
+    let mut layers = layers.into_iter();
+    let mut merged = layers.next().unwrap_or_default();
+    merged.reserve(capacity.saturating_sub(merged.len()));
+    for mut layer in layers {
+        merged.append(&mut layer);
+    }
+    // Each layer is already ordered. Rust's stable slice sort detects those
+    // natural runs, merging them without the repeated pairwise allocations
+    // that previously copied the largest syntax layer several times.
+    merged.sort_by(decoration_order);
+    merged.dedup();
+    merged
+}
+
 fn ace_jump_labels(count: usize) -> Vec<String> {
     const ALPHABET: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
     let mut width = 1_usize;
@@ -1839,10 +1944,17 @@ struct SubstituteConfirmation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct QuickfixPosition {
+    line: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct QuickfixEntry {
     path: PathBuf,
     line: usize,
     column: usize,
+    selection_end: Option<QuickfixPosition>,
     column_utf16: bool,
     text: String,
 }
@@ -1857,6 +1969,56 @@ impl QuickfixEntry {
             compact(&self.text, 80)
         )
     }
+
+    fn selection_byte_range(&self, text: &str) -> Option<Range<usize>> {
+        let end = self.selection_end.as_ref()?;
+        let line_starts = std::iter::once(0)
+            .chain(
+                text.match_indices('\n')
+                    .map(|(byte, _)| byte.saturating_add(1)),
+            )
+            .collect::<Vec<_>>();
+        let start = quickfix_position_byte(
+            text,
+            &line_starts,
+            self.line,
+            self.column,
+            self.column_utf16,
+        )?;
+        let end =
+            quickfix_position_byte(text, &line_starts, end.line, end.column, self.column_utf16)?;
+        (start < end).then_some(start..end)
+    }
+}
+
+fn quickfix_position_byte(
+    text: &str,
+    line_starts: &[usize],
+    line: usize,
+    column: usize,
+    utf16: bool,
+) -> Option<usize> {
+    let line = line.checked_sub(1)?;
+    let line_start = *line_starts.get(line)?;
+    let line_end = line_starts
+        .get(line.saturating_add(1))
+        .map_or(text.len(), |next| next.saturating_sub(1));
+    let line_text = text.get(line_start..line_end)?;
+    let column = column.checked_sub(1)?;
+    if !utf16 {
+        return (column <= line_text.len()).then_some(line_start + column);
+    }
+    let mut current_utf16 = 0;
+    for (byte, character) in line_text.char_indices() {
+        if current_utf16 == column {
+            return Some(line_start + byte);
+        }
+        current_utf16 = current_utf16.saturating_add(character.len_utf16());
+        if current_utf16 > column {
+            return None;
+        }
+    }
+    (current_utf16 == column).then_some(line_end)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1874,6 +2036,7 @@ impl DiagnosticEntry {
             path: self.path.clone(),
             line: self.line,
             column: self.column,
+            selection_end: None,
             column_utf16: false,
             text: format!("{}: {}", self.severity.label(), self.message),
         }
@@ -2109,7 +2272,7 @@ fn substitution_message(
     let Ok(changed) = transaction.apply_to_string(original) else {
         return summary;
     };
-    let Some(last) = transaction.edits.last() else {
+    let Some(last) = transaction.edits().last() else {
         return summary;
     };
     let anchor = transaction
@@ -2150,6 +2313,7 @@ fn parse_vimgrep_line(line: &str) -> Option<QuickfixEntry> {
         path: fields.next()?.into(),
         line: fields.next()?.parse().ok()?,
         column: fields.next()?.parse().ok()?,
+        selection_end: None,
         column_utf16: false,
         text: fields.next().unwrap_or_default().to_owned(),
     })

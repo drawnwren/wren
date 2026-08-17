@@ -23,6 +23,7 @@ wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
 wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
 wren-provider = { version = "0.1.0", path = "../wren-provider" }
 wren-session = { version = "0.1.0", path = "../wren-session" }
+wren-scheduling = { version = "0.1.0", path = "../wren-scheduling" }
 wren-term = { version = "0.1.0", path = "../wren-term" }
 wren-text = { version = "0.1.0", path = "../wren-text" }
 wren-types = { version = "0.1.0", path = "../wren-types" }

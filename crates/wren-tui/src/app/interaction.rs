@@ -195,6 +195,27 @@ impl App {
                 self.keymap.groups.get(prefix).map_or(prefix, Box::as_ref)
             )
         };
+        self.show_key_hints(title, entries);
+    }
+
+    pub(super) fn show_normal_prefix_hints(&mut self, prefix: char) {
+        let entries = normal_prefix_hint_entries(prefix, self.active_lsp_navigation_capabilities());
+        if entries.is_empty() {
+            return;
+        }
+        let title = match prefix {
+            'g' => " goto ",
+            '[' => " previous ",
+            ']' => " next ",
+            'z' => " viewport ",
+            'Z' => " quit ",
+            '\u{17}' => " window ",
+            _ => " NORMAL ",
+        };
+        self.show_key_hints(title.to_owned(), entries);
+    }
+
+    fn show_key_hints(&mut self, title: String, entries: BTreeMap<String, String>) {
         let width = entries
             .keys()
             .map(|key| key.chars().count())
@@ -209,6 +230,7 @@ impl App {
             title: title.into(),
             text: text.into(),
             scroll: 0,
+            cursor: None,
             decorations: Vec::new(),
         });
         self.popup_deadline = None;
@@ -262,6 +284,7 @@ impl App {
                 title: "Error".into(),
                 text: message.into(),
                 scroll: 0,
+                cursor: None,
                 decorations: Vec::new(),
             });
             self.popup_deadline = Some(Instant::now() + Duration::from_secs(8));
@@ -401,7 +424,7 @@ impl App {
         self.decorations.remove(&buffer_id);
         self.semantic_decorations.remove(&buffer_id);
         self.prime_active_syntax();
-        self.schedule_lsp_start();
+        self.ensure_workspace_lsp_started();
         Ok(())
     }
 
@@ -417,6 +440,18 @@ impl App {
     }
 
     pub(super) fn dispatch_key(&mut self, key: KeyEvent) {
+        if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace)
+            && insert_mutation_key(key)
+        {
+            match self.active.editor.handle_key(key) {
+                Ok(transaction) => {
+                    self.message.clear();
+                    self.after_effect(transaction, Vec::new());
+                }
+                Err(error) => self.engine_error(error),
+            }
+            return;
+        }
         let registers_before = register_snapshot(&self.active.editor);
         let marks_before = mark_snapshot(&self.active.editor);
         let macros_before = macro_snapshot(&self.active.editor);
@@ -468,34 +503,42 @@ impl App {
         if transaction.is_none() && state_deltas.is_empty() {
             return;
         }
-        for delta in &state_deltas {
-            self.client_state.apply(delta);
-        }
-        if !state_deltas.is_empty() {
-            if let Err(error) =
-                sync_client_state(&mut self.active, &mut self.inactive, &self.client_state)
-            {
-                self.show_error(format!("client state: {error}"));
-            }
-            self.client_state_worker.try_save(self.client_state.clone());
-        }
+        self.apply_state_deltas(&state_deltas);
         if let Err(error) =
             self.mutations
                 .append(self.active.document_id, transaction.clone(), state_deltas)
         {
             self.show_error(format!("mutation outbox: {error}"));
         }
-        let Some(transaction) = transaction else {
+        if let Some(transaction) = transaction {
+            self.after_text_transaction(transaction);
+        }
+    }
+
+    fn apply_state_deltas(&mut self, state_deltas: &[StateDelta]) {
+        for delta in state_deltas {
+            self.client_state.apply(delta);
+        }
+        if state_deltas.is_empty() {
             return;
-        };
+        }
+        if let Err(error) =
+            sync_client_state(&mut self.active, &mut self.inactive, &self.client_state)
+        {
+            self.show_error(format!("client state: {error}"));
+        }
+        self.client_state_worker.try_save(self.client_state.clone());
+    }
+
+    fn after_text_transaction(&mut self, transaction: Transaction) {
         if let Some(semantic) = self.semantic_decorations.get_mut(&self.active.buffer_id)
-            && semantic.revision == transaction.base_revision
+            && semantic.revision == transaction.base_revision()
         {
             semantic.map_through(&transaction, self.active.editor.revision());
         }
         self.refresh_changed_syntax(&transaction);
         if let Some(before) = self.active.git_index_text.as_ref().map(Arc::clone) {
-            self.git_worker.refresh(GitHunkRequest {
+            self.schedule_git_hunk_refresh(GitHunkRequest {
                 buffer_id: self.active.buffer_id,
                 revision: self.active.editor.revision(),
                 before,
@@ -504,13 +547,21 @@ impl App {
         } else {
             self.active.git_hunks.clear();
         }
+        self.schedule_lsp_semantics();
+        self.append_recovery_frame();
+    }
+
+    fn schedule_lsp_semantics(&mut self) {
         if let Some(lsp) = &mut self.lsp {
-            if lsp.semantic_legend.is_some() {
+            if lsp.capabilities.semantic_legend.is_some() {
                 lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
             }
         } else if self.lsp_start.is_some() || self.lsp_background.is_some() {
             self.lsp_semantic_dirty = true;
         }
+    }
+
+    fn append_recovery_frame(&self) {
         if let Some(wal) = &self.active.wal {
             wal.append_frame(
                 self.active.base_hash,
@@ -520,4 +571,83 @@ impl App {
             );
         }
     }
+}
+
+fn insert_mutation_key(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Delete
+    ) || matches!(key.code, KeyCode::Char(_) if key.modifiers.is_empty())
+        || matches!(key.code, KeyCode::Char('w' | 'u') if key.modifiers == Modifiers::CONTROL)
+}
+
+pub(super) fn normal_prefix_hint_entries(
+    prefix: char,
+    navigation: Option<LspNavigationCapabilities>,
+) -> BTreeMap<String, String> {
+    let mut entries = BTreeMap::new();
+    let mut add = |key: &str, description: &str| {
+        entries.insert(key.to_owned(), description.to_owned());
+    };
+    match prefix {
+        'g' => {
+            for (key, description) in [
+                ("g", "first line / [count] line"),
+                ("e", "previous word end"),
+                ("E", "previous WORD end"),
+                ("0", "line start"),
+                ("$", "line end"),
+                ("_", "last nonblank"),
+                ("q", "format to text width"),
+                (";", "older change"),
+                (",", "newer change"),
+            ] {
+                add(key, description);
+            }
+            if let Some(navigation) = navigation {
+                if navigation.declaration {
+                    add("D", "declaration");
+                }
+                if navigation.definition {
+                    add("d", "definition");
+                }
+                if navigation.implementation {
+                    add("i", "implementation");
+                }
+                if navigation.references {
+                    add("r", "references");
+                }
+            }
+        }
+        '[' => {
+            add("c", "previous Git hunk");
+            add("d", "previous diagnostic");
+        }
+        ']' => {
+            add("c", "next Git hunk");
+            add("d", "next diagnostic");
+        }
+        'z' => {
+            add("b", "cursor line at bottom");
+            add("t", "cursor line at top");
+            add("z", "cursor line centered");
+        }
+        'Z' => {
+            add("Q", "quit without saving");
+            add("Z", "write and quit");
+        }
+        '\u{17}' => {
+            add("h", "focus left");
+            add("j", "focus down");
+            add("k", "focus up / signature help");
+            add("l", "focus right");
+            add("s", "horizontal split");
+            add("v", "vertical split");
+            add("c", "close window");
+            add("o", "close other windows");
+            add("w", "next window");
+        }
+        _ => {}
+    }
+    entries
 }

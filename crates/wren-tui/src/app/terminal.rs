@@ -510,6 +510,7 @@ impl App {
             title: "Avante · Codex".into(),
             text: text.into(),
             scroll: 0,
+            cursor: None,
             decorations,
         });
         self.popup_deadline = None;
@@ -653,10 +654,10 @@ impl App {
                 }
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let detail = if !stderr.trim().is_empty() {
-                    stderr.trim()
-                } else {
+                let detail = if stderr.trim().is_empty() {
                     stdout.trim()
+                } else {
+                    stderr.trim()
                 };
                 let status = output
                     .status

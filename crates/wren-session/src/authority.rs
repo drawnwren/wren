@@ -53,7 +53,7 @@ impl AuthorityDocument {
         }
         self.history
             .iter()
-            .filter(|transaction| transaction.base_revision >= base)
+            .filter(|transaction| transaction.base_revision() >= base)
             .cloned()
             .collect()
     }
@@ -840,8 +840,7 @@ fn validate_transaction_for_store(
     transaction: &Transaction,
     text: &DefaultText,
 ) -> Result<(), wren_types::TransactionError> {
-    transaction.validate()?;
-    for edit in &transaction.edits {
+    for edit in transaction.edits() {
         for offset in [edit.range.start, edit.range.end] {
             if offset > text.len_bytes() {
                 return Err(wren_types::TransactionError::OutOfBounds {

@@ -79,7 +79,10 @@ impl ClientStateWorker {
         let (sender, receiver) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("wren-client-state".to_owned())
-            .spawn(move || client_state_loop(store, receiver))
+            .spawn(move || {
+                wren_scheduling::mark_background();
+                client_state_loop(store, receiver);
+            })
             .context("spawn client state writer")?;
         Ok((
             Self {
@@ -374,7 +377,10 @@ impl MutationWorker {
         let (sender, receiver) = mpsc::channel();
         let join = thread::Builder::new()
             .name("wren-in-process-session".to_owned())
-            .spawn(move || mutation_loop(authority, outbox, receiver))
+            .spawn(move || {
+                wren_scheduling::mark_background();
+                mutation_loop(authority, outbox, receiver);
+            })
             .context("spawn in-process mutation session")?;
         Ok(Self {
             sender,
@@ -450,38 +456,17 @@ pub(super) fn mutation_loop(
         .highest_client_sequence(client_id)
         .get()
         .saturating_add(1);
-    let mut pending = None;
-    loop {
-        let message = match pending.take() {
-            Some(message) => message,
-            None => match receiver.recv() {
-                Ok(message) => message,
-                Err(_) => break,
-            },
-        };
+    let mut messages = DeferredMessages::new(&receiver);
+    while let Some(message) = messages.next() {
         match message {
             MutationMessage::Register {
                 document_id,
                 text,
                 reply,
             } => {
-                let result = if let Some(document) = authority.document(document_id) {
-                    if document.text_equals(&text) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "durable session text for {document_id:?} differs from local recovery; explicit reconciliation is required"
-                        ))
-                    }
-                } else {
-                    authority
-                        .register_document(document_id, text, client_id)
-                        .map(|_| ())
-                        .map_err(|current| current.to_string())
-                };
-                if let Err(current) = &result {
-                    error = Some(current.clone());
-                }
+                let result =
+                    register_mutation_document(&mut authority, client_id, document_id, text);
+                record_persistence_error(&mut error, &result);
                 let _ = reply.send(result);
             }
             MutationMessage::Append {
@@ -489,25 +474,8 @@ pub(super) fn mutation_loop(
                 transaction,
                 state_deltas,
             } => {
-                let mut batch = vec![(document_id, transaction, state_deltas)];
-                while batch.len() < MAX_MUTATION_BATCH {
-                    match receiver.recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD) {
-                        Ok(MutationMessage::Append {
-                            document_id,
-                            transaction,
-                            state_deltas,
-                        }) => batch.push((document_id, transaction, state_deltas)),
-                        Ok(control) => {
-                            pending = Some(control);
-                            break;
-                        }
-                        Err(
-                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
-                        ) => {
-                            break;
-                        }
-                    }
-                }
+                let batch =
+                    collect_mutation_batch(&mut messages, (document_id, transaction, state_deltas));
                 if error.is_some() {
                     continue;
                 }
@@ -519,21 +487,98 @@ pub(super) fn mutation_loop(
                     next_sequence,
                     batch,
                 );
-                if let Err(current) = result {
-                    error = Some(current.to_string());
-                } else {
-                    next_sequence = next_sequence.saturating_add(batch_len);
+                match result {
+                    Ok(()) => next_sequence = next_sequence.saturating_add(batch_len),
+                    Err(current) => error = Some(current.to_string()),
                 }
             }
             MutationMessage::Barrier(reply) => {
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                let _ = reply.send(persistence_status(&error));
             }
             MutationMessage::Stop(reply) => {
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                let _ = reply.send(persistence_status(&error));
                 break;
             }
         }
     }
+}
+
+struct DeferredMessages<'a, T> {
+    receiver: &'a mpsc::Receiver<T>,
+    deferred: Option<T>,
+}
+
+impl<'a, T> DeferredMessages<'a, T> {
+    fn new(receiver: &'a mpsc::Receiver<T>) -> Self {
+        Self {
+            receiver,
+            deferred: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<T> {
+        self.deferred.take().or_else(|| self.receiver.recv().ok())
+    }
+
+    fn recv_timeout(&self) -> Result<T, mpsc::RecvTimeoutError> {
+        self.receiver
+            .recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD)
+    }
+
+    fn defer(&mut self, message: T) {
+        debug_assert!(self.deferred.is_none());
+        self.deferred = Some(message);
+    }
+}
+
+fn register_mutation_document(
+    authority: &mut SessionAuthority,
+    client_id: ClientId,
+    document_id: DocumentId,
+    text: String,
+) -> Result<(), String> {
+    match authority.document(document_id) {
+        Some(document) if document.text_equals(&text) => Ok(()),
+        Some(_) => Err(format!(
+            "durable session text for {document_id:?} differs from local recovery; explicit reconciliation is required"
+        )),
+        None => authority
+            .register_document(document_id, text, client_id)
+            .map(|_| ())
+            .map_err(|current| current.to_string()),
+    }
+}
+
+fn collect_mutation_batch(
+    messages: &mut DeferredMessages<'_, MutationMessage>,
+    first: PendingMutation,
+) -> Vec<PendingMutation> {
+    let mut batch = vec![first];
+    while batch.len() < MAX_MUTATION_BATCH {
+        match messages.recv_timeout() {
+            Ok(MutationMessage::Append {
+                document_id,
+                transaction,
+                state_deltas,
+            }) => batch.push((document_id, transaction, state_deltas)),
+            Ok(control) => {
+                messages.defer(control);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    batch
+}
+
+fn record_persistence_error<T, E: ToString>(error: &mut Option<String>, result: &Result<T, E>) {
+    if let Err(current) = result {
+        *error = Some(current.to_string());
+    }
+}
+
+fn persistence_status(error: &Option<String>) -> Result<(), String> {
+    error.clone().map_or(Ok(()), Err)
 }
 
 pub(super) fn replay_outstanding_mutations(
@@ -579,7 +624,7 @@ fn submit_local_mutations(
             .or_insert(document.revision);
         let mut documents = Vec::new();
         if let Some(mut transaction) = transaction {
-            transaction.base_revision = *revision;
+            transaction.rebase(*revision);
             documents.push(DocumentMutation {
                 document_id,
                 lease_epoch: document.lease.lease_epoch,
@@ -647,7 +692,10 @@ impl WalWorker {
         let (sender, receiver) = mpsc::channel();
         let join = thread::Builder::new()
             .name("wren-wal".to_owned())
-            .spawn(move || wal_loop(&wal, receiver))
+            .spawn(move || {
+                wren_scheduling::mark_background();
+                wal_loop(&wal, receiver);
+            })
             .ok();
         Self { sender, join }
     }
@@ -701,15 +749,8 @@ impl Drop for WalWorker {
 
 pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
     let mut error: Option<String> = None;
-    let mut pending = None;
-    loop {
-        let message = match pending.take() {
-            Some(message) => message,
-            None => match receiver.recv() {
-                Ok(message) => message,
-                Err(_) => break,
-            },
-        };
+    let mut messages = DeferredMessages::new(&receiver);
+    while let Some(message) = messages.next() {
         match message {
             WalMessage::AppendFrame {
                 base_hash,
@@ -717,57 +758,66 @@ pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
                 text,
                 cursor,
             } => {
-                let mut latest = (base_hash, revision, text, cursor);
-                loop {
-                    match receiver.recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD) {
-                        Ok(WalMessage::AppendFrame {
-                            base_hash,
-                            revision,
-                            text,
-                            cursor,
-                        }) => latest = (base_hash, revision, text, cursor),
-                        Ok(control) => {
-                            pending = Some(control);
-                            break;
-                        }
-                        Err(
-                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
-                        ) => break,
-                    }
-                }
-                let (base_hash, revision, text, cursor) = latest;
-                let text = text.shared();
-                let result = if *blake3::hash(text.as_bytes()).as_bytes() == base_hash {
-                    wal.clear()
-                } else {
-                    wal.append(&RecoveredState {
-                        base_hash,
-                        revision,
-                        text: text.to_string(),
-                        cursor,
-                    })
-                };
-                if let Err(current) = result {
-                    error = Some(current.to_string());
-                }
+                let latest =
+                    collect_latest_wal_frame(&mut messages, (base_hash, revision, text, cursor));
+                let result = persist_wal_frame(wal, latest);
+                record_persistence_error(&mut error, &result);
             }
             WalMessage::Clear(reply) => {
-                if error.is_none()
-                    && let Err(current) = wal.clear()
-                {
-                    error = Some(current.to_string());
+                if error.is_none() {
+                    record_persistence_error(&mut error, &wal.clear());
                 }
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                let _ = reply.send(persistence_status(&error));
             }
             WalMessage::Barrier(reply) => {
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                let _ = reply.send(persistence_status(&error));
             }
             WalMessage::Stop(reply) => {
-                let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                let _ = reply.send(persistence_status(&error));
                 break;
             }
         }
     }
+}
+
+type PendingWalFrame = ([u8; 32], u64, FrameText, usize);
+
+fn collect_latest_wal_frame(
+    messages: &mut DeferredMessages<'_, WalMessage>,
+    mut latest: PendingWalFrame,
+) -> PendingWalFrame {
+    loop {
+        match messages.recv_timeout() {
+            Ok(WalMessage::AppendFrame {
+                base_hash,
+                revision,
+                text,
+                cursor,
+            }) => latest = (base_hash, revision, text, cursor),
+            Ok(control) => {
+                messages.defer(control);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    latest
+}
+
+fn persist_wal_frame(wal: &LocalWal, frame: PendingWalFrame) -> Result<()> {
+    let (base_hash, revision, text, cursor) = frame;
+    let text = text.shared();
+    if *blake3::hash(text.as_bytes()).as_bytes() == base_hash {
+        wal.clear()?;
+    } else {
+        wal.append(&RecoveredState {
+            base_hash,
+            revision,
+            text: text.to_string(),
+            cursor,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

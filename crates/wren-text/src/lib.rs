@@ -72,7 +72,7 @@ impl TextStore for RopeyText {
     }
 
     fn apply(&mut self, transaction: &Transaction) {
-        for edit in transaction.edits.iter().rev() {
+        for edit in transaction.edits().iter().rev() {
             let start = self.rope.byte_to_char(edit.range.start);
             let end = self.rope.byte_to_char(edit.range.end);
             if start != end {
@@ -139,7 +139,7 @@ impl TextStore for CropText {
     }
 
     fn apply(&mut self, transaction: &Transaction) {
-        for edit in transaction.edits.iter().rev() {
+        for edit in transaction.edits().iter().rev() {
             self.rope.replace(edit.range.clone(), &edit.insert);
         }
     }
@@ -199,10 +199,7 @@ impl TextStore for PieceTreeStub {
     }
 
     fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
-        match self.text.get(range) {
-            Some(text) => Cow::Borrowed(text),
-            None => Cow::Borrowed(""),
-        }
+        Cow::Borrowed(self.text.get(range).unwrap_or(""))
     }
 
     fn line_of_byte(&self, byte: usize) -> usize {
@@ -262,6 +259,14 @@ mod tests {
         assert_eq!(store.line_of_byte(6), 1);
         assert_eq!(store.byte_of_line(2), 11);
         assert_eq!(store.byte_of_line(usize::MAX), store.len_bytes());
+        assert_line_index(&store);
+
+        let empty = T::from_reader(Cursor::new("")).expect("empty UTF-8 document loads");
+        assert_eq!(empty.byte_of_line(24), 0);
+        assert_eq!(empty.line_starts(), vec![0]);
+    }
+
+    fn assert_line_index<T: TextStore>(store: &T) {
         let line_starts = store.line_starts();
         assert_eq!(line_starts.first(), Some(&0));
         assert_eq!(line_starts.len(), 4);
@@ -271,10 +276,6 @@ mod tests {
                 .enumerate()
                 .all(|(line, byte)| store.byte_of_line(line) == *byte)
         );
-
-        let empty = T::from_reader(Cursor::new("")).expect("empty UTF-8 document loads");
-        assert_eq!(empty.byte_of_line(24), 0);
-        assert_eq!(empty.line_starts(), vec![0]);
     }
 
     #[test]

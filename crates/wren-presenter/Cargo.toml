@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+wren-scheduling = { version = "0.1.0", path = "../wren-scheduling" }
 wren-term = { version = "0.1.0", path = "../wren-term" }
 wren-view = { version = "0.1.0", path = "../wren-view" }
 

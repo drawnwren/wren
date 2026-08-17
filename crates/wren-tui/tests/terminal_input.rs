@@ -3,6 +3,9 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+
 use tempfile::{NamedTempFile, TempDir};
 use wren_workflow::PtySession;
 
@@ -80,6 +83,116 @@ fn quit_without_saving(session: &mut PtySession) {
         thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(session.exit_code(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_lsp_starts_on_open_even_while_input_remains_busy() {
+    let home = tempfile::tempdir().expect("isolated Wren home");
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).expect("create fake executable directory");
+    let server = bin.join("rust-analyzer");
+    std::fs::write(
+        &server,
+        r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+log_path = os.environ["WREN_TEST_LSP_LOG"]
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            raise SystemExit(0)
+        if line == b"\r\n":
+            break
+        name, value = line.decode().split(":", 1)
+        headers[name.lower()] = value.strip()
+    message = json.loads(sys.stdin.buffer.read(int(headers["content-length"])))
+    method = message.get("method", "")
+    with open(log_path, "a", encoding="utf-8") as output:
+        root = " " + message.get("params", {}).get("rootUri", "") if method == "initialize" else ""
+        output.write(method + root + "\n")
+        output.flush()
+    if "id" not in message:
+        continue
+    result = {"capabilities": {"hoverProvider": True}} if method == "initialize" else None
+    response = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(response)}\r\n\r\n".encode() + response)
+    sys.stdout.buffer.flush()
+"#,
+    )
+    .expect("write fake rust-analyzer");
+    let mut permissions = std::fs::metadata(&server)
+        .expect("fake server metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&server, permissions).expect("make fake server executable");
+
+    let source = home.path().join("main.rs");
+    std::fs::write(&source, "fn main() {}\n").expect("write Rust source");
+    let log = home.path().join("lsp.log");
+    let path_variable = format!(
+        "PATH={}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log_variable = format!("WREN_TEST_LSP_LOG={}", log.display());
+    let home_variable = format!("HOME={}", home.path().display());
+    let state_variable = format!("XDG_STATE_HOME={}/state", home.path().display());
+    let data_variable = format!("XDG_DATA_HOME={}/data", home.path().display());
+    let config_variable = format!("XDG_CONFIG_HOME={}/config", home.path().display());
+    let source_argument = source.to_string_lossy().into_owned();
+    let mut session = PtySession::spawn(
+        "env",
+        &[
+            home_variable.as_str(),
+            state_variable.as_str(),
+            data_variable.as_str(),
+            config_variable.as_str(),
+            path_variable.as_str(),
+            log_variable.as_str(),
+            env!("CARGO_BIN_EXE_wren"),
+            source_argument.as_str(),
+        ],
+        24,
+        80,
+    )
+    .expect("spawn Wren with fake workspace LSP");
+
+    // Keep the input loop active beyond the former 750 ms idle debounce. A
+    // workspace server must initialize anyway, before any hover is requested.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let startup_log = loop {
+        session.send_input(b"hl").expect("send continuous input");
+        session.poll().expect("poll Wren PTY");
+        let current = std::fs::read_to_string(&log).unwrap_or_default();
+        if current.contains("textDocument/didOpen") {
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "workspace LSP did not start while input remained active; log: {current}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(startup_log.contains("initialize file://"));
+    let workspace = std::fs::canonicalize(std::env::current_dir().expect("current workspace"))
+        .expect("canonical workspace");
+    assert!(
+        startup_log.contains(workspace.to_string_lossy().as_ref()),
+        "LSP was not rooted at the launch workspace: {startup_log}"
+    );
+    assert!(!startup_log.contains("textDocument/hover"));
+    wait_for_screen(
+        &mut session,
+        "editor readiness after workspace LSP startup",
+        |screen| screen.contains("NORMAL") && screen.contains("fn main"),
+    );
+    quit_without_saving(&mut session);
 }
 
 #[test]

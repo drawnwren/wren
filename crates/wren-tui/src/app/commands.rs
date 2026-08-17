@@ -551,7 +551,7 @@ impl App {
         self.message = message;
         self.record_active_file();
         self.prime_active_syntax();
-        self.schedule_lsp_start();
+        self.ensure_workspace_lsp_started();
         Ok(())
     }
 
@@ -701,7 +701,7 @@ impl App {
         self.views.set_active_buffer(self.active.buffer_id)?;
         self.message = self.active.name();
         self.prime_active_syntax();
-        self.schedule_lsp_start();
+        self.ensure_workspace_lsp_started();
         Ok(())
     }
 
@@ -1029,6 +1029,7 @@ impl App {
                 title: "diagnostic".into(),
                 text: diagnostic.into(),
                 scroll: 0,
+                cursor: None,
                 decorations: Vec::new(),
             });
             self.popup_deadline = None;
@@ -1215,6 +1216,7 @@ impl App {
             title: "Git hunk".into(),
             text: String::from_utf8_lossy(&patch).into_owned().into(),
             scroll: 0,
+            cursor: None,
             decorations: Vec::new(),
         });
         self.popup_deadline = None;
@@ -1243,6 +1245,7 @@ impl App {
             title: "Git blame".into(),
             text: String::from_utf8_lossy(&output.stdout).trim().into(),
             scroll: 0,
+            cursor: None,
             decorations: Vec::new(),
         });
         self.popup_deadline = None;

@@ -79,9 +79,10 @@ impl Edit {
 
 /// A sorted set of non-overlapping edits against one document revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TransactionData")]
 pub struct Transaction {
-    pub base_revision: DocumentRevision,
-    pub edits: Vec<Edit>,
+    base_revision: DocumentRevision,
+    edits: Vec<Edit>,
     /// Preserves anchor provenance when a composition cannot be represented by
     /// the final byte edits alone (for example, an edit at a collapsed edge).
     #[doc(hidden)]
@@ -89,10 +90,32 @@ pub struct Transaction {
     composition: Option<Box<Composition>>,
 }
 
+#[derive(Deserialize)]
+struct TransactionData {
+    base_revision: DocumentRevision,
+    edits: Vec<Edit>,
+}
+
+impl TryFrom<TransactionData> for Transaction {
+    type Error = TransactionError;
+
+    fn try_from(value: TransactionData) -> Result<Self, Self::Error> {
+        Self::new(value.base_revision, value.edits)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Composition {
     first: Transaction,
     second: Transaction,
+}
+
+/// A transaction whose structural invariants have already been checked.
+/// Reusing this view avoids validating the same immutable edit list for every
+/// anchor in decoration, selection, and viewport batches.
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetMapping<'a> {
+    transaction: &'a Transaction,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -133,7 +156,7 @@ impl Transaction {
             edits,
             composition: None,
         };
-        transaction.validate()?;
+        validate_edits(&transaction.edits)?;
         Ok(transaction)
     }
 
@@ -146,30 +169,33 @@ impl Transaction {
         }
     }
 
-    pub fn validate(&self) -> Result<(), TransactionError> {
-        let mut previous_end = 0;
-        let mut has_previous = false;
-        for edit in &self.edits {
-            if edit.range.start > edit.range.end {
-                return Err(TransactionError::ReversedRange {
-                    start: edit.range.start,
-                    end: edit.range.end,
-                });
-            }
-            if has_previous && edit.range.start < previous_end {
-                return Err(TransactionError::OverlappingEdits {
-                    start: edit.range.start,
-                    previous_end,
-                });
-            }
-            previous_end = edit.range.end;
-            has_previous = true;
-        }
-        Ok(())
+    #[must_use]
+    pub const fn base_revision(&self) -> DocumentRevision {
+        self.base_revision
+    }
+
+    #[must_use]
+    pub fn edits(&self) -> &[Edit] {
+        &self.edits
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.edits.is_empty()
+    }
+
+    #[must_use]
+    pub fn edit_count(&self) -> usize {
+        self.edits.len()
+    }
+
+    /// Retargets structurally identical edits after their durable revision is
+    /// assigned. Revision rebasing cannot invalidate edit ordering.
+    pub fn rebase(&mut self, base_revision: DocumentRevision) {
+        self.base_revision = base_revision;
     }
 
     pub fn validate_for_text(&self, text: &str) -> Result<(), TransactionError> {
-        self.validate()?;
         for edit in &self.edits {
             for offset in [edit.range.start, edit.range.end] {
                 if offset > text.len() {
@@ -192,18 +218,27 @@ impl Transaction {
         offsets: &mut [usize],
         bias: Bias,
     ) -> Result<(), TransactionError> {
-        self.validate()?;
+        let mapping = self.offset_mapping();
         for offset in offsets {
-            *offset = self.map_offset(*offset, bias)?;
+            *offset = mapping.map_offset(*offset, bias)?;
         }
         Ok(())
     }
 
+    /// Validate once before mapping any number of offsets through this
+    /// immutable transaction.
+    pub const fn offset_mapping(&self) -> OffsetMapping<'_> {
+        OffsetMapping { transaction: self }
+    }
+
     pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
-        self.validate()?;
+        self.offset_mapping().map_offset(byte, bias)
+    }
+
+    fn map_offset_validated(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
         if let Some(composition) = &self.composition {
-            let intermediate = composition.first.map_offset(byte, bias)?;
-            return composition.second.map_offset(intermediate, bias);
+            let intermediate = composition.first.map_offset_validated(byte, bias)?;
+            return composition.second.map_offset_validated(intermediate, bias);
         }
         let mut delta = 0_i128;
         let mut index = 0;
@@ -286,8 +321,6 @@ impl Transaction {
     /// The implementation uses symbolic base and inserted pieces, so it does not
     /// need the original document contents.
     pub fn then(&self, next: &Self) -> Result<Self, TransactionError> {
-        self.validate()?;
-        next.validate()?;
         let expected = self
             .base_revision
             .next()
@@ -345,7 +378,6 @@ impl Transaction {
 
     /// Builds an inverse transaction from the exact strings removed by each edit.
     pub fn invert(&self, deleted_text: &[Box<str>]) -> Result<Self, TransactionError> {
-        self.validate()?;
         if deleted_text.len() != self.edits.len() {
             return Err(TransactionError::DeletedTextCount {
                 expected: self.edits.len(),
@@ -426,6 +458,53 @@ impl Transaction {
     }
 }
 
+fn validate_edits(edits: &[Edit]) -> Result<(), TransactionError> {
+    let mut previous_end = 0;
+    let mut has_previous = false;
+    for edit in edits {
+        if edit.range.start > edit.range.end {
+            return Err(TransactionError::ReversedRange {
+                start: edit.range.start,
+                end: edit.range.end,
+            });
+        }
+        if has_previous && edit.range.start < previous_end {
+            return Err(TransactionError::OverlappingEdits {
+                start: edit.range.start,
+                previous_end,
+            });
+        }
+        previous_end = edit.range.end;
+        has_previous = true;
+    }
+    Ok(())
+}
+
+impl OffsetMapping<'_> {
+    #[must_use]
+    pub const fn base_revision(&self) -> DocumentRevision {
+        self.transaction.base_revision
+    }
+
+    #[must_use]
+    pub fn edits(&self) -> &[Edit] {
+        &self.transaction.edits
+    }
+
+    pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
+        self.transaction.map_offset_validated(byte, bias)
+    }
+
+    pub fn map_range(
+        &self,
+        range: Range<usize>,
+        start_bias: Bias,
+        end_bias: Bias,
+    ) -> Result<Range<usize>, TransactionError> {
+        Ok(self.map_offset(range.start, start_bias)?..self.map_offset(range.end, end_bias)?)
+    }
+}
+
 fn usize_from_i128(value: i128) -> Result<usize, TransactionError> {
     usize::try_from(value).map_err(|_| TransactionError::OffsetOverflow)
 }
@@ -444,8 +523,12 @@ pub struct Anchor {
 
 impl Anchor {
     pub fn map_through(self, transaction: &Transaction) -> Result<Self, TransactionError> {
+        self.map_with(&transaction.offset_mapping())
+    }
+
+    pub fn map_with(self, mapping: &OffsetMapping<'_>) -> Result<Self, TransactionError> {
         Ok(Self {
-            byte: transaction.map_offset(self.byte, self.bias)?,
+            byte: mapping.map_offset(self.byte, self.bias)?,
             bias: self.bias,
         })
     }
@@ -472,6 +555,10 @@ impl SelectionSet {
     }
 
     pub fn map_through(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
+        self.map_with(&transaction.offset_mapping())
+    }
+
+    pub fn map_with(&self, mapping: &OffsetMapping<'_>) -> Result<Self, TransactionError> {
         let mut ranges = Vec::with_capacity(self.ranges.len());
         for range in &self.ranges {
             let (anchor_bias, head_bias) = if range.anchor < range.head {
@@ -482,8 +569,8 @@ impl SelectionSet {
                 (Bias::Right, Bias::Right)
             };
             ranges.push(SelRange {
-                anchor: transaction.map_offset(range.anchor, anchor_bias)?,
-                head: transaction.map_offset(range.head, head_bias)?,
+                anchor: mapping.map_offset(range.anchor, anchor_bias)?,
+                head: mapping.map_offset(range.head, head_bias)?,
             });
         }
         Ok(Self {
@@ -832,17 +919,11 @@ impl DocumentMutation {
         }
         let mut expected = self.base_revision;
         for transaction in &self.transactions {
-            transaction.validate().map_err(|source| {
-                MutationValidationError::InvalidTransaction {
-                    document_id: self.document_id,
-                    source,
-                }
-            })?;
-            if transaction.base_revision != expected {
+            if transaction.base_revision() != expected {
                 return Err(MutationValidationError::RevisionChain {
                     document_id: self.document_id,
                     expected: expected.get(),
-                    actual: transaction.base_revision.get(),
+                    actual: transaction.base_revision().get(),
                 });
             }
             expected = expected
@@ -890,12 +971,6 @@ pub enum MutationValidationError {
         document_id: DocumentId,
         expected: u64,
         actual: u64,
-    },
-    #[error("document {document_id:?} contains an invalid transaction: {source}")]
-    InvalidTransaction {
-        document_id: DocumentId,
-        #[source]
-        source: TransactionError,
     },
     #[error("document mutation revision overflow")]
     RevisionOverflow,
@@ -1414,6 +1489,29 @@ mod tests {
             .expect("valid transaction");
         assert_eq!(transaction.map_offset(2, Bias::Left), Ok(2));
         assert_eq!(transaction.map_offset(2, Bias::Right), Ok(5));
+    }
+
+    #[test]
+    fn transaction_deserialization_preserves_structural_invariants() {
+        let invalid = r#"{
+            "base_revision": 4,
+            "edits": [
+                {"range": {"start": 2, "end": 5}, "insert": "a"},
+                {"range": {"start": 4, "end": 6}, "insert": "b"}
+            ]
+        }"#;
+        let error = serde_json::from_str::<Transaction>(invalid)
+            .expect_err("overlapping edits must not deserialize");
+        assert!(error.to_string().contains("overlaps"));
+
+        let original = Transaction::new(
+            DocumentRevision::new(4),
+            vec![Edit::new(2..5, "replacement")],
+        )
+        .expect("valid transaction");
+        let encoded = serde_json::to_string(&original).expect("serialize transaction");
+        let decoded: Transaction = serde_json::from_str(&encoded).expect("deserialize transaction");
+        assert_eq!(decoded, original);
     }
 
     #[test]

@@ -1489,7 +1489,7 @@ impl AiReviewBranch {
     ) -> Result<Transaction, WorkflowError> {
         let mut expected_revision = self.base_revision;
         for transaction in intervening {
-            if transaction.base_revision != expected_revision {
+            if transaction.base_revision() != expected_revision {
                 return Err(WorkflowError::Unmappable);
             }
             expected_revision = expected_revision.next().ok_or(WorkflowError::Unmappable)?;
@@ -1853,7 +1853,7 @@ mod tests {
                 ],
             )
             .expect("partial accept");
-        assert_eq!(mapped.edits[0].range, 4..5);
+        assert_eq!(mapped.edits()[0].range, 4..5);
     }
 
     #[cfg(unix)]

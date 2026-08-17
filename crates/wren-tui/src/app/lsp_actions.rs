@@ -6,26 +6,36 @@ impl App {
             .filter(|server| executable_exists(&server.program))
     }
 
-    pub(super) fn schedule_lsp_start(&mut self) {
+    pub(super) fn active_lsp_navigation_capabilities(&self) -> Option<LspNavigationCapabilities> {
+        self.lsp
+            .as_ref()
+            .filter(|lsp| lsp.document_id == self.active.document_id)
+            .map(|lsp| lsp.capabilities.navigation)
+            .or_else(|| {
+                let language =
+                    language_bundle(self.active.document.presentation_path()).language_id;
+                self.lsp_navigation_capabilities
+                    .get(language.as_ref())
+                    .copied()
+            })
+    }
+
+    pub(super) fn ensure_workspace_lsp_started(&mut self) {
+        self.begin_lsp_start();
+    }
+
+    pub(super) fn schedule_workspace_lsp_start(&mut self) {
         if self.lsp_background.is_some() || self.lsp_start.is_some() {
             self.lsp_start_due = None;
             return;
         }
-        if self.reuse_active_lsp_or_reset() {
+        if self.activate_available_lsp() {
             self.lsp_start_due = None;
         } else if self.active_language_server().is_some() {
             self.lsp_start_due = Some(Instant::now() + LSP_START_IDLE_PERIOD);
         } else {
             self.lsp_start_due = None;
-            if let Some(lsp) = &mut self.lsp {
-                lsp.semantic_due = None;
-            }
-        }
-    }
-
-    pub(super) fn defer_lsp_start_until_idle(&mut self) {
-        if self.lsp_start_due.is_some() {
-            self.lsp_start_due = Some(Instant::now() + LSP_START_IDLE_PERIOD);
+            self.suspend_lsp_semantics();
         }
     }
 
@@ -43,28 +53,29 @@ impl App {
         if self.lsp_background.is_some() || self.lsp_start.is_some() {
             return;
         }
-        if self.reuse_active_lsp_or_reset() {
+        if self.activate_available_lsp() {
             return;
         }
         // Visiting a help, generated, or otherwise unsupported buffer must
         // not tear down the root workspace's already-running server.
-        if self.active_language_server().is_none() {
-            if let Some(lsp) = &mut self.lsp {
-                lsp.semantic_due = None;
-            }
+        let Some(server) = self.active_language_server() else {
+            self.suspend_lsp_semantics();
             return;
-        }
+        };
+        self.start_active_lsp(server);
+    }
+
+    fn start_active_lsp(&mut self, server: LanguageServerInvocation) {
         if let Some(lsp) = self.lsp.take() {
             self.parked_lsps.push(lsp);
         }
         self.pending_lsp_hover = None;
         #[cfg(test)]
-        return;
+        {
+            let _ = server;
+        }
         #[cfg(not(test))]
         {
-            let Some(server) = self.active_language_server() else {
-                return;
-            };
             let Some(path) = self
                 .active
                 .document
@@ -86,9 +97,10 @@ impl App {
             match thread::Builder::new()
                 .name("wren-lsp-start".to_owned())
                 .spawn(move || {
+                    wren_scheduling::mark_background();
                     let result =
                         spawn_lsp_client(&server, &path, &root, revision, &text, environment)
-                            .map(|(client, uri, semantic_legend)| {
+                            .map(|(client, uri, capabilities)| {
                                 let open_documents = BTreeMap::from([(
                                     document_id,
                                     LspOpenDocument {
@@ -104,10 +116,11 @@ impl App {
                                     server: server_state,
                                     root: root_state,
                                     open_documents,
-                                    semantic_due: semantic_legend
+                                    semantic_due: capabilities
+                                        .semantic_legend
                                         .as_ref()
                                         .map(|_| Instant::now() + LSP_SEMANTIC_IDLE_PERIOD),
-                                    semantic_legend,
+                                    capabilities,
                                 }
                             })
                             .map_err(|error| error.to_string());
@@ -140,48 +153,56 @@ impl App {
                 return Ok(true);
             }
         };
+        self.lsp_navigation_capabilities.insert(
+            lsp.server.language_id.clone().into_boxed_str(),
+            lsp.capabilities.navigation,
+        );
         self.lsp = Some(lsp);
-        let ready_for_active = self.activate_started_lsp();
         self.lsp_semantic_dirty = false;
-        if !ready_for_active {
-            return Ok(true);
+        if self.activate_started_lsp() {
+            self.resume_pending_lsp_request();
         }
-        self.resume_pending_lsp_request();
         Ok(true)
     }
 
-    fn reuse_active_lsp_or_reset(&mut self) -> bool {
-        match self.reuse_lsp_for_active() {
-            Ok(reused) => reused,
-            Err(error) => {
-                // Protocol failure is the one case where the selected client
-                // is no longer safe to retain and should be restarted.
-                self.lsp = None;
-                self.show_error(format!("language server: {error}"));
-                false
-            }
+    fn activate_available_lsp(&mut self) -> bool {
+        let Some(server) = language_server_invocation(self.active.document.presentation_path())
+        else {
+            return false;
+        };
+        let root = self.lsp_root();
+        if !self.select_reusable_lsp(&server, &root) {
+            return false;
         }
+        if let Err(error) = self.open_active_document_on_lsp(&server) {
+            // A protocol failure invalidates the selected client. This is the
+            // sole owner of that recovery policy.
+            self.lsp = None;
+            self.show_error(format!("language server: {error}"));
+            return false;
+        }
+        true
     }
 
     fn activate_started_lsp(&mut self) -> bool {
-        match self.reuse_lsp_for_active() {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(error) => {
-                self.lsp = None;
-                self.show_error(format!("language server: {error}"));
-            }
+        if self.activate_available_lsp() {
+            return true;
         }
-        if self.active_language_server().is_none() {
+        let Some(server) = self.active_language_server() else {
             // The completed root server remains owned by the workspace while
             // a non-LSP buffer is active.
-            if let Some(lsp) = &mut self.lsp {
-                lsp.semantic_due = None;
-            }
+            self.suspend_lsp_semantics();
             return false;
-        }
-        self.begin_lsp_start();
+        };
+        self.start_active_lsp(server);
         self.lsp_ready_for_active()
+    }
+
+    fn suspend_lsp_semantics(&mut self) {
+        if let Some(lsp) = &mut self.lsp {
+            lsp.semantic_due = None;
+        }
+        self.lsp_semantic_dirty = false;
     }
 
     fn resume_pending_lsp_request(&mut self) {
@@ -209,32 +230,29 @@ impl App {
             .is_some_and(|lsp| lsp.document_id == self.active.document_id)
     }
 
-    pub(super) fn reuse_lsp_for_active(&mut self) -> Result<bool> {
-        let Some(server) = language_server_invocation(self.active.document.presentation_path())
-        else {
-            return Ok(false);
-        };
-        let root = self.lsp_root();
+    fn select_reusable_lsp(&mut self, server: &LanguageServerInvocation, root: &Path) -> bool {
         let current_matches = self
             .lsp
             .as_ref()
-            .is_some_and(|lsp| lsp.server == server && lsp.root == root);
-        if !current_matches {
-            let Some(index) = self
-                .parked_lsps
-                .iter()
-                .position(|lsp| lsp.server == server && lsp.root == root)
-            else {
-                return Ok(false);
-            };
-            let replacement = self.parked_lsps.swap_remove(index);
-            if let Some(current) = self.lsp.replace(replacement) {
-                self.parked_lsps.push(current);
-            }
+            .is_some_and(|lsp| &lsp.server == server && lsp.root == root);
+        if current_matches {
+            return true;
         }
-        let Some(lsp) = &mut self.lsp else {
-            return Ok(false);
+        let Some(index) = self
+            .parked_lsps
+            .iter()
+            .position(|lsp| &lsp.server == server && lsp.root == root)
+        else {
+            return false;
         };
+        let replacement = self.parked_lsps.swap_remove(index);
+        if let Some(current) = self.lsp.replace(replacement) {
+            self.parked_lsps.push(current);
+        }
+        true
+    }
+
+    fn open_active_document_on_lsp(&mut self, server: &LanguageServerInvocation) -> Result<()> {
         let document_id = self.active.document_id;
         let revision = self.active.editor.revision();
         let uri = file_uri(
@@ -243,6 +261,10 @@ impl App {
                 .presentation_path()
                 .ok_or_else(|| anyhow!("LSP action needs a named buffer"))?,
         );
+        let lsp = self
+            .lsp
+            .as_mut()
+            .ok_or_else(|| anyhow!("selected language server disappeared"))?;
         if let Some(open) = lsp.open_documents.get(&document_id) {
             lsp.document_id = document_id;
             lsp.revision = open.revision;
@@ -261,13 +283,14 @@ impl App {
                 .insert(document_id, LspOpenDocument { uri, revision });
         }
         lsp.semantic_due = lsp
+            .capabilities
             .semantic_legend
             .as_ref()
             .map(|_| Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
-        Ok(true)
+        Ok(())
     }
 
-    pub(super) fn start_lsp(&self) -> Result<(LspClient, String)> {
+    pub(super) fn start_lsp(&mut self) -> Result<(LspClient, String)> {
         let server = self.active_language_server().ok_or_else(|| {
             let language = language_bundle(self.active.document.presentation_path()).language_id;
             anyhow!("no installed language server for {language}")
@@ -281,15 +304,18 @@ impl App {
         let environment = env::vars()
             .map(|(name, value)| (name.into_boxed_str(), value.into_boxed_str()))
             .collect();
-        spawn_lsp_client(
+        let language_id = server.language_id.clone().into_boxed_str();
+        let (client, uri, capabilities) = spawn_lsp_client(
             &server,
             path,
             &root,
             self.active.editor.revision(),
             &self.active.editor.contents(),
             environment,
-        )
-        .map(|(client, uri, _)| (client, uri))
+        )?;
+        self.lsp_navigation_capabilities
+            .insert(language_id, capabilities.navigation);
+        Ok((client, uri))
     }
 
     pub(super) fn lsp_position(&self) -> LspPosition {
@@ -466,6 +492,7 @@ impl App {
         thread::Builder::new()
             .name("wren-lsp-definition".to_owned())
             .spawn(move || {
+                wren_scheduling::mark_background();
                 let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
@@ -544,13 +571,26 @@ impl App {
         self.lsp = Some(result.lsp);
         if self.lsp_semantic_dirty {
             if let Some(lsp) = &mut self.lsp
-                && lsp.semantic_legend.is_some()
+                && lsp.capabilities.semantic_legend.is_some()
             {
                 lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
             }
             self.lsp_semantic_dirty = false;
         }
-        match (result.operation, result.outcome) {
+        self.apply_lsp_background_outcome(result.operation, result.outcome);
+        self.begin_lsp_start();
+        if self.lsp_ready_for_active() {
+            self.resume_pending_lsp_request();
+        }
+        Ok(true)
+    }
+
+    fn apply_lsp_background_outcome(
+        &mut self,
+        operation: LspBackgroundOperation,
+        outcome: Result<LspBackgroundPayload, String>,
+    ) {
+        match (operation, outcome) {
             (
                 LspBackgroundOperation::Location { method },
                 Ok(LspBackgroundPayload::Response(value)),
@@ -598,20 +638,6 @@ impl App {
                 self.show_error(format!("{label}: {error}"));
             }
         }
-        self.begin_lsp_start();
-        if !self.lsp_ready_for_active() {
-            return Ok(true);
-        }
-        if let Some(method) = self.pending_lsp_location.take() {
-            if let Err(error) = self.start_lsp_location_request(&method) {
-                self.show_error(format!("{method}: {error}"));
-            }
-        } else if let Some(method) = self.pending_lsp_hover.take()
-            && let Err(error) = self.lsp_hover_ready(&method)
-        {
-            self.show_error(format!("{method}: {error}"));
-        }
-        Ok(true)
     }
 
     pub(super) fn poll_lsp_semantic_due(&mut self) -> Result<bool> {
@@ -632,7 +658,7 @@ impl App {
         let Some(mut lsp) = self.lsp.take() else {
             return Ok(false);
         };
-        let Some(legend) = lsp.semantic_legend.clone() else {
+        let Some(legend) = lsp.capabilities.semantic_legend.clone() else {
             lsp.semantic_due = None;
             self.lsp = Some(lsp);
             return Ok(false);
@@ -647,6 +673,7 @@ impl App {
         thread::Builder::new()
             .name("wren-lsp-semantic".to_owned())
             .spawn(move || {
+                wren_scheduling::mark_background();
                 let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
@@ -739,6 +766,7 @@ impl App {
         thread::Builder::new()
             .name("wren-lsp-hover".to_owned())
             .spawn(move || {
+                wren_scheduling::mark_background();
                 let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
@@ -792,6 +820,7 @@ impl App {
                 title: "".into(),
                 text: text.into(),
                 scroll: 0,
+                cursor: None,
                 decorations,
             });
             self.popup_deadline = Some(Instant::now() + Duration::from_secs(6));
@@ -897,30 +926,11 @@ impl App {
         if let Some(edit) = action.get("edit") {
             self.apply_lsp_workspace_edit(edit)?;
         }
-        if let Some(command) = action.get("command") {
-            let (identifier, arguments) = if let Some(identifier) = command.as_str() {
-                (
-                    Some(identifier),
-                    action
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([])),
-                )
-            } else {
-                (
-                    command.get("command").and_then(serde_json::Value::as_str),
-                    command
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([])),
-                )
-            };
-            if let Some(identifier) = identifier {
-                let _ = client.request(
-                    "workspace/executeCommand",
-                    serde_json::json!({"command": identifier, "arguments": arguments}),
-                )?;
-            }
+        if let Some((identifier, arguments)) = code_action_command(action) {
+            let _ = client.request(
+                "workspace/executeCommand",
+                serde_json::json!({"command": identifier, "arguments": arguments}),
+            )?;
         }
         self.message = action
             .get("title")
@@ -1019,4 +1029,22 @@ impl App {
         self.message = "cdo complete".to_owned();
         Ok(())
     }
+}
+
+fn code_action_command(action: &serde_json::Value) -> Option<(&str, serde_json::Value)> {
+    let command = action.get("command")?;
+    let (identifier, arguments_owner) = command
+        .as_str()
+        .map(|identifier| (identifier, action))
+        .or_else(|| {
+            command
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(|identifier| (identifier, command))
+        })?;
+    let arguments = arguments_owner
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    Some((identifier, arguments))
 }

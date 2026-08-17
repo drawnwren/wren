@@ -36,6 +36,9 @@ impl App {
             self.active.buffer_id,
             BufferDecorations::new(revision, spans),
         );
+        self.provider_refresh_ranges
+            .entry(self.active.document_id)
+            .or_insert_with(|| Vec::with_capacity(4));
     }
 
     /// Reparse a bounded context around changed lines before the next frame.
@@ -43,17 +46,18 @@ impl App {
     /// newly typed syntax appears immediately without a remote LSP round trip
     /// or a whole-file parse on every keypress.
     pub(super) fn refresh_changed_syntax(&mut self, transaction: &Transaction) {
-        if transaction.edits.is_empty() {
+        if transaction.is_empty() {
             return;
         }
+        let mapping = transaction.offset_mapping();
         let text_store = self.active.editor.text();
         let text_len = text_store.len_bytes();
         let mut targets = transaction
-            .edits
+            .edits()
             .iter()
             .filter_map(|edit| {
-                let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
-                let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
+                let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
+                let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
                 let start_line = text_store.line_of_byte(start.min(text_len));
                 let end_line = text_store.line_of_byte(end.min(text_len));
                 let target_start_line = start_line.saturating_sub(1);
@@ -76,7 +80,7 @@ impl App {
             .or_default();
         *pending = std::mem::take(pending)
             .into_iter()
-            .filter_map(|range| map_range(range, transaction))
+            .filter_map(|range| map_range_with(range, &mapping))
             .chain(targets.iter().cloned())
             .collect();
         merge_ranges(pending);
@@ -100,7 +104,7 @@ impl App {
             .decorations
             .entry(self.active.buffer_id)
             .or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
-        if state.revision == transaction.base_revision {
+        if state.revision == transaction.base_revision() {
             state.replace_after_transaction(transaction, revision, &targets, replacement);
         } else {
             *state = BufferDecorations::new(revision, replacement);
@@ -127,17 +131,8 @@ impl App {
             };
             let cursor_line = buffer.editor.cursor_line_column().0;
             let margin = 3.min(viewport_height.saturating_sub(1) / 2);
-            let effective_top = if cursor_line < top_line.saturating_add(margin) {
-                cursor_line.saturating_sub(margin)
-            } else if cursor_line.saturating_add(margin) >= top_line.saturating_add(viewport_height)
-            {
-                cursor_line
-                    .saturating_add(margin)
-                    .saturating_add(1)
-                    .saturating_sub(viewport_height)
-            } else {
-                top_line
-            };
+            let effective_top =
+                viewport_top_with_margin(top_line, cursor_line, viewport_height, margin);
             if let Some(window) = self.views.windows.get_mut(window_index) {
                 window.top_line = effective_top;
             }
@@ -156,19 +151,16 @@ impl App {
                         .decorations
                         .get(&buffer_id)
                         .is_some_and(|state| state.revision == buffer.editor.revision());
-                if full_syntax_is_current
-                    && !self
-                        .provider_refresh_ranges
-                        .contains_key(&buffer.document_id)
-                {
+                let pending_refresh = self
+                    .provider_refresh_ranges
+                    .get(&buffer.document_id)
+                    .filter(|ranges| !ranges.is_empty());
+                if full_syntax_is_current && pending_refresh.is_none() {
                     return None;
                 }
                 let text_store = buffer.editor.text();
                 let (visible, near_viewport) = if full_syntax_is_current {
-                    let pending = self
-                        .provider_refresh_ranges
-                        .get(&buffer.document_id)
-                        .expect("current syntax refresh has pending ranges");
+                    let pending = pending_refresh?;
                     let start = pending.first()?.start;
                     let end = pending.last()?.end.max(start);
                     (start..end, start..end)
@@ -193,23 +185,24 @@ impl App {
                 })
             })
             .collect::<Vec<_>>();
+        let now = Instant::now();
         for refresh in refreshes {
-            let key = ProviderDemandKey::from(&refresh);
-            if self.provider_submitted.get(&refresh.document_id) == Some(&key) {
-                continue;
-            }
-            if self
-                .provider_refresh_due
-                .get(&refresh.document_id)
-                .is_some_and(|due| Instant::now() < *due)
-            {
-                continue;
-            }
-            if self.provider.try_refresh(refresh.clone()) {
-                self.provider_submitted.insert(refresh.document_id, key);
-                self.provider_refresh_due.remove(&refresh.document_id);
-            }
+            self.submit_provider_refresh(refresh, now);
         }
+    }
+
+    fn submit_provider_refresh(&mut self, refresh: ProviderRefresh, now: Instant) {
+        let key = ProviderDemandKey::from(&refresh);
+        let already_submitted = self.provider_submitted.get(&refresh.document_id) == Some(&key);
+        let still_debouncing = self
+            .provider_refresh_due
+            .get(&refresh.document_id)
+            .is_some_and(|due| now < *due);
+        if already_submitted || still_debouncing || !self.provider.try_refresh(refresh.clone()) {
+            return;
+        }
+        self.provider_submitted.insert(refresh.document_id, key);
+        self.provider_refresh_due.remove(&refresh.document_id);
     }
 
     pub(super) fn poll_provider_results(&mut self) -> bool {
@@ -242,7 +235,10 @@ impl App {
                     } else {
                         *state = BufferDecorations::new(revision, spans);
                     }
-                    self.provider_refresh_ranges.remove(&document_id);
+                    self.provider_refresh_ranges
+                        .entry(document_id)
+                        .or_insert_with(|| Vec::with_capacity(4))
+                        .clear();
                     changed = true;
                     self.provider_submitted
                         .entry(document_id)
@@ -293,6 +289,7 @@ impl App {
     }
 
     pub(super) fn poll_git_hunk_results(&mut self) -> bool {
+        self.flush_due_git_hunk_refreshes();
         let mut changed = false;
         while let Some(result) = self.git_worker.try_result() {
             let buffer = if self.active.buffer_id == result.buffer_id {
@@ -311,6 +308,33 @@ impl App {
             }
         }
         changed
+    }
+
+    pub(super) fn schedule_git_hunk_refresh(&mut self, request: GitHunkRequest) {
+        let due = Instant::now() + GIT_HUNK_IDLE_PERIOD;
+        if let Some(pending) = self
+            .pending_git_refreshes
+            .iter_mut()
+            .find(|pending| pending.request.buffer_id == request.buffer_id)
+        {
+            *pending = PendingGitHunkRefresh { due, request };
+        } else {
+            self.pending_git_refreshes
+                .push(PendingGitHunkRefresh { due, request });
+        }
+    }
+
+    fn flush_due_git_hunk_refreshes(&mut self) {
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.pending_git_refreshes.len() {
+            if self.pending_git_refreshes[index].due <= now {
+                let pending = self.pending_git_refreshes.swap_remove(index);
+                self.git_worker.refresh(pending.request);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     pub(super) fn request_completion(&mut self) {
@@ -644,4 +668,18 @@ impl App {
             self.active.editor.set_selection_range(range);
         }
     }
+}
+
+fn viewport_top_with_margin(
+    top_line: usize,
+    cursor_line: usize,
+    viewport_height: usize,
+    margin: usize,
+) -> usize {
+    let minimum = cursor_line
+        .saturating_add(margin)
+        .saturating_add(1)
+        .saturating_sub(viewport_height);
+    let maximum = cursor_line.saturating_sub(margin).max(minimum);
+    top_line.clamp(minimum, maximum)
 }

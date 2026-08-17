@@ -629,54 +629,76 @@ fn compile_compatible_query(
 /// one release behind, omitting only the unknown pattern preserves the rest of
 /// the same language query instead of discarding highlighting for the file.
 fn query_pattern_range(source: &str, error_offset: usize) -> Option<Range<usize>> {
-    let bytes = source.as_bytes();
-    let mut depth = 0_usize;
-    let mut start = None;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut in_comment = false;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if in_comment {
-            if byte == b'\n' {
-                in_comment = false;
+    let mut lexical = QueryLexicalState::Code;
+    let mut pattern = QueryPatternBounds::new(error_offset);
+    for (index, byte) in source.bytes().enumerate() {
+        lexical = match (lexical, byte) {
+            (QueryLexicalState::Comment, b'\n') | (QueryLexicalState::String, b'"') => {
+                QueryLexicalState::Code
             }
-            continue;
-        }
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
+            (QueryLexicalState::Comment, _) | (QueryLexicalState::Code, b';') => {
+                QueryLexicalState::Comment
             }
-            continue;
-        }
-        match byte {
-            b';' => in_comment = true,
-            b'"' => in_string = true,
-            b'(' | b'[' => {
-                if depth == 0 {
-                    start = Some(source[..index].rfind('\n').map_or(0, |line| line + 1));
+            (QueryLexicalState::String, b'\\') => QueryLexicalState::EscapedString,
+            (QueryLexicalState::String | QueryLexicalState::EscapedString, _)
+            | (QueryLexicalState::Code, b'"') => QueryLexicalState::String,
+            (QueryLexicalState::Code, b'(' | b'[') => {
+                pattern.open(source, index);
+                QueryLexicalState::Code
+            }
+            (QueryLexicalState::Code, b')' | b']') => {
+                if let Some(range) = pattern.close(source, index) {
+                    return Some(range);
                 }
-                depth = depth.saturating_add(1);
+                QueryLexicalState::Code
             }
-            b')' | b']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0
-                    && index >= error_offset
-                    && let Some(start) = start
-                {
-                    let end = source[index..]
-                        .find('\n')
-                        .map_or(source.len(), |line| index + line + 1);
-                    return Some(start..end);
-                }
-            }
-            _ => {}
-        }
+            (QueryLexicalState::Code, _) => QueryLexicalState::Code,
+        };
     }
     None
+}
+
+#[derive(Clone, Copy)]
+enum QueryLexicalState {
+    Code,
+    Comment,
+    String,
+    EscapedString,
+}
+
+struct QueryPatternBounds {
+    depth: usize,
+    start: Option<usize>,
+    error_offset: usize,
+}
+
+impl QueryPatternBounds {
+    fn new(error_offset: usize) -> Self {
+        Self {
+            depth: 0,
+            start: None,
+            error_offset,
+        }
+    }
+
+    fn open(&mut self, source: &str, index: usize) {
+        if self.depth == 0 {
+            self.start = Some(source[..index].rfind('\n').map_or(0, |line| line + 1));
+        }
+        self.depth = self.depth.saturating_add(1);
+    }
+
+    fn close(&mut self, source: &str, index: usize) -> Option<Range<usize>> {
+        self.depth = self.depth.saturating_sub(1);
+        if self.depth != 0 || index < self.error_offset {
+            return None;
+        }
+        let start = self.start?;
+        let end = source[index..]
+            .find('\n')
+            .map_or(source.len(), |line| index + line + 1);
+        Some(start..end)
+    }
 }
 
 fn highlight_query_source(language_id: &str) -> Option<(&'static str, &'static str)> {
@@ -1492,7 +1514,7 @@ mod tests {
             .accept(DocumentRevision::new(2), 0)
             .expect("fresh")
             .expect("candidate");
-        assert_eq!(transaction.edits[0].range, 0..3);
+        assert_eq!(transaction.edits()[0].range, 0..3);
     }
 
     #[test]

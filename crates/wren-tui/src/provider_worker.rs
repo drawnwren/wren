@@ -56,7 +56,7 @@ pub(super) struct PersistentLsp {
     pub(super) server: LanguageServerInvocation,
     pub(super) root: PathBuf,
     pub(super) open_documents: BTreeMap<DocumentId, LspOpenDocument>,
-    pub(super) semantic_legend: Option<SemanticTokenLegend>,
+    pub(super) capabilities: LspCapabilities,
     pub(super) semantic_due: Option<Instant>,
 }
 
@@ -149,6 +149,11 @@ pub(super) struct GitHunkRequest {
     pub(super) after: FrameText,
 }
 
+pub(super) struct PendingGitHunkRefresh {
+    pub(super) due: Instant,
+    pub(super) request: GitHunkRequest,
+}
+
 pub(super) struct GitHunkResult {
     pub(super) buffer_id: BufferId,
     pub(super) revision: DocumentRevision,
@@ -172,7 +177,10 @@ impl GitHunkWorker {
         let (results, receiver) = mpsc::channel();
         let join = thread::Builder::new()
             .name("wren-git-hunks".to_owned())
-            .spawn(move || git_hunk_loop(requests, results))
+            .spawn(move || {
+                wren_scheduling::mark_background();
+                git_hunk_loop(requests, results);
+            })
             .context("spawn Git hunk worker")?;
         Ok(Self {
             sender,
@@ -199,16 +207,9 @@ impl Drop for GitHunkWorker {
 
 fn git_hunk_loop(requests: mpsc::Receiver<GitHunkMessage>, results: mpsc::Sender<GitHunkResult>) {
     while let Ok(message) = requests.recv() {
-        let GitHunkMessage::Refresh(mut request) = message else {
+        let GitHunkMessage::Refresh(request) = message else {
             return;
         };
-        loop {
-            match requests.recv_timeout(Duration::from_millis(50)) {
-                Ok(GitHunkMessage::Refresh(newer)) => request = newer,
-                Ok(GitHunkMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-            }
-        }
         let after = request.after.shared();
         let hunks = git_hunks(&request.before, &after);
         if results

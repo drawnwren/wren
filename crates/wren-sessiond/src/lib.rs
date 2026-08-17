@@ -691,26 +691,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn socket_round_trip_negotiates_then_emits_received_before_durable() {
-        let directory = tempdir().expect("temporary directory");
-        let journal = SessionJournal::in_directory(directory.path());
-        let authority =
-            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
-        let head_path = directory.path().join("heads.link");
-        let head_writer =
-            Arc::new(SharedDocumentHeadWriter::create(&head_path, 8).expect("shared head writer"));
-        let server = SessionServer::new(authority)
-            .with_head_writer(head_writer)
-            .expect("publish heads");
-        let (mut client, mut daemon) = UnixStream::pair().expect("socket pair");
-        let task_server = server.clone();
-        let task = thread::spawn(move || task_server.serve_connection(&mut daemon));
-
+    fn negotiate(client: &mut UnixStream, request_id: u64) {
         write_envelope(
-            &mut client,
+            client,
             &Envelope::new(
-                10,
+                request_id,
                 envelope::Payload::Hello(Hello {
                     major: PROTOCOL_MAJOR,
                     minor: PROTOCOL_MINOR,
@@ -725,15 +710,17 @@ mod tests {
         )
         .expect("hello");
         assert!(matches!(
-            read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
+            read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
                 .expect("ack")
                 .expect("ack frame")
                 .payload,
             Some(envelope::Payload::HelloAck(_))
         ));
+    }
 
+    fn open_test_document(client: &mut UnixStream) {
         write_envelope(
-            &mut client,
+            client,
             &Envelope::new(
                 10,
                 envelope::Payload::OpenDocument(OpenDocument {
@@ -745,7 +732,7 @@ mod tests {
             DEFAULT_MAX_FRAME_BYTES,
         )
         .expect("open document");
-        let opened = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
+        let opened = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
             .expect("opened")
             .expect("opened frame");
         assert!(matches!(
@@ -753,9 +740,11 @@ mod tests {
             Some(envelope::Payload::DocumentOpened(ref opened))
                 if opened.document_id == 9 && opened.lease_epoch == 1
         ));
+    }
 
+    fn assert_received_then_durable(client: &mut UnixStream) {
         write_envelope(
-            &mut client,
+            client,
             &Envelope::new(
                 11,
                 envelope::Payload::ClientMutation(WireMutation::from(&mutation())),
@@ -763,10 +752,10 @@ mod tests {
             DEFAULT_MAX_FRAME_BYTES,
         )
         .expect("mutation");
-        let first = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
+        let first = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
             .expect("received")
             .expect("received frame");
-        let second = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
+        let second = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
             .expect("durable")
             .expect("durable frame");
         let Some(envelope::Payload::MutationResult(first)) = first.payload else {
@@ -783,7 +772,7 @@ mod tests {
             MutationResult::try_from(second).expect("durable conversion"),
             MutationResult::Durable { .. }
         ));
-        let event = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
+        let event = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
             .expect("session event")
             .expect("session event frame");
         assert_eq!(event.request_id, 0);
@@ -791,6 +780,27 @@ mod tests {
             event.payload,
             Some(envelope::Payload::SessionEvent(_))
         ));
+    }
+
+    #[test]
+    fn socket_round_trip_negotiates_then_emits_received_before_durable() {
+        let directory = tempdir().expect("temporary directory");
+        let journal = SessionJournal::in_directory(directory.path());
+        let authority =
+            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
+        let head_path = directory.path().join("heads.link");
+        let head_writer =
+            Arc::new(SharedDocumentHeadWriter::create(&head_path, 8).expect("shared head writer"));
+        let server = SessionServer::new(authority)
+            .with_head_writer(head_writer)
+            .expect("publish heads");
+        let (mut client, mut daemon) = UnixStream::pair().expect("socket pair");
+        let task_server = server.clone();
+        let task = thread::spawn(move || task_server.serve_connection(&mut daemon));
+
+        negotiate(&mut client, 10);
+        open_test_document(&mut client);
+        assert_received_then_durable(&mut client);
         drop(client);
         task.join()
             .expect("server thread")
