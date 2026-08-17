@@ -305,6 +305,7 @@ pub struct PtySession {
     output: mpsc::Receiver<Vec<u8>>,
     surface: TerminalSurface,
     bytes_read: usize,
+    pending_exit_code: Option<u32>,
     exit_code: Option<u32>,
 }
 
@@ -384,6 +385,7 @@ impl PtySession {
             output,
             surface: TerminalSurface::new(rows, columns),
             bytes_read: 0,
+            pending_exit_code: None,
             exit_code: None,
         })
     }
@@ -409,15 +411,27 @@ impl PtySession {
 
     pub fn poll(&mut self) -> Result<bool, WorkflowError> {
         let mut changed = false;
-        while let Ok(bytes) = self.output.try_recv() {
-            self.bytes_read = self.bytes_read.saturating_add(bytes.len());
-            self.surface.process(&bytes);
-            changed = true;
-        }
-        if self.exit_code.is_none()
+        let output_closed = loop {
+            match self.output.try_recv() {
+                Ok(bytes) => {
+                    self.bytes_read = self.bytes_read.saturating_add(bytes.len());
+                    self.surface.process(&bytes);
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if self.pending_exit_code.is_none()
             && let Some(status) = self.child.try_wait()?
         {
-            self.exit_code = Some(status.exit_code());
+            self.pending_exit_code = Some(status.exit_code());
+        }
+        if output_closed
+            && self.exit_code.is_none()
+            && let Some(code) = self.pending_exit_code.take()
+        {
+            self.exit_code = Some(code);
             changed = true;
         }
         Ok(changed)
@@ -1660,7 +1674,6 @@ mod tests {
             session.poll().expect("poll");
             thread::sleep(Duration::from_millis(1));
         }
-        session.poll().expect("final poll");
         assert_eq!(session.exit_code(), Some(0));
         assert!(session.surface().contents().contains("got:hello"));
         assert!(session.bytes_read() > 0);
