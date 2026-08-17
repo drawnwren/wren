@@ -1,6 +1,6 @@
 struct Params {
     text_len: u32,
-    _padding_0: u32,
+    invocations_per_row: u32,
     _padding_1: u32,
     _padding_2: u32,
 }
@@ -9,7 +9,7 @@ struct Params {
 var<storage, read> input_words: array<u32>;
 
 @group(0) @binding(1)
-var<storage, read_write> output_words: array<u32>;
+var<storage, read_write> output_words: array<atomic<u32>>;
 
 @group(0) @binding(2)
 var<uniform> params: Params;
@@ -158,18 +158,15 @@ fn keyword_length(start: u32) -> u32 {
 
 @compute @workgroup_size(256)
 fn classify(@builtin(global_invocation_id) invocation: vec3<u32>) {
-    let output_index = invocation.x;
-    let first_byte = output_index * 32u;
-    if first_byte >= params.text_len {
+    let byte_index = invocation.x + invocation.y * params.invocations_per_row;
+    if byte_index >= params.text_len {
         return;
     }
 
-    var starts = 0u;
-    for (var lane = 0u; lane < 32u; lane = lane + 1u) {
-        let byte_index = first_byte + lane;
-        if byte_index < params.text_len && keyword_length(byte_index) != 0u {
-            starts = starts | (1u << lane);
-        }
+    if keyword_length(byte_index) != 0u {
+        atomicOr(
+            &output_words[byte_index / 32u],
+            1u << (byte_index % 32u),
+        );
     }
-    output_words[output_index] = starts;
 }

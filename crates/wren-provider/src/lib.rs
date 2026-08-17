@@ -158,10 +158,20 @@ pub enum AccelerationBackend {
 // CPU and reserve the GPU for provider-scale batches.
 const MIN_GPU_CLASSIFICATION_BYTES: usize = 4 * 1024 * 1024;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LexicalSourceKey {
+    document_id: DocumentId,
+    revision: DocumentRevision,
+    generation: ProviderGeneration,
+    range: Range<usize>,
+}
+
 struct LexicalAccelerator {
     backend: AccelerationBackend,
     #[cfg(feature = "gpu")]
     gpu: Option<gpu::GpuLexical>,
+    #[cfg(feature = "gpu")]
+    resident_source: Option<LexicalSourceKey>,
 }
 
 impl std::fmt::Debug for LexicalAccelerator {
@@ -183,6 +193,8 @@ impl LexicalAccelerator {
             },
             #[cfg(feature = "gpu")]
             gpu: None,
+            #[cfg(feature = "gpu")]
+            resident_source: None,
         }
     }
 
@@ -191,10 +203,12 @@ impl LexicalAccelerator {
             backend: AccelerationBackend::Cpu,
             #[cfg(feature = "gpu")]
             gpu: None,
+            #[cfg(feature = "gpu")]
+            resident_source: None,
         }
     }
 
-    fn classify(&mut self, text: &str) -> Option<Vec<Range<usize>>> {
+    fn classify(&mut self, source: LexicalSourceKey, text: &str) -> Option<Vec<Range<usize>>> {
         if text.len() < MIN_GPU_CLASSIFICATION_BYTES
             || !text.is_ascii()
             || self.backend == AccelerationBackend::Cpu
@@ -204,7 +218,7 @@ impl LexicalAccelerator {
         #[cfg(not(feature = "gpu"))]
         {
             self.backend = AccelerationBackend::Cpu;
-            let _ = text;
+            let _ = (source, text);
             None
         }
         #[cfg(feature = "gpu")]
@@ -215,6 +229,7 @@ impl LexicalAccelerator {
                 match initialized {
                     Ok(Ok(gpu)) => {
                         self.gpu = Some(gpu);
+                        self.resident_source = None;
                         self.backend = AccelerationBackend::Gpu;
                     }
                     Ok(Err(_)) | Err(_) => {
@@ -227,12 +242,18 @@ impl LexicalAccelerator {
             if !gpu.supports(text.len()) {
                 return None;
             }
-            let classified =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.classify(text)));
+            let upload_required = self.resident_source.as_ref() != Some(&source);
+            let classified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gpu.classify(text, upload_required)
+            }));
             match classified {
-                Ok(Ok(ranges)) => Some(ranges),
+                Ok(Ok(ranges)) => {
+                    self.resident_source = Some(source);
+                    Some(ranges)
+                }
                 Ok(Err(_)) | Err(_) => {
                     self.gpu = None;
+                    self.resident_source = None;
                     self.backend = AccelerationBackend::Cpu;
                     None
                 }
@@ -463,7 +484,13 @@ impl ProviderActor {
         {
             for range in &requested_ranges {
                 let source = &document.text[range.clone()];
-                if let Some(ranges) = lexical_accelerator.classify(source) {
+                let source_key = LexicalSourceKey {
+                    document_id,
+                    revision: document.revision,
+                    generation: document.generation,
+                    range: range.clone(),
+                };
+                if let Some(ranges) = lexical_accelerator.classify(source_key, source) {
                     spans.extend(ranges.into_iter().map(|span| HighlightSpan {
                         range: range.start + span.start..range.start + span.end,
                         kind: "keyword".into(),
@@ -1836,7 +1863,9 @@ mod tests {
                 .into_iter()
                 .map(|span| span.range)
                 .collect::<Vec<_>>();
-            let actual = gpu.classify(source).expect("GPU lexical classification");
+            let actual = gpu
+                .classify(source, true)
+                .expect("GPU lexical classification");
             assert_eq!(actual, expected, "GPU mismatch for {source:?}");
         }
     }

@@ -21,7 +21,9 @@ struct Buffers {
 struct DispatchSize {
     input: usize,
     output: usize,
-    workgroups: u32,
+    workgroups_x: u32,
+    workgroups_y: u32,
+    invocations_per_row: u32,
 }
 
 pub(super) struct GpuLexical {
@@ -112,22 +114,31 @@ impl GpuLexical {
         let Some(output_size) = output_size(text_len) else {
             return false;
         };
-        let output_words = output_size / 4;
-        let workgroups = output_words.div_ceil(workgroup_size());
+        let Some((workgroups_x, workgroups_y)) = dispatch_dimensions(text_len, self.max_workgroups)
+        else {
+            return false;
+        };
         text_len > 0
             && u32::try_from(text_len).is_ok()
             && u64::try_from(input_size).is_ok_and(|size| size <= self.max_buffer_size)
             && u64::try_from(output_size).is_ok_and(|size| size <= self.max_buffer_size)
-            && u32::try_from(workgroups).is_ok_and(|count| count <= self.max_workgroups)
+            && workgroups_x <= self.max_workgroups
+            && workgroups_y <= self.max_workgroups
     }
 
-    pub(super) fn classify(&mut self, text: &str) -> Result<Vec<Range<usize>>, String> {
+    pub(super) fn classify(
+        &mut self,
+        text: &str,
+        upload_required: bool,
+    ) -> Result<Vec<Range<usize>>, String> {
         let size = self.validate_dispatch(text)?;
-        self.ensure_capacity(
+        let buffers_replaced = self.ensure_capacity(
             u64::try_from(size.input).map_err(|error| error.to_string())?,
             u64::try_from(size.output).map_err(|error| error.to_string())?,
         );
-        self.upload_text(text, size.input)?;
+        if upload_required || buffers_replaced {
+            self.upload_text(text, size)?;
+        }
         let buffers = self
             .buffers
             .as_ref()
@@ -150,24 +161,29 @@ impl GpuLexical {
             input_size(text.len()).ok_or_else(|| "GPU input buffer size overflow".to_owned())?;
         let output =
             output_size(text.len()).ok_or_else(|| "GPU output buffer size overflow".to_owned())?;
-        let workgroups = u32::try_from((output / 4).div_ceil(workgroup_size()))
-            .map_err(|error| error.to_string())?;
+        let (workgroups_x, workgroups_y) = dispatch_dimensions(text.len(), self.max_workgroups)
+            .ok_or_else(|| "document exceeds GPU dispatch limits".to_owned())?;
+        let invocations_per_row = workgroups_x
+            .checked_mul(WORKGROUP_SIZE)
+            .ok_or_else(|| "GPU dispatch width overflow".to_owned())?;
         Ok(DispatchSize {
             input,
             output,
-            workgroups,
+            workgroups_x,
+            workgroups_y,
+            invocations_per_row,
         })
     }
 
-    fn upload_text(&mut self, text: &str, input_size: usize) -> Result<(), String> {
+    fn upload_text(&mut self, text: &str, size: DispatchSize) -> Result<(), String> {
         let buffers = self
             .buffers
             .as_ref()
             .ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
-        let input = if input_size == text.len() {
+        let input = if size.input == text.len() {
             text.as_bytes()
         } else {
-            self.upload.resize(input_size, 0);
+            self.upload.resize(size.input, 0);
             self.upload[..text.len()].copy_from_slice(text.as_bytes());
             &self.upload
         };
@@ -178,6 +194,7 @@ impl GpuLexical {
                 .map_err(|error| error.to_string())?
                 .to_le_bytes(),
         );
+        params[4..8].copy_from_slice(&size.invocations_per_row.to_le_bytes());
         self.queue.write_buffer(&self.params, 0, &params);
         Ok(())
     }
@@ -192,6 +209,11 @@ impl GpuLexical {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wren lexical classifier"),
             });
+        encoder.clear_buffer(
+            &buffers.output,
+            0,
+            Some(u64::try_from(size.output).map_err(|error| error.to_string())?),
+        );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wren lexical classifier"),
@@ -199,7 +221,7 @@ impl GpuLexical {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &buffers.bind_group, &[]);
-            pass.dispatch_workgroups(size.workgroups, 1, 1);
+            pass.dispatch_workgroups(size.workgroups_x, size.workgroups_y, 1);
         }
         encoder.copy_buffer_to_buffer(
             &buffers.output,
@@ -247,11 +269,11 @@ impl GpuLexical {
         result
     }
 
-    fn ensure_capacity(&mut self, input_required: u64, output_required: u64) {
+    fn ensure_capacity(&mut self, input_required: u64, output_required: u64) -> bool {
         if self.buffers.as_ref().is_some_and(|buffers| {
             buffers.input_capacity >= input_required && buffers.output_capacity >= output_required
         }) {
-            return;
+            return false;
         }
         let input_capacity = input_required
             .checked_next_power_of_two()
@@ -270,7 +292,9 @@ impl GpuLexical {
         let output = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wren lexical output"),
             size: output_capacity,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -305,6 +329,7 @@ impl GpuLexical {
             input_capacity,
             output_capacity,
         });
+        true
     }
 }
 
@@ -338,6 +363,20 @@ fn output_size(length: usize) -> Option<usize> {
 
 fn workgroup_size() -> usize {
     usize::try_from(WORKGROUP_SIZE).unwrap_or(256)
+}
+
+fn dispatch_dimensions(text_len: usize, max_workgroups: u32) -> Option<(u32, u32)> {
+    let total = text_len.div_ceil(workgroup_size());
+    let maximum = usize::try_from(max_workgroups).ok()?;
+    if total == 0 || maximum == 0 {
+        return None;
+    }
+    let x = total.min(maximum);
+    let y = total.div_ceil(x);
+    if y > maximum {
+        return None;
+    }
+    Some((u32::try_from(x).ok()?, u32::try_from(y).ok()?))
 }
 
 fn keyword_length_at(text: &[u8], start: usize) -> Option<usize> {

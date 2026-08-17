@@ -15,18 +15,25 @@ The dependency checker enforces these internal edges:
 
 ```text
 wren-types <- wren-text <- wren-position
+wren-types <- wren-text <- wren-session
 wren-types <- wren-grammar <- wren-engine <- wren-view
 wren-view <- wren-term <- wren-tui
+wren-scheduling <- wren-presenter
+wren-scheduling <- wren-tui
 ```
 
 `wren-engine` may consume the text and position branches but cannot depend on
 terminal, OS, async, or harness packages. Tokio is forbidden in types, text,
 position, grammar, engine, and view. OS-facing dependencies are restricted to
-term, binaries, and harness packages. Library builds deny `unwrap` and `expect`
-outside tests; binaries remain responsible for top-level error reporting.
+term, scheduling, binaries, and harness packages. `wren-scheduling` centralizes
+the platform QoS policy used by the presenter and TUI without entering the
+deterministic core. The session authority consumes `wren-text` so canonical
+documents remain rope-backed while mutations are staged and journaled. Library
+builds deny `unwrap` and `expect` outside tests; binaries remain responsible for
+top-level error reporting.
 
-`wren-proto`, `wren-session`, and `wren-sessiond` remain compileable stubs. The
-unstable mutation envelope is hidden and is not serializable.
+`wren-proto`, `wren-session`, and `wren-sessiond` keep protocol, authority, and
+transport responsibilities outside the deterministic editor core.
 
 ## Alternatives rejected
 
@@ -36,4 +43,3 @@ unstable mutation envelope is hidden and is not serializable.
   replay and put runtime scheduling on the input path.
 - Filling Phase-2 crates speculatively: rejected because it would freeze an
   explicitly unstable mutation boundary.
-

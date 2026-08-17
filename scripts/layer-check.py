@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 ALLOWED_INTERNAL = {
     "wren-types": set(),
+    "wren-scheduling": set(),
     "wren-shmem": {"wren-types"},
     "wren-client-state": {"wren-types", "wren-view", "wren-shmem"},
     "wren-text": {"wren-types"},
@@ -26,9 +27,9 @@ ALLOWED_INTERNAL = {
     "wren-command": {"wren-types"},
     "wren-view": {"wren-types", "wren-engine"},
     "wren-term": {"wren-view"},
-    "wren-presenter": {"wren-view", "wren-term"},
+    "wren-presenter": {"wren-view", "wren-term", "wren-scheduling"},
     "wren-proto": {"wren-types"},
-    "wren-session": {"wren-types"},
+    "wren-session": {"wren-types", "wren-text"},
     "wren-tui": {
         "wren-types",
         "wren-command",
@@ -45,6 +46,7 @@ ALLOWED_INTERNAL = {
         "wren-provider",
         "wren-proto",
         "wren-session",
+        "wren-scheduling",
     },
     "wren-sessiond": {
         "wren-session",
