@@ -85,7 +85,7 @@ fn production_probe(iterations: u64) -> Result<ProductionLatencyReport> {
     );
     let report: ProductionLatencyReport = serde_json::from_slice(&output.stdout)
         .context("decode full-production latency probe report")?;
-    anyhow::ensure!(report.schema == 1, "unsupported production probe schema");
+    anyhow::ensure!(report.schema == 2, "unsupported production probe schema");
     anyhow::ensure!(
         !report.samples.is_empty(),
         "production probe returned no samples"
@@ -835,7 +835,7 @@ fn production_case_p99_gate(case: &str) -> u64 {
     match case {
         "insert_character" | "enter_insert" => RealtimeCase::InsertCharacter.p99_gate_nanos(),
         "delete_character" => RealtimeCase::DeleteCharacter.p99_gate_nanos(),
-        "local_motion" | "bottom_navigation" | "leave_insert" => {
+        "local_motion" | "bottom_navigation" | "cold_bottom_navigation" | "leave_insert" => {
             RealtimeCase::LocalMotion.p99_gate_nanos()
         }
         "selection_change" | "enter_visual" => RealtimeCase::SelectionChange.p99_gate_nanos(),
@@ -907,6 +907,84 @@ struct ReportInputs<'a> {
     gates: &'a GateResults,
 }
 
+fn production_workload_report(production: &ProductionMetrics, gates: &GateResults) -> Value {
+    json!({
+        "name": production.report.workload,
+        "width": production.report.width,
+        "height": production.report.height,
+        "syntax_spans": production.report.syntax_spans,
+        "synthetic_semantic_spans": production.report.synthetic_semantic_spans,
+        "search_highlight_active": production.report.search_highlight_active,
+        "diagnostic_count": production.report.diagnostic_count,
+        "git_baseline_active": production.report.git_baseline_active,
+        "setup_presentations": production.report.setup_presentations,
+        "large_file_open": {
+            "hard_gate": true,
+            "maximum_gate_nanos": LARGE_FILE_OPEN_MAX_GATE_NANOS,
+            "observed_nanos": production.report.open_nanos,
+            "passed": gates.large_file_open,
+        },
+        "large_file_first_desired_frame": {
+            "hard_gate": true,
+            "maximum_gate_nanos": LARGE_FILE_FIRST_FRAME_MAX_GATE_NANOS,
+            "observed_nanos": production.report.first_desired_frame_nanos,
+            "passed": gates.large_file_first_frame,
+        },
+        "large_file_open_to_first_terminal_write": {
+            "hard_gate": true,
+            "maximum_gate_nanos": LARGE_FILE_OPEN_TO_TERMINAL_MAX_GATE_NANOS,
+            "observed_nanos": production.report.open_to_first_terminal_write_nanos,
+            "passed": gates.large_file_open_to_terminal,
+        },
+    })
+}
+
+fn component_grid_report(realtime: &RealtimeMetrics, gates: &GateResults) -> Value {
+    json!({
+        "coverage": "engine_and_workspace_composer_component_only",
+        "omitted_production_stages": [
+            "TUI App transaction side effects",
+            "syntax and semantic decoration selection",
+            "search, Git, diagnostic, and selection decorations",
+            "editor overlays"
+        ],
+        "hard_gate": true,
+        "p99_gate_nanos": REALTIME_AGGREGATE_P99_GATE_NANOS,
+        "maximum_gate_nanos": REALTIME_MAX_GATE_NANOS,
+        "p99_passed": gates.aggregate_realtime_p99,
+        "maximum_passed": gates.aggregate_realtime_maximum,
+        "observed_maximum_nanos": realtime.desired_grid_max,
+        "aggregate_passed": gates.aggregate_realtime(),
+        "passed": gates.realtime(),
+        "distribution": distribution(&realtime.desired_grid),
+        "realtime_commands": realtime_case_report(realtime),
+    })
+}
+
+fn production_frame_report(production: &ProductionMetrics, gates: &GateResults) -> Value {
+    json!({
+        "coverage": "full_tui_app_decorations_overlays_and_workspace_renderer",
+        "hard_gate": true,
+        "p99_gate_nanos": REALTIME_AGGREGATE_P99_GATE_NANOS,
+        "maximum_gate_nanos": REALTIME_MAX_GATE_NANOS,
+        "p99_passed": gates.production_desired_p99,
+        "maximum_passed": gates.production_desired_maximum,
+        "case_p99_passed": gates.production_cases_p99,
+        "case_maximum_passed": gates.production_cases_maximum,
+        "observed_maximum_nanos": production.desired_max,
+        "passed": gates.full_production_desired_frame,
+        "distribution": distribution(&production.desired),
+        "realtime_commands": production_case_report(production),
+        "stage_distributions": {
+            "input_dispatch": distribution(&production.input),
+            "app_background_poll": distribution(&production.app_poll),
+            "provider_scheduling": distribution(&production.provider_schedule),
+            "desired_frame_construction": distribution(&production.frame),
+        },
+        "workload": production_workload_report(production, gates),
+    })
+}
+
 fn report(inputs: ReportInputs<'_>) -> Value {
     let ReportInputs {
         arguments,
@@ -934,69 +1012,8 @@ fn report(inputs: ReportInputs<'_>) -> Value {
             "observed_maximum_nanos": realtime.grid_build_max,
             "distribution": distribution(&realtime.grid_build),
         },
-        "component_physical_input_to_workspace_grid_ready": {
-            "coverage": "engine_and_workspace_composer_component_only",
-            "omitted_production_stages": [
-                "TUI App transaction side effects",
-                "syntax and semantic decoration selection",
-                "search, Git, diagnostic, and selection decorations",
-                "editor overlays"
-            ],
-            "hard_gate": true,
-            "p99_gate_nanos": REALTIME_AGGREGATE_P99_GATE_NANOS,
-            "maximum_gate_nanos": REALTIME_MAX_GATE_NANOS,
-            "p99_passed": gates.aggregate_realtime_p99,
-            "maximum_passed": gates.aggregate_realtime_maximum,
-            "observed_maximum_nanos": realtime.desired_grid_max,
-            "aggregate_passed": gates.aggregate_realtime(),
-            "passed": gates.realtime(),
-            "distribution": distribution(&realtime.desired_grid),
-            "realtime_commands": realtime_case_report(realtime),
-        },
-        "physical_input_to_desired_frame_ready": {
-            "coverage": "full_tui_app_decorations_overlays_and_workspace_renderer",
-            "hard_gate": true,
-            "p99_gate_nanos": REALTIME_AGGREGATE_P99_GATE_NANOS,
-            "maximum_gate_nanos": REALTIME_MAX_GATE_NANOS,
-            "p99_passed": gates.production_desired_p99,
-            "maximum_passed": gates.production_desired_maximum,
-            "case_p99_passed": gates.production_cases_p99,
-            "case_maximum_passed": gates.production_cases_maximum,
-            "observed_maximum_nanos": production.desired_max,
-            "passed": gates.full_production_desired_frame,
-            "distribution": distribution(&production.desired),
-            "realtime_commands": production_case_report(production),
-            "stage_distributions": {
-                "input_dispatch": distribution(&production.input),
-                "app_background_poll": distribution(&production.app_poll),
-                "provider_scheduling": distribution(&production.provider_schedule),
-                "desired_frame_construction": distribution(&production.frame),
-            },
-            "workload": {
-                "name": production.report.workload,
-                "width": production.report.width,
-                "height": production.report.height,
-                "syntax_spans": production.report.syntax_spans,
-                "large_file_open": {
-                    "hard_gate": true,
-                    "maximum_gate_nanos": LARGE_FILE_OPEN_MAX_GATE_NANOS,
-                    "observed_nanos": production.report.open_nanos,
-                    "passed": gates.large_file_open,
-                },
-                "large_file_first_desired_frame": {
-                    "hard_gate": true,
-                    "maximum_gate_nanos": LARGE_FILE_FIRST_FRAME_MAX_GATE_NANOS,
-                    "observed_nanos": production.report.first_desired_frame_nanos,
-                    "passed": gates.large_file_first_frame,
-                },
-                "large_file_open_to_first_terminal_write": {
-                    "hard_gate": true,
-                    "maximum_gate_nanos": LARGE_FILE_OPEN_TO_TERMINAL_MAX_GATE_NANOS,
-                    "observed_nanos": production.report.open_to_first_terminal_write_nanos,
-                    "passed": gates.large_file_open_to_terminal,
-                },
-            },
-        },
+        "component_physical_input_to_workspace_grid_ready": component_grid_report(realtime, gates),
+        "physical_input_to_desired_frame_ready": production_frame_report(production, gates),
         "task_command_yield_to_ui": {
             "hard_gate": true,
             "passed": gates.task_yield(),
@@ -1031,6 +1048,7 @@ fn report(inputs: ReportInputs<'_>) -> Value {
         },
         "terminal_backpressure": {
             "published_frames": production.report.published_frames,
+            "scenario_setup_presentations": production.report.setup_presentations,
             "dropped_frames": production.report.dropped_frames,
             "presented_frames": production.report.presented_frames,
         },

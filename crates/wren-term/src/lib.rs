@@ -104,6 +104,8 @@ pub enum TerminalError {
 pub struct SystemTerminalBackend {
     terminal: PlatformTerminal,
     true_color: bool,
+    render_buffer: Vec<u8>,
+    style_cache: Vec<(CellStyle, Box<[u8]>)>,
     deferred_parser: Parser,
     deferred_input: VecDeque<TerminalInput>,
 }
@@ -127,6 +129,8 @@ impl SystemTerminalBackend {
         Ok(Self {
             terminal,
             true_color: supports_true_color(),
+            render_buffer: Vec::with_capacity(64 * 1024),
+            style_cache: Vec::new(),
             deferred_parser: Parser::default(),
             deferred_input: VecDeque::new(),
         })
@@ -305,7 +309,14 @@ impl TerminalBackend for SystemTerminalBackend {
     type Error = TerminalError;
 
     fn submit(&mut self, patch: &[TerminalPatch]) -> Result<(), Self::Error> {
-        render_patches(&mut self.terminal, patch, self.true_color)?;
+        self.render_buffer.clear();
+        render_patches(
+            &mut self.render_buffer,
+            patch,
+            self.true_color,
+            &mut self.style_cache,
+        )?;
+        self.terminal.write_all(&self.render_buffer)?;
         self.terminal
             .flush()
             .map_err(|error| TerminalError::Render(error.to_string()))
@@ -316,6 +327,8 @@ impl TerminalBackend for SystemTerminalBackend {
 pub struct TerminaBackend<W> {
     writer: W,
     true_color: bool,
+    render_buffer: Vec<u8>,
+    style_cache: Vec<(CellStyle, Box<[u8]>)>,
 }
 
 impl<W: Write> TerminaBackend<W> {
@@ -323,6 +336,8 @@ impl<W: Write> TerminaBackend<W> {
         Ok(Self {
             writer,
             true_color: supports_true_color(),
+            render_buffer: Vec::with_capacity(64 * 1024),
+            style_cache: Vec::new(),
         })
     }
 
@@ -362,7 +377,14 @@ impl<W: Write> TerminalBackend for TerminaBackend<W> {
     type Error = TerminalError;
 
     fn submit(&mut self, patch: &[TerminalPatch]) -> Result<(), Self::Error> {
-        render_patches(&mut self.writer, patch, self.true_color)?;
+        self.render_buffer.clear();
+        render_patches(
+            &mut self.render_buffer,
+            patch,
+            self.true_color,
+            &mut self.style_cache,
+        )?;
+        self.writer.write_all(&self.render_buffer)?;
         self.writer
             .flush()
             .map_err(|error| TerminalError::Render(error.to_string()))
@@ -449,17 +471,22 @@ fn render_patches(
     output: &mut impl Write,
     patch: &[TerminalPatch],
     true_color: bool,
+    style_cache: &mut Vec<(CellStyle, Box<[u8]>)>,
 ) -> Result<(), TerminalError> {
+    let mut active_style = None;
     for change in patch {
         match change {
-            TerminalPatch::Clear => write!(
-                output,
-                "{}{}",
-                Csi::Sgr(Sgr::Reset),
-                Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay))
-            )?,
+            TerminalPatch::Clear => {
+                write!(
+                    output,
+                    "{}{}",
+                    Csi::Sgr(Sgr::Reset),
+                    Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay))
+                )?;
+                active_style = None;
+            }
             TerminalPatch::ClearToEndOfLine(style) => {
-                write_style(output, *style, true_color)?;
+                write_style_if_changed(output, *style, true_color, &mut active_style, style_cache)?;
                 write!(
                     output,
                     "{}",
@@ -474,8 +501,22 @@ fn render_patches(
                     col: terminal_coordinate(*column)?,
                 })
             )?,
-            TerminalPatch::SetStyle(style) => write_style(output, *style, true_color)?,
+            TerminalPatch::SetStyle(style) => {
+                write_style_if_changed(output, *style, true_color, &mut active_style, style_cache)?
+            }
             TerminalPatch::Put(cell) => output.write_all(cell.grapheme.as_bytes())?,
+            TerminalPatch::PutRow(row) => {
+                for cell in &row.cells {
+                    write_style_if_changed(
+                        output,
+                        cell.style,
+                        true_color,
+                        &mut active_style,
+                        style_cache,
+                    )?;
+                    output.write_all(cell.grapheme.as_bytes())?;
+                }
+            }
             TerminalPatch::ShowCursor(visible) => {
                 let mode = dec_mode(DecPrivateModeCode::ShowCursor);
                 write!(
@@ -490,6 +531,27 @@ fn render_patches(
             }
         }
     }
+    Ok(())
+}
+
+fn write_style_if_changed(
+    output: &mut impl Write,
+    style: CellStyle,
+    true_color: bool,
+    active_style: &mut Option<CellStyle>,
+    cache: &mut Vec<(CellStyle, Box<[u8]>)>,
+) -> io::Result<()> {
+    if *active_style == Some(style) {
+        return Ok(());
+    }
+    *active_style = Some(style);
+    if let Some((_, bytes)) = cache.iter().find(|(cached, _)| *cached == style) {
+        return output.write_all(bytes);
+    }
+    let mut bytes = Vec::with_capacity(48);
+    write_style(&mut bytes, style, true_color)?;
+    output.write_all(&bytes)?;
+    cache.push((style, bytes.into_boxed_slice()));
     Ok(())
 }
 
@@ -658,10 +720,46 @@ fn map_key_code(code: TermKeyCode) -> Option<(TerminalKeyCode, bool)> {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountingSink {
+        writes: usize,
+        flushes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
     fn parse_one(bytes: &[u8]) -> TerminalInput {
         let mut parser = Parser::default();
         parser.parse(bytes, false);
         map_input(parser.pop().expect("parsed event"))
+    }
+
+    #[test]
+    fn termina_submits_each_complete_patch_set_with_one_writer_call() {
+        let mut backend = TerminaBackend::new(CountingSink::default(), 80, 24).expect("backend");
+        backend
+            .submit(&[
+                TerminalPatch::MoveTo { column: 2, row: 3 },
+                TerminalPatch::SetStyle(CellStyle::default()),
+                TerminalPatch::ShowCursor(true),
+            ])
+            .expect("submit patches");
+        let sink = backend.into_inner();
+        assert_eq!(sink.writes, 1);
+        assert_eq!(sink.flushes, 1);
+        assert!(!sink.bytes.is_empty());
     }
 
     #[test]
@@ -853,6 +951,7 @@ mod tests {
                 TerminalPatch::ShowCursor(true),
             ],
             true,
+            &mut Vec::new(),
         )
         .expect("render");
         assert_eq!(output, b"\x1b[m\x1b[2J\x1b[3;5H\x1b[?25l\x1b[?25h");

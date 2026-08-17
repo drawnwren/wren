@@ -13,6 +13,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 xattr.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
+wren-text = { version = "0.1.0", path = "../wren-text" }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

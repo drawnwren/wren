@@ -311,7 +311,7 @@ fn scenario_c(iterations: u64, directory: &Path, text: &str) -> Result<Timings> 
             .context("recovered startup document")?;
         let mut layout = ViewportLayout::new(120, 40);
         let grid = layout.desired_grid(&EngineFrame {
-            text: document.text.clone().into(),
+            text: document.text().into(),
             cursor_byte: 0,
         });
         let speculative = elapsed_nanos(started);

@@ -26,6 +26,26 @@
           craneLib = (crane.mkLib pkgs).overrideToolchain rust;
           fuzzRust = pkgs.rust-bin.nightly."2026-08-14".minimal;
           fuzzCraneLib = (crane.mkLib pkgs).overrideToolchain fuzzRust;
+          cargoSource = pkgs.lib.cleanSourceWith {
+            name = "wren-cargo-source";
+            src = ./.;
+            filter = path: type:
+              let
+                sourcePath = toString path;
+                cargoAsset = pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix sourcePath) [
+                  ".proto"
+                  ".scm"
+                  ".wgsl"
+                  ".wit"
+                ];
+                checkAsset = pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix sourcePath) [
+                  "/crates/wren-types/proptest-regressions/lib.txt"
+                  "/harness/corpus/documents/unicode.txt"
+                  "/scripts/layer-check.py"
+                ] || pkgs.lib.hasInfix "/harness/conformance/goldens/" sourcePath;
+              in
+                craneLib.filterCargoSources path type || cargoAsset || checkAsset;
+          };
           oracle = pkgs.neovim;
           # Wren's language profiles are expected to work from the installed
           # package, not only from a project dev shell. Keep every configured
@@ -95,15 +115,21 @@
           commonArgs = {
             pname = "wren";
             version = "0.1.0";
-            src = self;
+            src = cargoSource;
             strictDeps = true;
             cargoExtraArgs = "--locked --workspace";
           };
           cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
             pname = "wren-dependencies";
           });
-          package = craneLib.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
+          packageArgs = commonArgs // {
+            cargoExtraArgs = "--locked -p wren-tui --bin wren";
+          };
+          packageCargoArtifacts = craneLib.buildDepsOnly (packageArgs // {
+            pname = "wren-package-dependencies";
+          });
+          package = craneLib.buildPackage (packageArgs // {
+            cargoArtifacts = packageCargoArtifacts;
             # The dedicated cargoNextest check below owns the test suite so a
             # package build does not compile and execute every test twice.
             doCheck = false;
@@ -133,13 +159,13 @@
             doCheck = false;
           });
           fuzzCargoVendorDir = fuzzCraneLib.vendorCargoDeps {
-            src = self;
+            src = cargoSource;
             cargoLock = ./fuzz/Cargo.lock;
           };
           fuzzArgs = {
             pname = "wren-fuzz-smoke-check";
             version = "0.1.0";
-            src = self;
+            src = cargoSource;
             strictDeps = true;
             CARGO_TARGET_DIR = "target";
             cargoToml = ./Cargo.toml;
@@ -153,7 +179,7 @@
             '';
           };
           fuzzDummySrc = fuzzCraneLib.mkDummySrc {
-            src = self;
+            src = cargoSource;
             cargoLock = ./fuzz/Cargo.lock;
             cleanCargoTomlFilter = path:
               pkgs.lib.lists.hasPrefix [ "package" "metadata" ] path

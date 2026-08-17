@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 use thiserror::Error;
+use wren_text::{DefaultText, TextStore};
 use wren_types::{
     AcceptedDocument, ClientId, ClientMutation, ClientSequence, DocumentFrontier, DocumentId,
     DocumentMutation, DocumentRevision, EventOrigin, LeaseEpoch, LeaseGrant, MutationId,
@@ -13,10 +14,10 @@ use wren_types::{
 use crate::journal::{JournalEntry, RegisteredDocument};
 use crate::{SessionJournal, SessionJournalError};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AuthorityDocument {
     pub document_id: DocumentId,
-    pub text: String,
+    text: DefaultText,
     pub revision: DocumentRevision,
     pub lease: LeaseGrant,
     // Rebase history is deliberately independent from the replay event window.
@@ -25,13 +26,26 @@ pub struct AuthorityDocument {
     history: Vec<Transaction>,
 }
 
+#[derive(Clone)]
 struct StagedDocumentUpdate {
-    text: String,
+    text: DefaultText,
     revision: DocumentRevision,
     transactions: Vec<Transaction>,
 }
 
 impl AuthorityDocument {
+    /// Materializes the authoritative text for external consumers such as a
+    /// save or snapshot. Mutation staging itself remains rope-backed.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.text.slice(0..self.text.len_bytes()).into_owned()
+    }
+
+    #[must_use]
+    pub fn text_equals(&self, expected: &str) -> bool {
+        self.text.slice(0..self.text.len_bytes()) == expected
+    }
+
     #[must_use]
     pub fn delta_since(&self, base: DocumentRevision) -> Vec<Transaction> {
         if base >= self.revision {
@@ -122,7 +136,7 @@ struct DedupEntry {
     durable: MutationResult,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionAuthority {
     journal: SessionJournal,
     session_id: SessionId,
@@ -304,31 +318,95 @@ impl SessionAuthority {
         &mut self,
         mutation: ClientMutation,
     ) -> Result<MutationSubmission, AuthorityError> {
-        mutation.validate()?;
-        let mutation_hash = canonical_hash(&mutation)?;
-        if let Some(submission) = self.previous_submission(&mutation, mutation_hash)? {
-            return Ok(submission);
-        }
-        self.validate_client_sequence(&mutation)?;
-        let mut staged_documents = match self.stage_documents(&mutation)? {
-            Ok(documents) => documents,
-            Err(rejection) => return Ok(MutationSubmission::Rejected(rejection)),
-        };
-        let (events, final_sequence) = self.events_for(&mutation)?;
-        let durable = durable_result(&mutation, final_sequence)?;
-
-        // The append includes sync_data. Only after it succeeds may memory
-        // expose the accepted state or the client receive `Durable`.
-        self.journal.append_mutation(&mutation, &durable, &events)?;
-        self.apply_staged_documents(&mut staged_documents);
-        self.install_committed(&mutation, durable.clone(), events, mutation_hash)?;
-        self.enforce_event_retention()?;
-        Ok(MutationSubmission::Accepted {
-            received: MutationResult::Received {
-                mutation_id: mutation.mutation_id,
-            },
-            durable,
+        let mut submissions = self.submit_batch(vec![mutation])?;
+        submissions.pop().ok_or_else(|| {
+            AuthorityError::Replay("single mutation submission produced no result".to_owned())
         })
+    }
+
+    /// Validates an ordered burst against a private staged authority, writes
+    /// every accepted commit as independent journal records in one durable
+    /// write, and only then publishes the staged state. An I/O or validation
+    /// error leaves the live authority unchanged.
+    pub fn submit_batch(
+        &mut self,
+        mutations: Vec<ClientMutation>,
+    ) -> Result<Vec<MutationSubmission>, AuthorityError> {
+        let mut staged_authority = self.clone();
+        let mut journal_entries = Vec::with_capacity(mutations.len());
+        let mut submissions = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            mutation.validate()?;
+            let mutation_hash = canonical_hash(&mutation)?;
+            if let Some(submission) =
+                staged_authority.previous_submission(&mutation, mutation_hash)?
+            {
+                submissions.push(submission);
+                continue;
+            }
+            staged_authority.validate_client_sequence(&mutation)?;
+            let mut staged_documents = match staged_authority.stage_documents(&mutation)? {
+                Ok(documents) => documents,
+                Err(rejection) => {
+                    submissions.push(MutationSubmission::Rejected(rejection));
+                    continue;
+                }
+            };
+            let (events, final_sequence) = staged_authority.events_for(&mutation)?;
+            let durable = durable_result(&mutation, final_sequence)?;
+
+            journal_entries.push(JournalEntry::MutationCommitted {
+                mutation: mutation.clone(),
+                durable: durable.clone(),
+                events: events.clone(),
+            });
+            staged_authority.apply_staged_documents(&mut staged_documents);
+            staged_authority.install_committed(
+                &mutation,
+                durable.clone(),
+                events,
+                mutation_hash,
+            )?;
+            if let Some(continuity) = staged_authority.staged_retention_boundary()? {
+                staged_authority.replay(continuity.clone())?;
+                journal_entries.push(continuity);
+            }
+            submissions.push(MutationSubmission::Accepted {
+                received: MutationResult::Received {
+                    mutation_id: mutation.mutation_id,
+                },
+                durable,
+            });
+        }
+
+        // The O_DSYNC batch write is the durable frontier. Only after it
+        // succeeds may memory expose any accepted state or Durable result.
+        self.journal.append_many(&journal_entries)?;
+        *self = staged_authority;
+        Ok(submissions)
+    }
+
+    fn staged_retention_boundary(&self) -> Result<Option<JournalEntry>, AuthorityError> {
+        if self.events.len() <= self.event_retention_limit {
+            return Ok(None);
+        }
+        let new_session_epoch = self
+            .session_epoch
+            .get()
+            .checked_add(1)
+            .map(SessionEpoch::new)
+            .ok_or(AuthorityError::CounterOverflow)?;
+        let workspace_generation = self
+            .workspace_generation
+            .get()
+            .checked_add(1)
+            .map(WorkspaceGeneration::new)
+            .ok_or(AuthorityError::CounterOverflow)?;
+        Ok(Some(JournalEntry::ContinuityBroken {
+            new_session_epoch,
+            workspace_generation,
+            retained_after: self.session_sequence,
+        }))
     }
 
     fn previous_submission(
@@ -616,9 +694,9 @@ impl SessionAuthority {
                         )));
                     }
                     for transaction in &document_mutation.transactions {
-                        document.text = transaction
-                            .apply_to_string(&document.text)
+                        validate_transaction_for_store(transaction, &document.text)
                             .map_err(|error| AuthorityError::Replay(error.to_string()))?;
+                        document.text.apply(transaction);
                         document.revision = document
                             .revision
                             .next()
@@ -671,7 +749,7 @@ impl SessionAuthority {
             document_id,
             AuthorityDocument {
                 document_id,
-                text: registered.text,
+                text: text_store(registered.text),
                 revision: registered.frontier.revision,
                 lease: registered.lease,
                 history: Vec::new(),
@@ -737,12 +815,13 @@ fn stage_document(
     let mut revision = document.revision;
     let mut transactions = Vec::with_capacity(mutation.transactions.len());
     for transaction in &mutation.transactions {
-        text = transaction.apply_to_string(&text).map_err(|error| {
+        validate_transaction_for_store(transaction, &text).map_err(|error| {
             AuthorityError::Replay(format!(
                 "transaction for {:?} could not apply: {error}",
                 mutation.document_id
             ))
         })?;
+        text.apply(transaction);
         revision = revision.next().ok_or(AuthorityError::CounterOverflow)?;
         transactions.push(transaction.clone());
     }
@@ -751,6 +830,31 @@ fn stage_document(
         revision,
         transactions,
     })
+}
+
+fn text_store(text: String) -> DefaultText {
+    DefaultText::from_string(text)
+}
+
+fn validate_transaction_for_store(
+    transaction: &Transaction,
+    text: &DefaultText,
+) -> Result<(), wren_types::TransactionError> {
+    transaction.validate()?;
+    for edit in &transaction.edits {
+        for offset in [edit.range.start, edit.range.end] {
+            if offset > text.len_bytes() {
+                return Err(wren_types::TransactionError::OutOfBounds {
+                    offset,
+                    len: text.len_bytes(),
+                });
+            }
+            if !text.is_char_boundary(offset) {
+                return Err(wren_types::TransactionError::NotCharBoundary { offset });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn durable_result(
@@ -845,7 +949,10 @@ mod tests {
             }
         ));
         assert_eq!(
-            first.document(DocumentId::new(11)).expect("document").text,
+            first
+                .document(DocumentId::new(11))
+                .expect("document")
+                .text(),
             "xbase"
         );
         drop(first);
@@ -855,7 +962,7 @@ mod tests {
             recovered
                 .document(DocumentId::new(11))
                 .expect("recovered document")
-                .text,
+                .text(),
             "xbase"
         );
         let duplicate = recovered.submit(original).expect("retry after lost ack");
@@ -864,8 +971,56 @@ mod tests {
             recovered
                 .document(DocumentId::new(11))
                 .expect("deduplicated document")
-                .text,
+                .text(),
             "xbase"
+        );
+    }
+
+    #[test]
+    fn ordered_batch_is_durable_as_independent_recoverable_commits() {
+        let directory = tempdir().expect("temporary directory");
+        let mut authority = open_authority(directory.path());
+        authority
+            .register_document(DocumentId::new(11), "base", ClientId::new(7))
+            .expect("register document");
+        let mutations = (0..128_u64)
+            .map(|index| mutation(index + 1, index + 1, 1, index, "x"))
+            .collect::<Vec<_>>();
+        let submissions = authority
+            .submit_batch(mutations)
+            .expect("submit mutation batch");
+        assert_eq!(submissions.len(), 128);
+        assert!(submissions.iter().all(|submission| matches!(
+            submission,
+            MutationSubmission::Accepted {
+                durable: MutationResult::Durable { .. },
+                ..
+            }
+        )));
+        let expected = format!("{}base", "x".repeat(128));
+        assert_eq!(
+            authority
+                .document(DocumentId::new(11))
+                .expect("document")
+                .text(),
+            expected
+        );
+
+        drop(authority);
+        let recovered = open_authority(directory.path());
+        assert_eq!(
+            recovered
+                .document(DocumentId::new(11))
+                .expect("recovered document")
+                .text(),
+            expected
+        );
+        assert_eq!(
+            recovered
+                .document(DocumentId::new(11))
+                .expect("recovered document")
+                .revision,
+            DocumentRevision::new(128)
         );
     }
 
@@ -897,14 +1052,17 @@ mod tests {
             MutationSubmission::Rejected(MutationResult::LeaseLost { .. })
         ));
         assert_eq!(
-            authority.document(DocumentId::new(11)).expect("first").text,
+            authority
+                .document(DocumentId::new(11))
+                .expect("first")
+                .text(),
             "a"
         );
         assert_eq!(
             authority
                 .document(DocumentId::new(12))
                 .expect("second")
-                .text,
+                .text(),
             "b"
         );
         assert_eq!(authority.session_sequence(), SessionSequence::new(0));
@@ -993,7 +1151,7 @@ mod tests {
             recovered
                 .document(DocumentId::new(11))
                 .expect("document")
-                .text,
+                .text(),
             "xa"
         );
     }

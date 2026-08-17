@@ -6,122 +6,127 @@ impl App {
         if input.is_empty() {
             return Ok(());
         }
-        if input == "FormatToggle" {
-            self.format_on_save = !self.format_on_save;
-            self.message = format!(
-                "format-on-save globally {}",
-                if self.format_on_save {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
+        if self.execute_custom_ex(input)? {
             return Ok(());
-        }
-        if input == "FormatToggle!" {
-            let document_id = self.active.document_id;
-            if !self.format_disabled.remove(&document_id) {
-                self.format_disabled.insert(document_id);
-            }
-            self.message = format!(
-                "format-on-save for buffer {}",
-                if self.format_disabled.contains(&document_id) {
-                    "disabled"
-                } else {
-                    "enabled"
-                }
-            );
-            return Ok(());
-        }
-        let mut words = input.split_whitespace();
-        match words.next() {
-            Some("colorscheme" | "Catppuccin") => {
-                let requested = words.next().unwrap_or("catppuccin");
-                let flavor = CatppuccinFlavor::parse(requested)
-                    .ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
-                self.theme_flavor = flavor;
-                self.theme = CatppuccinPalette::for_flavor(flavor);
-                self.message = format!("colorscheme catppuccin-{}", flavor.name());
-                return Ok(());
-            }
-            Some("setcolor") => {
-                let name = words
-                    .next()
-                    .ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
-                let value = words
-                    .next()
-                    .ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
-                let color = RgbColor::from_hex(value)
-                    .ok_or_else(|| anyhow!("invalid RGB color {value:?}; expected #RRGGBB"))?;
-                if !self.theme.set(name, color) {
-                    bail!("unknown Catppuccin color slot {name:?}");
-                }
-                self.message = format!(
-                    "theme {name}=#{:02x}{:02x}{:02x}",
-                    color.red, color.green, color.blue
-                );
-                return Ok(());
-            }
-            Some("Git") => {
-                let arguments = words.map(Box::<str>::from).collect::<Vec<_>>();
-                let root = self.active_git_root()?;
-                let program = git_ex_program(&arguments);
-                return self.open_terminal_in(Some(program), &arguments, &root);
-            }
-            Some("Gwrite") => return self.git_stage_buffer(),
-            Some("Gdiffsplit") => return self.git_diff_index(),
-            Some("AvanteToggle") => {
-                if self
-                    .popup
-                    .as_ref()
-                    .is_some_and(|popup| popup.title.as_ref() == "Avante · Codex")
-                {
-                    self.popup = None;
-                    self.popup_deadline = None;
-                } else if self.ai_transcript.is_empty() {
-                    self.prompt = Some(Prompt::new(PromptKind::Ai));
-                } else {
-                    self.show_ai_transcript();
-                }
-                return Ok(());
-            }
-            Some("Codex" | "AvanteChat" | "AvanteAsk") => {
-                let prompt = words.collect::<Vec<_>>().join(" ");
-                if prompt.is_empty() {
-                    self.prompt = Some(Prompt::new(PromptKind::Ai));
-                    return Ok(());
-                } else {
-                    return self.start_ai_task(&prompt);
-                }
-            }
-            Some("RustLsp") => {
-                return match words.next() {
-                    Some("testables" | "test") => {
-                        self.open_terminal(Some("cargo"), &["test".into()])
-                    }
-                    Some("debuggables" | "debug") => self.open_debug_repl(),
-                    _ => self.open_terminal(Some("cargo"), &["run".into()]),
-                };
-            }
-            _ => {}
         }
         self.execute_ex_command(parse_ex(input)?)
     }
 
+    fn execute_custom_ex(&mut self, input: &str) -> Result<bool> {
+        match input {
+            "FormatToggle" => self.toggle_global_format(),
+            "FormatToggle!" => self.toggle_buffer_format(),
+            _ => return self.execute_named_custom_ex(input),
+        }
+        Ok(true)
+    }
+
+    fn execute_named_custom_ex(&mut self, input: &str) -> Result<bool> {
+        let mut words = input.split_whitespace();
+        let Some(name) = words.next() else {
+            return Ok(false);
+        };
+        match name {
+            "colorscheme" | "Catppuccin" => self.set_colorscheme(words.next()),
+            "setcolor" => self.set_theme_color(words.next(), words.next()),
+            "Git" => self.open_git_terminal(words),
+            "Gwrite" => self.git_stage_buffer(),
+            "Gdiffsplit" => self.git_diff_index(),
+            "AvanteToggle" => self.toggle_ai_transcript(),
+            "Codex" | "AvanteChat" | "AvanteAsk" => self.open_ai_prompt(words),
+            "RustLsp" => self.open_rust_lsp_action(words.next()),
+            _ => return Ok(false),
+        }?;
+        Ok(true)
+    }
+
+    fn toggle_global_format(&mut self) {
+        self.format_on_save = !self.format_on_save;
+        let state = if self.format_on_save {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        self.message = format!("format-on-save globally {state}");
+    }
+
+    fn toggle_buffer_format(&mut self) {
+        let document_id = self.active.document_id;
+        let disabled = !self.format_disabled.remove(&document_id);
+        if disabled {
+            self.format_disabled.insert(document_id);
+        }
+        let state = if disabled { "disabled" } else { "enabled" };
+        self.message = format!("format-on-save for buffer {state}");
+    }
+
+    fn set_colorscheme(&mut self, requested: Option<&str>) -> Result<()> {
+        let requested = requested.unwrap_or("catppuccin");
+        let flavor = CatppuccinFlavor::parse(requested)
+            .ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
+        self.theme_flavor = flavor;
+        self.theme = CatppuccinPalette::for_flavor(flavor);
+        self.message = format!("colorscheme catppuccin-{}", flavor.name());
+        Ok(())
+    }
+
+    fn set_theme_color(&mut self, name: Option<&str>, value: Option<&str>) -> Result<()> {
+        let name = name.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
+        let value = value.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
+        let color = RgbColor::from_hex(value)
+            .ok_or_else(|| anyhow!("invalid RGB color {value:?}; expected #RRGGBB"))?;
+        if !self.theme.set(name, color) {
+            bail!("unknown Catppuccin color slot {name:?}");
+        }
+        self.message = format!(
+            "theme {name}=#{:02x}{:02x}{:02x}",
+            color.red, color.green, color.blue
+        );
+        Ok(())
+    }
+
+    fn open_git_terminal<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> Result<()> {
+        let arguments = words.map(Box::<str>::from).collect::<Vec<_>>();
+        let root = self.active_git_root()?;
+        self.open_terminal_in(Some(git_ex_program(&arguments)), &arguments, &root)
+    }
+
+    fn toggle_ai_transcript(&mut self) -> Result<()> {
+        if self
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.title.as_ref() == "Avante · Codex")
+        {
+            self.popup = None;
+            self.popup_deadline = None;
+        } else if self.ai_transcript.is_empty() {
+            self.prompt = Some(Prompt::new(PromptKind::Ai));
+        } else {
+            self.show_ai_transcript();
+        }
+        Ok(())
+    }
+
+    fn open_ai_prompt<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> Result<()> {
+        let prompt = words.collect::<Vec<_>>().join(" ");
+        if prompt.is_empty() {
+            self.prompt = Some(Prompt::new(PromptKind::Ai));
+            return Ok(());
+        }
+        self.start_ai_task(&prompt)
+    }
+
+    fn open_rust_lsp_action(&mut self, action: Option<&str>) -> Result<()> {
+        match action {
+            Some("testables" | "test") => self.open_terminal(Some("cargo"), &["test".into()]),
+            Some("debuggables" | "debug") => self.open_debug_repl(),
+            _ => self.open_terminal(Some("cargo"), &["run".into()]),
+        }
+    }
+
     pub(super) fn execute_ex_command(&mut self, command: ExCommand) -> Result<()> {
         match command {
-            ExCommand::Goto { address } => {
-                let line = self.resolve_address(&address)?;
-                self.active
-                    .editor
-                    .set_cursor(self.active.editor.text().byte_of_line(line));
-                if let Some((pattern, direction)) = address_search_pattern(&address) {
-                    let persist = !pattern.is_empty();
-                    let pattern = self.effective_search_pattern(pattern)?;
-                    self.synchronize_search(&pattern, direction, persist)?;
-                }
-                Ok(())
-            }
+            ExCommand::Goto { address } => self.goto_address(&address),
             ExCommand::Substitute {
                 range,
                 pattern,
@@ -152,75 +157,17 @@ impl App {
             ExCommand::Normal { range, keys, .. } => self.execute_normal(range.as_ref(), &keys),
             ExCommand::Write {
                 range, all, path, ..
-            } => {
-                if let Some(range) = range.as_ref() {
-                    let path = path
-                        .as_deref()
-                        .map(Path::new)
-                        .ok_or_else(|| anyhow!("ranged :write requires a destination path"))?;
-                    return self.write_range(range, path);
-                }
-                if all {
-                    self.save_all()
-                } else {
-                    self.save(path.as_deref().map(Path::new))
-                }
-            }
-            ExCommand::WriteQuit { path, .. } => {
-                self.save(path.as_deref().map(Path::new))?;
-                self.quit = true;
-                Ok(())
-            }
-            ExCommand::Quit { all, bang } => {
-                let dirty = self.active.editor.is_dirty()
-                    || (all && self.inactive.iter().any(|buffer| buffer.editor.is_dirty()));
-                if dirty && !bang {
-                    self.show_error("E37: unsaved changes; use :q!");
-                    return Ok(());
-                }
-                self.quit = true;
-                Ok(())
-            }
-            ExCommand::Edit { bang, path } => {
-                let Some(path) = path else {
-                    self.show_error("usage: :e[!] FILE");
-                    return Ok(());
-                };
-                if self.active.editor.is_dirty() && !bang {
-                    self.show_error("E37: unsaved changes; use :e!");
-                    return Ok(());
-                }
-                self.open_buffer(Path::new(path.as_ref()))
-            }
+            } => self.write_command(range.as_ref(), all, path.as_deref()),
+            ExCommand::WriteQuit { path, .. } => self.write_quit(path.as_deref()),
+            ExCommand::Quit { all, bang } => self.quit_command(all, bang),
+            ExCommand::Edit { bang, path } => self.edit_command(bang, path.as_deref()),
             ExCommand::Buffer {
                 action,
                 bang,
                 target,
             } => self.buffer_command(action, bang, target.as_deref()),
-            ExCommand::Split { vertical, path } => {
-                if let Some(path) = path {
-                    self.open_buffer(Path::new(path.as_ref()))?;
-                }
-                self.views.split_active(if vertical {
-                    SplitAxis::Vertical
-                } else {
-                    SplitAxis::Horizontal
-                })?;
-                self.message = if vertical {
-                    "vertical split created".to_owned()
-                } else {
-                    "horizontal split created".to_owned()
-                };
-                Ok(())
-            }
-            ExCommand::Close { bang } => {
-                if self.active.editor.is_dirty() && !bang {
-                    self.show_error("E37: unsaved changes; use :close!");
-                    return Ok(());
-                }
-                self.views.close_active_window()?;
-                self.activate_view_buffer()
-            }
+            ExCommand::Split { vertical, path } => self.split_command(vertical, path.as_deref()),
+            ExCommand::Close { bang } => self.close_command(bang),
             ExCommand::Tab { action, path } => self.tab_command(action, path.as_deref()),
             ExCommand::Undo => {
                 let transaction = self.active.editor.undo()?;
@@ -237,36 +184,8 @@ impl App {
                 self.message = value.to_editor_text();
                 Ok(())
             }
-            ExCommand::Registers { names } => {
-                let entries: Vec<_> = self
-                    .active
-                    .editor
-                    .registers()
-                    .filter(|(name, _)| names.is_empty() || names.contains(*name))
-                    .map(|(name, value)| format!("\"{name} {}", compact(value.text.as_ref(), 24)))
-                    .collect();
-                self.message = if entries.is_empty() {
-                    "no registers".to_owned()
-                } else {
-                    entries.join("  ")
-                };
-                Ok(())
-            }
-            ExCommand::Marks { names } => {
-                let entries: Vec<_> = self
-                    .active
-                    .editor
-                    .marks()
-                    .filter(|(name, _)| names.is_empty() || names.contains(*name))
-                    .map(|(name, byte)| format!("'{name}={byte}"))
-                    .collect();
-                self.message = if entries.is_empty() {
-                    "no marks".to_owned()
-                } else {
-                    entries.join("  ")
-                };
-                Ok(())
-            }
+            ExCommand::Registers { names } => self.show_registers(&names),
+            ExCommand::Marks { names } => self.show_marks(&names),
             ExCommand::NoHighlight => {
                 self.search_highlight = false;
                 self.message.clear();
@@ -282,25 +201,7 @@ impl App {
             ExCommand::Messages => self.show_debug_output(),
             ExCommand::Grep { pattern, paths } => self.grep(&pattern, &paths),
             ExCommand::Cdo { command } => self.execute_cdo(*command),
-            ExCommand::ConvertUtf8 => {
-                if self.active.document.encoding() == DocumentEncoding::Utf8 {
-                    self.message = "document is already UTF-8".to_owned();
-                    return Ok(());
-                }
-                let converted = self.active.document.convert_to_utf8()?;
-                self.active.editor.set_read_only(false);
-                let transaction = Transaction::new(
-                    self.active.editor.revision(),
-                    vec![Edit::new(
-                        0..self.active.editor.text().len_bytes(),
-                        converted,
-                    )],
-                )?;
-                self.active.editor.apply_transaction(transaction.clone())?;
-                self.after_transaction(Some(transaction));
-                self.message = "converted invalid bytes to explicit UTF-8 \\xNN escapes".to_owned();
-                Ok(())
-            }
+            ExCommand::ConvertUtf8 => self.convert_active_to_utf8(),
             ExCommand::Terminal { program, arguments } => {
                 self.open_terminal(program.as_deref(), &arguments)
             }
@@ -310,6 +211,132 @@ impl App {
             }
             ExCommand::Find { query } => self.start_file_picker(&query),
         }
+    }
+
+    fn goto_address(&mut self, address: &ExAddress) -> Result<()> {
+        let line = self.resolve_address(address)?;
+        self.active
+            .editor
+            .set_cursor(self.active.editor.text().byte_of_line(line));
+        let Some((pattern, direction)) = address_search_pattern(address) else {
+            return Ok(());
+        };
+        let persist = !pattern.is_empty();
+        let pattern = self.effective_search_pattern(pattern)?;
+        self.synchronize_search(&pattern, direction, persist)
+    }
+
+    fn write_command(
+        &mut self,
+        range: Option<&ExRange>,
+        all: bool,
+        path: Option<&str>,
+    ) -> Result<()> {
+        if let Some(range) = range {
+            let path = path
+                .map(Path::new)
+                .ok_or_else(|| anyhow!("ranged :write requires a destination path"))?;
+            return self.write_range(range, path);
+        }
+        if all {
+            return self.save_all();
+        }
+        self.save(path.map(Path::new))
+    }
+
+    fn write_quit(&mut self, path: Option<&str>) -> Result<()> {
+        self.save(path.map(Path::new))?;
+        self.quit = true;
+        Ok(())
+    }
+
+    fn quit_command(&mut self, all: bool, bang: bool) -> Result<()> {
+        let inactive_dirty = all && self.inactive.iter().any(|buffer| buffer.editor.is_dirty());
+        if (self.active.editor.is_dirty() || inactive_dirty) && !bang {
+            self.show_error("E37: unsaved changes; use :q!");
+            return Ok(());
+        }
+        self.quit = true;
+        Ok(())
+    }
+
+    fn edit_command(&mut self, bang: bool, path: Option<&str>) -> Result<()> {
+        let Some(path) = path else {
+            self.show_error("usage: :e[!] FILE");
+            return Ok(());
+        };
+        if self.active.editor.is_dirty() && !bang {
+            self.show_error("E37: unsaved changes; use :e!");
+            return Ok(());
+        }
+        self.open_buffer(Path::new(path))
+    }
+
+    fn split_command(&mut self, vertical: bool, path: Option<&str>) -> Result<()> {
+        if let Some(path) = path {
+            self.open_buffer(Path::new(path))?;
+        }
+        let (axis, message) = if vertical {
+            (SplitAxis::Vertical, "vertical split created")
+        } else {
+            (SplitAxis::Horizontal, "horizontal split created")
+        };
+        self.views.split_active(axis)?;
+        self.message = message.to_owned();
+        Ok(())
+    }
+
+    fn close_command(&mut self, bang: bool) -> Result<()> {
+        if self.active.editor.is_dirty() && !bang {
+            self.show_error("E37: unsaved changes; use :close!");
+            return Ok(());
+        }
+        self.views.close_active_window()?;
+        self.activate_view_buffer()
+    }
+
+    fn show_registers(&mut self, names: &str) -> Result<()> {
+        let entries = self
+            .active
+            .editor
+            .registers()
+            .filter(|(name, _)| names.is_empty() || names.contains(*name))
+            .map(|(name, value)| format!("\"{name} {}", compact(value.text.as_ref(), 24)))
+            .collect::<Vec<_>>();
+        self.message = joined_entries(entries, "no registers");
+        Ok(())
+    }
+
+    fn show_marks(&mut self, names: &str) -> Result<()> {
+        let entries = self
+            .active
+            .editor
+            .marks()
+            .filter(|(name, _)| names.is_empty() || names.contains(*name))
+            .map(|(name, byte)| format!("'{name}={byte}"))
+            .collect::<Vec<_>>();
+        self.message = joined_entries(entries, "no marks");
+        Ok(())
+    }
+
+    fn convert_active_to_utf8(&mut self) -> Result<()> {
+        if self.active.document.encoding() == DocumentEncoding::Utf8 {
+            self.message = "document is already UTF-8".to_owned();
+            return Ok(());
+        }
+        let converted = self.active.document.convert_to_utf8()?;
+        self.active.editor.set_read_only(false);
+        let transaction = Transaction::new(
+            self.active.editor.revision(),
+            vec![Edit::new(
+                0..self.active.editor.text().len_bytes(),
+                converted,
+            )],
+        )?;
+        self.active.editor.apply_transaction(transaction.clone())?;
+        self.after_transaction(Some(transaction));
+        self.message = "converted invalid bytes to explicit UTF-8 \\xNN escapes".to_owned();
+        Ok(())
     }
 
     pub(super) fn effective_search_pattern(&self, pattern: &str) -> Result<String> {
@@ -524,7 +551,7 @@ impl App {
         self.message = message;
         self.record_active_file();
         self.prime_active_syntax();
-        self.begin_lsp_start();
+        self.schedule_lsp_start();
         Ok(())
     }
 
@@ -674,7 +701,7 @@ impl App {
         self.views.set_active_buffer(self.active.buffer_id)?;
         self.message = self.active.name();
         self.prime_active_syntax();
-        self.begin_lsp_start();
+        self.schedule_lsp_start();
         Ok(())
     }
 
@@ -1494,5 +1521,13 @@ impl App {
             self.terminal_focused = true;
         }
         Ok(())
+    }
+}
+
+fn joined_entries(entries: Vec<String>, empty: &str) -> String {
+    if entries.is_empty() {
+        empty.to_owned()
+    } else {
+        entries.join("  ")
     }
 }

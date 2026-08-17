@@ -156,6 +156,8 @@ Unsaved edits use a checksummed recovery WAL; undo history and oldfiles persist.
 ";
 
 const MESSAGES_BUFFER_NAME: &str = "[Messages]";
+const LSP_START_IDLE_PERIOD: Duration = Duration::from_millis(750);
+const LSP_SEMANTIC_IDLE_PERIOD: Duration = Duration::from_millis(750);
 type PresenterBackend = TerminaBackend<std::io::Stdout>;
 type SharedPresenterBackend = Arc<Mutex<PresenterBackend>>;
 
@@ -218,8 +220,11 @@ fn run_editor(cli: &Cli) -> Result<()> {
         needs_render |= poll_app_work(&mut app)?;
         app.capture_debug_output();
         presenter.check_failure()?;
+        // Provider refinement is independently debounced from rendering. Poll
+        // its due time even while input is idle so Tree-sitter catches up after
+        // a typing burst without requiring another keypress.
+        app.schedule_provider_refreshes(layout.height);
         if !app.quit && needs_render {
-            app.schedule_provider_refreshes(layout.height);
             presenter.publish(desired_frame(&mut layout, &app))?;
         }
     }
@@ -318,6 +323,7 @@ fn poll_app_work(app: &mut App) -> Result<bool> {
     let mut changed = app.poll_task_results()?;
     changed |= app.poll_provider_results();
     changed |= app.poll_git_hunk_results();
+    app.poll_lsp_start_due();
     changed |= app.poll_lsp_start()?;
     changed |= app.poll_lsp_background()?;
     changed |= app.poll_lsp_semantic_due()?;
@@ -380,7 +386,6 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     layout.ensure_cursor_visible(&frame, 1);
     let frames = buffer_frames(app, frame);
     let prompt = prompt_text(app);
-    let status = app.status();
     let mut decorations = syntax_decorations(app);
     add_search_decorations(app, &mut decorations);
     let line_decorations = add_buffer_decorations(app, &mut decorations);
@@ -390,10 +395,101 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
         &frames,
         &decorations,
         &line_decorations,
-        &status,
+        " ",
         prompt.as_deref(),
     );
+    prefetch_document_end(layout, app, &frames, &line_decorations);
     Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()))
+}
+
+fn prefetch_document_end(
+    layout: &mut ViewportLayout,
+    app: &App,
+    frames: &[(BufferId, wren_engine::EngineFrame)],
+    line_decorations: &[(BufferId, Vec<LineDecoration>)],
+) {
+    if app.active.editor.revision().get() != 0
+        || app.active.editor.mode() != Mode::Normal
+        || app.views.windows.len() != 1
+        || !app.active.class.policy().whole_document_syntax
+        || language_bundle(app.active.document.presentation_path())
+            .language_id
+            .as_ref()
+            == "markdown"
+    {
+        return;
+    }
+    let rows = app.viewport_rows.max(1);
+    let text = app.active.editor.text();
+    let last_line = text.line_of_byte(text.len_bytes());
+    if last_line <= rows.saturating_mul(2) {
+        return;
+    }
+    let margin = 3.min(rows.saturating_sub(1) / 2);
+    let top_line = last_line
+        .saturating_add(margin)
+        .saturating_add(1)
+        .saturating_sub(rows);
+    let window = app.views.active_window();
+    if window.top_line != 0 {
+        return;
+    }
+    let start = text.byte_of_line(top_line);
+    let syntax_end = text
+        .byte_of_line(top_line.saturating_add(rows).saturating_add(1))
+        .max(start);
+    let range = start..syntax_end;
+    let mut spans = app
+        .decorations
+        .get(&app.active.buffer_id)
+        .filter(|state| state.revision == app.active.editor.revision())
+        .map_or_else(Vec::new, |state| state.spans_in(range.clone()));
+    if let Some(state) = app
+        .semantic_decorations
+        .get(&app.active.buffer_id)
+        .filter(|state| state.revision == app.active.editor.revision())
+    {
+        spans.extend(state.spans_in(range));
+    }
+    if app.search_highlight {
+        let search_end = text.byte_of_line(top_line.saturating_add(rows));
+        spans.extend(
+            app.active
+                .editor
+                .search_match_ranges(start..search_end, 4_096)
+                .into_iter()
+                .map(|range| DecorationSpan {
+                    range,
+                    priority: 3_000_000,
+                    style: CellStyle {
+                        foreground: Some(CellColor::Rgb(app.theme.crust)),
+                        background: Some(CellColor::Rgb(app.theme.yellow)),
+                        ..CellStyle::default()
+                    },
+                }),
+        );
+    }
+    if let Some(path) = app.active.document.presentation_path() {
+        let mut ignored_lines = Vec::new();
+        add_diagnostic_decorations(app, &app.active, path, &mut spans, &mut ignored_lines);
+    }
+    let Some(frame) = frames
+        .iter()
+        .find_map(|(buffer_id, frame)| (*buffer_id == app.active.buffer_id).then_some(frame))
+    else {
+        return;
+    };
+    let frame = wren_engine::EngineFrame {
+        text: frame.text.clone(),
+        cursor_byte: app.active.editor.document_end_byte(),
+    };
+    let lines = line_decorations
+        .iter()
+        .find_map(|(buffer_id, lines)| {
+            (*buffer_id == app.active.buffer_id).then_some(lines.as_slice())
+        })
+        .unwrap_or_default();
+    layout.prefetch_workspace_viewport(window.id, &frame, top_line, &spans, lines);
 }
 
 #[cfg(test)]
@@ -439,7 +535,6 @@ fn desired_frame_profiled(
     layout.ensure_cursor_visible(&frame, 1);
     let frames = buffer_frames(app, frame);
     let prompt = prompt_text(app);
-    let status = app.status();
     let inputs = inputs_at.elapsed();
 
     let syntax_at = Instant::now();
@@ -461,7 +556,7 @@ fn desired_frame_profiled(
         &frames,
         &decorations,
         &line_decorations,
-        &status,
+        " ",
         prompt.as_deref(),
     );
     let render = render_at.elapsed();
@@ -1359,6 +1454,8 @@ struct App {
     provider: ProviderWorker,
     git_worker: GitHunkWorker,
     provider_submitted: BTreeMap<DocumentId, ProviderDemandKey>,
+    provider_refresh_due: BTreeMap<DocumentId, Instant>,
+    provider_refresh_ranges: BTreeMap<DocumentId, Vec<Range<usize>>>,
     decorations: BTreeMap<BufferId, BufferDecorations>,
     semantic_decorations: BTreeMap<BufferId, BufferDecorations>,
     prompt: Option<Prompt>,
@@ -1396,6 +1493,7 @@ struct App {
     lsp_completion: Option<LspCompletion>,
     lsp: Option<PersistentLsp>,
     parked_lsps: Vec<PersistentLsp>,
+    lsp_start_due: Option<Instant>,
     lsp_start: Option<mpsc::Receiver<Result<PersistentLsp, String>>>,
     lsp_background: Option<mpsc::Receiver<LspBackgroundResult>>,
     lsp_semantic_dirty: bool,
@@ -1428,8 +1526,14 @@ struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferDecorations {
     revision: DocumentRevision,
+    /// Provider-owned baseline spans in the coordinate space before
+    /// `transforms`. Ordinary edits update the small visible override set,
+    /// rather than rewriting every span in a large file.
     spans: Vec<DecorationSpan>,
     prefix_max_end: Vec<usize>,
+    transforms: Vec<Transaction>,
+    overrides: Vec<DecorationSpan>,
+    invalidated: Vec<Range<usize>>,
 }
 
 impl BufferDecorations {
@@ -1440,6 +1544,9 @@ impl BufferDecorations {
             revision,
             spans,
             prefix_max_end: Vec::new(),
+            transforms: Vec::new(),
+            overrides: Vec::new(),
+            invalidated: Vec::new(),
         };
         decorations.rebuild_index();
         decorations
@@ -1458,13 +1565,11 @@ impl BufferDecorations {
     }
 
     fn map_through(&mut self, transaction: &Transaction, revision: DocumentRevision) {
-        let spans = std::mem::take(&mut self.spans);
-        self.spans = spans
-            .into_iter()
-            .filter_map(|span| map_decoration_span(span, transaction))
-            .collect();
+        self.advance_current_coordinates(transaction);
+        self.invalidated
+            .extend(transaction_current_edit_ranges(transaction));
+        merge_ranges(&mut self.invalidated);
         self.revision = revision;
-        self.rebuild_index();
     }
 
     fn replace_after_transaction(
@@ -1474,33 +1579,100 @@ impl BufferDecorations {
         ranges: &[Range<usize>],
         mut replacement: Vec<DecorationSpan>,
     ) {
-        let spans = std::mem::take(&mut self.spans);
-        let mapped = spans.into_iter().filter_map(|span| {
-            let span = map_decoration_span(span, transaction)?;
-            (!ranges
+        self.advance_current_coordinates(transaction);
+        self.overrides.retain(|span| {
+            !ranges
                 .iter()
-                .any(|range| ranges_overlap(&span.range, range)))
-            .then_some(span)
+                .any(|range| ranges_overlap(&span.range, range))
         });
         replacement.sort_by(decoration_order);
         replacement.dedup();
-        self.spans = merge_sorted_decorations(mapped, replacement.into_iter());
+        self.overrides = merge_sorted_decorations(
+            std::mem::take(&mut self.overrides).into_iter(),
+            replacement.into_iter(),
+        );
+        self.invalidated.extend(ranges.iter().cloned());
+        merge_ranges(&mut self.invalidated);
         self.revision = revision;
-        self.rebuild_index();
+    }
+
+    fn advance_current_coordinates(&mut self, transaction: &Transaction) {
+        self.overrides = std::mem::take(&mut self.overrides)
+            .into_iter()
+            .filter_map(|span| map_decoration_span(span, transaction))
+            .collect();
+        self.invalidated = std::mem::take(&mut self.invalidated)
+            .into_iter()
+            .filter_map(|range| map_range(range, transaction))
+            .collect();
+        let cancels_previous = self
+            .transforms
+            .last()
+            .and_then(|previous| previous.then(transaction).ok())
+            .is_some_and(|composed| composed.edits.is_empty());
+        if cancels_previous {
+            self.transforms.pop();
+        } else {
+            self.transforms.push(transaction.clone());
+        }
+    }
+
+    fn replace_current_ranges(
+        &mut self,
+        ranges: &[Range<usize>],
+        mut replacement: Vec<DecorationSpan>,
+    ) {
+        self.overrides.retain(|span| {
+            !ranges
+                .iter()
+                .any(|range| ranges_overlap(&span.range, range))
+        });
+        replacement.sort_by(decoration_order);
+        replacement.dedup();
+        self.overrides = merge_sorted_decorations(
+            std::mem::take(&mut self.overrides).into_iter(),
+            replacement.into_iter(),
+        );
+        self.invalidated.extend(ranges.iter().cloned());
+        merge_ranges(&mut self.invalidated);
     }
 
     fn spans_in(&self, range: Range<usize>) -> Vec<DecorationSpan> {
+        let base_range = self
+            .transforms
+            .iter()
+            .rev()
+            .fold(range.clone(), unmap_range);
         let first = self
             .prefix_max_end
-            .partition_point(|maximum_end| *maximum_end <= range.start);
+            .partition_point(|maximum_end| *maximum_end <= base_range.start);
         let last = self
             .spans
-            .partition_point(|span| span.range.start < range.end);
-        self.spans[first..last]
+            .partition_point(|span| span.range.start < base_range.end);
+        let mut spans = self.spans[first..last]
             .iter()
-            .filter(|span| span.range.start < range.end && range.start < span.range.end)
             .cloned()
-            .collect()
+            .filter_map(|span| {
+                let span = self.transforms.iter().try_fold(span, |span, transaction| {
+                    map_decoration_span(span, transaction)
+                })?;
+                (ranges_overlap(&span.range, &range)
+                    && !self
+                        .invalidated
+                        .iter()
+                        .any(|invalidated| ranges_overlap(&span.range, invalidated)))
+                .then_some(span)
+            })
+            .collect::<Vec<_>>();
+        spans.extend(
+            self.overrides
+                .iter()
+                .filter(|span| ranges_overlap(&span.range, &range))
+                .cloned(),
+        );
+        spans.sort_by(decoration_order);
+        spans.dedup();
+        spans
     }
 }
 
@@ -1512,6 +1684,71 @@ fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Optio
         style: span.style,
         priority: span.priority,
     })
+}
+
+fn map_range(range: Range<usize>, transaction: &Transaction) -> Option<Range<usize>> {
+    let start = transaction.map_offset(range.start, Bias::Left).ok()?;
+    let end = transaction.map_offset(range.end, Bias::Right).ok()?;
+    (start < end).then_some(start..end)
+}
+
+fn transaction_current_edit_ranges(transaction: &Transaction) -> Vec<Range<usize>> {
+    transaction
+        .edits
+        .iter()
+        .filter_map(|edit| {
+            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
+            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
+            (start < end).then_some(start..end)
+        })
+        .collect()
+}
+
+fn unmap_range(range: Range<usize>, transaction: &Transaction) -> Range<usize> {
+    let start = unmap_offset(transaction, range.start, Bias::Left);
+    let end = unmap_offset(transaction, range.end, Bias::Right);
+    start.min(end)..end.max(start)
+}
+
+fn unmap_offset(transaction: &Transaction, offset: usize, bias: Bias) -> usize {
+    let mut old_cursor = 0_usize;
+    let mut new_cursor = 0_usize;
+    for edit in &transaction.edits {
+        let unchanged = edit.range.start.saturating_sub(old_cursor);
+        let unchanged_end = new_cursor.saturating_add(unchanged);
+        if offset < unchanged_end {
+            return old_cursor.saturating_add(offset.saturating_sub(new_cursor));
+        }
+        new_cursor = unchanged_end;
+        let inserted_end = new_cursor.saturating_add(edit.insert.len());
+        if offset < inserted_end {
+            return match bias {
+                Bias::Left => edit.range.start,
+                Bias::Right => edit.range.end,
+            };
+        }
+        if offset == inserted_end {
+            return edit.range.end;
+        }
+        new_cursor = inserted_end;
+        old_cursor = edit.range.end;
+    }
+    old_cursor.saturating_add(offset.saturating_sub(new_cursor))
+}
+
+fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged = Vec::<Range<usize>>::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
 }
 
 fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
@@ -2055,12 +2292,10 @@ fn grammar_key(key: TerminalKey) -> Option<KeyEvent> {
         TerminalKeyCode::Delete => KeyCode::Delete,
         TerminalKeyCode::Home => KeyCode::Home,
         TerminalKeyCode::End => KeyCode::End,
-        TerminalKeyCode::PageUp => KeyCode::Up,
-        TerminalKeyCode::PageDown => KeyCode::Down,
+        TerminalKeyCode::PageUp | TerminalKeyCode::Up => KeyCode::Up,
+        TerminalKeyCode::PageDown | TerminalKeyCode::Down => KeyCode::Down,
         TerminalKeyCode::Left => KeyCode::Left,
         TerminalKeyCode::Right => KeyCode::Right,
-        TerminalKeyCode::Up => KeyCode::Up,
-        TerminalKeyCode::Down => KeyCode::Down,
         TerminalKeyCode::Insert => return None,
     };
     let mut modifiers = Modifiers::empty();

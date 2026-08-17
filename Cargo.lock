@@ -3969,6 +3969,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "wren-text",
  "wren-types",
  "xattr",
 ]
@@ -4063,6 +4064,7 @@ name = "wren-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "serde",
  "serde_json",
  "tempfile",

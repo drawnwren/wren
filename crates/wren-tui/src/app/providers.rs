@@ -17,6 +17,7 @@ impl App {
             return;
         }
         let bundle = language_bundle(self.active.document.presentation_path());
+        let language_id = bundle.language_id.clone();
         let frame = self.active.editor.frame();
         let text = frame.text.as_ref();
         let spans = self
@@ -27,7 +28,7 @@ impl App {
                 frame.text.shared(),
                 bundle,
             )
-            .unwrap_or_else(|_| lexical_highlight_text(text))
+            .unwrap_or_else(|_| highlight_text(text, &language_id))
             .into_iter()
             .map(|span| provider_decoration(span, self.theme))
             .collect::<Vec<_>>();
@@ -69,6 +70,16 @@ impl App {
             return;
         }
         targets.sort_by_key(|target| target.start);
+        let pending = self
+            .provider_refresh_ranges
+            .entry(self.active.document_id)
+            .or_default();
+        *pending = std::mem::take(pending)
+            .into_iter()
+            .filter_map(|range| map_range(range, transaction))
+            .chain(targets.iter().cloned())
+            .collect();
+        merge_ranges(pending);
         let frame = self.active.editor.frame();
         let mut replacement = Vec::new();
         for target in &targets {
@@ -94,6 +105,10 @@ impl App {
         } else {
             *state = BufferDecorations::new(revision, replacement);
         }
+        self.provider_refresh_due.insert(
+            self.active.document_id,
+            Instant::now() + Duration::from_millis(50),
+        );
     }
 
     pub(super) fn schedule_provider_refreshes(&mut self, viewport_height: usize) {
@@ -136,21 +151,45 @@ impl App {
             .into_iter()
             .filter_map(|(buffer_id, (top_line, bottom_line))| {
                 let buffer = self.buffer(buffer_id)?;
+                let full_syntax_is_current = buffer.class.policy().whole_document_syntax
+                    && self
+                        .decorations
+                        .get(&buffer_id)
+                        .is_some_and(|state| state.revision == buffer.editor.revision());
+                if full_syntax_is_current
+                    && !self
+                        .provider_refresh_ranges
+                        .contains_key(&buffer.document_id)
+                {
+                    return None;
+                }
                 let text_store = buffer.editor.text();
-                let visible_start = text_store.byte_of_line(top_line);
-                let visible_end = text_store.byte_of_line(bottom_line).max(visible_start);
-                let near_start = text_store.byte_of_line(top_line.saturating_sub(viewport_height));
-                let near_end = text_store
-                    .byte_of_line(bottom_line.saturating_add(viewport_height))
-                    .max(visible_end);
+                let (visible, near_viewport) = if full_syntax_is_current {
+                    let pending = self
+                        .provider_refresh_ranges
+                        .get(&buffer.document_id)
+                        .expect("current syntax refresh has pending ranges");
+                    let start = pending.first()?.start;
+                    let end = pending.last()?.end.max(start);
+                    (start..end, start..end)
+                } else {
+                    let visible_start = text_store.byte_of_line(top_line);
+                    let visible_end = text_store.byte_of_line(bottom_line).max(visible_start);
+                    let near_start =
+                        text_store.byte_of_line(top_line.saturating_sub(viewport_height));
+                    let near_end = text_store
+                        .byte_of_line(bottom_line.saturating_add(viewport_height))
+                        .max(visible_end);
+                    (visible_start..visible_end, near_start..near_end)
+                };
                 Some(ProviderRefresh {
                     buffer_id,
                     document_id: buffer.document_id,
                     revision: buffer.editor.revision(),
                     text: buffer.editor.frame().text,
                     bundle: language_bundle(buffer.document.presentation_path()),
-                    visible: visible_start..visible_end,
-                    near_viewport: near_start..near_end,
+                    visible,
+                    near_viewport,
                 })
             })
             .collect::<Vec<_>>();
@@ -159,8 +198,16 @@ impl App {
             if self.provider_submitted.get(&refresh.document_id) == Some(&key) {
                 continue;
             }
+            if self
+                .provider_refresh_due
+                .get(&refresh.document_id)
+                .is_some_and(|due| Instant::now() < *due)
+            {
+                continue;
+            }
             if self.provider.try_refresh(refresh.clone()) {
                 self.provider_submitted.insert(refresh.document_id, key);
+                self.provider_refresh_due.remove(&refresh.document_id);
             }
         }
     }
@@ -186,27 +233,17 @@ impl App {
                         .into_iter()
                         .map(|span| provider_decoration(span, self.theme))
                         .collect::<Vec<_>>();
-                    let mut merged = self
+                    let state = self
                         .decorations
-                        .get(&buffer_id)
-                        .filter(|state| state.revision == revision)
-                        .map_or_else(Vec::new, |state| state.spans.clone());
-                    merged.retain(|span| {
-                        !ranges.iter().any(|range| {
-                            span.range.start < range.end && range.start < span.range.end
-                        })
-                    });
-                    merged.extend(spans);
-                    // Paint broader parent captures first so narrower semantic
-                    // captures at the same start offset win deterministically.
-                    merged
-                        .sort_by_key(|span| (span.range.start, std::cmp::Reverse(span.range.end)));
-                    merged.dedup();
-                    let next = BufferDecorations::new(revision, merged);
-                    if self.decorations.get(&buffer_id) != Some(&next) {
-                        self.decorations.insert(buffer_id, next);
-                        changed = true;
+                        .entry(buffer_id)
+                        .or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
+                    if state.revision == revision {
+                        state.replace_current_ranges(&ranges, spans);
+                    } else {
+                        *state = BufferDecorations::new(revision, spans);
                     }
+                    self.provider_refresh_ranges.remove(&document_id);
+                    changed = true;
                     self.provider_submitted
                         .entry(document_id)
                         .or_insert(ProviderDemandKey {

@@ -124,13 +124,44 @@ pub(super) fn client_state_loop(
     receiver: mpsc::Receiver<ClientStateMessage>,
 ) {
     let mut error: Option<String> = None;
-    for message in receiver {
+    loop {
+        let Ok(message) = receiver.recv() else {
+            break;
+        };
         match message {
-            ClientStateMessage::Save(state) => {
-                if error.is_none()
+            ClientStateMessage::Save(mut state) => {
+                enum Completion {
+                    Save,
+                    Barrier(mpsc::Sender<Result<(), String>>),
+                    Stop,
+                }
+                let completion = loop {
+                    match receiver.recv_timeout(Duration::from_millis(10)) {
+                        Ok(ClientStateMessage::Save(newer)) => state = newer,
+                        Ok(ClientStateMessage::Barrier {
+                            state: newest,
+                            reply,
+                        }) => {
+                            state = newest;
+                            break Completion::Barrier(reply);
+                        }
+                        Ok(ClientStateMessage::Stop)
+                        | Err(mpsc::RecvTimeoutError::Disconnected) => break Completion::Stop,
+                        Err(mpsc::RecvTimeoutError::Timeout) => break Completion::Save,
+                    }
+                };
+                let retry = matches!(completion, Completion::Barrier(_));
+                if (error.is_none() || retry)
                     && let Err(current) = store.save_durable(&state)
                 {
                     error = Some(current.to_string());
+                }
+                match completion {
+                    Completion::Save => {}
+                    Completion::Barrier(reply) => {
+                        let _ = reply.send(error.clone().map_or(Ok(()), Err));
+                    }
+                    Completion::Stop => break,
                 }
             }
             ClientStateMessage::Barrier { state, reply } => {
@@ -290,6 +321,12 @@ pub(super) enum MutationMessage {
     Stop(mpsc::Sender<Result<(), String>>),
 }
 
+const MAX_MUTATION_BATCH: usize = 512;
+// Local-durable work is asynchronous relative to the optimistic replica. A
+// short quiet period forms the architecture's batching envelope; Barrier and
+// Stop still cut the batch immediately for save/suspend/exit frontiers.
+const DURABILITY_GROUP_COMMIT_QUIET_PERIOD: Duration = Duration::from_millis(50);
+
 pub(super) struct MutationWorker {
     sender: mpsc::Sender<MutationMessage>,
     join: Option<JoinHandle<()>>,
@@ -413,7 +450,15 @@ pub(super) fn mutation_loop(
         .highest_client_sequence(client_id)
         .get()
         .saturating_add(1);
-    for message in receiver {
+    let mut pending = None;
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match receiver.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
         match message {
             MutationMessage::Register {
                 document_id,
@@ -421,7 +466,7 @@ pub(super) fn mutation_loop(
                 reply,
             } => {
                 let result = if let Some(document) = authority.document(document_id) {
-                    if document.text == text {
+                    if document.text_equals(&text) {
                         Ok(())
                     } else {
                         Err(format!(
@@ -444,22 +489,40 @@ pub(super) fn mutation_loop(
                 transaction,
                 state_deltas,
             } => {
+                let mut batch = vec![(document_id, transaction, state_deltas)];
+                while batch.len() < MAX_MUTATION_BATCH {
+                    match receiver.recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD) {
+                        Ok(MutationMessage::Append {
+                            document_id,
+                            transaction,
+                            state_deltas,
+                        }) => batch.push((document_id, transaction, state_deltas)),
+                        Ok(control) => {
+                            pending = Some(control);
+                            break;
+                        }
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => {
+                            break;
+                        }
+                    }
+                }
                 if error.is_some() {
                     continue;
                 }
-                let result = submit_local_mutation(
+                let batch_len = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                let result = submit_local_mutations(
                     &mut authority,
                     &outbox,
                     client_id,
                     next_sequence,
-                    document_id,
-                    transaction,
-                    state_deltas,
+                    batch,
                 );
                 if let Err(current) = result {
                     error = Some(current.to_string());
                 } else {
-                    next_sequence = next_sequence.saturating_add(1);
+                    next_sequence = next_sequence.saturating_add(batch_len);
                 }
             }
             MutationMessage::Barrier(reply) => {
@@ -492,48 +555,74 @@ pub(super) fn replay_outstanding_mutations(
     Ok(())
 }
 
-pub(super) fn submit_local_mutation(
+type PendingMutation = (DocumentId, Option<Transaction>, Vec<StateDelta>);
+
+fn submit_local_mutations(
     authority: &mut SessionAuthority,
     outbox: &MutationOutbox,
     client_id: ClientId,
-    sequence: u64,
-    document_id: DocumentId,
-    transaction: Option<Transaction>,
-    state_deltas: Vec<StateDelta>,
+    first_sequence: u64,
+    pending: Vec<PendingMutation>,
 ) -> Result<()> {
-    let document = authority
-        .document(document_id)
-        .ok_or_else(|| anyhow!("document is not registered"))?;
-    let mut documents = Vec::new();
-    if let Some(mut transaction) = transaction {
-        transaction.base_revision = document.revision;
-        documents.push(DocumentMutation {
-            document_id,
-            lease_epoch: document.lease.lease_epoch,
-            base_revision: document.revision,
-            semantic_group_id: SemanticGroupId::new(sequence),
-            semantic_group_kind: SemanticGroupKind::Operator,
-            undo_parent: None,
-            transactions: vec![transaction],
+    let mut document_revisions = std::collections::BTreeMap::new();
+    let mut mutations = Vec::with_capacity(pending.len());
+    for (offset, (document_id, transaction, state_deltas)) in pending.into_iter().enumerate() {
+        let offset = u64::try_from(offset).context("mutation batch exceeds u64")?;
+        let sequence = first_sequence
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("client mutation sequence overflow"))?;
+        let document = authority
+            .document(document_id)
+            .ok_or_else(|| anyhow!("document is not registered"))?;
+        let revision = document_revisions
+            .entry(document_id)
+            .or_insert(document.revision);
+        let mut documents = Vec::new();
+        if let Some(mut transaction) = transaction {
+            transaction.base_revision = *revision;
+            documents.push(DocumentMutation {
+                document_id,
+                lease_epoch: document.lease.lease_epoch,
+                base_revision: *revision,
+                semantic_group_id: SemanticGroupId::new(sequence),
+                semantic_group_kind: SemanticGroupKind::Operator,
+                undo_parent: None,
+                transactions: vec![transaction],
+            });
+            *revision = revision
+                .next()
+                .ok_or_else(|| anyhow!("document revision overflow"))?;
+        }
+        mutations.push(ClientMutation {
+            mutation_id: MutationId::new(sequence),
+            client_id,
+            client_sequence: ClientSequence::new(sequence),
+            state_deltas,
+            documents,
         });
     }
-    let mutation = ClientMutation {
-        mutation_id: MutationId::new(sequence),
-        client_id,
-        client_sequence: ClientSequence::new(sequence),
-        state_deltas,
-        documents,
-    };
-    outbox.append(&mutation)?;
-    match authority.submit(mutation)? {
-        MutationSubmission::Accepted { durable, .. } => {
-            if !outbox.observe_result(&durable)? {
-                bail!("durable mutation was missing from the client outbox");
-            }
-            Ok(())
+
+    outbox.append_many(&mutations)?;
+    let submissions = authority.submit_batch(mutations)?;
+    let mut durable = Vec::with_capacity(submissions.len());
+    let mut rejection = None;
+    for submission in submissions {
+        match submission {
+            MutationSubmission::Accepted {
+                durable: acknowledged,
+                ..
+            } => durable.push(acknowledged),
+            MutationSubmission::Rejected(result) => rejection = Some(result),
         }
-        MutationSubmission::Rejected(result) => bail!("in-process mutation rejected: {result:?}"),
     }
+    let acknowledged = outbox.observe_results(&durable)?;
+    if acknowledged != durable.len() {
+        bail!("durable mutation batch was missing from the client outbox");
+    }
+    if let Some(result) = rejection {
+        bail!("in-process mutation rejected: {result:?}");
+    }
+    Ok(())
 }
 
 pub(super) enum WalMessage {
@@ -612,7 +701,15 @@ impl Drop for WalWorker {
 
 pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
     let mut error: Option<String> = None;
-    for message in receiver {
+    let mut pending = None;
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match receiver.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
         match message {
             WalMessage::AppendFrame {
                 base_hash,
@@ -620,13 +717,37 @@ pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
                 text,
                 cursor,
             } => {
-                let state = RecoveredState {
-                    base_hash,
-                    revision,
-                    text: text.shared().to_string(),
-                    cursor,
+                let mut latest = (base_hash, revision, text, cursor);
+                loop {
+                    match receiver.recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD) {
+                        Ok(WalMessage::AppendFrame {
+                            base_hash,
+                            revision,
+                            text,
+                            cursor,
+                        }) => latest = (base_hash, revision, text, cursor),
+                        Ok(control) => {
+                            pending = Some(control);
+                            break;
+                        }
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => break,
+                    }
+                }
+                let (base_hash, revision, text, cursor) = latest;
+                let text = text.shared();
+                let result = if *blake3::hash(text.as_bytes()).as_bytes() == base_hash {
+                    wal.clear()
+                } else {
+                    wal.append(&RecoveredState {
+                        base_hash,
+                        revision,
+                        text: text.to_string(),
+                        cursor,
+                    })
                 };
-                if let Err(current) = wal.append(&state) {
+                if let Err(current) = result {
                     error = Some(current.to_string());
                 }
             }
@@ -646,5 +767,105 @@ pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_state_quiet_period_keeps_the_latest_state_and_barrier() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = ClientViewStateStore::new(directory.path());
+        let inspect = store.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || client_state_loop(store, receiver));
+        let mut stale = DurableClientState::new(ClientId::new(1));
+        stale.apply(&StateDelta::CommandHistory("stale".into()));
+        sender
+            .send(ClientStateMessage::Save(Box::new(stale)))
+            .expect("stale state");
+        let mut latest = DurableClientState::new(ClientId::new(1));
+        latest.apply(&StateDelta::CommandHistory("latest".into()));
+        sender
+            .send(ClientStateMessage::Save(Box::new(latest.clone())))
+            .expect("latest state");
+        let (reply, response) = mpsc::channel();
+        sender
+            .send(ClientStateMessage::Barrier {
+                state: Box::new(latest.clone()),
+                reply,
+            })
+            .expect("barrier request");
+        response.recv().expect("barrier response").expect("barrier");
+        sender.send(ClientStateMessage::Stop).expect("stop");
+        worker.join().expect("client state worker");
+        assert_eq!(
+            inspect
+                .load_durable(ClientId::new(1))
+                .expect("load state")
+                .expect("durable state"),
+            latest
+        );
+    }
+
+    #[test]
+    fn mutation_group_commit_flushes_every_edit_at_a_barrier() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal = SessionJournal::in_directory(directory.path().join("session"));
+        let authority =
+            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("open authority");
+        let outbox = MutationOutbox::in_directory(directory.path().join("outbox"));
+        let inspect_outbox = outbox.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || mutation_loop(authority, outbox, receiver));
+
+        let (reply, response) = mpsc::channel();
+        sender
+            .send(MutationMessage::Register {
+                document_id: DocumentId::new(1),
+                text: "base".to_owned(),
+                reply,
+            })
+            .expect("register request");
+        response
+            .recv()
+            .expect("register response")
+            .expect("register");
+        for _ in 0..128 {
+            sender
+                .send(MutationMessage::Append {
+                    document_id: DocumentId::new(1),
+                    transaction: Some(
+                        Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "x")])
+                            .expect("transaction"),
+                    ),
+                    state_deltas: Vec::new(),
+                })
+                .expect("append request");
+        }
+        let (reply, response) = mpsc::channel();
+        sender
+            .send(MutationMessage::Barrier(reply))
+            .expect("barrier request");
+        response.recv().expect("barrier response").expect("barrier");
+        let (reply, response) = mpsc::channel();
+        sender
+            .send(MutationMessage::Stop(reply))
+            .expect("stop request");
+        response.recv().expect("stop response").expect("stop");
+        worker.join().expect("mutation worker");
+
+        assert!(inspect_outbox.outstanding().expect("outbox").is_empty());
+        let recovered =
+            SessionAuthority::open(journal, SessionId::new(1)).expect("recover authority");
+        assert_eq!(
+            recovered
+                .document(DocumentId::new(1))
+                .expect("document")
+                .text(),
+            format!("{}base", "x".repeat(128))
+        );
     }
 }

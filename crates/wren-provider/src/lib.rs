@@ -33,6 +33,12 @@ pub enum ProviderRequest {
         text: Box<str>,
         bundle: LanguageBundle,
     },
+    AdvanceDocumentRevision {
+        document_id: DocumentId,
+        from_revision: DocumentRevision,
+        revision: DocumentRevision,
+        generation: ProviderGeneration,
+    },
     Demand {
         document_id: DocumentId,
         demand: ProviderDemand,
@@ -114,6 +120,11 @@ pub enum ProviderError {
     MissingProgram(PathBuf),
     #[error("completion result targets revision {actual:?}, expected {expected:?}")]
     StaleCompletion {
+        expected: DocumentRevision,
+        actual: DocumentRevision,
+    },
+    #[error("provider document is at revision {expected:?}, cannot advance from {actual:?}")]
+    StaleDocumentRevision {
         expected: DocumentRevision,
         actual: DocumentRevision,
     },
@@ -376,6 +387,27 @@ impl ProviderActor {
                         grammar_backend,
                     },
                 );
+                Ok(ProviderResponse::Updated {
+                    key: document_key(document_id, revision, generation),
+                })
+            }
+            ProviderRequest::AdvanceDocumentRevision {
+                document_id,
+                from_revision,
+                revision,
+                generation,
+            } => {
+                let document = self
+                    .documents
+                    .get_mut(&document_id)
+                    .ok_or(ProviderError::UnknownDocument(document_id))?;
+                if document.revision != from_revision || document.generation != generation {
+                    return Err(ProviderError::StaleDocumentRevision {
+                        expected: document.revision,
+                        actual: from_revision,
+                    });
+                }
+                document.revision = revision;
                 Ok(ProviderResponse::Updated {
                     key: document_key(document_id, revision, generation),
                 })
@@ -769,9 +801,9 @@ fn satisfies_neovim_predicates(
                     == (predicate.operator.as_ref() == "has-parent?")
             }
             "contains?" => neovim_contains_predicate(query_match, &predicate.args, text),
-            // These change display metadata or byte ranges, not whether a
-            // query pattern matches. Byte offsets are applied separately.
-            "offset!" => true,
+            // Unrecognized predicates, including display metadata and byte
+            // offsets, do not change whether a query pattern matches. Byte
+            // offsets are applied separately.
             _ => true,
         })
 }
@@ -1231,8 +1263,28 @@ impl ProviderSupervisor {
     }
 
     fn remember(&mut self, request: &ProviderRequest) {
-        if let ProviderRequest::UpdateDocument { document_id, .. } = request {
-            self.open_documents.insert(*document_id, request.clone());
+        match request {
+            ProviderRequest::UpdateDocument { document_id, .. } => {
+                self.open_documents.insert(*document_id, request.clone());
+            }
+            ProviderRequest::AdvanceDocumentRevision {
+                document_id,
+                from_revision,
+                revision,
+                generation,
+            } => {
+                if let Some(ProviderRequest::UpdateDocument {
+                    revision: stored_revision,
+                    bundle,
+                    ..
+                }) = self.open_documents.get_mut(document_id)
+                    && stored_revision == from_revision
+                    && bundle.provider_generation() == *generation
+                {
+                    *stored_revision = *revision;
+                }
+            }
+            _ => {}
         }
     }
 

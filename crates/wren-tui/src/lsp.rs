@@ -113,6 +113,12 @@ pub(super) fn parse_semantic_tokens(
     let Some(data) = response.get("data").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
+    let line_starts = std::iter::once(0)
+        .chain(
+            text.match_indices('\n')
+                .map(|(byte, _)| byte.saturating_add(1)),
+        )
+        .collect::<Vec<_>>();
     let mut spans = Vec::with_capacity(data.len() / 5);
     let mut line = 0_u32;
     let mut character = 0_u32;
@@ -148,10 +154,12 @@ pub(super) fn parse_semantic_tokens(
         } else {
             delta_start
         };
-        let Some(start) = lsp_position_byte(text, line, character) else {
+        let Some(start) = lsp_position_byte_indexed(text, &line_starts, line, character) else {
             continue;
         };
-        let Some(end) = lsp_position_byte(text, line, character.saturating_add(length)) else {
+        let Some(end) =
+            lsp_position_byte_indexed(text, &line_starts, line, character.saturating_add(length))
+        else {
             continue;
         };
         if start >= end {
@@ -203,16 +211,17 @@ pub(super) fn parse_semantic_tokens(
     spans
 }
 
-pub(super) fn lsp_position_byte(text: &str, line: u32, character: u32) -> Option<usize> {
+fn lsp_position_byte_indexed(
+    text: &str,
+    line_starts: &[usize],
+    line: u32,
+    character: u32,
+) -> Option<usize> {
     let line = usize::try_from(line).ok()?;
-    let start = if line == 0 {
-        0
-    } else {
-        text.match_indices('\n').nth(line - 1)?.0.saturating_add(1)
-    };
-    let end = text[start..]
-        .find('\n')
-        .map_or(text.len(), |offset| start + offset);
+    let start = *line_starts.get(line)?;
+    let end = line_starts
+        .get(line.saturating_add(1))
+        .map_or(text.len(), |next| next.saturating_sub(1));
     let wanted = usize::try_from(character).ok()?;
     let mut utf16 = 0;
     for (offset, current) in text[start..end].char_indices() {
@@ -227,154 +236,235 @@ pub(super) fn lsp_position_byte(text: &str, line: u32, character: u32) -> Option
     (utf16 == wanted).then_some(end)
 }
 
+type LanguageServerFactory = fn(&Path, &str) -> LanguageServerInvocation;
+
+struct LanguageServerRule {
+    extensions: &'static [&'static str],
+    build: LanguageServerFactory,
+}
+
+const LANGUAGE_SERVER_RULES: &[LanguageServerRule] = &[
+    LanguageServerRule {
+        extensions: &["rs"],
+        build: rust_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"],
+        build: typescript_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["py", "pyi"],
+        build: python_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["go"],
+        build: go_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["tf", "tfvars"],
+        build: terraform_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["nix"],
+        build: nix_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["hs", "lhs"],
+        build: haskell_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["lua"],
+        build: lua_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["sh", "bash", "zsh"],
+        build: bash_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["c", "h"],
+        build: c_language_server,
+    },
+    LanguageServerRule {
+        extensions: &["cc", "cpp", "cxx", "hh", "hpp", "hxx", "msg"],
+        build: cpp_language_server,
+    },
+];
+
 pub(super) fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvocation> {
     let path = path?;
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let extension = extension.as_str();
-    let (program, arguments, language_id, initialization_options, settings) = match extension {
-        "rs" => (
-            "rust-analyzer",
-            Vec::new(),
-            "rust",
-            serde_json::Value::Null,
-            serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}}),
-        ),
-        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => (
-            "pnpm",
-            vec![
-                "exec".to_owned(),
-                "typescript-language-server".to_owned(),
-                "--stdio".to_owned(),
-            ],
-            match extension {
-                "ts" | "mts" | "cts" => "typescript",
-                "tsx" => "typescriptreact",
-                "jsx" => "javascriptreact",
-                _ => "javascript",
-            },
-            serde_json::json!({"jsx": {"enabled": true}}),
-            serde_json::json!({
-                "typescript": {
-                    "suggestionActions": {"enabled": true},
-                    "updateImportsOnFileMove": {"enabled": "always"}
-                },
-                "javascript": {
-                    "updateImportsOnFileMove": {"enabled": "always"}
-                }
-            }),
-        ),
-        "py" | "pyi" => {
-            let interpreter = python_interpreter(path);
-            (
-                "basedpyright-langserver",
-                vec!["--stdio".to_owned()],
-                "python",
-                serde_json::Value::Null,
-                serde_json::json!({
-                    "python": {"pythonPath": interpreter},
-                    "basedpyright": {
-                        "analysis": {
-                            "autoSearchPaths": true,
-                            "useLibraryCodeForTypes": true,
-                            "diagnosticMode": "workspace",
-                            "inlayHints": {
-                                "variableTypes": true,
-                                "callArgumentNames": true,
-                                "functionReturnTypes": true,
-                                "parameterNames": true
-                            }
-                        }
-                    }
-                }),
-            )
-        }
-        "go" => (
-            "gopls",
-            Vec::new(),
-            "go",
-            serde_json::Value::Null,
-            serde_json::json!({}),
-        ),
-        "tf" | "tfvars" => (
-            "terraform-ls",
-            vec!["serve".to_owned()],
-            "terraform",
-            serde_json::Value::Null,
-            serde_json::json!({}),
-        ),
-        "nix" => {
-            let input = env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned());
-            let expression = nixd_nixpkgs_expression(nixd_expression_path().as_deref(), &input);
-            (
-                "nixd",
-                Vec::new(),
-                "nix",
-                serde_json::Value::Null,
-                serde_json::json!({
-                    "nixd": {
-                        "nixpkgs": {"expr": expression},
-                        "formatting": {"command": ["nixfmt"]}
-                    }
-                }),
-            )
-        }
-        "hs" | "lhs" => (
-            "haskell-language-server-wrapper",
-            vec!["--lsp".to_owned()],
-            "haskell",
-            serde_json::Value::Null,
-            serde_json::json!({
-                "haskell": {
-                    "plugin": {
-                        "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
-                        "fourmolu": {"config": {"external": true}}
-                    },
-                    "formattingProvider": "fourmolu"
-                }
-            }),
-        ),
-        "lua" => (
-            "lua-language-server",
-            Vec::new(),
-            "lua",
-            serde_json::Value::Null,
-            serde_json::json!({
-                "Lua": {
-                    "runtime": {"version": "LuaJIT"},
-                    "workspace": {"checkThirdParty": false}
-                }
-            }),
-        ),
-        "sh" | "bash" | "zsh" => (
-            "bash-language-server",
-            vec!["start".to_owned()],
-            "shellscript",
-            serde_json::Value::Null,
-            serde_json::json!({}),
-        ),
-        "c" | "h" => (
-            "clangd",
-            Vec::new(),
-            "c",
-            serde_json::Value::Null,
-            serde_json::json!({}),
-        ),
-        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "msg" => (
-            "clangd",
-            Vec::new(),
-            "cpp",
-            serde_json::Value::Null,
-            serde_json::json!({}),
-        ),
-        _ => return None,
-    };
-    Some(LanguageServerInvocation {
+    LANGUAGE_SERVER_RULES
+        .iter()
+        .find(|rule| rule.extensions.contains(&extension.as_str()))
+        .map(|rule| (rule.build)(path, &extension))
+}
+
+fn language_server(
+    program: &str,
+    arguments: &[&str],
+    language_id: &str,
+    initialization_options: serde_json::Value,
+    settings: serde_json::Value,
+) -> LanguageServerInvocation {
+    LanguageServerInvocation {
         program: program.to_owned(),
-        arguments,
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
         language_id: language_id.to_owned(),
         initialization_options,
         settings,
-    })
+    }
+}
+
+fn rust_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "rust-analyzer",
+        &[],
+        "rust",
+        serde_json::Value::Null,
+        serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}}),
+    )
+}
+
+fn typescript_language_server(_: &Path, extension: &str) -> LanguageServerInvocation {
+    let language_id = match extension {
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "typescriptreact",
+        "jsx" => "javascriptreact",
+        _ => "javascript",
+    };
+    language_server(
+        "pnpm",
+        &["exec", "typescript-language-server", "--stdio"],
+        language_id,
+        serde_json::json!({"jsx": {"enabled": true}}),
+        serde_json::json!({
+            "typescript": {
+                "suggestionActions": {"enabled": true},
+                "updateImportsOnFileMove": {"enabled": "always"}
+            },
+            "javascript": {"updateImportsOnFileMove": {"enabled": "always"}}
+        }),
+    )
+}
+
+fn python_language_server(path: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "basedpyright-langserver",
+        &["--stdio"],
+        "python",
+        serde_json::Value::Null,
+        serde_json::json!({
+            "python": {"pythonPath": python_interpreter(path)},
+            "basedpyright": {"analysis": {
+                "autoSearchPaths": true,
+                "useLibraryCodeForTypes": true,
+                "diagnosticMode": "workspace",
+                "inlayHints": {
+                    "variableTypes": true,
+                    "callArgumentNames": true,
+                    "functionReturnTypes": true,
+                    "parameterNames": true
+                }
+            }}
+        }),
+    )
+}
+
+fn go_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "gopls",
+        &[],
+        "go",
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
+}
+
+fn terraform_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "terraform-ls",
+        &["serve"],
+        "terraform",
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
+}
+
+fn nix_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    let input = env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned());
+    let expression = nixd_nixpkgs_expression(nixd_expression_path().as_deref(), &input);
+    language_server(
+        "nixd",
+        &[],
+        "nix",
+        serde_json::Value::Null,
+        serde_json::json!({"nixd": {
+            "nixpkgs": {"expr": expression},
+            "formatting": {"command": ["nixfmt"]}
+        }}),
+    )
+}
+
+fn haskell_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "haskell-language-server-wrapper",
+        &["--lsp"],
+        "haskell",
+        serde_json::Value::Null,
+        serde_json::json!({"haskell": {
+            "plugin": {
+                "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
+                "fourmolu": {"config": {"external": true}}
+            },
+            "formattingProvider": "fourmolu"
+        }}),
+    )
+}
+
+fn lua_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "lua-language-server",
+        &[],
+        "lua",
+        serde_json::Value::Null,
+        serde_json::json!({"Lua": {
+            "runtime": {"version": "LuaJIT"},
+            "workspace": {"checkThirdParty": false}
+        }}),
+    )
+}
+
+fn bash_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "bash-language-server",
+        &["start"],
+        "shellscript",
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
+}
+
+fn c_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "clangd",
+        &[],
+        "c",
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
+}
+
+fn cpp_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
+    language_server(
+        "clangd",
+        &[],
+        "cpp",
+        serde_json::Value::Null,
+        serde_json::json!({}),
+    )
 }
 
 pub(super) fn nixd_nixpkgs_expression(config: Option<&Path>, input: &str) -> String {

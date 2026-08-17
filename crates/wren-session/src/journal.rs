@@ -56,15 +56,6 @@ pub(crate) enum JournalEntry {
     },
 }
 
-#[derive(Serialize)]
-enum BorrowedJournalEntry<'a> {
-    MutationCommitted {
-        mutation: &'a ClientMutation,
-        durable: &'a MutationResult,
-        events: &'a [SessionEvent],
-    },
-}
-
 #[derive(Debug, Error)]
 pub enum SessionJournalError {
     #[error("session journal operation for {path} failed: {source}")]
@@ -114,20 +105,18 @@ impl SessionJournal {
         self.append_value(entry)
     }
 
-    pub(crate) fn append_mutation(
-        &self,
-        mutation: &ClientMutation,
-        durable: &MutationResult,
-        events: &[SessionEvent],
-    ) -> Result<(), SessionJournalError> {
-        self.append_value(&BorrowedJournalEntry::MutationCommitted {
-            mutation,
-            durable,
-            events,
-        })
+    pub(crate) fn append_many(&self, entries: &[JournalEntry]) -> Result<(), SessionJournalError> {
+        self.append_values(entries)
     }
 
     fn append_value(&self, entry: &impl Serialize) -> Result<(), SessionJournalError> {
+        self.append_values(std::slice::from_ref(entry))
+    }
+
+    fn append_values<T: Serialize>(&self, entries: &[T]) -> Result<(), SessionJournalError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let mut writer = self
             .writer
             .lock()
@@ -151,7 +140,7 @@ impl SessionJournal {
         let file = writer
             .as_mut()
             .ok_or_else(|| self.io(io::Error::other("session journal writer unavailable")))?;
-        crate::record::write(file, MAGIC, entry).map_err(|error| self.record(error))?;
+        crate::record::write_many(file, MAGIC, entries).map_err(|error| self.record(error))?;
         #[cfg(any(
             target_os = "linux",
             target_os = "android",

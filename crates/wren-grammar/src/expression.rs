@@ -215,112 +215,127 @@ fn lex(source: &str) -> Result<Vec<Token>, ExpressionError> {
             cursor += character.len_utf8();
             continue;
         }
-        if character.is_ascii_digit()
-            || (character == '.'
-                && source[cursor + 1..]
-                    .chars()
-                    .next()
-                    .is_some_and(|next| next.is_ascii_digit()))
-        {
-            let start = cursor;
-            cursor += character.len_utf8();
-            while cursor < source.len() {
-                let next = source[cursor..].chars().next().unwrap_or(' ');
-                if !next.is_ascii_digit() && next != '.' {
-                    break;
-                }
-                cursor += next.len_utf8();
-            }
-            let text = &source[start..cursor];
-            let number = text.parse().map_err(|_| ExpressionError::InvalidNumber {
-                text: text.to_owned(),
-                byte: start,
-            })?;
-            tokens.push(Token::Number(number));
-            continue;
-        }
-        if matches!(character, '\'' | '"') {
-            let quote = character;
-            let start = cursor;
-            cursor += quote.len_utf8();
-            let mut value = String::new();
-            let mut escaped = false;
-            let mut terminated = false;
-            while cursor < source.len() {
-                let next = source[cursor..].chars().next().unwrap_or(' ');
-                cursor += next.len_utf8();
-                if escaped {
-                    value.push(match next {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        other => other,
-                    });
-                    escaped = false;
-                } else if next == '\\' {
-                    escaped = true;
-                } else if next == quote {
-                    terminated = true;
-                    break;
-                } else {
-                    value.push(next);
-                }
-            }
-            if !terminated {
-                return Err(ExpressionError::UnterminatedString { byte: start });
-            }
-            tokens.push(Token::String(value));
-            continue;
-        }
-        if character.is_alphabetic() || character == '_' {
-            let start = cursor;
-            cursor += character.len_utf8();
-            while cursor < source.len() {
-                let next = source[cursor..].chars().next().unwrap_or(' ');
-                if !next.is_alphanumeric() && !matches!(next, '_' | '.') {
-                    break;
-                }
-                cursor += next.len_utf8();
-            }
-            tokens.push(Token::Identifier(source[start..cursor].to_owned()));
-            continue;
-        }
-        let (token, width) = match &source[cursor..] {
-            rest if rest.starts_with("==") => (Token::EqualEqual, 2),
-            rest if rest.starts_with("!=") => (Token::BangEqual, 2),
-            rest if rest.starts_with("<=") => (Token::LessEqual, 2),
-            rest if rest.starts_with(">=") => (Token::GreaterEqual, 2),
-            rest if rest.starts_with("&&") => (Token::AndAnd, 2),
-            rest if rest.starts_with("||") => (Token::OrOr, 2),
-            _ => (
-                match character {
-                    '+' => Token::Plus,
-                    '-' => Token::Minus,
-                    '*' => Token::Star,
-                    '/' => Token::Slash,
-                    '%' => Token::Percent,
-                    '!' => Token::Bang,
-                    '<' => Token::Less,
-                    '>' => Token::Greater,
-                    '(' => Token::LeftParen,
-                    ')' => Token::RightParen,
-                    '[' => Token::LeftBracket,
-                    ']' => Token::RightBracket,
-                    ',' => Token::Comma,
-                    _ => {
-                        return Err(ExpressionError::UnexpectedCharacter {
-                            character,
-                            byte: cursor,
-                        });
-                    }
-                },
-                character.len_utf8(),
-            ),
-        };
-        cursor += width;
-        tokens.push(token);
+        tokens.push(lex_token(source, &mut cursor, character)?);
     }
     Ok(tokens)
+}
+
+fn lex_token(source: &str, cursor: &mut usize, character: char) -> Result<Token, ExpressionError> {
+    if is_number_start(source, *cursor, character) {
+        return lex_number(source, cursor, character);
+    }
+    if matches!(character, '\'' | '"') {
+        return lex_string(source, cursor, character);
+    }
+    if character.is_alphabetic() || character == '_' {
+        return Ok(lex_identifier(source, cursor, character));
+    }
+    lex_symbol(&source[*cursor..], cursor, character)
+}
+
+fn is_number_start(source: &str, cursor: usize, character: char) -> bool {
+    character.is_ascii_digit()
+        || (character == '.'
+            && source[cursor + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_digit()))
+}
+
+fn lex_number(source: &str, cursor: &mut usize, first: char) -> Result<Token, ExpressionError> {
+    let start = *cursor;
+    *cursor += first.len_utf8();
+    while *cursor < source.len() {
+        let next = source[*cursor..].chars().next().unwrap_or(' ');
+        if !next.is_ascii_digit() && next != '.' {
+            break;
+        }
+        *cursor += next.len_utf8();
+    }
+    let text = &source[start..*cursor];
+    text.parse()
+        .map(Token::Number)
+        .map_err(|_| ExpressionError::InvalidNumber {
+            text: text.to_owned(),
+            byte: start,
+        })
+}
+
+fn lex_string(source: &str, cursor: &mut usize, quote: char) -> Result<Token, ExpressionError> {
+    let start = *cursor;
+    *cursor += quote.len_utf8();
+    let mut value = String::new();
+    let mut escaped = false;
+    while *cursor < source.len() {
+        let next = source[*cursor..].chars().next().unwrap_or(' ');
+        *cursor += next.len_utf8();
+        if escaped {
+            value.push(unescape(next));
+            escaped = false;
+        } else if next == '\\' {
+            escaped = true;
+        } else if next == quote {
+            return Ok(Token::String(value));
+        } else {
+            value.push(next);
+        }
+    }
+    Err(ExpressionError::UnterminatedString { byte: start })
+}
+
+fn unescape(character: char) -> char {
+    match character {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        other => other,
+    }
+}
+
+fn lex_identifier(source: &str, cursor: &mut usize, first: char) -> Token {
+    let start = *cursor;
+    *cursor += first.len_utf8();
+    while *cursor < source.len() {
+        let next = source[*cursor..].chars().next().unwrap_or(' ');
+        if !next.is_alphanumeric() && !matches!(next, '_' | '.') {
+            break;
+        }
+        *cursor += next.len_utf8();
+    }
+    Token::Identifier(source[start..*cursor].to_owned())
+}
+
+fn lex_symbol(rest: &str, cursor: &mut usize, character: char) -> Result<Token, ExpressionError> {
+    let (token, width) = match rest {
+        rest if rest.starts_with("==") => (Token::EqualEqual, 2),
+        rest if rest.starts_with("!=") => (Token::BangEqual, 2),
+        rest if rest.starts_with("<=") => (Token::LessEqual, 2),
+        rest if rest.starts_with(">=") => (Token::GreaterEqual, 2),
+        rest if rest.starts_with("&&") => (Token::AndAnd, 2),
+        rest if rest.starts_with("||") => (Token::OrOr, 2),
+        _ => (single_symbol(character, *cursor)?, character.len_utf8()),
+    };
+    *cursor += width;
+    Ok(token)
+}
+
+fn single_symbol(character: char, byte: usize) -> Result<Token, ExpressionError> {
+    match character {
+        '+' => Ok(Token::Plus),
+        '-' => Ok(Token::Minus),
+        '*' => Ok(Token::Star),
+        '/' => Ok(Token::Slash),
+        '%' => Ok(Token::Percent),
+        '!' => Ok(Token::Bang),
+        '<' => Ok(Token::Less),
+        '>' => Ok(Token::Greater),
+        '(' => Ok(Token::LeftParen),
+        ')' => Ok(Token::RightParen),
+        '[' => Ok(Token::LeftBracket),
+        ']' => Ok(Token::RightBracket),
+        ',' => Ok(Token::Comma),
+        _ => Err(ExpressionError::UnexpectedCharacter { character, byte }),
+    }
 }
 
 struct Parser<'a> {

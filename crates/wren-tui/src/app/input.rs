@@ -2,6 +2,9 @@ use super::*;
 
 impl App {
     pub(super) fn handle_input(&mut self, input: TerminalInput) -> Result<()> {
+        if !matches!(&input, TerminalInput::Ignored) {
+            self.defer_lsp_start_until_idle();
+        }
         if self.terminal_focused {
             return self.handle_terminal_input(input);
         }
@@ -60,8 +63,9 @@ impl App {
             // through `handle_mouse_click` before generic input dispatch.
             TerminalInput::MouseClick { .. }
             | TerminalInput::MouseDrag { .. }
-            | TerminalInput::MouseRelease { .. } => Ok(()),
-            TerminalInput::Ignored | TerminalInput::Resized { .. } => Ok(()),
+            | TerminalInput::MouseRelease { .. }
+            | TerminalInput::Ignored
+            | TerminalInput::Resized { .. } => Ok(()),
         }
     }
 
@@ -212,75 +216,18 @@ impl App {
 
     pub(super) fn handle_prompt_key(&mut self, key: TerminalKey) -> Result<()> {
         match key.code {
-            TerminalKeyCode::Escape => {
-                if self.search_prompt_origin.is_some() {
-                    self.cancel_search_prompt()?;
-                } else {
-                    self.prompt = None;
-                    self.message.clear();
-                }
-            }
-            TerminalKeyCode::Backspace => {
-                if self.prompt.as_ref().is_some_and(|prompt| {
-                    prompt.kind == PromptKind::FileBrowser && prompt.buffer.is_empty()
-                }) {
-                    self.browse_parent()?;
-                    return Ok(());
-                }
-                if let Some(prompt) = &mut self.prompt {
-                    prompt.buffer.pop();
-                }
-                self.update_prompt_picker()?;
-            }
-            TerminalKeyCode::Enter => {
-                let prompt = self
-                    .prompt
-                    .take()
-                    .ok_or_else(|| anyhow!("prompt vanished"))?;
-                if let Err(error) = self.execute_prompt(prompt) {
-                    self.show_error(error);
-                }
-            }
-            TerminalKeyCode::Up => {
-                if self.prompt.as_ref().is_some_and(|prompt| {
-                    matches!(
-                        prompt.kind,
-                        PromptKind::FilePicker
-                            | PromptKind::FileBrowser
-                            | PromptKind::Grep
-                            | PromptKind::Location
-                    )
-                }) {
-                    self.move_picker(-1);
-                } else {
-                    self.move_prompt_history(-1);
-                }
-            }
-            TerminalKeyCode::Down => {
-                if self.prompt.as_ref().is_some_and(|prompt| {
-                    matches!(
-                        prompt.kind,
-                        PromptKind::FilePicker
-                            | PromptKind::FileBrowser
-                            | PromptKind::Grep
-                            | PromptKind::Location
-                    )
-                }) {
-                    self.move_picker(1);
-                } else {
-                    self.move_prompt_history(1);
-                }
-            }
+            TerminalKeyCode::Escape => self.cancel_prompt()?,
+            TerminalKeyCode::Backspace => self.backspace_prompt()?,
+            TerminalKeyCode::Enter => self.submit_prompt()?,
+            TerminalKeyCode::Up => self.navigate_prompt(-1),
+            TerminalKeyCode::Down => self.navigate_prompt(1),
             TerminalKeyCode::PageUp if self.prompt_kind_is_picker() => self.move_picker(-10),
             TerminalKeyCode::PageDown if self.prompt_kind_is_picker() => self.move_picker(10),
             TerminalKeyCode::Char('u' | 'U') if key.control && self.prompt_kind_is_picker() => {
-                self.picker_preview_scroll = self.picker_preview_scroll.saturating_sub(4);
+                self.scroll_picker_preview(-4);
             }
             TerminalKeyCode::Char('d' | 'D') if key.control && self.prompt_kind_is_picker() => {
-                self.picker_preview_scroll = self
-                    .picker_preview_scroll
-                    .saturating_add(4)
-                    .min(self.picker_preview.lines().count().saturating_sub(1));
+                self.scroll_picker_preview(4);
             }
             TerminalKeyCode::Char('n' | 'N' | 'j' | 'J')
                 if key.control && self.prompt_kind_is_picker() =>
@@ -292,22 +239,8 @@ impl App {
             {
                 self.move_picker(-1)
             }
-            TerminalKeyCode::Left
-                if self.prompt.as_ref().is_some_and(|prompt| {
-                    prompt.kind == PromptKind::FileBrowser && prompt.buffer.is_empty()
-                }) =>
-            {
-                self.browse_parent()?
-            }
-            TerminalKeyCode::Right if self.prompt_kind_is_picker() => {
-                let prompt = self
-                    .prompt
-                    .take()
-                    .ok_or_else(|| anyhow!("prompt vanished"))?;
-                if let Err(error) = self.execute_prompt(prompt) {
-                    self.show_error(error);
-                }
-            }
+            TerminalKeyCode::Left if self.empty_file_browser_prompt() => self.browse_parent()?,
+            TerminalKeyCode::Right if self.prompt_kind_is_picker() => self.submit_prompt()?,
             TerminalKeyCode::Tab => self.complete_prompt(),
             TerminalKeyCode::Char('n' | 'N' | 'p' | 'P') if key.control => self.complete_prompt(),
             TerminalKeyCode::Char(character) if !key.control && !key.super_key => {
@@ -319,6 +252,70 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn cancel_prompt(&mut self) -> Result<()> {
+        if self.search_prompt_origin.is_some() {
+            return self.cancel_search_prompt();
+        }
+        self.prompt = None;
+        self.message.clear();
+        Ok(())
+    }
+
+    fn backspace_prompt(&mut self) -> Result<()> {
+        if self.empty_file_browser_prompt() {
+            return self.browse_parent();
+        }
+        if let Some(prompt) = &mut self.prompt {
+            prompt.buffer.pop();
+        }
+        self.update_prompt_picker()
+    }
+
+    fn submit_prompt(&mut self) -> Result<()> {
+        let prompt = self
+            .prompt
+            .take()
+            .ok_or_else(|| anyhow!("prompt vanished"))?;
+        if let Err(error) = self.execute_prompt(prompt) {
+            self.show_error(error);
+        }
+        Ok(())
+    }
+
+    fn navigate_prompt(&mut self, offset: isize) {
+        if self.prompt_uses_picker_navigation() {
+            self.move_picker(offset);
+        } else {
+            self.move_prompt_history(offset);
+        }
+    }
+
+    fn prompt_uses_picker_navigation(&self) -> bool {
+        self.prompt.as_ref().is_some_and(|prompt| {
+            matches!(
+                prompt.kind,
+                PromptKind::FilePicker
+                    | PromptKind::FileBrowser
+                    | PromptKind::Grep
+                    | PromptKind::Location
+            )
+        })
+    }
+
+    fn scroll_picker_preview(&mut self, offset: isize) {
+        let last_line = self.picker_preview.lines().count().saturating_sub(1);
+        self.picker_preview_scroll = self
+            .picker_preview_scroll
+            .saturating_add_signed(offset)
+            .min(last_line);
+    }
+
+    fn empty_file_browser_prompt(&self) -> bool {
+        self.prompt.as_ref().is_some_and(|prompt| {
+            prompt.kind == PromptKind::FileBrowser && prompt.buffer.is_empty()
+        })
     }
 
     pub(super) fn prompt_kind_is_picker(&self) -> bool {

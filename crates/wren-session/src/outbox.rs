@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -37,15 +38,28 @@ pub enum OutboxError {
     MutationIdCollision { mutation_id: MutationId },
 }
 
+const COMPACT_AFTER_DURABLE_RECORDS: usize = 256;
+
+#[derive(Debug, Default)]
+struct OutboxState {
+    outstanding: Vec<ClientMutation>,
+    loaded: bool,
+    durable_records_since_compaction: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationOutbox {
     path: PathBuf,
+    state: Arc<Mutex<OutboxState>>,
 }
 
 impl MutationOutbox {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            state: Arc::new(Mutex::new(OutboxState::default())),
+        }
     }
 
     #[must_use]
@@ -59,40 +73,97 @@ impl MutationOutbox {
     }
 
     pub fn append(&self, mutation: &ClientMutation) -> Result<(), OutboxError> {
-        let outstanding = self.outstanding()?;
-        if let Some(existing) = outstanding
-            .iter()
-            .find(|existing| existing.mutation_id == mutation.mutation_id)
-        {
-            if existing != mutation {
-                return Err(OutboxError::MutationIdCollision {
-                    mutation_id: mutation.mutation_id,
-                });
-            }
-            return Ok(());
-        }
-        self.append_record(&OutboxRecord::Mutation(mutation.clone()))
+        self.append_many(std::slice::from_ref(mutation)).map(|_| ())
     }
 
-    /// Returns true only when a durable acknowledgement compacted a known
-    /// mutation. `Received` and rejection results never remove client data.
-    pub fn observe_result(&self, result: &MutationResult) -> Result<bool, OutboxError> {
-        let MutationResult::Durable { mutation_id, .. } = result else {
-            return Ok(false);
-        };
-        if !self
-            .outstanding()?
+    /// Crash-safely records a group of mutations with one durability sync.
+    /// Every mutation remains an independently checksummed WAL record.
+    pub fn append_many(&self, mutations: &[ClientMutation]) -> Result<usize, OutboxError> {
+        let mut state = self.lock_state()?;
+        self.load_state(&mut state)?;
+        let outstanding = &mut state.outstanding;
+        let mut known = outstanding
             .iter()
-            .any(|mutation| mutation.mutation_id == *mutation_id)
-        {
-            return Ok(false);
+            .map(|mutation| (mutation.mutation_id, mutation))
+            .collect::<HashMap<_, _>>();
+        let mut additions = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            if let Some(existing) = known.get(&mutation.mutation_id) {
+                if *existing != mutation {
+                    return Err(OutboxError::MutationIdCollision {
+                        mutation_id: mutation.mutation_id,
+                    });
+                }
+                continue;
+            }
+            known.insert(mutation.mutation_id, mutation);
+            additions.push(mutation.clone());
         }
-        self.append_record(&OutboxRecord::Durable(*mutation_id))?;
-        self.compact()?;
-        Ok(true)
+        let records = additions
+            .iter()
+            .cloned()
+            .map(OutboxRecord::Mutation)
+            .collect::<Vec<_>>();
+        self.append_records(&records)?;
+        let appended = additions.len();
+        outstanding.extend(additions);
+        Ok(appended)
+    }
+
+    /// Returns true only when a durable acknowledgement records a known
+    /// mutation. `Received` and rejection results never remove client data.
+    /// Durable records are crash-safe immediately; physical compaction is
+    /// periodic so an acknowledgement does not rewrite the whole WAL.
+    pub fn observe_result(&self, result: &MutationResult) -> Result<bool, OutboxError> {
+        self.observe_results(std::slice::from_ref(result))
+            .map(|acknowledged| acknowledged == 1)
+    }
+
+    /// Crash-safely records all known durable acknowledgements with one sync.
+    /// Unknown, duplicate, received, and rejected results are ignored.
+    pub fn observe_results(&self, results: &[MutationResult]) -> Result<usize, OutboxError> {
+        let mut state = self.lock_state()?;
+        self.load_state(&mut state)?;
+        let outstanding = &state.outstanding;
+        let mut known = outstanding
+            .iter()
+            .map(|mutation| mutation.mutation_id)
+            .collect::<HashSet<_>>();
+        let acknowledged = results
+            .iter()
+            .filter_map(|result| match result {
+                MutationResult::Durable { mutation_id, .. } if known.remove(mutation_id) => {
+                    Some(*mutation_id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let records = acknowledged
+            .iter()
+            .copied()
+            .map(OutboxRecord::Durable)
+            .collect::<Vec<_>>();
+        self.append_records(&records)?;
+        state
+            .outstanding
+            .retain(|mutation| !acknowledged.contains(&mutation.mutation_id));
+        state.durable_records_since_compaction = state
+            .durable_records_since_compaction
+            .saturating_add(acknowledged.len());
+        if state.durable_records_since_compaction >= COMPACT_AFTER_DURABLE_RECORDS {
+            self.compact_outstanding(&state.outstanding)?;
+            state.durable_records_since_compaction = 0;
+        }
+        Ok(acknowledged.len())
     }
 
     pub fn outstanding(&self) -> Result<Vec<ClientMutation>, OutboxError> {
+        let mut state = self.lock_state()?;
+        self.load_state(&mut state)?;
+        Ok(state.outstanding.clone())
+    }
+
+    fn recover_outstanding(&self) -> Result<Vec<ClientMutation>, OutboxError> {
         let records = self.recover_records()?;
         let mut positions: HashMap<MutationId, usize> = HashMap::new();
         let mut mutations: Vec<Option<ClientMutation>> = Vec::new();
@@ -127,7 +198,14 @@ impl MutationOutbox {
     }
 
     pub fn compact(&self) -> Result<(), OutboxError> {
-        let outstanding = self.outstanding()?;
+        let mut state = self.lock_state()?;
+        self.load_state(&mut state)?;
+        self.compact_outstanding(&state.outstanding)?;
+        state.durable_records_since_compaction = 0;
+        Ok(())
+    }
+
+    fn compact_outstanding(&self, outstanding: &[ClientMutation]) -> Result<(), OutboxError> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|source| self.io(source))?;
         let mut temporary = NamedTempFile::new_in(parent).map_err(|source| self.io(source))?;
@@ -135,7 +213,7 @@ impl MutationOutbox {
             crate::record::write(
                 temporary.as_file_mut(),
                 MAGIC,
-                &OutboxRecord::Mutation(mutation),
+                &OutboxRecord::Mutation(mutation.clone()),
             )
             .map_err(|error| self.record(error))?;
         }
@@ -153,8 +231,22 @@ impl MutationOutbox {
         Ok(())
     }
 
-    fn append_record(&self, record: &OutboxRecord) -> Result<(), OutboxError> {
-        crate::record::append(&self.path, MAGIC, record).map_err(|error| self.record(error))
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OutboxState>, OutboxError> {
+        self.state
+            .lock()
+            .map_err(|_| self.io(io::Error::other("mutation outbox state lock poisoned")))
+    }
+
+    fn load_state(&self, state: &mut OutboxState) -> Result<(), OutboxError> {
+        if !state.loaded {
+            state.outstanding = self.recover_outstanding()?;
+            state.loaded = true;
+        }
+        Ok(())
+    }
+
+    fn append_records(&self, records: &[OutboxRecord]) -> Result<(), OutboxError> {
+        crate::record::append_many(&self.path, MAGIC, records).map_err(|error| self.record(error))
     }
 
     fn recover_records(&self) -> Result<Vec<OutboxRecord>, OutboxError> {
@@ -240,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn received_never_compacts_but_durable_does() {
+    fn received_never_acknowledges_but_durable_does() {
         let directory = tempdir().expect("temporary directory");
         let outbox = MutationOutbox::in_directory(directory.path());
         outbox.append(&mutation()).expect("append");
@@ -254,6 +346,92 @@ mod tests {
         assert_eq!(outbox.outstanding().expect("outstanding"), vec![mutation()]);
         assert!(outbox.observe_result(&durable()).expect("durable"));
         assert!(outbox.outstanding().expect("compacted").is_empty());
+    }
+
+    #[test]
+    fn mutation_and_acknowledgement_batches_survive_reopen() {
+        let directory = tempdir().expect("temporary directory");
+        let outbox = MutationOutbox::in_directory(directory.path());
+        let mutations = (1..=64_u64)
+            .map(|sequence| {
+                let mut pending = mutation();
+                pending.mutation_id = MutationId::new(sequence);
+                pending.client_sequence = ClientSequence::new(sequence);
+                pending
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outbox.append_many(&mutations).expect("append batch"), 64);
+        drop(outbox);
+
+        let reopened = MutationOutbox::in_directory(directory.path());
+        assert_eq!(reopened.outstanding().expect("recover batch"), mutations);
+        let acknowledgements = mutations
+            .iter()
+            .map(|mutation| MutationResult::Durable {
+                mutation_id: mutation.mutation_id,
+                client_sequence: mutation.client_sequence,
+                session_sequence: SessionSequence::new(mutation.client_sequence.get()),
+                documents: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reopened
+                .observe_results(&acknowledgements)
+                .expect("acknowledge batch"),
+            64
+        );
+        drop(reopened);
+        assert!(
+            MutationOutbox::in_directory(directory.path())
+                .outstanding()
+                .expect("recover acknowledgements")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn colliding_id_rejects_a_whole_outbox_batch_before_writing() {
+        let directory = tempdir().expect("temporary directory");
+        let outbox = MutationOutbox::in_directory(directory.path());
+        let first = mutation();
+        let mut collision = first.clone();
+        collision.state_deltas.clear();
+        assert!(matches!(
+            outbox.append_many(&[first, collision]),
+            Err(OutboxError::MutationIdCollision { .. })
+        ));
+        assert!(outbox.outstanding().expect("empty outbox").is_empty());
+    }
+
+    #[test]
+    fn durable_records_compact_periodically_instead_of_rewriting_per_ack() {
+        let directory = tempdir().expect("temporary directory");
+        let outbox = MutationOutbox::in_directory(directory.path());
+        for sequence in 1..=COMPACT_AFTER_DURABLE_RECORDS {
+            let mutation_id = MutationId::new(sequence as u64);
+            let mut pending = mutation();
+            pending.mutation_id = mutation_id;
+            outbox.append(&pending).expect("append");
+            let mut acknowledged = durable();
+            let MutationResult::Durable {
+                mutation_id: durable_id,
+                ..
+            } = &mut acknowledged
+            else {
+                unreachable!();
+            };
+            *durable_id = mutation_id;
+            assert!(outbox.observe_result(&acknowledged).expect("durable"));
+        }
+
+        assert_eq!(
+            std::fs::metadata(outbox.path())
+                .expect("compacted outbox")
+                .len(),
+            0
+        );
+        let reopened = MutationOutbox::in_directory(directory.path());
+        assert!(reopened.outstanding().expect("reopened outbox").is_empty());
     }
 
     #[test]
@@ -299,7 +477,7 @@ mod tests {
             authority
                 .document(DocumentId::new(4))
                 .expect("document")
-                .text,
+                .text(),
             "ext"
         );
         assert_eq!(authority.client_state(ClientId::new(2)).len(), 1);

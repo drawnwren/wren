@@ -263,6 +263,12 @@ impl Grammar {
 
 fn parse_impl(keys: &[KeyEvent]) -> Result<ParseResult, GrammarError> {
     if let [key] = keys
+        && key.modifiers.is_empty()
+        && let Some(command) = complete_normal_command(key.code, NonZeroU32::MIN, None)
+    {
+        return Ok(ParseResult::Command(command));
+    }
+    if let [key] = keys
         && key.code == KeyCode::Char('r')
         && key.modifiers == Modifiers::CONTROL
     {
@@ -464,142 +470,196 @@ fn parse_normal_command(
     register: Option<Register>,
 ) -> Result<ParseResult, GrammarError> {
     let key = checked_key(keys, cursor)?;
-    if key.code == KeyCode::Char('g') {
-        if cursor + 1 == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::PrefixG {
-                operator: None,
-                count,
-                register,
-            }));
+    match key.code {
+        KeyCode::Char('g') => parse_g_command(keys, cursor, count, register),
+        KeyCode::Char('f' | 'F' | 't' | 'T') => {
+            parse_find_command(keys, cursor, key.code, count, register)
         }
-        let motion = match require_char(keys, cursor + 1)? {
-            'g' => Motion::GoToLine,
-            'e' => Motion::WordEndBackward,
-            'E' => Motion::BigWordBackward,
-            '0' => Motion::LineStart,
-            '$' => Motion::LineEnd,
-            '_' => Motion::LastNonBlank,
-            _ => {
-                return Err(GrammarError::UnexpectedKey {
-                    index: cursor + 1,
-                    key: checked_key(keys, cursor + 1)?.code,
-                });
-            }
-        };
-        return finish(keys, cursor + 2, Command::Move { motion, count });
-    }
-    if matches!(key.code, KeyCode::Char('f' | 'F' | 't' | 'T')) {
-        let forward = matches!(key.code, KeyCode::Char('f' | 't'));
-        let till = matches!(key.code, KeyCode::Char('t' | 'T'));
-        if cursor + 1 == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::FindCharacterPending {
-                operator: None,
-                count,
-                register,
-                forward,
-                till,
-            }));
-        }
-        let character = require_char(keys, cursor + 1)?;
-        return finish(
+        KeyCode::Char('r') => parse_replace_command(keys, cursor, count),
+        code => finish(
             keys,
-            cursor + 2,
-            Command::Move {
-                motion: match (forward, till) {
-                    (true, false) => Motion::FindForward(character),
-                    (false, false) => Motion::FindBackward(character),
-                    (true, true) => Motion::TillForward(character),
-                    (false, true) => Motion::TillBackward(character),
-                },
-                count,
-            },
-        );
+            cursor + 1,
+            simple_normal_command(code, cursor, count, register)?,
+        ),
     }
-    if key.code == KeyCode::Char('r') {
-        if cursor + 1 == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::ReplaceCharacterPending {
-                count,
-            }));
+}
+
+fn parse_g_command(
+    keys: &[KeyEvent],
+    cursor: usize,
+    count: NonZeroU32,
+    register: Option<Register>,
+) -> Result<ParseResult, GrammarError> {
+    if cursor + 1 == keys.len() {
+        return Ok(ParseResult::Pending(ParseState::PrefixG {
+            operator: None,
+            count,
+            register,
+        }));
+    }
+    let motion = match require_char(keys, cursor + 1)? {
+        'g' => Motion::GoToLine,
+        'e' => Motion::WordEndBackward,
+        'E' => Motion::BigWordBackward,
+        '0' => Motion::LineStart,
+        '$' => Motion::LineEnd,
+        '_' => Motion::LastNonBlank,
+        _ => {
+            return Err(GrammarError::UnexpectedKey {
+                index: cursor + 1,
+                key: checked_key(keys, cursor + 1)?.code,
+            });
         }
-        return finish(
-            keys,
-            cursor + 2,
-            Command::ReplaceChar {
-                character: require_char(keys, cursor + 1)?,
-                count,
-            },
-        );
+    };
+    finish(keys, cursor + 2, Command::Move { motion, count })
+}
+
+fn parse_find_command(
+    keys: &[KeyEvent],
+    cursor: usize,
+    code: KeyCode,
+    count: NonZeroU32,
+    register: Option<Register>,
+) -> Result<ParseResult, GrammarError> {
+    let forward = matches!(code, KeyCode::Char('f' | 't'));
+    let till = matches!(code, KeyCode::Char('t' | 'T'));
+    if cursor + 1 == keys.len() {
+        return Ok(ParseResult::Pending(ParseState::FindCharacterPending {
+            operator: None,
+            count,
+            register,
+            forward,
+            till,
+        }));
     }
-    let command = match key.code {
+    let character = require_char(keys, cursor + 1)?;
+    let motion = match (forward, till) {
+        (true, false) => Motion::FindForward(character),
+        (false, false) => Motion::FindBackward(character),
+        (true, true) => Motion::TillForward(character),
+        (false, true) => Motion::TillBackward(character),
+    };
+    finish(keys, cursor + 2, Command::Move { motion, count })
+}
+
+fn parse_replace_command(
+    keys: &[KeyEvent],
+    cursor: usize,
+    count: NonZeroU32,
+) -> Result<ParseResult, GrammarError> {
+    if cursor + 1 == keys.len() {
+        return Ok(ParseResult::Pending(ParseState::ReplaceCharacterPending {
+            count,
+        }));
+    }
+    finish(
+        keys,
+        cursor + 2,
+        Command::ReplaceChar {
+            character: require_char(keys, cursor + 1)?,
+            count,
+        },
+    )
+}
+
+fn simple_normal_command(
+    code: KeyCode,
+    index: usize,
+    count: NonZeroU32,
+    register: Option<Register>,
+) -> Result<Command, GrammarError> {
+    complete_normal_command(code, count, register)
+        .ok_or(GrammarError::UnexpectedKey { index, key: code })
+}
+
+fn complete_normal_command(
+    code: KeyCode,
+    count: NonZeroU32,
+    register: Option<Register>,
+) -> Option<Command> {
+    let command = match code {
         KeyCode::Char('i') => Command::EnterInsert,
         KeyCode::Char('a') => Command::EnterAppend,
         KeyCode::Char('I') => Command::EnterInsertAtLineStart,
         KeyCode::Char('A') => Command::EnterInsertAtLineEnd,
         KeyCode::Char('R') => Command::EnterReplace,
         KeyCode::Char('o' | 'O') => Command::OpenLine {
-            above: key.code == KeyCode::Char('O'),
+            above: code == KeyCode::Char('O'),
         },
         KeyCode::Char('x' | 'X') | KeyCode::Delete | KeyCode::Backspace => Command::DeleteChar {
-            backward: matches!(key.code, KeyCode::Char('X') | KeyCode::Backspace),
+            backward: matches!(code, KeyCode::Char('X') | KeyCode::Backspace),
             count,
             register,
         },
         KeyCode::Char('J') => Command::JoinLines { count },
-        KeyCode::Char('D' | 'C' | 'Y') => Command::ApplyOperator {
-            operator: match key.code {
-                KeyCode::Char('C') => Operator::Change,
-                KeyCode::Char('Y') => Operator::Yank,
-                _ => Operator::Delete,
-            },
-            motion: if key.code == KeyCode::Char('Y') {
-                Motion::WholeLine
-            } else {
-                Motion::LineEnd
-            },
-            count,
-            register,
-            range_kind: if key.code == KeyCode::Char('Y') {
-                RangeKind::LineWise
-            } else {
-                RangeKind::CharacterWise
-            },
-        },
-        KeyCode::Char('s' | 'S') => Command::ApplyOperator {
-            operator: Operator::Change,
-            motion: if key.code == KeyCode::Char('S') {
-                Motion::WholeLine
-            } else {
-                Motion::Right
-            },
-            count,
-            register,
-            range_kind: if key.code == KeyCode::Char('S') {
-                RangeKind::LineWise
-            } else {
-                RangeKind::CharacterWise
-            },
-        },
+        KeyCode::Char(character @ ('D' | 'C' | 'Y')) => {
+            line_operator_command(character, count, register)
+        }
+        KeyCode::Char(character @ ('s' | 'S')) => substitute_command(character, count, register),
         KeyCode::Char('~') => Command::ToggleCase { count },
         KeyCode::Char('p' | 'P') => Command::Paste {
-            before: key.code == KeyCode::Char('P'),
+            before: code == KeyCode::Char('P'),
             count,
             register,
         },
         KeyCode::Char('u') => Command::Undo { count },
         KeyCode::Char('n' | 'N') => Command::SearchNext {
-            reverse: key.code == KeyCode::Char('N'),
+            reverse: code == KeyCode::Char('N'),
             count,
         },
         KeyCode::Char('.') => Command::Repeat { count },
-        code => {
-            let motion = motion_for(code).ok_or(GrammarError::UnexpectedKey {
-                index: cursor,
-                key: code,
-            })?;
-            Command::Move { motion, count }
-        }
+        code => Command::Move {
+            motion: motion_for(code)?,
+            count,
+        },
     };
-    finish(keys, cursor + 1, command)
+    Some(command)
+}
+
+fn line_operator_command(
+    character: char,
+    count: NonZeroU32,
+    register: Option<Register>,
+) -> Command {
+    let linewise = character == 'Y';
+    Command::ApplyOperator {
+        operator: match character {
+            'C' => Operator::Change,
+            'Y' => Operator::Yank,
+            _ => Operator::Delete,
+        },
+        motion: if linewise {
+            Motion::WholeLine
+        } else {
+            Motion::LineEnd
+        },
+        count,
+        register,
+        range_kind: if linewise {
+            RangeKind::LineWise
+        } else {
+            RangeKind::CharacterWise
+        },
+    }
+}
+
+fn substitute_command(character: char, count: NonZeroU32, register: Option<Register>) -> Command {
+    let linewise = character == 'S';
+    Command::ApplyOperator {
+        operator: Operator::Change,
+        motion: if linewise {
+            Motion::WholeLine
+        } else {
+            Motion::Right
+        },
+        count,
+        register,
+        range_kind: if linewise {
+            RangeKind::LineWise
+        } else {
+            RangeKind::CharacterWise
+        },
+    }
 }
 
 fn finish(keys: &[KeyEvent], cursor: usize, command: Command) -> Result<ParseResult, GrammarError> {

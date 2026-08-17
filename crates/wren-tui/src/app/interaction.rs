@@ -401,7 +401,7 @@ impl App {
         self.decorations.remove(&buffer_id);
         self.semantic_decorations.remove(&buffer_id);
         self.prime_active_syntax();
-        self.begin_lsp_start();
+        self.schedule_lsp_start();
         Ok(())
     }
 
@@ -506,7 +506,7 @@ impl App {
         }
         if let Some(lsp) = &mut self.lsp {
             if lsp.semantic_legend.is_some() {
-                lsp.semantic_due = Some(Instant::now() + Duration::from_millis(750));
+                lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
             }
         } else if self.lsp_start.is_some() || self.lsp_background.is_some() {
             self.lsp_semantic_dirty = true;

@@ -1,188 +1,285 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum HighlightStyle {
+    Keyword,
+    Comment,
+    Pink,
+    Sky,
+    Overlay,
+    Green,
+    Teal,
+    Peach,
+    Mauve,
+    Yellow,
+    ItalicYellow,
+    Blue,
+    Maroon,
+    Lavender,
+    Red,
+    Sapphire,
+    Text,
+    Raw,
+    Link,
+    Strong,
+    Italic,
+}
+
+struct HighlightRule {
+    style: HighlightStyle,
+    exact: &'static [&'static str],
+    prefixes: &'static [&'static str],
+    suffixes: &'static [&'static str],
+}
+
+impl HighlightRule {
+    fn matches(&self, kind: &str) -> bool {
+        self.exact.contains(&kind)
+            || self.prefixes.iter().any(|prefix| kind.starts_with(prefix))
+            || self.suffixes.iter().any(|suffix| kind.ends_with(suffix))
+    }
+}
+
+const HIGHLIGHT_RULES: &[HighlightRule] = &[
+    HighlightRule {
+        style: HighlightStyle::Keyword,
+        exact: &[
+            "conditional",
+            "repeat",
+            "exception",
+            "type.qualifier",
+            "type.definition",
+            "storage",
+            "storageclass",
+        ],
+        prefixes: &["keyword"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Comment,
+        exact: &[],
+        prefixes: &["comment"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Pink,
+        exact: &["include", "constant.macro", "function.macro"],
+        prefixes: &["preproc", "attribute", "decorator"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Sky,
+        exact: &["operator"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Overlay,
+        exact: &[],
+        prefixes: &["punctuation"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Pink,
+        exact: &["escape"],
+        prefixes: &["string.escape", "string.special"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Green,
+        exact: &[],
+        prefixes: &["string"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Pink,
+        exact: &[],
+        prefixes: &["character.special"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Teal,
+        exact: &[],
+        prefixes: &["character"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Peach,
+        exact: &["boolean", "float"],
+        prefixes: &["number", "constant"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Mauve,
+        exact: &["type.builtin"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Yellow,
+        exact: &["constructor"],
+        prefixes: &["type"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Peach,
+        exact: &["function.builtin"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Blue,
+        exact: &["tag"],
+        prefixes: &["function", "method"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Pink,
+        exact: &["variable.parameter.builtin"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Maroon,
+        exact: &["parameter"],
+        prefixes: &["variable.parameter"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Lavender,
+        exact: &["property", "field"],
+        prefixes: &["variable.member"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Teal,
+        exact: &["semantic.enum-member"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Yellow,
+        exact: &["semantic.event"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Pink,
+        exact: &["semantic.regexp"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Blue,
+        exact: &["semantic.decorator"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::ItalicYellow,
+        exact: &[
+            "semantic.namespace",
+            "tag.attribute",
+            "namespace",
+            "module",
+            "module.builtin",
+        ],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Red,
+        exact: &["variable.builtin"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Keyword,
+        exact: &[],
+        prefixes: &["markup.heading"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Raw,
+        exact: &[],
+        prefixes: &["markup.raw"],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Link,
+        exact: &[],
+        prefixes: &["markup.link"],
+        suffixes: &[".url"],
+    },
+    HighlightRule {
+        style: HighlightStyle::Strong,
+        exact: &["markup.strong"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Italic,
+        exact: &["markup.italic"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Sapphire,
+        exact: &["label", "symbol"],
+        prefixes: &[],
+        suffixes: &[],
+    },
+    HighlightRule {
+        style: HighlightStyle::Text,
+        exact: &[],
+        prefixes: &["variable"],
+        suffixes: &[],
+    },
+];
+
 pub(super) fn provider_decoration(span: HighlightSpan, theme: CatppuccinPalette) -> DecorationSpan {
-    let style = match span.kind.as_ref() {
-        kind if kind.starts_with("keyword")
-            || matches!(
-                kind,
-                "conditional"
-                    | "repeat"
-                    | "exception"
-                    | "type.qualifier"
-                    | "type.definition"
-                    | "storage"
-                    | "storageclass"
-            ) =>
-        {
-            CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(theme.mauve)),
-                ..CellStyle::default()
-            }
-        }
-        kind if kind.starts_with("comment") => CellStyle {
-            italic: true,
-            foreground: Some(CellColor::Rgb(theme.overlay2)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("preproc")
-            || kind.starts_with("attribute")
-            || kind.starts_with("decorator")
-            || matches!(kind, "include" | "constant.macro" | "function.macro") =>
-        {
-            CellStyle {
-                foreground: Some(CellColor::Rgb(theme.pink)),
-                ..CellStyle::default()
-            }
-        }
-        "operator" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.sky)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("punctuation") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.overlay2)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("string.escape")
-            || kind.starts_with("string.special")
-            || kind == "escape" =>
-        {
-            CellStyle {
-                foreground: Some(CellColor::Rgb(theme.pink)),
-                ..CellStyle::default()
-            }
-        }
-        kind if kind.starts_with("string") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.green)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("character.special") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.pink)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("character") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.teal)),
-            ..CellStyle::default()
-        },
-        kind if kind == "boolean"
-            || kind == "float"
-            || kind.starts_with("number")
-            || kind.starts_with("constant") =>
-        {
-            CellStyle {
-                foreground: Some(CellColor::Rgb(theme.peach)),
-                ..CellStyle::default()
-            }
-        }
-        "type.builtin" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.mauve)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("type") || kind == "constructor" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.yellow)),
-            ..CellStyle::default()
-        },
-        "function.builtin" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.peach)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("function") || kind.starts_with("method") || kind == "tag" => {
-            CellStyle {
-                foreground: Some(CellColor::Rgb(theme.blue)),
-                ..CellStyle::default()
-            }
-        }
-        "variable.parameter.builtin" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.pink)),
-            ..CellStyle::default()
-        },
-        kind if kind == "parameter" || kind.starts_with("variable.parameter") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.maroon)),
-            ..CellStyle::default()
-        },
-        kind if matches!(kind, "property" | "field") || kind.starts_with("variable.member") => {
-            CellStyle {
-                foreground: Some(CellColor::Rgb(theme.lavender)),
-                ..CellStyle::default()
-            }
-        }
-        "semantic.enum-member" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.teal)),
-            ..CellStyle::default()
-        },
-        "semantic.event" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.yellow)),
-            ..CellStyle::default()
-        },
-        "semantic.regexp" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.pink)),
-            ..CellStyle::default()
-        },
-        "semantic.decorator" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.blue)),
-            ..CellStyle::default()
-        },
-        "semantic.namespace" => CellStyle {
-            italic: true,
-            foreground: Some(CellColor::Rgb(theme.yellow)),
-            ..CellStyle::default()
-        },
-        "tag.attribute" => CellStyle {
-            italic: true,
-            foreground: Some(CellColor::Rgb(theme.yellow)),
-            ..CellStyle::default()
-        },
-        "variable.builtin" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.red)),
-            ..CellStyle::default()
-        },
-        "namespace" | "module" | "module.builtin" => CellStyle {
-            italic: true,
-            foreground: Some(CellColor::Rgb(theme.yellow)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("markup.heading") => CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(theme.mauve)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("markup.raw") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.green)),
-            background: Some(CellColor::Rgb(theme.surface0)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("markup.link") || kind.ends_with(".url") => CellStyle {
-            underline: true,
-            foreground: Some(CellColor::Rgb(theme.blue)),
-            ..CellStyle::default()
-        },
-        "markup.strong" => CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(theme.text)),
-            ..CellStyle::default()
-        },
-        "markup.italic" => CellStyle {
-            italic: true,
-            foreground: Some(CellColor::Rgb(theme.text)),
-            ..CellStyle::default()
-        },
-        "label" | "symbol" => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.sapphire)),
-            ..CellStyle::default()
-        },
-        kind if kind.starts_with("variable") => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.text)),
-            ..CellStyle::default()
-        },
-        _ => CellStyle {
-            foreground: Some(CellColor::Rgb(theme.text)),
-            ..CellStyle::default()
-        },
-    };
+    let style = HIGHLIGHT_RULES
+        .iter()
+        .find(|rule| rule.matches(&span.kind))
+        .map_or(HighlightStyle::Text, |rule| rule.style);
     DecorationSpan {
         range: span.range,
-        style,
+        style: highlight_cell_style(style, theme),
         priority: span.priority,
+    }
+}
+
+fn highlight_cell_style(style: HighlightStyle, theme: CatppuccinPalette) -> CellStyle {
+    let (foreground, bold, italic, underline, background) = match style {
+        HighlightStyle::Keyword => (theme.mauve, true, false, false, None),
+        HighlightStyle::Comment => (theme.overlay2, false, true, false, None),
+        HighlightStyle::Pink => (theme.pink, false, false, false, None),
+        HighlightStyle::Sky => (theme.sky, false, false, false, None),
+        HighlightStyle::Overlay => (theme.overlay2, false, false, false, None),
+        HighlightStyle::Green => (theme.green, false, false, false, None),
+        HighlightStyle::Teal => (theme.teal, false, false, false, None),
+        HighlightStyle::Peach => (theme.peach, false, false, false, None),
+        HighlightStyle::Mauve => (theme.mauve, false, false, false, None),
+        HighlightStyle::Yellow => (theme.yellow, false, false, false, None),
+        HighlightStyle::ItalicYellow => (theme.yellow, false, true, false, None),
+        HighlightStyle::Blue => (theme.blue, false, false, false, None),
+        HighlightStyle::Maroon => (theme.maroon, false, false, false, None),
+        HighlightStyle::Lavender => (theme.lavender, false, false, false, None),
+        HighlightStyle::Red => (theme.red, false, false, false, None),
+        HighlightStyle::Sapphire => (theme.sapphire, false, false, false, None),
+        HighlightStyle::Text => (theme.text, false, false, false, None),
+        HighlightStyle::Raw => (theme.green, false, false, false, Some(theme.surface0)),
+        HighlightStyle::Link => (theme.blue, false, false, true, None),
+        HighlightStyle::Strong => (theme.text, true, false, false, None),
+        HighlightStyle::Italic => (theme.text, false, true, false, None),
+    };
+    CellStyle {
+        bold,
+        italic,
+        underline,
+        foreground: Some(CellColor::Rgb(foreground)),
+        background: background.map(CellColor::Rgb),
+        ..CellStyle::default()
     }
 }
 

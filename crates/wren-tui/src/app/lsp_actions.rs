@@ -6,22 +6,45 @@ impl App {
             .filter(|server| executable_exists(&server.program))
     }
 
+    pub(super) fn schedule_lsp_start(&mut self) {
+        if self.lsp_background.is_some() || self.lsp_start.is_some() {
+            self.lsp_start_due = None;
+            return;
+        }
+        if self.reuse_active_lsp_or_reset() {
+            self.lsp_start_due = None;
+        } else if self.active_language_server().is_some() {
+            self.lsp_start_due = Some(Instant::now() + LSP_START_IDLE_PERIOD);
+        } else {
+            self.lsp_start_due = None;
+            if let Some(lsp) = &mut self.lsp {
+                lsp.semantic_due = None;
+            }
+        }
+    }
+
+    pub(super) fn defer_lsp_start_until_idle(&mut self) {
+        if self.lsp_start_due.is_some() {
+            self.lsp_start_due = Some(Instant::now() + LSP_START_IDLE_PERIOD);
+        }
+    }
+
+    pub(super) fn poll_lsp_start_due(&mut self) {
+        if self.lsp_start_due.is_some_and(|due| Instant::now() >= due) {
+            self.begin_lsp_start();
+        }
+    }
+
     pub(super) fn begin_lsp_start(&mut self) {
+        self.lsp_start_due = None;
         // A startup owns a live child as soon as its worker is spawned. Buffer
         // navigation must wait for it and attach the new document afterward,
         // never drop the receiver and implicitly kill/restart that child.
         if self.lsp_background.is_some() || self.lsp_start.is_some() {
             return;
         }
-        match self.reuse_lsp_for_active() {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                // Protocol failure is the one case where the selected client
-                // is no longer safe to retain and should be restarted.
-                self.lsp = None;
-                self.show_error(format!("language server: {error}"));
-            }
+        if self.reuse_active_lsp_or_reset() {
+            return;
         }
         // Visiting a help, generated, or otherwise unsupported buffer must
         // not tear down the root workspace's already-running server.
@@ -83,7 +106,7 @@ impl App {
                                     open_documents,
                                     semantic_due: semantic_legend
                                         .as_ref()
-                                        .map(|_| Instant::now() + Duration::from_millis(750)),
+                                        .map(|_| Instant::now() + LSP_SEMANTIC_IDLE_PERIOD),
                                     semantic_legend,
                                 }
                             })
@@ -110,54 +133,74 @@ impl App {
             }
         };
         self.lsp_start = None;
-        let ready_for_active = match result {
-            Ok(lsp) => {
-                self.lsp = Some(lsp);
-                match self.reuse_lsp_for_active() {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        if language_server_invocation(self.active.document.presentation_path())
-                            .is_none()
-                        {
-                            // The completed root server remains owned by the
-                            // workspace while a non-LSP buffer is active.
-                            if let Some(lsp) = &mut self.lsp {
-                                lsp.semantic_due = None;
-                            }
-                            self.lsp_semantic_dirty = false;
-                            false
-                        } else {
-                            self.begin_lsp_start();
-                            self.lsp_ready_for_active()
-                        }
-                    }
-                    Err(error) => {
-                        self.lsp = None;
-                        self.show_error(format!("language server: {error}"));
-                        self.begin_lsp_start();
-                        false
-                    }
-                }
-            }
+        let lsp = match result {
+            Ok(lsp) => lsp,
             Err(error) => {
                 self.show_error(format!("language server: {error}"));
                 return Ok(true);
             }
         };
+        self.lsp = Some(lsp);
+        let ready_for_active = self.activate_started_lsp();
         self.lsp_semantic_dirty = false;
         if !ready_for_active {
             return Ok(true);
         }
-        if let Some(method) = self.pending_lsp_location.take() {
-            if let Err(error) = self.start_lsp_location_request(&method) {
-                self.show_error(format!("{method}: {error}"));
+        self.resume_pending_lsp_request();
+        Ok(true)
+    }
+
+    fn reuse_active_lsp_or_reset(&mut self) -> bool {
+        match self.reuse_lsp_for_active() {
+            Ok(reused) => reused,
+            Err(error) => {
+                // Protocol failure is the one case where the selected client
+                // is no longer safe to retain and should be restarted.
+                self.lsp = None;
+                self.show_error(format!("language server: {error}"));
+                false
             }
-        } else if let Some(method) = self.pending_lsp_hover.take()
-            && let Err(error) = self.lsp_hover_ready(&method)
-        {
+        }
+    }
+
+    fn activate_started_lsp(&mut self) -> bool {
+        match self.reuse_lsp_for_active() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                self.lsp = None;
+                self.show_error(format!("language server: {error}"));
+            }
+        }
+        if self.active_language_server().is_none() {
+            // The completed root server remains owned by the workspace while
+            // a non-LSP buffer is active.
+            if let Some(lsp) = &mut self.lsp {
+                lsp.semantic_due = None;
+            }
+            return false;
+        }
+        self.begin_lsp_start();
+        self.lsp_ready_for_active()
+    }
+
+    fn resume_pending_lsp_request(&mut self) {
+        if let Some(method) = self.pending_lsp_location.take() {
+            let result = self.start_lsp_location_request(&method);
+            self.report_lsp_request_result(&method, result);
+            return;
+        }
+        let Some(method) = self.pending_lsp_hover.take() else {
+            return;
+        };
+        let result = self.lsp_hover_ready(&method);
+        self.report_lsp_request_result(&method, result);
+    }
+
+    fn report_lsp_request_result(&mut self, method: &str, result: Result<()>) {
+        if let Err(error) = result {
             self.show_error(format!("{method}: {error}"));
         }
-        Ok(true)
     }
 
     pub(super) fn lsp_ready_for_active(&self) -> bool {
@@ -220,7 +263,7 @@ impl App {
         lsp.semantic_due = lsp
             .semantic_legend
             .as_ref()
-            .map(|_| Instant::now() + Duration::from_millis(750));
+            .map(|_| Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
         Ok(true)
     }
 
@@ -423,7 +466,7 @@ impl App {
         thread::Builder::new()
             .name("wren-lsp-definition".to_owned())
             .spawn(move || {
-                let outcome = (|| -> Result<serde_json::Value, String> {
+                let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
                             .did_change_full(
@@ -445,6 +488,7 @@ impl App {
                                 "position": position,
                             }),
                         )
+                        .map(LspBackgroundPayload::Response)
                         .map_err(|error| error.to_string())
                 })();
                 let _ = sender.send(LspBackgroundResult {
@@ -502,12 +546,15 @@ impl App {
             if let Some(lsp) = &mut self.lsp
                 && lsp.semantic_legend.is_some()
             {
-                lsp.semantic_due = Some(Instant::now() + Duration::from_millis(750));
+                lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
             }
             self.lsp_semantic_dirty = false;
         }
         match (result.operation, result.outcome) {
-            (LspBackgroundOperation::Location { method }, Ok(value)) => {
+            (
+                LspBackgroundOperation::Location { method },
+                Ok(LspBackgroundPayload::Response(value)),
+            ) => {
                 if let Err(error) = self.finish_lsp_location(&method, &value) {
                     self.show_error(format!("{method}: {error}"));
                 }
@@ -518,7 +565,7 @@ impl App {
                     document_id,
                     revision,
                 },
-                Ok(value),
+                Ok(LspBackgroundPayload::Response(value)),
             ) => {
                 if self.active.document_id == document_id
                     && self.active.editor.revision() == revision
@@ -530,31 +577,24 @@ impl App {
                 LspBackgroundOperation::Semantic {
                     buffer_id,
                     revision,
-                    text,
-                    legend,
                 },
-                Ok(value),
+                Ok(LspBackgroundPayload::SemanticDecorations(spans)),
             ) => {
                 if self
                     .buffer(buffer_id)
                     .is_some_and(|buffer| buffer.editor.revision() == revision)
                 {
-                    let spans = parse_semantic_tokens(&text, &value, &legend)
-                        .into_iter()
-                        .map(|span| provider_decoration(span, self.theme))
-                        .collect();
-                    self.semantic_decorations
-                        .insert(buffer_id, BufferDecorations::new(revision, spans));
+                    self.semantic_decorations.insert(buffer_id, spans);
                 }
             }
+            (operation, Ok(_)) => {
+                let label = operation.label();
+                self.show_error(format!(
+                    "{label}: background worker returned the wrong result"
+                ));
+            }
             (operation, Err(error)) => {
-                let label = match operation {
-                    LspBackgroundOperation::Location { method } => method,
-                    LspBackgroundOperation::Hover { method, .. } => method,
-                    LspBackgroundOperation::Semantic { .. } => {
-                        "textDocument/semanticTokens/full".to_owned()
-                    }
-                };
+                let label = operation.label();
                 self.show_error(format!("{label}: {error}"));
             }
         }
@@ -602,18 +642,18 @@ impl App {
         let buffer_id = self.active.buffer_id;
         let revision = self.active.editor.revision();
         let text = self.active.editor.contents().into_boxed_str();
-        let request_text = text.clone();
+        let theme = self.theme;
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("wren-lsp-semantic".to_owned())
             .spawn(move || {
-                let outcome = (|| -> Result<serde_json::Value, String> {
+                let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
                             .did_change_full(
                                 &lsp.uri,
                                 i64::try_from(revision.get()).unwrap_or(i64::MAX),
-                                &request_text,
+                                &text,
                             )
                             .map_err(|error| error.to_string())?;
                         lsp.revision = revision;
@@ -621,20 +661,26 @@ impl App {
                             open.revision = revision;
                         }
                     }
-                    lsp.client
+                    let response = lsp
+                        .client
                         .request(
                             "textDocument/semanticTokens/full",
                             serde_json::json!({"textDocument": {"uri": lsp.uri}}),
                         )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| error.to_string())?;
+                    let spans = parse_semantic_tokens(&text, &response, &legend)
+                        .into_iter()
+                        .map(|span| provider_decoration(span, theme))
+                        .collect();
+                    Ok(LspBackgroundPayload::SemanticDecorations(
+                        BufferDecorations::new(revision, spans),
+                    ))
                 })();
                 let _ = sender.send(LspBackgroundResult {
                     lsp,
                     operation: LspBackgroundOperation::Semantic {
                         buffer_id,
                         revision,
-                        text,
-                        legend,
                     },
                     outcome,
                 });
@@ -693,7 +739,7 @@ impl App {
         thread::Builder::new()
             .name("wren-lsp-hover".to_owned())
             .spawn(move || {
-                let outcome = (|| -> Result<serde_json::Value, String> {
+                let outcome = (|| -> Result<LspBackgroundPayload, String> {
                     if lsp.revision != revision {
                         lsp.client
                             .did_change_full(
@@ -715,6 +761,7 @@ impl App {
                                 "position": position,
                             }),
                         )
+                        .map(LspBackgroundPayload::Response)
                         .map_err(|error| error.to_string())
                 })();
                 let _ = sender.send(LspBackgroundResult {

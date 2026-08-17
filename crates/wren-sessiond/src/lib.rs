@@ -521,7 +521,7 @@ impl SessionServer {
                 .document(document_id)
                 .ok_or(AuthorityError::UnknownDocument(document_id))?;
             (
-                authoritative.text.clone(),
+                authoritative.text(),
                 authoritative.revision,
                 authoritative.lease.lease_epoch,
                 session_epoch,
@@ -576,7 +576,7 @@ impl SessionServer {
             let document = authority
                 .document(request.document_id)
                 .ok_or(AuthorityError::UnknownDocument(request.document_id))?;
-            (document.text.clone(), document.revision)
+            (document.text(), document.revision)
         };
         if revision != request.required_frontier {
             return Err(ServerError::SaveFrontier {
@@ -801,7 +801,7 @@ mod tests {
             recovered
                 .document(DocumentId::new(9))
                 .expect("document")
-                .text,
+                .text(),
             "socket document"
         );
         let (_, heads) = SharedDocumentHeadReader::open(&head_path)
@@ -878,7 +878,7 @@ mod tests {
             recovered
                 .document(DocumentId::new(9))
                 .expect("document")
-                .text,
+                .text(),
             "document"
         );
         assert!(matches!(
@@ -892,7 +892,7 @@ mod tests {
             recovered
                 .document(DocumentId::new(9))
                 .expect("retried document")
-                .text,
+                .text(),
             "socket document"
         );
     }

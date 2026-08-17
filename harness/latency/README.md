@@ -6,8 +6,9 @@ Measures editor insert/delete/motion/operator/selection/viewport and
 completion-acceptance paths in two scopes. The component scope drives the
 engine and production `ClientViewModel` workspace composer. The full-product
 scope drives the real TUI `App` over a 14,000-line Rust file, including syntax,
-semantic/search/Git/diagnostic/selection decorations, overlays, the presenter,
-and the Termina writer. The report keeps both scopes explicit so a fast
+synthetic semantic/search/Git/diagnostic/selection decorations, overlays, the
+presenter, and the Termina writer. The synthetic semantic count is disclosed
+in the report; no live LSP response is implied. The report keeps both scopes explicit so a fast
 component result cannot be mistaken for a full-product result.
 
 Both desired-frame scopes retain the architecture's 77,654ns p99 and 100

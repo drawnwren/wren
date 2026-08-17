@@ -52,6 +52,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn status(&self) -> String {
         let mode = match self.active.editor.mode() {
             Mode::Normal => "NORMAL",
@@ -104,6 +105,14 @@ impl App {
     }
 
     pub(super) fn status_overlay(&self) -> StatusOverlay {
+        let (mode, styles) = self.status_mode_and_styles();
+        StatusOverlay {
+            left: self.left_status_segments(mode, styles),
+            right: self.right_status_segments(styles),
+        }
+    }
+
+    fn status_mode_and_styles(&self) -> ((&'static str, RgbColor), [CellStyle; 3]) {
         let mode = match self.active.editor.mode() {
             Mode::Normal => ("NORMAL", self.theme.blue),
             Mode::Insert => ("INSERT", self.theme.green),
@@ -111,42 +120,34 @@ impl App {
             Mode::Visual => ("VISUAL", self.theme.mauve),
             Mode::VisualLine => ("V-LINE", self.theme.mauve),
         };
-        let section_a = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.base)),
-            background: Some(CellColor::Rgb(mode.1)),
-            ..CellStyle::default()
-        };
-        let section_b = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.surface1)),
-            ..CellStyle::default()
-        };
-        let section_c = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
+        let styles = [
+            CellStyle {
+                bold: true,
+                foreground: Some(CellColor::Rgb(self.theme.base)),
+                background: Some(CellColor::Rgb(mode.1)),
+                ..CellStyle::default()
+            },
+            CellStyle {
+                bold: true,
+                foreground: Some(CellColor::Rgb(self.theme.text)),
+                background: Some(CellColor::Rgb(self.theme.surface1)),
+                ..CellStyle::default()
+            },
+            CellStyle {
+                foreground: Some(CellColor::Rgb(self.theme.text)),
+                background: Some(CellColor::Rgb(self.theme.mantle)),
+                ..CellStyle::default()
+            },
+        ];
+        (mode, styles)
+    }
+
+    fn left_status_segments(
+        &self,
+        mode: (&str, RgbColor),
+        [section_a, section_b, section_c]: [CellStyle; 3],
+    ) -> Vec<StatusSegment> {
         let path = self.active.name();
-        let flags = format!(
-            "{}{}{}",
-            if self.active.editor.is_dirty() {
-                " [+]"
-            } else {
-                ""
-            },
-            if self.active.editor.is_read_only() {
-                " [RO]"
-            } else {
-                ""
-            },
-            if self.active.mixed_line_endings {
-                " [mixed EOL]"
-            } else {
-                ""
-            }
-        );
         let mut left = vec![StatusSegment {
             text: format!(" {} ", mode.0).into(),
             style: section_a,
@@ -173,7 +174,7 @@ impl App {
             });
         }
         left.push(StatusSegment {
-            text: format!(" {path}{flags} ").into(),
+            text: format!(" {path}{} ", self.active_status_flags()).into(),
             style: section_c,
         });
         if !self.message.is_empty() {
@@ -185,7 +186,13 @@ impl App {
                 },
             });
         }
+        left
+    }
 
+    fn right_status_segments(
+        &self,
+        [section_a, section_b, section_c]: [CellStyle; 3],
+    ) -> Vec<StatusSegment> {
         let (line, column) = self.active.editor.cursor_line_column();
         let text = self.active.editor.text();
         let line_count = text.line_of_byte(text.len_bytes()).saturating_add(1);
@@ -194,7 +201,7 @@ impl App {
             .checked_div(line_count)
             .unwrap_or(100);
         let language = language_bundle(self.active.document.presentation_path()).language_id;
-        let right = vec![
+        vec![
             StatusSegment {
                 text: format!(" utf-8  unix  {language} ").into(),
                 style: section_c,
@@ -207,8 +214,18 @@ impl App {
                 text: format!(" {}:{} ", line + 1, column + 1).into(),
                 style: section_a,
             },
-        ];
-        StatusOverlay { left, right }
+        ]
+    }
+
+    fn active_status_flags(&self) -> String {
+        [
+            self.active.editor.is_dirty().then_some(" [+]"),
+            self.active.editor.is_read_only().then_some(" [RO]"),
+            self.active.mixed_line_endings.then_some(" [mixed EOL]"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub(super) fn expression_context(&self) -> ExpressionContext {

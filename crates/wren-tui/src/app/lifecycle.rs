@@ -26,14 +26,13 @@ impl App {
     ) -> Result<Self> {
         let buffer_id = BufferId::new(1);
         let document_id = stable_document_id(document.presentation_path());
-        let (mut active, mut message) =
+        let (mut active, opened_message) =
             BufferState::from_opened(buffer_id, document_id, document, opened, line, wal)?;
+        let mut messages = Vec::new();
+        push_message(&mut messages, opened_message);
         let (client_state_worker, client_state) = ClientStateWorker::open(ClientId::new(1))?;
         if let Err(error) = restore_client_state(&mut active, &client_state) {
-            if !message.is_empty() {
-                message.push_str("; ");
-            }
-            message.push_str(&format!("client state: {error}"));
+            messages.push(format!("client state: {error}"));
         }
         let name = active.name();
         let jump_history: Vec<JumpLocation> = client_state
@@ -56,19 +55,9 @@ impl App {
         let mutations = MutationWorker::start(&root_workspace)?;
         mutations.register(document_id, active.editor.frame().text.as_ref().to_owned())?;
         let (theme_flavor, theme, theme_message) = load_theme();
-        if !theme_message.is_empty() {
-            if !message.is_empty() {
-                message.push_str("; ");
-            }
-            message.push_str(&theme_message);
-        }
+        push_message(&mut messages, theme_message);
         let (keymap, keymap_message) = load_keymap();
-        if !keymap_message.is_empty() {
-            if !message.is_empty() {
-                message.push_str("; ");
-            }
-            message.push_str(&keymap_message);
-        }
+        push_message(&mut messages, keymap_message);
         let last_search_direction = if client_state.search_backward {
             SearchDirection::Backward
         } else {
@@ -87,6 +76,8 @@ impl App {
             provider: ProviderWorker::start()?,
             git_worker: GitHunkWorker::start()?,
             provider_submitted: BTreeMap::new(),
+            provider_refresh_due: BTreeMap::new(),
+            provider_refresh_ranges: BTreeMap::new(),
             decorations: BTreeMap::new(),
             semantic_decorations: BTreeMap::new(),
             prompt: None,
@@ -95,7 +86,7 @@ impl App {
             search_highlight: false,
             last_substitute: None,
             substitute_confirmation: None,
-            message,
+            message: messages.join("; "),
             tasks: TaskRunner::new(1, 8)?,
             active_task: None,
             next_task_id: 1,
@@ -124,6 +115,7 @@ impl App {
             lsp_completion: None,
             lsp: None,
             parked_lsps: Vec::new(),
+            lsp_start_due: None,
             lsp_start: None,
             lsp_background: None,
             lsp_semantic_dirty: false,
@@ -155,7 +147,14 @@ impl App {
         app.capture_debug_output();
         app.record_active_file();
         app.prime_active_syntax();
-        app.begin_lsp_start();
+        app.active.editor.prepare_realtime_navigation();
+        app.schedule_lsp_start();
         Ok(app)
+    }
+}
+
+fn push_message(messages: &mut Vec<String>, message: String) {
+    if !message.is_empty() {
+        messages.push(message);
     }
 }

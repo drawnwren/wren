@@ -78,15 +78,27 @@ pub(super) enum LspBackgroundOperation {
     Semantic {
         buffer_id: BufferId,
         revision: DocumentRevision,
-        text: Box<str>,
-        legend: SemanticTokenLegend,
     },
+}
+
+impl LspBackgroundOperation {
+    pub(super) fn label(&self) -> &str {
+        match self {
+            Self::Location { method } | Self::Hover { method, .. } => method,
+            Self::Semantic { .. } => "textDocument/semanticTokens/full",
+        }
+    }
+}
+
+pub(super) enum LspBackgroundPayload {
+    Response(serde_json::Value),
+    SemanticDecorations(BufferDecorations),
 }
 
 pub(super) struct LspBackgroundResult {
     pub(super) lsp: PersistentLsp,
     pub(super) operation: LspBackgroundOperation,
-    pub(super) outcome: Result<serde_json::Value, String>,
+    pub(super) outcome: Result<LspBackgroundPayload, String>,
 }
 
 pub(super) enum ProviderWorkerMessage {
@@ -193,9 +205,8 @@ fn git_hunk_loop(requests: mpsc::Receiver<GitHunkMessage>, results: mpsc::Sender
         loop {
             match requests.recv_timeout(Duration::from_millis(50)) {
                 Ok(GitHunkMessage::Refresh(newer)) => request = newer,
-                Ok(GitHunkMessage::Stop) => return,
+                Ok(GitHunkMessage::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
         let after = request.after.shared();
@@ -351,15 +362,17 @@ pub(super) fn provider_loop(
     // A viewport demand is not a document update. Keeping these identities
     // separate avoids serializing and reparsing the entire buffer on every
     // scroll while still replacing the provider snapshot on each revision.
-    let mut uploaded =
-        BTreeMap::<DocumentId, (DocumentRevision, wren_types::ProviderGeneration)>::new();
+    let mut uploaded = UploadedProviderDocuments::new();
+    let mut pending = std::collections::VecDeque::new();
     loop {
-        let Some(message) = next_provider_message(&requests, &immediate_requests) else {
+        let Some(message) = next_provider_message(&requests, &immediate_requests, &mut pending)
+        else {
             return;
         };
         match message {
             ProviderWorkerMessage::Refresh(refresh) => {
-                let result = refresh_provider(*refresh, &mut uploaded, &mut request);
+                let refresh = coalesce_provider_refresh(*refresh, &requests, &mut pending);
+                let result = refresh_provider(refresh, &mut uploaded, &mut request);
                 if results.send(result).is_err() {
                     return;
                 }
@@ -379,17 +392,55 @@ pub(super) fn provider_loop(
     }
 }
 
-type UploadedProviderDocuments =
-    BTreeMap<DocumentId, (DocumentRevision, wren_types::ProviderGeneration)>;
+struct UploadedProviderDocument {
+    revision: DocumentRevision,
+    generation: wren_types::ProviderGeneration,
+    text: Arc<str>,
+}
+
+type UploadedProviderDocuments = BTreeMap<DocumentId, UploadedProviderDocument>;
 
 fn next_provider_message(
     requests: &mpsc::Receiver<ProviderWorkerMessage>,
     immediate_requests: &mpsc::Receiver<ProviderWorkerMessage>,
+    pending: &mut std::collections::VecDeque<ProviderWorkerMessage>,
 ) -> Option<ProviderWorkerMessage> {
     match immediate_requests.try_recv() {
         Ok(message) => Some(message),
-        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => requests.recv().ok(),
+        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+            pending.pop_front().or_else(|| requests.recv().ok())
+        }
     }
+}
+
+fn coalesce_provider_refresh(
+    mut newest: ProviderRefresh,
+    requests: &mpsc::Receiver<ProviderWorkerMessage>,
+    pending: &mut std::collections::VecDeque<ProviderWorkerMessage>,
+) -> ProviderRefresh {
+    while let Ok(message) = requests.try_recv() {
+        match message {
+            ProviderWorkerMessage::Refresh(candidate)
+                if candidate.document_id == newest.document_id =>
+            {
+                newest = *candidate;
+            }
+            ProviderWorkerMessage::Refresh(candidate) => {
+                if let Some(ProviderWorkerMessage::Refresh(queued)) =
+                    pending.iter_mut().find(|message| {
+                        matches!(message, ProviderWorkerMessage::Refresh(queued) if queued.document_id == candidate.document_id)
+                    })
+                {
+                    *queued = candidate;
+                } else {
+                    pending.push_back(ProviderWorkerMessage::Refresh(candidate));
+                }
+            }
+            ProviderWorkerMessage::Wake => {}
+            control => pending.push_back(control),
+        }
+    }
+    newest
 }
 
 fn unexpected_provider_response(
@@ -409,9 +460,40 @@ fn ensure_provider_document(
     uploaded: &mut UploadedProviderDocuments,
     request: &mut impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) -> Result<(), wren_provider::ProviderError> {
-    let identity = (revision, bundle.provider_generation());
-    if uploaded.get(&document_id) == Some(&identity) {
+    let generation = bundle.provider_generation();
+    if uploaded
+        .get(&document_id)
+        .is_some_and(|document| document.revision == revision && document.generation == generation)
+    {
         return Ok(());
+    }
+    if let Some(document) = uploaded.get(&document_id)
+        && document.generation == generation
+        && document.text.as_ref() == text.as_ref()
+    {
+        let from_revision = document.revision;
+        return match request(&ProviderRequest::AdvanceDocumentRevision {
+            document_id,
+            from_revision,
+            revision,
+            generation,
+        })? {
+            ProviderResponse::Updated { .. } => {
+                uploaded.insert(
+                    document_id,
+                    UploadedProviderDocument {
+                        revision,
+                        generation,
+                        text,
+                    },
+                );
+                Ok(())
+            }
+            response => Err(unexpected_provider_response(
+                "document revision advance",
+                response,
+            )),
+        };
     }
     match request(&ProviderRequest::UpdateDocument {
         document_id,
@@ -420,7 +502,14 @@ fn ensure_provider_document(
         bundle,
     })? {
         ProviderResponse::Updated { .. } => {
-            uploaded.insert(document_id, identity);
+            uploaded.insert(
+                document_id,
+                UploadedProviderDocument {
+                    revision,
+                    generation,
+                    text,
+                },
+            );
             Ok(())
         }
         response => Err(unexpected_provider_response("document update", response)),

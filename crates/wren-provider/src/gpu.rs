@@ -17,6 +17,13 @@ struct Buffers {
     output_capacity: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DispatchSize {
+    input: usize,
+    output: usize,
+    workgroups: u32,
+}
+
 pub(super) struct GpuLexical {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -115,6 +122,21 @@ impl GpuLexical {
     }
 
     pub(super) fn classify(&mut self, text: &str) -> Result<Vec<Range<usize>>, String> {
+        let size = self.validate_dispatch(text)?;
+        self.ensure_capacity(
+            u64::try_from(size.input).map_err(|error| error.to_string())?,
+            u64::try_from(size.output).map_err(|error| error.to_string())?,
+        );
+        self.upload_text(text, size.input)?;
+        let buffers = self
+            .buffers
+            .as_ref()
+            .ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
+        let submission = self.submit(buffers, size)?;
+        self.read_ranges(buffers, submission, size.output, text)
+    }
+
+    fn validate_dispatch(&self, text: &str) -> Result<DispatchSize, String> {
         if !text.is_ascii() {
             return Err("GPU lexical classifier currently requires ASCII input".to_owned());
         }
@@ -124,27 +146,32 @@ impl GpuLexical {
         if self.failed.load(Ordering::Acquire) {
             return Err("GPU lexical classifier device is unavailable".to_owned());
         }
-
-        let input_size =
+        let input =
             input_size(text.len()).ok_or_else(|| "GPU input buffer size overflow".to_owned())?;
-        let output_size =
+        let output =
             output_size(text.len()).ok_or_else(|| "GPU output buffer size overflow".to_owned())?;
-        self.ensure_capacity(
-            u64::try_from(input_size).map_err(|error| error.to_string())?,
-            u64::try_from(output_size).map_err(|error| error.to_string())?,
-        );
+        let workgroups = u32::try_from((output / 4).div_ceil(workgroup_size()))
+            .map_err(|error| error.to_string())?;
+        Ok(DispatchSize {
+            input,
+            output,
+            workgroups,
+        })
+    }
+
+    fn upload_text(&mut self, text: &str, input_size: usize) -> Result<(), String> {
         let buffers = self
             .buffers
             .as_ref()
             .ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
-        if input_size == text.len() {
-            self.queue.write_buffer(&buffers.input, 0, text.as_bytes());
+        let input = if input_size == text.len() {
+            text.as_bytes()
         } else {
             self.upload.resize(input_size, 0);
             self.upload[..text.len()].copy_from_slice(text.as_bytes());
-            self.upload[text.len()..].fill(0);
-            self.queue.write_buffer(&buffers.input, 0, &self.upload);
-        }
+            &self.upload
+        };
+        self.queue.write_buffer(&buffers.input, 0, input);
         let mut params = [0_u8; 16];
         params[..4].copy_from_slice(
             &u32::try_from(text.len())
@@ -152,7 +179,14 @@ impl GpuLexical {
                 .to_le_bytes(),
         );
         self.queue.write_buffer(&self.params, 0, &params);
+        Ok(())
+    }
 
+    fn submit(
+        &self,
+        buffers: &Buffers,
+        size: DispatchSize,
+    ) -> Result<wgpu::SubmissionIndex, String> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -165,22 +199,25 @@ impl GpuLexical {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &buffers.bind_group, &[]);
-            let output_words = output_size / 4;
-            let workgroups = output_words.div_ceil(workgroup_size());
-            pass.dispatch_workgroups(
-                u32::try_from(workgroups).map_err(|error| error.to_string())?,
-                1,
-                1,
-            );
+            pass.dispatch_workgroups(size.workgroups, 1, 1);
         }
         encoder.copy_buffer_to_buffer(
             &buffers.output,
             0,
             &buffers.readback,
             0,
-            u64::try_from(output_size).map_err(|error| error.to_string())?,
+            u64::try_from(size.output).map_err(|error| error.to_string())?,
         );
-        let submission = self.queue.submit([encoder.finish()]);
+        Ok(self.queue.submit([encoder.finish()]))
+    }
+
+    fn read_ranges(
+        &self,
+        buffers: &Buffers,
+        submission: wgpu::SubmissionIndex,
+        output_size: usize,
+        text: &str,
+    ) -> Result<Vec<Range<usize>>, String> {
         let slice = buffers
             .readback
             .slice(..u64::try_from(output_size).map_err(|error| error.to_string())?);
@@ -202,27 +239,12 @@ impl GpuLexical {
             buffers.readback.unmap();
             return Err("GPU lexical classifier reported a device error".to_owned());
         }
-
-        let mapped = slice
+        let result = slice
             .get_mapped_range()
-            .map_err(|error| format!("read GPU lexical classifier result: {error}"))?;
-        let mut ranges = Vec::new();
-        for (word_index, bytes) in mapped.chunks_exact(4).enumerate() {
-            let mut starts = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            while starts != 0 {
-                let bit = usize::try_from(starts.trailing_zeros()).unwrap_or(0);
-                let start = word_index * 32 + bit;
-                if start < text.len()
-                    && let Some(length) = keyword_length_at(text.as_bytes(), start)
-                {
-                    ranges.push(start..start + length);
-                }
-                starts &= starts - 1;
-            }
-        }
-        drop(mapped);
+            .map_err(|error| format!("read GPU lexical classifier result: {error}"))
+            .map(|mapped| decode_ranges(&mapped, text));
         buffers.readback.unmap();
-        Ok(ranges)
+        result
     }
 
     fn ensure_capacity(&mut self, input_required: u64, output_required: u64) {
@@ -284,6 +306,24 @@ impl GpuLexical {
             output_capacity,
         });
     }
+}
+
+fn decode_ranges(mapped: &[u8], text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    for (word_index, bytes) in mapped.chunks_exact(4).enumerate() {
+        let mut starts = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        while starts != 0 {
+            let bit = usize::try_from(starts.trailing_zeros()).unwrap_or(0);
+            let start = word_index * 32 + bit;
+            if start < text.len()
+                && let Some(length) = keyword_length_at(text.as_bytes(), start)
+            {
+                ranges.push(start..start + length);
+            }
+            starts &= starts - 1;
+        }
+    }
+    ranges
 }
 
 fn input_size(length: usize) -> Option<usize> {

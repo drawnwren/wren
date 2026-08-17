@@ -1352,6 +1352,12 @@ pub struct GitHunk {
 
 #[must_use]
 pub fn git_hunks(before: &str, after: &str) -> Vec<GitHunk> {
+    // The editor deliberately debounces buffer diffs. Insert/backspace pairs
+    // commonly return to the index contents before the worker runs; avoid
+    // interning and histogram-diffing the whole file in that case.
+    if before == after {
+        return Vec::new();
+    }
     let input = InternedInput::new(before, after);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);

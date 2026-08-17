@@ -205,6 +205,21 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     }
     let argument = tail.trim_start();
 
+    parse_named_ex(range, name, bang, argument)
+}
+
+fn parse_named_ex(
+    range: Option<ExRange>,
+    name: &str,
+    bang: bool,
+    argument: &str,
+) -> Result<ExCommand, ExError> {
+    if let Some(action) = buffer_action(name) {
+        return buffer(action, bang, argument);
+    }
+    if let Some(action) = tab_action(name) {
+        return tab(action, argument);
+    }
     match name {
         "s" | "substitute" => parse_substitute(range, argument),
         "g" | "global" => parse_global(range, false, argument, name),
@@ -236,12 +251,6 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
             bang,
             path: optional_argument(argument),
         }),
-        "bn" | "bnext" => buffer(BufferAction::Next, bang, argument),
-        "bp" | "bprevious" => buffer(BufferAction::Previous, bang, argument),
-        "bf" | "bfirst" => buffer(BufferAction::First, bang, argument),
-        "bl" | "blast" => buffer(BufferAction::Last, bang, argument),
-        "bd" | "bdelete" => buffer(BufferAction::Delete, bang, argument),
-        "b" | "buffer" => buffer(BufferAction::Select, bang, argument),
         "sp" | "split" => Ok(ExCommand::Split {
             vertical: false,
             path: optional_argument(argument),
@@ -251,12 +260,6 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
             path: optional_argument(argument),
         }),
         "clo" | "close" => Ok(ExCommand::Close { bang }),
-        "tabnew" | "tabe" | "tabedit" => tab(TabAction::New, argument),
-        "tabn" | "tabnext" => tab(TabAction::Next, argument),
-        "tabp" | "tabprevious" => tab(TabAction::Previous, argument),
-        "tabfirst" => tab(TabAction::First, argument),
-        "tablast" => tab(TabAction::Last, argument),
-        "tabclose" => tab(TabAction::Close, argument),
         "marks" => Ok(ExCommand::Marks {
             names: argument.into(),
         }),
@@ -264,21 +267,7 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
             names: argument.into(),
         }),
         "grep" | "vimgrep" => parse_grep(argument, name),
-        "cdo" => {
-            if argument.is_empty() {
-                return Err(ExError::MissingArgument {
-                    command: name.into(),
-                });
-            }
-            parse_ex(argument)
-                .map(|command| ExCommand::Cdo {
-                    command: Box::new(command),
-                })
-                .map_err(|source| ExError::Nested {
-                    command: name.into(),
-                    source: Box::new(source),
-                })
-        }
+        "cdo" => parse_cdo(argument, name),
         "u" | "undo" => Ok(ExCommand::Undo),
         "redo" => Ok(ExCommand::Redo),
         "echo" => Ok(ExCommand::Echo {
@@ -290,38 +279,89 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
         }),
         "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
         "convertutf8" => Ok(ExCommand::ConvertUtf8),
-        "term" | "terminal" => {
-            let mut words = argument.split_whitespace();
-            Ok(ExCommand::Terminal {
-                program: words.next().map(Into::into),
-                arguments: words.map(Into::into).collect(),
-            })
-        }
-        "make" => {
-            let mut words = argument.split_whitespace();
-            let program = words.next().ok_or_else(|| ExError::MissingArgument {
-                command: name.into(),
-            })?;
-            Ok(ExCommand::Make {
-                program: program.into(),
-                arguments: words.map(Into::into).collect(),
-            })
-        }
-        "format" => {
-            let mut words = argument.split_whitespace();
-            let program = words.next().ok_or_else(|| ExError::MissingArgument {
-                command: name.into(),
-            })?;
-            Ok(ExCommand::Format {
-                program: program.into(),
-                arguments: words.map(Into::into).collect(),
-            })
-        }
+        "term" | "terminal" => Ok(parse_terminal(argument)),
+        "make" => parse_required_process(argument, name, ProcessCommand::Make),
+        "format" => parse_required_process(argument, name, ProcessCommand::Format),
         "find" => Ok(ExCommand::Find {
             query: argument.into(),
         }),
         _ => Err(ExError::UnknownCommand(name.into())),
     }
+}
+
+fn buffer_action(name: &str) -> Option<BufferAction> {
+    match name {
+        "bn" | "bnext" => Some(BufferAction::Next),
+        "bp" | "bprevious" => Some(BufferAction::Previous),
+        "bf" | "bfirst" => Some(BufferAction::First),
+        "bl" | "blast" => Some(BufferAction::Last),
+        "bd" | "bdelete" => Some(BufferAction::Delete),
+        "b" | "buffer" => Some(BufferAction::Select),
+        _ => None,
+    }
+}
+
+fn tab_action(name: &str) -> Option<TabAction> {
+    match name {
+        "tabnew" | "tabe" | "tabedit" => Some(TabAction::New),
+        "tabn" | "tabnext" => Some(TabAction::Next),
+        "tabp" | "tabprevious" => Some(TabAction::Previous),
+        "tabfirst" => Some(TabAction::First),
+        "tablast" => Some(TabAction::Last),
+        "tabclose" => Some(TabAction::Close),
+        _ => None,
+    }
+}
+
+fn parse_cdo(argument: &str, name: &str) -> Result<ExCommand, ExError> {
+    if argument.is_empty() {
+        return Err(ExError::MissingArgument {
+            command: name.into(),
+        });
+    }
+    parse_ex(argument)
+        .map(|command| ExCommand::Cdo {
+            command: Box::new(command),
+        })
+        .map_err(|source| ExError::Nested {
+            command: name.into(),
+            source: Box::new(source),
+        })
+}
+
+fn parse_terminal(argument: &str) -> ExCommand {
+    let mut words = argument.split_whitespace();
+    ExCommand::Terminal {
+        program: words.next().map(Into::into),
+        arguments: words.map(Into::into).collect(),
+    }
+}
+
+enum ProcessCommand {
+    Make,
+    Format,
+}
+
+fn parse_required_process(
+    argument: &str,
+    name: &str,
+    command: ProcessCommand,
+) -> Result<ExCommand, ExError> {
+    let mut words = argument.split_whitespace();
+    let program = words.next().ok_or_else(|| ExError::MissingArgument {
+        command: name.into(),
+    })?;
+    let arguments = words.map(Into::into).collect();
+    Ok(match command {
+        ProcessCommand::Make => ExCommand::Make {
+            program: program.into(),
+            arguments,
+        },
+        ProcessCommand::Format => ExCommand::Format {
+            program: program.into(),
+            arguments,
+        },
+    })
 }
 
 fn parse_range(input: &str) -> Result<(Option<ExRange>, &str), ExError> {

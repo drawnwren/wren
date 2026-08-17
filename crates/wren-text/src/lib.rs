@@ -95,6 +95,15 @@ pub struct CropText {
     rope: crop::Rope,
 }
 
+impl CropText {
+    #[must_use]
+    pub fn from_string(text: String) -> Self {
+        Self {
+            rope: crop::Rope::from(text),
+        }
+    }
+}
+
 /// Chosen Phase-0 default; see `docs/decisions/0002-textstore.md`.
 pub type DefaultText = CropText;
 
@@ -102,9 +111,7 @@ impl TextStore for CropText {
     fn from_reader(mut reader: impl Read) -> io::Result<Self> {
         let mut text = String::new();
         reader.read_to_string(&mut text)?;
-        Ok(Self {
-            rope: crop::Rope::from(text),
-        })
+        Ok(Self::from_string(text))
     }
 
     fn len_bytes(&self) -> usize {

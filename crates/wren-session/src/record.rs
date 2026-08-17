@@ -21,6 +21,17 @@ pub(crate) fn append<T: Serialize>(
     magic: &[u8; 8],
     value: &T,
 ) -> Result<(), RecordError> {
+    append_many(path, magic, std::slice::from_ref(value))
+}
+
+pub(crate) fn append_many<T: Serialize>(
+    path: &Path,
+    magic: &[u8; 8],
+    values: &[T],
+) -> Result<(), RecordError> {
+    if values.is_empty() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(RecordError::Io)?;
     }
@@ -29,7 +40,7 @@ pub(crate) fn append<T: Serialize>(
         .append(true)
         .open(path)
         .map_err(RecordError::Io)?;
-    write(&mut file, magic, value)?;
+    write_many(&mut file, magic, values)?;
     file.sync_data().map_err(RecordError::Io)
 }
 
@@ -38,17 +49,31 @@ pub(crate) fn write<T: Serialize>(
     magic: &[u8; 8],
     value: &T,
 ) -> Result<(), RecordError> {
-    let payload = serde_json::to_vec(value).map_err(RecordError::Serialization)?;
-    let length = u64::try_from(payload.len()).map_err(|_| RecordError::Malformed {
-        offset: 0,
-        reason: "record length exceeds u64".into(),
-    })?;
-    let mut record = Vec::with_capacity(magic.len() + LENGTH_LEN + CHECKSUM_LEN + payload.len());
-    record.extend_from_slice(magic);
-    record.extend_from_slice(&length.to_le_bytes());
-    record.extend_from_slice(blake3::hash(&payload).as_bytes());
-    record.extend_from_slice(&payload);
-    writer.write_all(&record).map_err(RecordError::Io)
+    write_many(writer, magic, std::slice::from_ref(value))
+}
+
+/// Serializes a group of independently recoverable records into one write.
+/// Callers choose the durability frontier (for example `sync_data` or an
+/// `O_DSYNC` descriptor) after this returns.
+pub(crate) fn write_many<T: Serialize>(
+    writer: &mut impl Write,
+    magic: &[u8; 8],
+    values: &[T],
+) -> Result<(), RecordError> {
+    let mut records = Vec::new();
+    for value in values {
+        let payload = serde_json::to_vec(value).map_err(RecordError::Serialization)?;
+        let length = u64::try_from(payload.len()).map_err(|_| RecordError::Malformed {
+            offset: 0,
+            reason: "record length exceeds u64".into(),
+        })?;
+        records.reserve(magic.len() + LENGTH_LEN + CHECKSUM_LEN + payload.len());
+        records.extend_from_slice(magic);
+        records.extend_from_slice(&length.to_le_bytes());
+        records.extend_from_slice(blake3::hash(&payload).as_bytes());
+        records.extend_from_slice(&payload);
+    }
+    writer.write_all(&records).map_err(RecordError::Io)
 }
 
 pub(crate) fn recover<T: DeserializeOwned>(

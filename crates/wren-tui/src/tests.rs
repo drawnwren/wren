@@ -4,6 +4,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
+// Debug unit tests share the process with dozens of parser/provider threads;
+// release keeps the product budget while the hard isolated distributions live
+// in `wren-latency`.
+const fn test_latency_budget(release: Duration, debug: Duration) -> Duration {
+    if cfg!(debug_assertions) {
+        debug
+    } else {
+        release
+    }
+}
+
 fn terminal_character(character: char) -> TerminalKey {
     TerminalKey {
         code: TerminalKeyCode::Char(character),
@@ -12,6 +23,28 @@ fn terminal_character(character: char) -> TerminalKey {
         alt: false,
         super_key: false,
     }
+}
+
+fn terminal_key(code: TerminalKeyCode) -> TerminalKey {
+    TerminalKey {
+        code,
+        shift: false,
+        control: false,
+        alt: false,
+        super_key: false,
+    }
+}
+
+fn type_prompt(app: &mut App, text: &str) {
+    for character in text.chars() {
+        app.handle_prompt_key(terminal_character(character))
+            .expect("type prompt");
+    }
+}
+
+fn submit_prompt(app: &mut App) {
+    app.handle_prompt_key(terminal_key(TerminalKeyCode::Enter))
+        .expect("submit prompt");
 }
 
 #[cfg(unix)]
@@ -111,6 +144,45 @@ fn wal_worker_observes_barriers_and_clear() {
     assert!(wal.recover_latest().expect("recover").is_some());
     worker.clear().expect("clear");
     assert_eq!(wal.recover_latest().expect("recover"), None);
+}
+
+#[test]
+fn wal_worker_coalesces_a_burst_without_losing_the_latest_revision() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let wal = LocalWal::in_directory(directory.path(), b"app-coalescing-test");
+    let worker = WalWorker::start(wal.clone());
+    for revision in 1..=100 {
+        worker.append_frame(
+            [0; 32],
+            revision,
+            FrameText::from(format!("revision {revision}")),
+            revision as usize,
+        );
+    }
+    worker.barrier().expect("barrier");
+
+    let recovered = wal
+        .recover_latest()
+        .expect("recover latest")
+        .expect("recovery state");
+    assert_eq!(recovered.revision, 100);
+    assert_eq!(recovered.text, "revision 100");
+    assert_eq!(recovered.cursor, 100);
+}
+
+#[test]
+fn wal_worker_removes_recovery_state_when_edits_return_to_the_saved_base() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let wal = LocalWal::in_directory(directory.path(), b"app-clean-state-test");
+    let worker = WalWorker::start(wal.clone());
+    let base_hash = *blake3::hash(b"base").as_bytes();
+    worker.append_frame(base_hash, 1, FrameText::from("changed"), 7);
+    worker.barrier().expect("dirty barrier");
+    assert!(wal.recover_latest().expect("dirty recovery").is_some());
+
+    worker.append_frame(base_hash, 2, FrameText::from("base"), 4);
+    worker.barrier().expect("clean barrier");
+    assert_eq!(wal.recover_latest().expect("clean recovery"), None);
 }
 
 #[test]
@@ -423,7 +495,8 @@ fn full_syntax_is_ready_on_file_open_viewport_change_and_buffer_change() {
     let mut app = App::open(Some(&first), None).expect("open first");
     app.format_on_save = false;
     assert!(
-        opened_at.elapsed() < Duration::from_millis(250),
+        opened_at.elapsed()
+            < test_latency_budget(Duration::from_millis(250), Duration::from_millis(500)),
         "initial full syntax exceeded first-frame latency budget: {:?}",
         opened_at.elapsed()
     );
@@ -478,17 +551,16 @@ fn full_syntax_is_ready_on_file_open_viewport_change_and_buffer_change() {
         .get(&app.active.buffer_id)
         .expect("changed syntax");
     assert_eq!(changed.revision, app.active.editor.revision());
+    let changed_spans = changed.spans_in(0..app.active.editor.text().len_bytes());
     assert!(
-        changed
-            .spans
+        changed_spans
             .iter()
             .any(|span| span.range.start == 0 && span.range.end >= 3),
         "newly inserted keyword must be highlighted before provider polling"
     );
     let shifted_last = last_function + "pub ".len();
     assert!(
-        changed
-            .spans
+        changed_spans
             .iter()
             .any(|span| span.range.contains(&shifted_last))
     );
@@ -496,7 +568,8 @@ fn full_syntax_is_ready_on_file_open_viewport_change_and_buffer_change() {
     let second_opened_at = Instant::now();
     app.open_buffer(&second).expect("open second");
     assert!(
-        second_opened_at.elapsed() < Duration::from_millis(250),
+        second_opened_at.elapsed()
+            < test_latency_budget(Duration::from_millis(250), Duration::from_millis(500)),
         "new-buffer syntax exceeded first-frame latency budget: {:?}",
         second_opened_at.elapsed()
     );
@@ -536,8 +609,37 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
         .decorations
         .get(&app.active.buffer_id)
         .map_or(0, |state| state.spans.len());
+    let semantic = app
+        .decorations
+        .get(&app.active.buffer_id)
+        .map(|decorations| {
+            decorations
+                .spans
+                .iter()
+                .step_by(6)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    app.semantic_decorations.insert(
+        app.active.buffer_id,
+        BufferDecorations::new(app.active.editor.revision(), semantic),
+    );
+    app.active
+        .editor
+        .search("value_", SearchDirection::Forward)
+        .expect("search highlight");
+    app.search_highlight = true;
+    app.diagnostics.push(DiagnosticEntry {
+        path: source.clone(),
+        line: 1,
+        column: 1,
+        severity: DiagnosticSeverity::Warning,
+        message: "benchmark diagnostic".to_owned(),
+    });
     let mut layout = ViewportLayout::new(120, 40);
     layout.configure_dotfile_profile();
+    app.resize_terminal(40, 120);
     app.schedule_provider_refreshes(layout.height);
     let (_frame, first_frame) = desired_frame_profiled(&mut layout, &app);
     let last_line = app.active.editor.text().byte_of_line(13_999);
@@ -548,6 +650,17 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     app.schedule_provider_refreshes(layout.height);
     let navigation_schedule_elapsed = navigation_schedule_at.elapsed();
     let (_frame, navigation_frame) = desired_frame_profiled(&mut layout, &app);
+    app.dispatch_key(KeyEvent::character('h'));
+    let (_frame, local_motion_frame) = desired_frame_profiled(&mut layout, &app);
+    app.handle_editor_key(TerminalKey {
+        code: TerminalKeyCode::Char('u'),
+        shift: false,
+        control: true,
+        alt: false,
+        super_key: false,
+    })
+    .expect("half-page viewport motion");
+    let (_frame, viewport_frame) = desired_frame_profiled(&mut layout, &app);
     app.dispatch_key(KeyEvent::character('i'));
     let edit_input_at = Instant::now();
     app.dispatch_key(KeyEvent::character('x'));
@@ -556,15 +669,19 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     app.schedule_provider_refreshes(layout.height);
     let edit_schedule_elapsed = edit_schedule_at.elapsed();
     let (_frame, edit_frame) = desired_frame_profiled(&mut layout, &app);
+    app.dispatch_key(KeyEvent::plain(KeyCode::Escape));
+    app.dispatch_key(KeyEvent::character('v'));
+    app.dispatch_key(KeyEvent::character('h'));
+    let (_frame, selection_frame) = desired_frame_profiled(&mut layout, &app);
     eprintln!(
-        "large Rust gate: open={open_elapsed:?} first_frame=[{first_frame}] navigation_input={navigation_input_elapsed:?} navigation_schedule={navigation_schedule_elapsed:?} navigation_frame=[{navigation_frame}] edit_input={edit_input_elapsed:?} edit_schedule={edit_schedule_elapsed:?} edit_frame=[{edit_frame}] spans={span_count}"
+        "large Rust gate: open={open_elapsed:?} first_frame=[{first_frame}] navigation_input={navigation_input_elapsed:?} navigation_schedule={navigation_schedule_elapsed:?} navigation_frame=[{navigation_frame}] local_motion_frame=[{local_motion_frame}] viewport_frame=[{viewport_frame}] edit_input={edit_input_elapsed:?} edit_schedule={edit_schedule_elapsed:?} edit_frame=[{edit_frame}] selection_frame=[{selection_frame}] spans={span_count}"
     );
     assert!(
         span_count >= 42_000,
         "large-file gate must retain full syntax"
     );
     assert!(
-        open_elapsed < Duration::from_secs(1),
+        open_elapsed < test_latency_budget(Duration::from_secs(1), Duration::from_secs(2)),
         "large-file open took {open_elapsed:?}"
     );
     assert!(
@@ -714,12 +831,157 @@ fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
         .expect("stop provider");
     worker.join().expect("provider worker");
     assert_eq!(updates.load(Ordering::Relaxed), 1);
+    let completed_demands = receiver
+        .try_iter()
+        .filter(|result| matches!(result, ProviderWorkerResult::Decorations { .. }))
+        .count();
+    assert!((1..=2).contains(&completed_demands));
+}
+
+#[test]
+fn background_provider_coalesces_queued_stale_document_revisions() {
+    let (sender, requests) = mpsc::channel();
+    let (_immediate_sender, immediate_requests) = mpsc::channel();
+    let (results, _receiver) = mpsc::channel();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&updates);
+    let worker = thread::spawn(move || {
+        let mut actor = ProviderActor::default();
+        let mut first = true;
+        provider_loop(requests, immediate_requests, results, |request| {
+            if let ProviderRequest::UpdateDocument { revision, .. } = request {
+                observed.lock().expect("updates").push(*revision);
+                if first {
+                    first = false;
+                    started_sender.send(()).expect("started");
+                    release_receiver.recv().expect("release");
+                }
+            }
+            actor.handle(request.clone())
+        });
+    });
+    let make_refresh = |revision| {
+        ProviderWorkerMessage::Refresh(Box::new(ProviderRefresh {
+            buffer_id: BufferId::new(1),
+            document_id: DocumentId::new(1),
+            revision: DocumentRevision::new(revision),
+            text: FrameText::from(format!("fn revision_{revision}() {{}}\n")),
+            bundle: language_bundle(Some(Path::new("coalesced.rs"))),
+            visible: 0..24,
+            near_viewport: 0..24,
+        }))
+    };
+    sender.send(make_refresh(1)).expect("first refresh");
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first refresh started");
+    for revision in 2..=9 {
+        sender
+            .send(make_refresh(revision))
+            .expect("queue stale refresh");
+    }
+    release_sender.send(()).expect("release first refresh");
+    sender
+        .send(ProviderWorkerMessage::Stop)
+        .expect("stop provider");
+    worker.join().expect("provider worker");
     assert_eq!(
-        receiver
-            .try_iter()
-            .filter(|result| matches!(result, ProviderWorkerResult::Decorations { .. }))
-            .count(),
-        2
+        *updates.lock().expect("updates"),
+        vec![DocumentRevision::new(1), DocumentRevision::new(9)]
+    );
+}
+
+#[test]
+fn unchanged_provider_text_advances_revision_without_reupload_or_reparse() {
+    let (sender, requests) = mpsc::channel();
+    let (_immediate_sender, immediate_requests) = mpsc::channel();
+    let (results, receiver) = mpsc::channel();
+    let updates = Arc::new(AtomicUsize::new(0));
+    let advances = Arc::new(AtomicUsize::new(0));
+    let observed_updates = Arc::clone(&updates);
+    let observed_advances = Arc::clone(&advances);
+    let worker = thread::spawn(move || {
+        let mut actor = ProviderActor::default();
+        provider_loop(requests, immediate_requests, results, |request| {
+            match request {
+                ProviderRequest::UpdateDocument { .. } => {
+                    observed_updates.fetch_add(1, Ordering::Relaxed);
+                }
+                ProviderRequest::AdvanceDocumentRevision { .. } => {
+                    observed_advances.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            actor.handle(request.clone())
+        });
+    });
+    let text = FrameText::from("fn unchanged() {}\n");
+    let refresh = |revision| {
+        ProviderWorkerMessage::Refresh(Box::new(ProviderRefresh {
+            buffer_id: BufferId::new(1),
+            document_id: DocumentId::new(1),
+            revision: DocumentRevision::new(revision),
+            text: text.clone(),
+            bundle: language_bundle(Some(Path::new("unchanged.rs"))),
+            visible: 0..text.len(),
+            near_viewport: 0..text.len(),
+        }))
+    };
+    sender.send(refresh(1)).expect("initial refresh");
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial result");
+    sender.send(refresh(2)).expect("revision advance");
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("advanced result");
+    sender
+        .send(ProviderWorkerMessage::Stop)
+        .expect("stop provider");
+    worker.join().expect("provider worker");
+    assert_eq!(updates.load(Ordering::Relaxed), 1);
+    assert_eq!(advances.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn changed_provider_revision_waits_for_the_typing_quiet_period() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("debounce.rs");
+    let text = (0..200)
+        .map(|line| format!("fn debounce_{line}() {{}}\n"))
+        .collect::<String>();
+    fs::write(&source, &text).expect("source");
+    let mut app = App::open(Some(&source), None).expect("app");
+    app.dispatch_key(KeyEvent::character('i'));
+    app.dispatch_key(KeyEvent::character('x'));
+    let revision = app.active.editor.revision();
+    app.schedule_provider_refreshes(20);
+    assert_ne!(
+        app.provider_submitted
+            .get(&app.active.document_id)
+            .map(|key| key.revision),
+        Some(revision)
+    );
+    app.provider_refresh_due
+        .insert(app.active.document_id, Instant::now());
+    app.schedule_provider_refreshes(20);
+    assert_eq!(
+        app.provider_submitted
+            .get(&app.active.document_id)
+            .map(|key| key.revision),
+        Some(revision)
+    );
+    let submitted = app
+        .provider_submitted
+        .get(&app.active.document_id)
+        .expect("submitted changed-line refresh");
+    assert_eq!(submitted.visible_start, submitted.near_start);
+    assert_eq!(submitted.visible_end, submitted.near_end);
+    assert!(
+        submitted.visible_end < text.len() / 4,
+        "a local edit must not replace a whole viewport or document of syntax spans"
     );
 }
 
@@ -894,7 +1156,23 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     fs::write(&source, "fn main() { target(); }\n").expect("source");
     let mut app = App::open(Some(&source), None).expect("app");
     let workspace_root = app.lsp_root();
-    let (server, log) = fake_lsp_server(directory.path());
+    let revision = attach_fake_root_lsp(&mut app, directory.path(), &source, &workspace_root);
+    exercise_async_lsp_requests(&mut app);
+    let (outside_workspace, second) = open_outside_rust(&mut app, &workspace_root);
+    exercise_cross_workspace_jumps(&mut app, &source, &second, &workspace_root);
+    exercise_non_lsp_jump(&mut app, outside_workspace.path(), &second, &workspace_root);
+    exercise_language_server_parking(&mut app, &second, &workspace_root, revision);
+    exercise_malformed_definition_recovery(&mut app);
+}
+
+#[cfg(unix)]
+fn attach_fake_root_lsp(
+    app: &mut App,
+    directory: &Path,
+    source: &Path,
+    workspace_root: &Path,
+) -> DocumentRevision {
+    let (server, log) = fake_lsp_server(directory);
     let environment = env::vars()
         .map(|(name, value)| (name.into_boxed_str(), value.into_boxed_str()))
         .collect();
@@ -902,29 +1180,21 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     let started = Instant::now();
     let (client, uri, legend) = spawn_lsp_client(
         &server,
-        &source,
-        &workspace_root,
+        source,
+        workspace_root,
         revision,
         "fn main() { target(); }\n",
         environment,
     )
     .expect("start fake LSP");
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "client readiness waited on post-initialize work: {:?}",
-        started.elapsed()
+    assert_elapsed_below(
+        started,
+        test_latency_budget(Duration::from_millis(100), Duration::from_millis(500)),
+        "client readiness waited on post-initialize work",
     );
-    let log_deadline = Instant::now() + Duration::from_millis(250);
-    let startup_log = loop {
-        let current = fs::read_to_string(&log).unwrap_or_default();
-        if current.contains("textDocument/didOpen") {
-            break current;
-        }
-        assert!(Instant::now() < log_deadline, "didOpen was not observed");
-        thread::yield_now();
-    };
+    let startup_log = wait_for_log(&log, "textDocument/didOpen");
     assert!(startup_log.contains("initialize"));
-    assert!(startup_log.contains(&file_uri(&workspace_root)));
+    assert!(startup_log.contains(&file_uri(workspace_root)));
     assert!(startup_log.contains("textDocument/didOpen"));
     assert!(!startup_log.contains("semanticTokens/full"));
 
@@ -934,12 +1204,49 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
         revision,
         uri: uri.clone(),
         client,
-        server: language_server_invocation(Some(&source)).expect("Rust profile"),
-        root: workspace_root.clone(),
+        server: language_server_invocation(Some(source)).expect("Rust profile"),
+        root: workspace_root.to_path_buf(),
         open_documents: BTreeMap::from([(document_id, LspOpenDocument { uri, revision })]),
         semantic_legend: legend,
         semantic_due: None,
     });
+    revision
+}
+
+#[cfg(unix)]
+fn wait_for_log(path: &Path, expected: &str) -> String {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let current = fs::read_to_string(path).unwrap_or_default();
+        if current.contains(expected) {
+            return current;
+        }
+        assert!(Instant::now() < deadline, "{expected} was not observed");
+        thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn assert_elapsed_below(started: Instant, budget: Duration, operation: &str) {
+    assert!(
+        started.elapsed() < budget,
+        "{operation}: {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+fn poll_lsp_until_complete(app: &mut App, operation: &str) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while app.lsp_background.is_some() {
+        assert!(Instant::now() < deadline, "fake {operation} timed out");
+        let _ = app.poll_lsp_background().expect("poll LSP operation");
+        thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn exercise_async_lsp_requests(app: &mut App) {
     let semantic_due = Instant::now() + Duration::from_secs(10);
     app.lsp.as_mut().expect("fake LSP").semantic_due = Some(semantic_due);
     app.handle_input(TerminalInput::Key(terminal_character('l')))
@@ -952,50 +1259,43 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     let dispatched = Instant::now();
     app.lsp_location("textDocument/definition")
         .expect("dispatch gd");
-    assert!(
-        dispatched.elapsed() < Duration::from_millis(20),
-        "gd blocked the input loop: {:?}",
-        dispatched.elapsed()
+    assert_elapsed_below(
+        dispatched,
+        Duration::from_millis(20),
+        "gd blocked the input loop",
     );
     assert!(app.lsp_background.is_some());
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while app.lsp_background.is_some() {
-        assert!(Instant::now() < deadline, "fake definition timed out");
-        let _ = app.poll_lsp_background().expect("poll gd");
-        thread::yield_now();
-    }
+    poll_lsp_until_complete(app, "definition");
     assert!(app.message.contains("no location"));
 
     let dispatched = Instant::now();
     app.handle_editor_key(terminal_character('K'))
         .expect("dispatch hover");
-    assert!(
-        dispatched.elapsed() < Duration::from_millis(20),
-        "K blocked the input loop: {:?}",
-        dispatched.elapsed()
+    assert_elapsed_below(
+        dispatched,
+        Duration::from_millis(20),
+        "K blocked the input loop",
     );
     assert!(app.lsp_background.is_some());
     let motion = Instant::now();
     app.handle_editor_key(terminal_character('l'))
         .expect("move while hover is pending");
-    assert!(
-        motion.elapsed() < Duration::from_millis(20),
-        "pending hover blocked ordinary input: {:?}",
-        motion.elapsed()
+    assert_elapsed_below(
+        motion,
+        Duration::from_millis(20),
+        "pending hover blocked ordinary input",
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while app.lsp_background.is_some() {
-        assert!(Instant::now() < deadline, "fake hover timed out");
-        let _ = app.poll_lsp_background().expect("poll hover");
-        thread::yield_now();
-    }
+    poll_lsp_until_complete(app, "hover");
     assert!(
         app.popup
             .as_ref()
             .is_some_and(|popup| { popup.text.contains("delayed hover details") })
     );
     app.popup = None;
+}
 
+#[cfg(unix)]
+fn open_outside_rust(app: &mut App, workspace_root: &Path) -> (tempfile::TempDir, PathBuf) {
     let outside_workspace = tempfile::tempdir().expect("outside workspace");
     let second = outside_workspace.path().join("other.rs");
     fs::write(&second, "pub fn target() {}\n").expect("second source");
@@ -1006,7 +1306,7 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     );
     assert_eq!(
         app.lsp.as_ref().map(|lsp| lsp.root.as_path()),
-        std::fs::canonicalize(&workspace_root).ok().as_deref()
+        std::fs::canonicalize(workspace_root).ok().as_deref()
     );
     app.navigate_to_entry(&QuickfixEntry {
         path: second.clone(),
@@ -1021,37 +1321,49 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     assert_eq!(reused.document_id, app.active.document_id);
     assert_eq!(reused.open_documents.len(), 2);
     assert_eq!(reused.root, workspace_root);
+    (outside_workspace, second)
+}
 
+#[cfg(unix)]
+fn exercise_cross_workspace_jumps(
+    app: &mut App,
+    source: &Path,
+    second: &Path,
+    workspace_root: &Path,
+) {
     assert!(app.navigate_jump_count(true, 1).expect("Ctrl-O to root"));
     assert!(
         app.active
             .document
             .presentation_path()
-            .is_some_and(|path| { same_path(path, &source) })
+            .is_some_and(|path| { same_path(path, source) })
     );
     assert!(app.lsp_start.is_none());
     assert_eq!(
         app.lsp
             .as_ref()
-            .map(|lsp| (&lsp.root, lsp.open_documents.len())),
-        Some((&workspace_root, 2))
+            .map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())),
+        Some((workspace_root, 2))
     );
     assert!(app.navigate_jump_count(false, 1).expect("Ctrl-I outside"));
     assert!(
         app.active
             .document
             .presentation_path()
-            .is_some_and(|path| { same_path(path, &second) })
+            .is_some_and(|path| { same_path(path, second) })
     );
     assert!(app.lsp_start.is_none());
     assert_eq!(
         app.lsp
             .as_ref()
-            .map(|lsp| (&lsp.root, lsp.open_documents.len())),
-        Some((&workspace_root, 2))
+            .map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())),
+        Some((workspace_root, 2))
     );
+}
 
-    let notes = outside_workspace.path().join("notes.txt");
+#[cfg(unix)]
+fn exercise_non_lsp_jump(app: &mut App, outside: &Path, second: &Path, workspace_root: &Path) {
+    let notes = outside.join("notes.txt");
     fs::write(&notes, "not an LSP buffer\n").expect("notes");
     if let Some(lsp) = &mut app.lsp {
         lsp.semantic_due = Some(Instant::now());
@@ -1071,17 +1383,25 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
         app.active
             .document
             .presentation_path()
-            .is_some_and(|path| { same_path(path, &second) })
+            .is_some_and(|path| { same_path(path, second) })
     );
     assert!(app.lsp_start.is_none());
     assert!(app.lsp.as_ref().and_then(|lsp| lsp.semantic_due).is_some());
     assert_eq!(
         app.lsp
             .as_ref()
-            .map(|lsp| (&lsp.root, lsp.open_documents.len())),
-        Some((&workspace_root, 2))
+            .map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())),
+        Some((workspace_root, 2))
     );
+}
 
+#[cfg(unix)]
+fn exercise_language_server_parking(
+    app: &mut App,
+    second: &Path,
+    workspace_root: &Path,
+    revision: DocumentRevision,
+) {
     let python_workspace = tempfile::tempdir().expect("Python workspace");
     let python_source = python_workspace.path().join("tool.py");
     fs::write(&python_source, "def tool():\n  pass\n").expect("Python source");
@@ -1089,7 +1409,7 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     let (python_client, python_uri, python_legend) = spawn_lsp_client(
         &python_fake,
         &python_source,
-        &workspace_root,
+        workspace_root,
         revision,
         "def tool():\n  pass\n",
         env::vars()
@@ -1103,7 +1423,7 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
         uri: python_uri,
         client: python_client,
         server: language_server_invocation(Some(&python_source)).expect("Python profile"),
-        root: workspace_root.clone(),
+        root: workspace_root.to_path_buf(),
         open_documents: BTreeMap::new(),
         semantic_legend: python_legend,
         semantic_due: None,
@@ -1116,7 +1436,7 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     assert_eq!(app.parked_lsps.len(), 1);
     app.lsp_request_at_cursor("textDocument/hover", serde_json::json!({}))
         .expect("parked Python client remains live");
-    app.open_buffer(&second).expect("return to Rust");
+    app.open_buffer(second).expect("return to Rust");
     assert_eq!(
         app.lsp.as_ref().map(|lsp| lsp.server.language_id.as_str()),
         Some("rust")
@@ -1124,7 +1444,10 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
     assert_eq!(app.parked_lsps.len(), 1);
     app.lsp_request_at_cursor("textDocument/hover", serde_json::json!({}))
         .expect("parked Rust client remains live");
+}
 
+#[cfg(unix)]
+fn exercise_malformed_definition_recovery(app: &mut App) {
     let lsp = app.lsp.take().expect("reused LSP");
     let (sender, receiver) = mpsc::channel();
     sender
@@ -1133,7 +1456,9 @@ fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
             operation: LspBackgroundOperation::Location {
                 method: "textDocument/definition".to_owned(),
             },
-            outcome: Ok(serde_json::json!({"range": {"start": {"line": 0}}})),
+            outcome: Ok(LspBackgroundPayload::Response(
+                serde_json::json!({"range": {"start": {"line": 0}}}),
+            )),
         })
         .expect("queue malformed definition result");
     app.lsp_background = Some(receiver);
@@ -1308,6 +1633,30 @@ fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
         normal_foregrounds,
         "Visual background must compose with the maximum-priority highlight foreground"
     );
+}
+
+#[test]
+fn inverse_edits_do_not_accumulate_decoration_coordinate_transforms() {
+    let mut revision = DocumentRevision::new(1);
+    let expected = DecorationSpan {
+        range: 10..13,
+        style: CellStyle::default(),
+        priority: 1,
+    };
+    let mut decorations = BufferDecorations::new(revision, vec![expected.clone()]);
+
+    for _ in 0..1_000 {
+        let insert = Transaction::new(revision, vec![Edit::new(0..0, "x")]).expect("insert");
+        revision = revision.next().expect("insert revision");
+        decorations.map_through(&insert, revision);
+
+        let delete = Transaction::new(revision, vec![Edit::new(0..1, "")]).expect("delete");
+        revision = revision.next().expect("delete revision");
+        decorations.map_through(&delete, revision);
+    }
+
+    assert!(decorations.transforms.is_empty());
+    assert_eq!(decorations.spans_in(0..32), vec![expected]);
 }
 
 #[test]
@@ -1499,33 +1848,12 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
 
     app.handle_editor_key(terminal_character('/'))
         .expect("open forward search");
-    for character in "h.t".chars() {
-        app.handle_prompt_key(terminal_character(character))
-            .expect("type search");
-    }
+    type_prompt(&mut app, "h.t");
     assert_eq!(app.active.editor.primary_cursor(), 5, "incremental match");
     assert!(app.search_highlight);
-    app.handle_prompt_key(TerminalKey {
-        code: TerminalKeyCode::Enter,
-        shift: false,
-        control: false,
-        alt: false,
-        super_key: false,
-    })
-    .expect("commit search");
+    submit_prompt(&mut app);
     assert_eq!(app.active.editor.primary_cursor(), 5);
-
-    let mut layout = ViewportLayout::new(80, 10);
-    layout.configure_dotfile_profile();
-    let frame = desired_frame(&mut layout, &app);
-    assert!(frame.rows.iter().any(|row| row.cells.iter().any(|cell| {
-        cell.grapheme.as_ref() == "h"
-            && matches!(
-                cell.style.background,
-                Some(CellColor::Rgb(color))
-                    if color == app.theme.yellow || color == app.theme.peach
-            )
-    })));
+    assert_search_highlight_rendered(&app);
 
     app.handle_editor_key(terminal_character('n'))
         .expect("next match");
@@ -1539,18 +1867,8 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
         .set_cursor(app.active.editor.text().len_bytes());
     app.handle_editor_key(terminal_character('?'))
         .expect("open backward search");
-    for character in "hit".chars() {
-        app.handle_prompt_key(terminal_character(character))
-            .expect("type backward search");
-    }
-    app.handle_prompt_key(TerminalKey {
-        code: TerminalKeyCode::Enter,
-        shift: false,
-        control: false,
-        alt: false,
-        super_key: false,
-    })
-    .expect("commit backward search");
+    type_prompt(&mut app, "hit");
+    submit_prompt(&mut app);
     assert_eq!(app.active.editor.primary_cursor(), 21);
     app.handle_editor_key(terminal_character('n'))
         .expect("repeat backward search");
@@ -1558,19 +1876,10 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
 
     app.handle_editor_key(terminal_character('/'))
         .expect("start cancelable search");
-    for character in "zero".chars() {
-        app.handle_prompt_key(terminal_character(character))
-            .expect("type cancelable search");
-    }
+    type_prompt(&mut app, "zero");
     assert_eq!(app.active.editor.primary_cursor(), 0);
-    app.handle_prompt_key(TerminalKey {
-        code: TerminalKeyCode::Escape,
-        shift: false,
-        control: false,
-        alt: false,
-        super_key: false,
-    })
-    .expect("cancel search");
+    app.handle_prompt_key(terminal_key(TerminalKeyCode::Escape))
+        .expect("cancel search");
     assert_eq!(app.active.editor.primary_cursor(), 13);
     assert_eq!(
         app.active.editor.last_search(),
@@ -1582,6 +1891,20 @@ fn slash_search_is_incremental_highlighted_repeatable_and_cancelable() {
     app.handle_editor_key(terminal_character('n'))
         .expect("search remains repeatable after nohlsearch");
     assert_eq!(app.active.editor.primary_cursor(), 5);
+}
+
+fn assert_search_highlight_rendered(app: &App) {
+    let mut layout = ViewportLayout::new(80, 10);
+    layout.configure_dotfile_profile();
+    let frame = desired_frame(&mut layout, app);
+    assert!(frame.rows.iter().any(|row| row.cells.iter().any(|cell| {
+        cell.grapheme.as_ref() == "h"
+            && matches!(
+                cell.style.background,
+                Some(CellColor::Rgb(color))
+                    if color == app.theme.yellow || color == app.theme.peach
+            )
+    })));
 }
 
 #[test]
@@ -2006,6 +2329,12 @@ fn dotfile_language_profiles_cover_declared_filetypes_and_tools() {
             .program,
         "fourmolu"
     );
+    assert_bundled_language_profiles();
+    assert_special_language_server_settings();
+    assert_language_server_profiles();
+}
+
+fn assert_bundled_language_profiles() {
     let bundled = [
         ("script.sh", "bash"),
         ("source.c", "c"),
@@ -2044,7 +2373,9 @@ fn dotfile_language_profiles_cover_declared_filetypes_and_tools() {
             "wrong bundled grammar for {path}"
         );
     }
+}
 
+fn assert_special_language_server_settings() {
     let c = language_server_invocation(Some(Path::new("main.c"))).expect("C LSP");
     assert_eq!(
         (c.program.as_str(), c.language_id.as_str()),
@@ -2071,6 +2402,9 @@ fn dotfile_language_profiles_cover_declared_filetypes_and_tools() {
         nixd_nixpkgs_expression(None, "nixpkgs"),
         "import <nixpkgs> { }"
     );
+}
+
+fn assert_language_server_profiles() {
     let lsp_profiles = [
         ("main.rs", "rust-analyzer", "rust"),
         ("main.js", "pnpm", "javascript"),
@@ -2330,6 +2664,37 @@ fn lsp_semantic_tokens_override_tree_sitter_with_dotfile_groups() {
         semantic_value.style.foreground,
         Some(CellColor::Rgb(app.theme.peach)),
         "readonly semantic token must override the overlapping Tree-sitter function capture"
+    );
+}
+
+#[test]
+fn full_buffer_semantic_token_decoding_is_linear_and_bounded() {
+    const LINES: usize = 14_000;
+    let text = "let value = 1;\n".repeat(LINES);
+    let mut data = Vec::with_capacity(LINES * 5);
+    for line in 0..LINES {
+        data.extend([
+            serde_json::json!(usize::from(line != 0)),
+            serde_json::json!(4),
+            serde_json::json!(5),
+            serde_json::json!(0),
+            serde_json::json!(0),
+        ]);
+    }
+    let response = serde_json::json!({"data": data});
+    let legend = SemanticTokenLegend {
+        token_types: vec!["variable".to_owned()],
+        token_modifiers: Vec::new(),
+    };
+
+    let started = Instant::now();
+    let spans = parse_semantic_tokens(&text, &response, &legend);
+    let elapsed = started.elapsed();
+
+    assert_eq!(spans.len(), LINES);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "full-buffer semantic decoding regressed to {elapsed:?}; line lookup must remain indexed"
     );
 }
 

@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -8,9 +9,12 @@ use wren_presenter::{PresentationObserver, Presenter};
 use wren_term::{
     TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode,
 };
-use wren_view::{TerminalPatch, ViewportLayout};
+use wren_view::{CellColor, CellStyle, TerminalPatch, ViewportLayout};
 
-use super::{App, desired_frame, poll_app_work};
+use super::{
+    App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, desired_frame,
+    poll_app_work,
+};
 
 const WIDTH: usize = 120;
 const HEIGHT: usize = 40;
@@ -35,9 +39,14 @@ pub struct ProductionLatencyReport {
     pub height: usize,
     pub requested_iterations: u64,
     pub syntax_spans: usize,
+    pub synthetic_semantic_spans: usize,
+    pub search_highlight_active: bool,
+    pub diagnostic_count: usize,
+    pub git_baseline_active: bool,
     pub open_nanos: u64,
     pub first_desired_frame_nanos: u64,
     pub open_to_first_terminal_write_nanos: u64,
+    pub setup_presentations: u64,
     pub published_frames: u64,
     pub dropped_frames: u64,
     pub presented_frames: u64,
@@ -111,7 +120,34 @@ struct Probe {
     samples: Vec<ProductionLatencySample>,
 }
 
+struct PreparedApp {
+    app: App,
+    syntax_spans: usize,
+    semantic_spans: usize,
+}
+
+struct StartedProbe {
+    probe: Probe,
+    first_desired_frame_nanos: u64,
+    open_to_first_terminal_write_nanos: u64,
+}
+
 impl Probe {
+    fn present_setup(&mut self) -> Result<()> {
+        let frame = desired_frame(&mut self.layout, &self.app);
+        let epoch = frame.epoch;
+        self.presenter.publish(frame)?;
+        let presented = self
+            .presented
+            .recv_timeout(Duration::from_secs(5))
+            .context("production latency setup presentation timed out")?;
+        anyhow::ensure!(
+            presented == epoch,
+            "presenter completed an unexpected setup epoch"
+        );
+        Ok(())
+    }
+
     fn measure(&mut self, scenario: &str, input: TerminalInput) -> Result<()> {
         let started = Instant::now();
         self.app.handle_input(input)?;
@@ -159,6 +195,45 @@ impl Probe {
 /// as the executable. Callers should isolate HOME/XDG state because the App's
 /// durability paths are intentionally part of the measured product behavior.
 pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatencyReport> {
+    let (source_file, source) = production_fixture()?;
+    let source_path = source_file.path();
+    let open_started = Instant::now();
+    let app = App::open(Some(source_path), None).context("open production latency fixture")?;
+    let open_nanos = elapsed_nanos(open_started);
+    let prepared = prepare_app(app, source_path, source)?;
+    let StartedProbe {
+        mut probe,
+        first_desired_frame_nanos,
+        open_to_first_terminal_write_nanos,
+    } = start_probe(prepared.app, open_started)?;
+    let samples_per_case = run_probe_workload(&mut probe, iterations)?;
+    let samples = std::mem::take(&mut probe.samples);
+    let stats = probe.presenter.finish()?;
+    Ok(ProductionLatencyReport {
+        schema: 2,
+        workload:
+            "full_tui_app_large_rust_14000_lines_active_syntax_semantic_search_git_diagnostics"
+                .into(),
+        width: WIDTH,
+        height: HEIGHT,
+        requested_iterations: iterations,
+        syntax_spans: prepared.syntax_spans,
+        synthetic_semantic_spans: prepared.semantic_spans,
+        search_highlight_active: true,
+        diagnostic_count: 2,
+        git_baseline_active: true,
+        open_nanos,
+        first_desired_frame_nanos,
+        open_to_first_terminal_write_nanos,
+        setup_presentations: samples_per_case,
+        published_frames: stats.published_frames,
+        dropped_frames: stats.dropped_frames,
+        presented_frames: stats.presented_frames,
+        samples,
+    })
+}
+
+fn production_fixture() -> Result<(tempfile::NamedTempFile, String)> {
     let source = (0..LARGE_RUST_LINES)
         .map(|line| {
             format!(
@@ -169,7 +244,7 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
     let mut source_file = tempfile::Builder::new()
         .prefix("wren-production-latency-")
         .suffix(".rs")
-        .tempfile_in(std::env::current_dir()?)
+        .tempfile()
         .context("create production latency fixture")?;
     source_file
         .write_all(source.as_bytes())
@@ -177,11 +252,10 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
     source_file
         .flush()
         .context("flush production latency fixture")?;
-    let source_path = source_file.path();
+    Ok((source_file, source))
+}
 
-    let open_started = Instant::now();
-    let mut app = App::open(Some(source_path), None).context("open production latency fixture")?;
-    let open_nanos = elapsed_nanos(open_started);
+fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<PreparedApp> {
     app.active.git_index_text = Some(Arc::from(source));
     app.active.refresh_git_hunks();
     let syntax_spans = app
@@ -192,7 +266,61 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
         syntax_spans >= 42_000,
         "production probe did not retain full syntax highlighting"
     );
+    let revision = app.active.editor.revision();
+    let semantic_spans = app
+        .decorations
+        .get(&app.active.buffer_id)
+        .map(|decorations| {
+            decorations
+                .spans
+                .iter()
+                .step_by(6)
+                .cloned()
+                .map(|mut span| {
+                    span.priority = 2_000_000;
+                    span.style = CellStyle {
+                        foreground: Some(CellColor::Rgb(app.theme.lavender)),
+                        ..span.style
+                    };
+                    span
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let semantic_spans_count = semantic_spans.len();
+    app.semantic_decorations.insert(
+        app.active.buffer_id,
+        BufferDecorations::new(revision, semantic_spans),
+    );
+    app.active
+        .editor
+        .search("value_", SearchDirection::Forward)
+        .context("prepare production search highlight")?;
+    app.search_highlight = true;
+    app.diagnostics.extend([
+        DiagnosticEntry {
+            path: source_path.to_path_buf(),
+            line: 1,
+            column: 1,
+            severity: DiagnosticSeverity::Warning,
+            message: "deterministic benchmark warning".to_owned(),
+        },
+        DiagnosticEntry {
+            path: source_path.to_path_buf(),
+            line: LARGE_RUST_LINES,
+            column: 1,
+            severity: DiagnosticSeverity::Error,
+            message: "deterministic benchmark error".to_owned(),
+        },
+    ]);
+    Ok(PreparedApp {
+        app,
+        syntax_spans,
+        semantic_spans: semantic_spans_count,
+    })
+}
 
+fn start_probe(mut app: App, open_started: Instant) -> Result<StartedProbe> {
     let mut layout = ViewportLayout::new(WIDTH, HEIGHT);
     layout.configure_dotfile_profile();
     app.resize_terminal(HEIGHT, WIDTH);
@@ -217,17 +345,30 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
         "presenter completed an unexpected first epoch"
     );
     let open_to_first_terminal_write_nanos = elapsed_nanos(open_started);
+    Ok(StartedProbe {
+        probe: Probe {
+            app,
+            layout,
+            presenter,
+            presented,
+            samples: Vec::new(),
+        },
+        first_desired_frame_nanos,
+        open_to_first_terminal_write_nanos,
+    })
+}
 
-    let mut probe = Probe {
-        app,
-        layout,
-        presenter,
-        presented,
-        samples: Vec::new(),
-    };
-    probe.measure("bottom_navigation", character('G'))?;
+fn run_probe_workload(probe: &mut Probe, iterations: u64) -> Result<u64> {
+    probe.measure("cold_bottom_navigation", character('G'))?;
 
-    let samples_per_case = iterations.saturating_add(3).saturating_div(4).max(1);
+    let samples_per_case = iterations.saturating_add(4).saturating_div(5).max(1);
+    for _ in 0..samples_per_case {
+        probe.app.active.editor.set_cursor(0);
+        probe.app.views.active_window_mut().top_line = 0;
+        probe.app.schedule_provider_refreshes(probe.layout.height);
+        probe.present_setup()?;
+        probe.measure("bottom_navigation", character('G'))?;
+    }
     for sample in 0..samples_per_case {
         probe.measure(
             "local_motion",
@@ -273,22 +414,5 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
             character(if sample % 2 == 0 { 'h' } else { 'l' }),
         )?;
     }
-
-    let samples = std::mem::take(&mut probe.samples);
-    let stats = probe.presenter.finish()?;
-    Ok(ProductionLatencyReport {
-        schema: 1,
-        workload: "full_tui_app_large_rust_14000_lines".into(),
-        width: WIDTH,
-        height: HEIGHT,
-        requested_iterations: iterations,
-        syntax_spans,
-        open_nanos,
-        first_desired_frame_nanos,
-        open_to_first_terminal_write_nanos,
-        published_frames: stats.published_frames,
-        dropped_frames: stats.dropped_frames,
-        presented_frames: stats.presented_frames,
-        samples,
-    })
+    Ok(samples_per_case)
 }

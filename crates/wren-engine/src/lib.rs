@@ -32,8 +32,15 @@ pub struct EngineFrame {
 pub struct FrameText {
     storage: Arc<FrameStorage>,
     line_starts: Arc<[usize]>,
+    line_start_shift: Option<LineStartShift>,
     previous_storage: Option<Weak<FrameStorage>>,
     single_line_change: Option<FrameTextChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineStartShift {
+    from_line: usize,
+    delta: i128,
 }
 
 #[derive(Debug)]
@@ -77,6 +84,7 @@ impl FrameText {
                 materialized: OnceLock::from(text),
             }),
             line_starts: line_starts.into(),
+            line_start_shift: None,
             previous_storage: None,
             single_line_change: None,
         }
@@ -93,50 +101,94 @@ impl FrameText {
                 materialized: OnceLock::from(text),
             }),
             line_starts: line_starts.into(),
+            line_start_shift: None,
             previous_storage: None,
             single_line_change: None,
         }
     }
 
     fn edited(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
+        self.validate_edit_boundaries(transaction)?;
+        let single_line_change = self.single_line_change(transaction);
+        if let Some(previous) = self.previous_if_inverse(transaction) {
+            return Ok(Self {
+                storage: Arc::clone(&previous.storage),
+                line_starts: Arc::clone(&previous.line_starts),
+                line_start_shift: previous.line_start_shift,
+                previous_storage: Some(Arc::downgrade(&self.storage)),
+                single_line_change,
+            });
+        }
+        let (capacity, line_starts, line_start_shift) =
+            self.edited_line_starts(transaction, single_line_change)?;
+        Ok(Self {
+            storage: Arc::new(FrameStorage {
+                source: FrameSource::Edited {
+                    previous: self.clone(),
+                    edits: transaction.edits.clone().into(),
+                },
+                materialized: OnceLock::new(),
+                len: capacity,
+            }),
+            line_starts,
+            line_start_shift,
+            previous_storage: Some(Arc::downgrade(&self.storage)),
+            single_line_change,
+        })
+    }
+
+    fn validate_edit_boundaries(&self, transaction: &Transaction) -> Result<(), TransactionError> {
         transaction.validate()?;
-        for edit in &transaction.edits {
-            for offset in [edit.range.start, edit.range.end] {
-                if offset > self.len() {
-                    return Err(TransactionError::OutOfBounds {
-                        offset,
-                        len: self.len(),
-                    });
-                }
-                if !self.is_char_boundary(offset) {
-                    return Err(TransactionError::NotCharBoundary { offset });
-                }
+        for offset in transaction
+            .edits
+            .iter()
+            .flat_map(|edit| [edit.range.start, edit.range.end])
+        {
+            if offset > self.len() {
+                return Err(TransactionError::OutOfBounds {
+                    offset,
+                    len: self.len(),
+                });
+            }
+            if !self.is_char_boundary(offset) {
+                return Err(TransactionError::NotCharBoundary { offset });
             }
         }
-        let single_line_change = transaction.edits.as_slice().first().and_then(|edit| {
-            (transaction.edits.len() == 1
-                && !edit.insert.contains('\n')
-                && !self.slice(edit.range.clone()).contains('\n'))
-            .then(|| {
-                let line = self.line_of_byte(edit.range.start);
-                let old_start = self.byte_of_line(line);
-                let mut old_end = self.byte_of_line(line.saturating_add(1));
-                if old_end > old_start && self.byte_at(old_end - 1) == Some(b'\n') {
-                    old_end -= 1;
-                }
-                let new_end = old_end
-                    .checked_sub(edit.range.len())?
-                    .checked_add(edit.insert.len())?;
-                Some(FrameTextChange {
-                    line,
-                    old_start,
-                    old_end,
-                    new_start: old_start,
-                    new_end,
-                })
-            })
-            .flatten()
-        });
+        Ok(())
+    }
+
+    fn single_line_change(&self, transaction: &Transaction) -> Option<FrameTextChange> {
+        let [edit] = transaction.edits.as_slice() else {
+            return None;
+        };
+        if edit.insert.contains('\n') || self.slice(edit.range.clone()).contains('\n') {
+            return None;
+        }
+        let line = self.line_of_byte(edit.range.start);
+        let old_start = self.byte_of_line(line);
+        let next_line = self.byte_of_line(line.saturating_add(1));
+        let old_end = if next_line > old_start && self.byte_at(next_line - 1) == Some(b'\n') {
+            next_line - 1
+        } else {
+            next_line
+        };
+        let new_end = old_end
+            .checked_sub(edit.range.len())?
+            .checked_add(edit.insert.len())?;
+        Some(FrameTextChange {
+            line,
+            old_start,
+            old_end,
+            new_start: old_start,
+            new_end,
+        })
+    }
+
+    fn edited_line_starts(
+        &self,
+        transaction: &Transaction,
+        single_line_change: Option<FrameTextChange>,
+    ) -> Result<(usize, Arc<[usize]>, Option<LineStartShift>), TransactionError> {
         let inserted_bytes = transaction
             .edits
             .iter()
@@ -152,6 +204,34 @@ impl FrameText {
             .checked_add(inserted_bytes)
             .and_then(|len| len.checked_sub(deleted_bytes))
             .ok_or(TransactionError::OffsetOverflow)?;
+        if let Some(change) = single_line_change {
+            let inserted =
+                i128::try_from(inserted_bytes).map_err(|_| TransactionError::OffsetOverflow)?;
+            let deleted =
+                i128::try_from(deleted_bytes).map_err(|_| TransactionError::OffsetOverflow)?;
+            let delta = inserted - deleted;
+            let from_line = change.line.saturating_add(1);
+            if delta == 0 || from_line >= self.line_starts.len() {
+                return Ok((
+                    capacity,
+                    Arc::clone(&self.line_starts),
+                    self.line_start_shift,
+                ));
+            }
+            if self
+                .line_start_shift
+                .is_none_or(|shift| shift.from_line == from_line)
+            {
+                let delta = self
+                    .line_start_shift
+                    .map_or(delta, |shift| shift.delta.saturating_add(delta));
+                return Ok((
+                    capacity,
+                    Arc::clone(&self.line_starts),
+                    (delta != 0).then_some(LineStartShift { from_line, delta }),
+                ));
+            }
+        }
         let mut line_starts = Vec::with_capacity(self.line_starts.len());
         line_starts.push(0);
         let mut old_line = 1;
@@ -161,18 +241,16 @@ impl FrameText {
         for edit in &transaction.edits {
             let target_start = target_len + (edit.range.start - source_cursor);
             while self
-                .line_starts
-                .get(old_line)
-                .is_some_and(|start| *start <= edit.range.start)
+                .line_start(old_line)
+                .is_some_and(|start| start <= edit.range.start)
             {
-                let start = self.line_starts[old_line];
+                let start = self.line_start(old_line).unwrap_or(edit.range.start);
                 line_starts.push(target_start - (edit.range.start - start));
                 old_line += 1;
             }
             while self
-                .line_starts
-                .get(old_line)
-                .is_some_and(|start| *start <= edit.range.end)
+                .line_start(old_line)
+                .is_some_and(|start| start <= edit.range.end)
             {
                 old_line += 1;
             }
@@ -186,24 +264,27 @@ impl FrameText {
         }
 
         let target_start = target_len;
-        while let Some(start) = self.line_starts.get(old_line).copied() {
+        while let Some(start) = self.line_start(old_line) {
             line_starts.push(target_start + (start - source_cursor));
             old_line += 1;
         }
         debug_assert_eq!(target_start + (self.len() - source_cursor), capacity);
-        Ok(Self {
-            storage: Arc::new(FrameStorage {
-                source: FrameSource::Edited {
-                    previous: self.clone(),
-                    edits: transaction.edits.clone().into(),
-                },
-                materialized: OnceLock::new(),
-                len: capacity,
-            }),
-            line_starts: line_starts.into(),
-            previous_storage: Some(Arc::downgrade(&self.storage)),
-            single_line_change,
-        })
+        Ok((capacity, line_starts.into(), None))
+    }
+
+    fn line_start(&self, line: usize) -> Option<usize> {
+        let start = self.line_starts.get(line).copied()?;
+        let Some(shift) = self
+            .line_start_shift
+            .filter(|shift| line >= shift.from_line)
+        else {
+            return Some(start);
+        };
+        if shift.delta >= 0 {
+            start.checked_add(usize::try_from(shift.delta).ok()?)
+        } else {
+            start.checked_sub(usize::try_from(shift.delta.unsigned_abs()).ok()?)
+        }
     }
 
     #[must_use]
@@ -319,6 +400,32 @@ impl FrameText {
         previous.byte_at(old_cursor.saturating_add(byte - new_cursor))
     }
 
+    fn previous_if_inverse(&self, transaction: &Transaction) -> Option<&FrameText> {
+        let FrameSource::Edited { previous, edits } = &self.storage.source else {
+            return None;
+        };
+        if edits.len() != transaction.edits.len() {
+            return None;
+        }
+        let mut delta = 0_i128;
+        for (forward, inverse) in edits.iter().zip(&transaction.edits) {
+            let start = i128::try_from(forward.range.start)
+                .ok()?
+                .checked_add(delta)?;
+            let start = usize::try_from(start).ok()?;
+            let end = start.checked_add(forward.insert.len())?;
+            if inverse.range != (start..end)
+                || inverse.insert.as_ref() != previous.slice(forward.range.clone()).as_ref()
+            {
+                return None;
+            }
+            delta = delta
+                .checked_add(i128::try_from(forward.insert.len()).ok()?)?
+                .checked_sub(i128::try_from(forward.range.len()).ok()?)?;
+        }
+        Some(previous)
+    }
+
     fn materialized(&self) -> &Arc<str> {
         self.storage.materialized.get_or_init(|| {
             let mut text = String::with_capacity(self.len());
@@ -330,14 +437,32 @@ impl FrameText {
 
     #[must_use]
     pub fn line_of_byte(&self, byte: usize) -> usize {
-        self.line_starts
-            .partition_point(|start| *start <= byte.min(self.len()))
-            .saturating_sub(1)
+        let byte = byte.min(self.len());
+        if self.line_start_shift.is_none() {
+            return self
+                .line_starts
+                .partition_point(|start| *start <= byte)
+                .saturating_sub(1);
+        }
+        let mut first = 0;
+        let mut last = self.line_starts.len();
+        while first < last {
+            let middle = first + (last - first) / 2;
+            if self.line_start(middle).is_some_and(|start| start <= byte) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        first.saturating_sub(1)
     }
 
     #[must_use]
     pub fn byte_of_line(&self, line: usize) -> usize {
-        self.line_starts.get(line).copied().unwrap_or(self.len())
+        if self.line_start_shift.is_none() {
+            return self.line_starts.get(line).copied().unwrap_or(self.len());
+        }
+        self.line_start(line).unwrap_or(self.len())
     }
 
     #[must_use]
@@ -352,6 +477,7 @@ impl FrameText {
     pub fn same_snapshot(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.storage, &other.storage)
             && Arc::ptr_eq(&self.line_starts, &other.line_starts)
+            && self.line_start_shift == other.line_start_shift
     }
 
     #[must_use]
@@ -371,7 +497,9 @@ impl FrameText {
 
 impl PartialEq for FrameText {
     fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref() && self.line_starts == other.line_starts
+        self.as_ref() == other.as_ref()
+            && self.line_starts == other.line_starts
+            && self.line_start_shift == other.line_start_shift
     }
 }
 
@@ -455,6 +583,8 @@ impl EchoEngine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::FrameText;
     use wren_types::{DocumentRevision, Edit, Transaction};
 
@@ -486,6 +616,45 @@ mod tests {
     }
 
     #[test]
+    fn same_line_edits_share_the_large_line_index() {
+        let original = FrameText::from("alpha\nbeta\ngamma\n");
+        let first = original
+            .edited(
+                &Transaction::new(DocumentRevision::new(0), vec![Edit::new(1..1, "x")])
+                    .expect("first transaction"),
+            )
+            .expect("first edit");
+        assert!(Arc::ptr_eq(&original.line_starts, &first.line_starts));
+        assert_eq!(first.byte_of_line(1), 7);
+        assert_eq!(first.line_of_byte(7), 1);
+
+        let second = first
+            .edited(
+                &Transaction::new(DocumentRevision::new(1), vec![Edit::new(2..2, "y")])
+                    .expect("second transaction"),
+            )
+            .expect("second edit");
+        assert!(Arc::ptr_eq(&original.line_starts, &second.line_starts));
+        assert_eq!(second.byte_of_line(2), 13);
+
+        let different_line = second
+            .edited(
+                &Transaction::new(DocumentRevision::new(2), vec![Edit::new(9..9, "z")])
+                    .expect("different-line transaction"),
+            )
+            .expect("different-line edit");
+        assert!(!Arc::ptr_eq(
+            &original.line_starts,
+            &different_line.line_starts
+        ));
+        assert_eq!(
+            different_line.slice(0..different_line.len()),
+            "axylpha\nbzeta\ngamma\n"
+        );
+        assert_eq!(different_line.byte_of_line(2), 14);
+    }
+
+    #[test]
     fn lazy_snapshot_preserves_multiple_edits_and_unicode_boundaries() {
         let original = FrameText::from("α one\nβ two\n");
         let transaction = Transaction::new(
@@ -500,5 +669,20 @@ mod tests {
         assert!(!edited.is_char_boundary(1));
         assert_eq!(edited.line_of_byte(8), 1);
         assert_eq!(edited.shared().as_ref(), "λ one\nβ three\n");
+    }
+
+    #[test]
+    fn exact_inverse_reuses_the_previous_snapshot_identity() {
+        let original = FrameText::from("large immutable document");
+        let forward = Transaction::new(DocumentRevision::new(0), vec![Edit::new(5..5, "!")])
+            .expect("forward transaction");
+        let edited = original.edited(&forward).expect("edited snapshot");
+        let inverse = forward
+            .inverted_against(original.as_ref())
+            .expect("inverse transaction");
+        let restored = edited.edited(&inverse).expect("restored snapshot");
+
+        assert!(restored.same_snapshot(&original));
+        assert_eq!(restored.as_ref(), original.as_ref());
     }
 }

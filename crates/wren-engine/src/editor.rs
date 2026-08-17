@@ -15,6 +15,30 @@ use wren_types::{
 
 use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
 
+trait MotionBehavior {
+    fn remembers_find_target(self) -> bool;
+    fn enters_jump_list(self) -> bool;
+}
+
+impl MotionBehavior for Motion {
+    fn remembers_find_target(self) -> bool {
+        matches!(
+            self,
+            Self::FindForward(_)
+                | Self::FindBackward(_)
+                | Self::TillForward(_)
+                | Self::TillBackward(_)
+        )
+    }
+
+    fn enters_jump_list(self) -> bool {
+        matches!(
+            self,
+            Self::GoToLine | Self::DocumentEnd | Self::ParagraphForward | Self::ParagraphBackward
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -157,6 +181,7 @@ impl SearchState {
         text: &str,
         revision: DocumentRevision,
         byte_range: Range<usize>,
+        text_origin: usize,
         limit: usize,
     ) -> Vec<Range<usize>> {
         let key = (byte_range.start, byte_range.end);
@@ -176,16 +201,21 @@ impl SearchState {
             return ranges.iter().take(limit).cloned().collect();
         }
         let mut ranges = Vec::new();
-        let mut cursor = byte_range.start;
-        while cursor <= byte_range.end && ranges.len() < limit {
+        let relative_start = byte_range.start.saturating_sub(text_origin).min(text.len());
+        let relative_end = byte_range.end.saturating_sub(text_origin).min(text.len());
+        let mut cursor = relative_start;
+        while cursor <= relative_end && ranges.len() < limit {
             let Some(found) = self.compiled.find_at(text, cursor) else {
                 break;
             };
-            if found.start() >= byte_range.end || found.end() > byte_range.end {
+            if found.start() >= relative_end || found.end() > relative_end {
                 break;
             }
             if !found.is_empty() {
-                ranges.push(found.range());
+                ranges.push(
+                    text_origin.saturating_add(found.start())
+                        ..text_origin.saturating_add(found.end()),
+                );
             }
             cursor = if found.is_empty() {
                 next_char_boundary(text, found.start())
@@ -301,6 +331,7 @@ pub enum EngineError {
 pub struct Editor<T: TextStore> {
     text: T,
     clean_text: Option<T>,
+    clean_frame_text: Option<FrameText>,
     frame_text: FrameText,
     revision: DocumentRevision,
     selections: SelectionSet,
@@ -358,30 +389,32 @@ impl<T: TextStore> Editor<T> {
         debug_assert_eq!(text.len_bytes(), contents.len());
         let clean_text = text.snapshot();
         let line_starts = clean_text.line_starts();
+        let frame_text = FrameText::from_indexed(contents.into(), line_starts);
         Self {
             text,
             clean_text: Some(clean_text),
-            frame_text: FrameText::from_indexed(contents.into(), line_starts),
+            clean_frame_text: Some(frame_text.clone()),
+            frame_text,
             revision: DocumentRevision::new(0),
             selections: SelectionSet {
                 primary: 0,
                 ranges: vec![SelRange { anchor: 0, head: 0 }],
             },
             mode: Mode::Normal,
-            pending_keys: Vec::new(),
+            pending_keys: Vec::with_capacity(8),
             parse_state: None,
             undo: Vec::new(),
             redo: Vec::new(),
             undo_branches: Vec::new(),
             insert_group: None,
             insert_style: InsertStyle::Insert,
-            insert_capture: String::new(),
+            insert_capture: String::with_capacity(64),
             registers: BTreeMap::new(),
             pending_clipboard_writes: Vec::new(),
             marks: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
-            recording_keys: Vec::new(),
+            recording_keys: Vec::with_capacity(64),
             last_macro: None,
             pending_control: None,
             macro_depth: 0,
@@ -390,7 +423,7 @@ impl<T: TextStore> Editor<T> {
             replaying_change: false,
             search: None,
             last_visual: None,
-            jumplist: Vec::new(),
+            jumplist: Vec::with_capacity(64),
             jump_index: 0,
             changelist: vec![0],
             change_index: 1,
@@ -549,18 +582,29 @@ impl<T: TextStore> Editor<T> {
 
     pub fn mark_clean(&mut self) {
         self.clean_text = Some(self.text.snapshot());
+        self.clean_frame_text = Some(self.frame_text.clone());
         self.dirty = false;
     }
 
     pub fn mark_dirty(&mut self) {
         self.clean_text = None;
+        self.clean_frame_text = None;
         self.dirty = true;
     }
 
     fn refresh_dirty(&mut self) {
-        self.dirty = self.clean_text.as_ref().is_none_or(|clean_text| {
-            self.text.len_bytes() != clean_text.len_bytes() || !self.text.content_eq(clean_text)
-        });
+        self.dirty = self
+            .clean_frame_text
+            .as_ref()
+            .is_none_or(|clean| !self.frame_text.same_snapshot(clean));
+        if self.dirty
+            && let Some(clean_text) = &self.clean_text
+            && self.text.len_bytes() == clean_text.len_bytes()
+            && self.text.content_eq(clean_text)
+        {
+            self.clean_frame_text = Some(self.frame_text.clone());
+            self.dirty = false;
+        }
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
@@ -892,6 +936,27 @@ impl<T: TextStore> Editor<T> {
         self.collapse_selection(destination);
     }
 
+    /// Pre-fault the synchronous single-key navigation path before the first
+    /// frame is presented. The temporary motion is fully rolled back; only
+    /// allocation capacity and executable pages remain warm for real input.
+    pub fn prepare_realtime_navigation(&mut self) {
+        if self.mode != Mode::Normal || !self.pending_keys.is_empty() {
+            return;
+        }
+        let selections = self.selections.clone();
+        let jump_len = self.jumplist.len();
+        let jump_index = self.jump_index;
+        let _ = self.handle_key(KeyEvent::character('G'));
+        self.selections = selections;
+        self.jumplist.truncate(jump_len);
+        self.jump_index = jump_index;
+    }
+
+    #[must_use]
+    pub fn document_end_byte(&self) -> usize {
+        self.document_end_destination()
+    }
+
     pub fn set_selection_range(&mut self, range: Range<usize>) {
         let text = self.frame_text.as_ref();
         let start = floor_char_boundary(text, range.start.min(text.len()));
@@ -1006,7 +1071,11 @@ impl<T: TextStore> Editor<T> {
             ParseResult::Command(command) => {
                 self.pending_keys.clear();
                 self.parse_state = None;
-                self.execute(command)
+                match command {
+                    Command::Move { motion, count } => self.execute_move(motion, count.get()),
+                    Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert),
+                    command => self.execute(command),
+                }
             }
         }
     }
@@ -1383,10 +1452,16 @@ impl<T: TextStore> Editor<T> {
         if search.pattern.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let text = self.contents();
-        let start = floor_char_boundary(&text, byte_range.start.min(text.len()));
-        let end = floor_char_boundary(&text, byte_range.end.min(text.len())).max(start);
-        search.match_ranges(&text, self.revision, start..end, limit)
+        let mut start = byte_range.start.min(self.frame_text.len());
+        while start > 0 && !self.frame_text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = byte_range.end.min(self.frame_text.len());
+        while end > start && !self.frame_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let text = self.frame_text.slice(start..end);
+        search.match_ranges(&text, self.revision, start..end, start, limit)
     }
 
     pub fn search_next(&mut self, reverse: bool) -> bool {
@@ -1592,69 +1667,16 @@ impl<T: TextStore> Editor<T> {
 
     fn execute(&mut self, command: Command) -> Result<Option<Transaction>, EngineError> {
         match command.clone() {
-            Command::EnterInsert => {
-                self.ensure_writable()?;
-                self.enter_insert(InsertStyle::Insert);
-                Ok(None)
-            }
-            Command::EnterAppend => {
-                self.ensure_writable()?;
-                let text = self.contents();
-                let cursor = self.primary_cursor();
-                if cursor < line_end(&text, cursor) {
-                    self.collapse_selection(next_char_boundary(&text, cursor));
-                }
-                self.enter_insert(InsertStyle::Append);
-                Ok(None)
-            }
-            Command::EnterInsertAtLineStart => {
-                self.ensure_writable()?;
-                let text = self.contents();
-                self.collapse_selection(first_non_blank(&text, self.primary_cursor()));
-                self.enter_insert(InsertStyle::LineStart);
-                Ok(None)
-            }
-            Command::EnterInsertAtLineEnd => {
-                self.ensure_writable()?;
-                let text = self.contents();
-                self.collapse_selection(line_end(&text, self.primary_cursor()));
-                self.enter_insert(InsertStyle::LineEnd);
-                Ok(None)
-            }
-            Command::EnterReplace => {
-                self.ensure_writable()?;
-                self.enter_insert(InsertStyle::Replace);
-                self.mode = Mode::Replace;
-                Ok(None)
-            }
+            Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert),
+            Command::EnterAppend => self.enter_append_command(),
+            Command::EnterInsertAtLineStart => self.enter_line_start_command(),
+            Command::EnterInsertAtLineEnd => self.enter_line_end_command(),
+            Command::EnterReplace => self.enter_replace_command(),
             Command::OpenLine { above } => {
                 self.ensure_writable()?;
                 self.open_line(above)
             }
-            Command::Move { motion, count } => {
-                let previous = self.primary_cursor();
-                if matches!(
-                    motion,
-                    Motion::FindForward(_)
-                        | Motion::FindBackward(_)
-                        | Motion::TillForward(_)
-                        | Motion::TillBackward(_)
-                ) {
-                    self.last_find = Some(motion);
-                }
-                self.move_cursor(motion, count.get());
-                if matches!(
-                    motion,
-                    Motion::GoToLine
-                        | Motion::DocumentEnd
-                        | Motion::ParagraphForward
-                        | Motion::ParagraphBackward
-                ) && self.primary_cursor() != previous
-                {
-                    self.push_jump(previous);
-                }
-                Ok(None)
-            }
+            Command::Move { motion, count } => self.execute_move(motion, count.get()),
             Command::ApplyOperator {
                 operator,
                 motion,
@@ -1662,16 +1684,7 @@ impl<T: TextStore> Editor<T> {
                 register,
                 range_kind,
             } => {
-                let result =
-                    self.apply_operator(operator, motion, count.get(), register, range_kind)?;
-                if result.is_some() && operator != Operator::Yank && !self.replaying_change {
-                    if operator == Operator::Change {
-                        self.pending_change = Some(command);
-                    } else {
-                        self.last_change = Some(RepeatAction::Command(command));
-                    }
-                }
-                Ok(result)
+                self.execute_operator(command, operator, motion, count.get(), register, range_kind)
             }
             Command::DeleteChar {
                 backward,
@@ -1718,6 +1731,85 @@ impl<T: TextStore> Editor<T> {
             }
             Command::Repeat { count } => self.repeat_last(count.get()),
         }
+    }
+
+    fn enter_insert_command(
+        &mut self,
+        style: InsertStyle,
+    ) -> Result<Option<Transaction>, EngineError> {
+        self.ensure_writable()?;
+        self.enter_insert(style);
+        Ok(None)
+    }
+
+    fn enter_append_command(&mut self) -> Result<Option<Transaction>, EngineError> {
+        self.ensure_writable()?;
+        let text = self.contents();
+        let cursor = self.primary_cursor();
+        if cursor < line_end(&text, cursor) {
+            self.collapse_selection(next_char_boundary(&text, cursor));
+        }
+        self.enter_insert(InsertStyle::Append);
+        Ok(None)
+    }
+
+    fn enter_line_start_command(&mut self) -> Result<Option<Transaction>, EngineError> {
+        self.ensure_writable()?;
+        let text = self.contents();
+        self.collapse_selection(first_non_blank(&text, self.primary_cursor()));
+        self.enter_insert(InsertStyle::LineStart);
+        Ok(None)
+    }
+
+    fn enter_line_end_command(&mut self) -> Result<Option<Transaction>, EngineError> {
+        self.ensure_writable()?;
+        let text = self.contents();
+        self.collapse_selection(line_end(&text, self.primary_cursor()));
+        self.enter_insert(InsertStyle::LineEnd);
+        Ok(None)
+    }
+
+    fn enter_replace_command(&mut self) -> Result<Option<Transaction>, EngineError> {
+        self.enter_insert_command(InsertStyle::Replace)?;
+        self.mode = Mode::Replace;
+        Ok(None)
+    }
+
+    fn execute_move(
+        &mut self,
+        motion: Motion,
+        count: u32,
+    ) -> Result<Option<Transaction>, EngineError> {
+        let previous = self.primary_cursor();
+        if motion.remembers_find_target() {
+            self.last_find = Some(motion);
+        }
+        self.move_cursor(motion, count);
+        if motion.enters_jump_list() && self.primary_cursor() != previous {
+            self.push_jump(previous);
+        }
+        Ok(None)
+    }
+
+    fn execute_operator(
+        &mut self,
+        command: Command,
+        operator: Operator,
+        motion: Motion,
+        count: u32,
+        register: Option<Register>,
+        range_kind: RangeKind,
+    ) -> Result<Option<Transaction>, EngineError> {
+        let result = self.apply_operator(operator, motion, count, register, range_kind)?;
+        if result.is_none() || operator == Operator::Yank || self.replaying_change {
+            return Ok(result);
+        }
+        if operator == Operator::Change {
+            self.pending_change = Some(command);
+        } else {
+            self.last_change = Some(RepeatAction::Command(command));
+        }
+        Ok(result)
     }
 
     fn remember_command_change(&mut self, command: &Command, changed: bool) {
@@ -1908,8 +2000,10 @@ impl<T: TextStore> Editor<T> {
         if cursor == 0 {
             return Ok(None);
         }
-        let text = self.contents();
-        let start = previous_char_boundary(&text, cursor);
+        let mut start = cursor.saturating_sub(1);
+        while start > 0 && !self.frame_text.is_char_boundary(start) {
+            start -= 1;
+        }
         self.insert_capture.pop();
         self.delete_insert_range(start, cursor)
     }
@@ -2345,13 +2439,12 @@ impl<T: TextStore> Editor<T> {
         let text = self.contents();
         let cursor = self.primary_cursor();
         let destination = match style {
-            InsertStyle::Insert => cursor,
+            InsertStyle::Insert | InsertStyle::Replace => cursor,
             InsertStyle::Append => next_char_boundary(&text, cursor).min(line_end(&text, cursor)),
             InsertStyle::LineStart => first_non_blank(&text, cursor),
             InsertStyle::LineEnd => line_end(&text, cursor),
             InsertStyle::OpenAbove => line_start(&text, cursor),
             InsertStyle::OpenBelow => line_end_with_newline(&text, cursor),
-            InsertStyle::Replace => cursor,
         };
         self.collapse_selection(destination);
     }
@@ -2398,7 +2491,9 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn move_cursor(&mut self, motion: Motion, count: u32) {
-        let destination = {
+        let destination = if motion == Motion::DocumentEnd {
+            self.document_end_destination()
+        } else {
             let text = self.frame_text.as_ref();
             normal_cursor_destination(
                 text,
@@ -2406,6 +2501,23 @@ impl<T: TextStore> Editor<T> {
             )
         };
         self.collapse_selection(destination);
+    }
+
+    fn document_end_destination(&self) -> usize {
+        let start = self
+            .frame_text
+            .byte_of_line(self.frame_text.line_starts.len().saturating_sub(1));
+        let tail = self.frame_text.slice(start..self.frame_text.len());
+        let offset = tail
+            .char_indices()
+            .find(|(_, character)| !matches!(character, ' ' | '\t'))
+            .map_or(tail.len(), |(offset, _)| offset);
+        let offset = if offset == tail.len() && !tail.is_empty() {
+            previous_char_boundary(&tail, offset)
+        } else {
+            offset
+        };
+        start.saturating_add(offset)
     }
 
     fn motion_destination(text: &str, cursor: usize, motion: Motion, count: u32) -> usize {
@@ -2435,14 +2547,15 @@ impl<T: TextStore> Editor<T> {
                 Motion::BigWordEnd => big_word_end(text, destination),
                 Motion::WordEndBackward => word_end_backward(text, destination),
                 Motion::LineStart => line_start(text, destination),
-                Motion::FirstNonBlank => first_non_blank(text, destination),
+                Motion::FirstNonBlank | Motion::LineFirstNonBlank => {
+                    first_non_blank(text, destination)
+                }
                 Motion::NextLineFirstNonBlank => {
                     first_non_blank(text, vertical_motion(text, destination, 1))
                 }
                 Motion::PreviousLineFirstNonBlank => {
                     first_non_blank(text, vertical_motion(text, destination, -1))
                 }
-                Motion::LineFirstNonBlank => first_non_blank(text, destination),
                 Motion::LastNonBlank => last_non_blank(text, destination),
                 Motion::Column => {
                     byte_at_line_column(text, destination, count.saturating_sub(1) as usize)
@@ -3720,5 +3833,33 @@ mod tests {
         feed(&mut editor, "vlo");
         let selection = &editor.selections().ranges[0];
         assert_eq!((selection.anchor, selection.head), (1, 0));
+    }
+
+    #[test]
+    fn document_end_uses_the_line_index_without_materializing_an_edit() {
+        let mut editor = editor("alpha\n  beta\n");
+        feed(&mut editor, "ix\u{1b}");
+        assert!(!editor.frame_text.is_materialized());
+
+        feed(&mut editor, "G");
+
+        assert_eq!(editor.primary_cursor(), editor.frame_text.len());
+        assert!(!editor.frame_text.is_materialized());
+    }
+
+    #[test]
+    fn realtime_navigation_preparation_has_no_editor_state_effect() {
+        let mut editor = editor("alpha\nbeta\n");
+        editor.set_cursor(2);
+        let selections = editor.selections().clone();
+        let jumps = editor.jumplist().collect::<Vec<_>>();
+        let jump_index = editor.jump_index();
+
+        editor.prepare_realtime_navigation();
+
+        assert_eq!(editor.selections(), &selections);
+        assert_eq!(editor.jumplist().collect::<Vec<_>>(), jumps);
+        assert_eq!(editor.jump_index(), jump_index);
+        assert_eq!(editor.mode(), Mode::Normal);
     }
 }

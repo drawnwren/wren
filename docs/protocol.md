@@ -16,12 +16,19 @@ created -> applied -> local-durable -> received -> remote-durable -> persisted
              +-- optimistic replica is immediately visible
 ```
 
-- The client appends a complete checksummed `ClientMutation` to its outbox. Text
-  and accompanying state changes therefore cannot tear apart.
+- The client appends complete, independently checksummed `ClientMutation`
+  records to its outbox. A group commit may place several records in one write
+  and sync, but recovery and semantic atomicity remain per mutation; text and
+  accompanying state changes therefore cannot tear apart. Save, suspend, and
+  shutdown barriers flush the current group.
 - The daemon emits `Received` before authority submission. A crash injected at
   this boundary leaves no journal commit and proves the outbox must remain.
-- `Durable` is emitted only after the checksummed session-journal record has
-  been synchronized. The durable result and mutation-ID hash survive restart.
+- `Durable` is emitted only after the independently checksummed session-journal
+  records in its group have been synchronized. The durable results and
+  mutation-ID hashes survive restart.
+- Durable acknowledgements are themselves appended in batches. Outbox
+  compaction is periodic and happens only after those acknowledgement records
+  are durable, avoiding a complete outbox rewrite for every edit.
 - A duplicate ID with the same content returns the original durable result
   without a second apply; reuse with different content is a hard collision.
 - Document revisions and leases are validated for every member before a cloned
@@ -62,12 +69,14 @@ memory, records the completed action count, and offers an identity-fenced retry.
 | lost durable acknowledgement | retry same ID; no second apply | `authority::durable_follows_journal_sync_and_duplicate_ids_are_not_reapplied` |
 | duplicate mutation | same durable result | same authority test + outbox reconciliation test |
 | mutation-ID collision | reject differing contents | authority dedup implementation |
+| collision inside a client group | reject the whole group before writing | `outbox::colliding_id_rejects_a_whole_outbox_batch_before_writing` |
 | client crash / torn outbox tail | recover complete mutations only | `outbox::torn_tail_preserves_the_last_complete_whole_mutation` |
 | corrupt client WAL | fail loudly | `wal::detects_checksum_corruption` |
 | daemon crash after `Received` | no journal apply; retry succeeds | `wren-sessiond::crash_after_received_leaves_no_commit_and_retry_is_durable` |
 | daemon crash after `Durable` | journal replay retains text and dedup | authority durable/restart test |
 | both sides crash | retry reconciles by mutation ID | `outbox::both_sides_can_crash_after_durable_and_reconcile_by_mutation_id` |
 | torn session-journal tail | retain complete records only | `journal::recovers_complete_records_and_ignores_a_torn_tail` |
+| crash after a grouped authority sync | replay every independent mutation in order | `authority::ordered_batch_is_durable_as_independent_recoverable_commits` |
 | corrupt session journal | fail loudly | `journal::checksum_corruption_is_never_silently_replayed` |
 | event continuity break | epoch changes; snapshot required | authority resume/epoch test |
 | stale base after event compaction | return retained document delta | authority resume/epoch test |

@@ -10,6 +10,10 @@ the presenter, and Termina serialization. The fixed production workload is a
 baseline is fully presented before its physical-input clock begins, and setup
 versus measured presentations are disclosed independently.
 
+The semantic layer in this deterministic local workload is synthesized from
+retained syntax spans and reported as `synthetic_semantic_spans`; it exercises
+the same composition and rendering path without claiming a live LSP response.
+
 Both the component and full-App desired-frame paths retain the architecture's
 77,654ns p99 target and 100,000ns worst-observed maximum. The harness reports
 and gates them separately; a passing component result cannot be cited as an

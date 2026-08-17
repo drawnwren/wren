@@ -53,6 +53,9 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+branches_sharing_code = "warn"
+cognitive_complexity = "warn"
+match_same_arms = "warn"
 
 [profile.release]
 lto = "thin"
