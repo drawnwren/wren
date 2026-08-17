@@ -590,19 +590,41 @@ fn query_tree_sitter_spans_with_workers(
         .iter()
         .map(|kind| Arc::<str>::from(*kind))
         .collect::<Vec<_>>();
+    let pattern_priorities = query_pattern_priorities(&query);
+    let capture_offsets = query_capture_offsets(&query);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).ok()?;
     let tree = parser.parse(text, None)?;
     let root = tree.root_node();
     let ranges = query_worker_ranges(root, text.len(), workers);
     let mut spans = if let [range] = ranges.as_slice() {
-        collect_query_spans(&query, root, text, &capture_kinds, range.clone())
+        collect_query_spans(
+            &query,
+            root,
+            text,
+            &capture_kinds,
+            &pattern_priorities,
+            &capture_offsets,
+            range.clone(),
+        )
     } else {
         std::thread::scope(|scope| {
             let handles = ranges.into_iter().map(|range| {
                 let query = &query;
                 let capture_kinds = &capture_kinds;
-                scope.spawn(move || collect_query_spans(query, root, text, capture_kinds, range))
+                let pattern_priorities = &pattern_priorities;
+                let capture_offsets = &capture_offsets;
+                scope.spawn(move || {
+                    collect_query_spans(
+                        query,
+                        root,
+                        text,
+                        capture_kinds,
+                        pattern_priorities,
+                        capture_offsets,
+                        range,
+                    )
+                })
             });
             handles
                 .map(|handle| handle.join().ok())
@@ -612,21 +634,7 @@ fn query_tree_sitter_spans_with_workers(
         .flatten()
         .collect()
     };
-    spans.sort_unstable_by(|left, right| {
-        (
-            left.range.start,
-            std::cmp::Reverse(left.range.end),
-            left.priority,
-            left.kind.as_ref(),
-        )
-            .cmp(&(
-                right.range.start,
-                std::cmp::Reverse(right.range.end),
-                right.priority,
-                right.kind.as_ref(),
-            ))
-    });
-    spans.dedup();
+    normalize_highlight_spans(&mut spans);
     Some(spans)
 }
 
@@ -659,6 +667,8 @@ fn collect_query_spans(
     root: tree_sitter::Node<'_>,
     text: &str,
     capture_kinds: &[Arc<str>],
+    pattern_priorities: &[u32],
+    capture_offsets: &[Vec<(u32, [isize; 4])>],
     range: Range<usize>,
 ) -> Vec<HighlightSpan> {
     let mut cursor = QueryCursor::new();
@@ -670,17 +680,14 @@ fn collect_query_spans(
         if !satisfies_neovim_predicates(query, query_match, text, &mut lua_patterns) {
             continue;
         }
-        let base_priority = query
-            .property_settings(query_match.pattern_index)
-            .iter()
-            .rev()
-            .find(|property| property.key.as_ref() == "priority")
-            .and_then(|property| property.value.as_deref())
-            .and_then(|priority| priority.parse::<u32>().ok())
-            .unwrap_or(100);
-        let priority = base_priority
-            .saturating_mul(10_000)
-            .saturating_add(u32::try_from(query_match.pattern_index).unwrap_or(u32::MAX));
+        let priority = pattern_priorities
+            .get(query_match.pattern_index)
+            .copied()
+            .unwrap_or(u32::MAX);
+        let offsets = capture_offsets
+            .get(query_match.pattern_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         for capture in query_match.captures {
             let Some(kind) = capture_kinds.get(capture.index as usize) else {
                 continue;
@@ -688,7 +695,12 @@ fn collect_query_spans(
             if kind.starts_with('_') || matches!(kind.as_ref(), "spell" | "nospell" | "none") {
                 continue;
             }
-            let range = neovim_capture_range(query, query_match, capture.index, text)
+            let range = offsets
+                .iter()
+                .find_map(|(index, offsets)| {
+                    (*index == capture.index)
+                        .then(|| offset_capture_range(text, capture.node, *offsets))
+                })
                 .unwrap_or_else(|| capture.node.byte_range());
             if range.start < range.end && range.end <= text.len() {
                 spans.push(HighlightSpan {
@@ -699,7 +711,89 @@ fn collect_query_spans(
             }
         }
     }
+    normalize_highlight_spans(&mut spans);
     spans
+}
+
+fn query_pattern_priorities(query: &Query) -> Vec<u32> {
+    (0..query.pattern_count())
+        .map(|pattern_index| {
+            let base_priority = query
+                .property_settings(pattern_index)
+                .iter()
+                .rev()
+                .find(|property| property.key.as_ref() == "priority")
+                .and_then(|property| property.value.as_deref())
+                .and_then(|priority| priority.parse::<u32>().ok())
+                .unwrap_or(100);
+            base_priority
+                .saturating_mul(10_000)
+                .saturating_add(u32::try_from(pattern_index).unwrap_or(u32::MAX))
+        })
+        .collect()
+}
+
+fn query_capture_offsets(query: &Query) -> Vec<Vec<(u32, [isize; 4])>> {
+    (0..query.pattern_count())
+        .map(|pattern_index| {
+            query
+                .general_predicates(pattern_index)
+                .iter()
+                .filter(|predicate| predicate.operator.as_ref() == "offset!")
+                .filter_map(|predicate| {
+                    let Some(QueryPredicateArg::Capture(capture_index)) = predicate.args.first()
+                    else {
+                        return None;
+                    };
+                    let offsets = predicate
+                        .args
+                        .iter()
+                        .skip(1)
+                        .filter_map(|arg| match arg {
+                            QueryPredicateArg::String(value) => value.parse::<isize>().ok(),
+                            QueryPredicateArg::Capture(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let [start_row, start_column, end_row, end_column] = offsets.as_slice() else {
+                        return None;
+                    };
+                    Some((
+                        *capture_index,
+                        [*start_row, *start_column, *end_row, *end_column],
+                    ))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn normalize_highlight_spans(spans: &mut Vec<HighlightSpan>) {
+    // QueryCursor already emits captures in byte order. Captures for the same
+    // node may arrive in query order rather than priority order, so canonicalize
+    // only those tiny equal-range groups instead of sorting the full file.
+    if !spans.is_sorted_by(|left, right| highlight_coordinate_order(left, right).is_le()) {
+        spans.sort_unstable_by(highlight_coordinate_order);
+    }
+    let mut start = 0;
+    while start < spans.len() {
+        let mut end = start.saturating_add(1);
+        while end < spans.len()
+            && spans[end].range.start == spans[start].range.start
+            && spans[end].range.end == spans[start].range.end
+        {
+            end = end.saturating_add(1);
+        }
+        spans[start..end].sort_unstable_by(|left, right| {
+            (left.priority, left.kind.as_ref()).cmp(&(right.priority, right.kind.as_ref()))
+        });
+        start = end;
+    }
+    spans.dedup();
+}
+
+fn highlight_coordinate_order(left: &HighlightSpan, right: &HighlightSpan) -> std::cmp::Ordering {
+    (left.range.start, std::cmp::Reverse(left.range.end))
+        .cmp(&(right.range.start, std::cmp::Reverse(right.range.end)))
 }
 
 fn cached_highlight_query(
@@ -993,53 +1087,25 @@ fn neovim_contains_predicate(
     })
 }
 
-fn neovim_capture_range(
-    query: &Query,
-    query_match: &QueryMatch<'_, '_>,
-    capture_index: u32,
+fn offset_capture_range(
     text: &str,
-) -> Option<Range<usize>> {
-    let capture = query_match
-        .captures
-        .iter()
-        .find(|capture| capture.index == capture_index)?;
-    let mut range = capture.node.byte_range();
-    for predicate in query.general_predicates(query_match.pattern_index) {
-        if predicate.operator.as_ref() != "offset!"
-            || !matches!(
-                predicate.args.first(),
-                Some(QueryPredicateArg::Capture(index)) if *index == capture_index
-            )
-        {
-            continue;
-        }
-        let offsets = predicate
-            .args
-            .iter()
-            .skip(1)
-            .filter_map(|arg| match arg {
-                QueryPredicateArg::String(value) => value.parse::<isize>().ok(),
-                QueryPredicateArg::Capture(_) => None,
-            })
-            .collect::<Vec<_>>();
-        if let [start_row, start_column, end_row, end_column] = offsets.as_slice() {
-            range.start = offset_byte(
-                text,
-                capture.node.start_position().row,
-                capture.node.start_position().column,
-                *start_row,
-                *start_column,
-            );
-            range.end = offset_byte(
-                text,
-                capture.node.end_position().row,
-                capture.node.end_position().column,
-                *end_row,
-                *end_column,
-            );
-        }
-    }
-    Some(range)
+    node: tree_sitter::Node<'_>,
+    [start_row, start_column, end_row, end_column]: [isize; 4],
+) -> Range<usize> {
+    offset_byte(
+        text,
+        node.start_position().row,
+        node.start_position().column,
+        start_row,
+        start_column,
+    )
+        ..offset_byte(
+            text,
+            node.end_position().row,
+            node.end_position().column,
+            end_row,
+            end_column,
+        )
 }
 
 fn offset_byte(

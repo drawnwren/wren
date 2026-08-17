@@ -20,10 +20,7 @@ impl App {
         let language_id = bundle.language_id.clone();
         let frame = self.active.editor.frame();
         let text = frame.text.as_ref();
-        let spans = highlight_text(text, &language_id)
-            .into_iter()
-            .map(|span| provider_decoration(span, self.theme))
-            .collect::<Vec<_>>();
+        let spans = provider_decorations(highlight_text(text, &language_id), self.theme);
         self.decorations.insert(
             self.active.buffer_id,
             BufferDecorations::new(revision, spans),

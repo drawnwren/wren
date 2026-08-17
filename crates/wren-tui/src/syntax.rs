@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 enum HighlightStyle {
@@ -238,15 +239,41 @@ const HIGHLIGHT_RULES: &[HighlightRule] = &[
 ];
 
 pub(super) fn provider_decoration(span: HighlightSpan, theme: CatppuccinPalette) -> DecorationSpan {
-    let style = HIGHLIGHT_RULES
-        .iter()
-        .find(|rule| rule.matches(&span.kind))
-        .map_or(HighlightStyle::Text, |rule| rule.style);
     DecorationSpan {
         range: span.range,
-        style: highlight_cell_style(style, theme),
+        style: provider_cell_style(&span.kind, theme),
         priority: span.priority,
     }
+}
+
+pub(super) fn provider_decorations(
+    spans: Vec<HighlightSpan>,
+    theme: CatppuccinPalette,
+) -> Vec<DecorationSpan> {
+    let mut styles = HashMap::<Arc<str>, CellStyle>::new();
+    spans
+        .into_iter()
+        .map(|span| {
+            let style = styles.get(span.kind.as_ref()).copied().unwrap_or_else(|| {
+                let style = provider_cell_style(&span.kind, theme);
+                styles.insert(Arc::clone(&span.kind), style);
+                style
+            });
+            DecorationSpan {
+                range: span.range,
+                style,
+                priority: span.priority,
+            }
+        })
+        .collect()
+}
+
+fn provider_cell_style(kind: &str, theme: CatppuccinPalette) -> CellStyle {
+    let style = HIGHLIGHT_RULES
+        .iter()
+        .find(|rule| rule.matches(kind))
+        .map_or(HighlightStyle::Text, |rule| rule.style);
+    highlight_cell_style(style, theme)
 }
 
 fn highlight_cell_style(style: HighlightStyle, theme: CatppuccinPalette) -> CellStyle {
