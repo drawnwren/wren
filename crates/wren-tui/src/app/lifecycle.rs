@@ -55,7 +55,11 @@ impl App {
             .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
             .unwrap_or_else(|_| PathBuf::from("."));
         let mutations = MutationWorker::start(&root_workspace)?;
-        mutations.register(document_id, active.editor.frame().text.as_ref().to_owned())?;
+        mutations.register(
+            document_id,
+            active.editor.frame().text.as_ref().to_owned(),
+            !active.editor.is_dirty(),
+        )?;
         let (theme_flavor, theme, theme_message) = load_theme();
         push_message(&mut messages, theme_message);
         let (keymap, keymap_message) = load_keymap();
@@ -106,6 +110,10 @@ impl App {
             picker_preview_scroll: 0,
             picker_preview_highlight_line: None,
             picker_preview_decorations: Vec::new(),
+            grep_generation: 0,
+            grep_due: None,
+            grep_pending: None,
+            grep_task: None,
             popup: None,
             popup_deadline: None,
             ace_jump: None,
@@ -139,13 +147,18 @@ impl App {
             root_workspace: root_workspace.clone(),
             workspace_folders: vec![root_workspace],
             debug_ui_visible: false,
-            ai_transcript: String::new(),
-            active_ai_task: None,
+            agent_terminal: None,
+            agent_terminal_escape_pending: false,
+            agent_window_prefix_pending: false,
+            agent_sidebar: AgentSidebarState::default(),
             last_staged_patch: None,
             theme_flavor,
             theme,
             viewport_rows: 24,
             viewport_columns: 80,
+            realtime_decorations_prepared: Cell::new(false),
+            startup_screen: RefCell::new(StartupScreen::default()),
+            started_at: Instant::now(),
             foreground_frame_pending: false,
             quit: false,
         };
@@ -159,6 +172,18 @@ impl App {
         // competes with server startup for an interactive frame.
         app.schedule_workspace_lsp_start();
         Ok(app)
+    }
+
+    pub(super) fn shows_startup_screen(&self) -> bool {
+        !self.terminal_focused
+            && self.active.document.presentation_path().is_none()
+            && self.active.display_name.is_none()
+            && self.active.editor.text().len_bytes() == 0
+            && !self.active.editor.is_dirty()
+            && self.inactive.is_empty()
+            && self.views.buffers.len() == 1
+            && self.views.windows.len() == 1
+            && self.views.tabs.len() == 1
     }
 
     /// Fault the first local input and edit paths with an independent store.
@@ -178,24 +203,6 @@ impl App {
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Escape))?;
         std::hint::black_box(editor.frame());
 
-        // Exercise the same visible-span cardinality as the live buffer while
-        // retaining only a disposable subset of its immutable decorations.
-        if let Some(state) = self.decorations.get(&self.active.buffer_id) {
-            let frame = self.active.editor.frame();
-            const PREPARED_VIEWPORT_ROWS: usize = 64;
-            let last_line = frame.text.line_of_byte(frame.text.len());
-            for top_line in [0, last_line.saturating_sub(PREPARED_VIEWPORT_ROWS)] {
-                prepare_decoration_mapping(
-                    state,
-                    &frame.text,
-                    self.active.editor.revision(),
-                    top_line,
-                    PREPARED_VIEWPORT_ROWS,
-                    self.theme,
-                )?;
-            }
-        }
-
         // A boundary motion warms App dispatch without changing selections,
         // history, or durable state. Preserve the user-visible message.
         let cursor = self.active.editor.primary_cursor();
@@ -206,40 +213,6 @@ impl App {
         self.message = message;
         Ok(())
     }
-}
-
-fn prepare_decoration_mapping(
-    state: &BufferDecorations,
-    frame: &FrameText,
-    revision: DocumentRevision,
-    top_line: usize,
-    rows: usize,
-    theme: CatppuccinPalette,
-) -> Result<()> {
-    let start = frame.byte_of_line(top_line);
-    let visible = start..frame.byte_of_line(top_line.saturating_add(rows).saturating_add(1));
-    let mut decorations = BufferDecorations::new(revision, state.spans_in(visible.clone()));
-    let transaction = Transaction::new(revision, vec![Edit::new(start..start, "x")])?;
-    let preview = frame.edited(&transaction)?;
-    let changed = start..preview.byte_of_line(top_line.saturating_add(2));
-    let replacement = lexical_highlight_text(preview.slice(changed.clone()).as_ref())
-        .into_iter()
-        .map(|mut span| {
-            span.range.start = span.range.start.saturating_add(start);
-            span.range.end = span.range.end.saturating_add(start);
-            provider_decoration(span, theme)
-        })
-        .collect();
-    decorations.replace_after_transaction(
-        &transaction,
-        revision
-            .next()
-            .ok_or_else(|| anyhow!("realtime preparation revision overflow"))?,
-        std::slice::from_ref(&changed),
-        replacement,
-    );
-    std::hint::black_box(decorations.spans_in(start..visible.end.saturating_add(1)));
-    Ok(())
 }
 
 fn push_message(messages: &mut Vec<String>, message: String) {

@@ -104,6 +104,22 @@ jobs:
           name: startup-${{ matrix.runner }}
           path: startup-${{ matrix.runner }}.json
 
+  tiling-performance:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Record complete empty-startup tiling render path
+        run: nix develop --command cargo run -p wren-tiling-performance --locked --release -- --iterations 1000 --output tiling-performance-${{ matrix.runner }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tiling-performance-${{ matrix.runner }}
+          path: tiling-performance-${{ matrix.runner }}.json
+
   system-gates:
     runs-on: ubuntu-24.04
     steps:
@@ -125,12 +141,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Gate realtime and startup distributions on pinned CPU
+      - name: Gate realtime, startup, and tiling distributions on pinned CPU
         env:
           WREN_BARE_METAL: "1"
         run: |
           nix develop --command cargo run -p wren-latency --locked --release -- --iterations 10000 --cpu "$WREN_BENCH_CPU" --gate --output latency-gate.json
           nix develop --command cargo run -p wren-startup --locked --release -- --iterations 1000 --cpu "$WREN_BENCH_CPU" --gate --output startup-gate.json
+          nix develop --command cargo run -p wren-tiling-performance --locked --release -- --iterations 1000 --cpu "$WREN_BENCH_CPU" --gate --output tiling-performance-gate.json
       - name: Gate remote convergence and persisted save under netem
         env:
           WREN_BENCH_REMOTE_HOST: ${{ vars.WREN_BENCH_REMOTE_HOST }}

@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
 use wren_term::TerminalBackend;
-use wren_view::{DesiredGrid, diff};
+use wren_view::{DesiredGrid, TerminalPatch, diff_into};
 
 pub type PresentationObserver = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
@@ -211,6 +211,7 @@ fn presenter_loop<B>(
     B::Error: Display,
 {
     let mut last_fully_written: Option<Arc<DesiredGrid>> = None;
+    let mut patches = Vec::<TerminalPatch>::new();
     loop {
         let frame = match queue.take() {
             Ok(Some(frame)) => frame,
@@ -220,7 +221,7 @@ fn presenter_loop<B>(
                 return;
             }
         };
-        let patches = diff(last_fully_written.as_deref(), &frame);
+        diff_into(last_fully_written.as_deref(), &frame, &mut patches);
         let write_result = backend
             .lock()
             .map_err(|_| "terminal backend lock is poisoned".to_owned())

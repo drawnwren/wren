@@ -393,7 +393,7 @@ impl App {
         }
         if let Err(error) = self
             .mutations
-            .register(document_id, messages.editor.contents())
+            .register(document_id, messages.editor.contents(), true)
         {
             if is_new {
                 self.views.buffers.retain(|buffer| buffer.id != buffer_id);
@@ -504,14 +504,14 @@ impl App {
             return;
         }
         self.apply_state_deltas(&state_deltas);
+        if let Some(transaction) = transaction.as_ref() {
+            self.after_text_transaction(transaction);
+        }
         if let Err(error) =
             self.mutations
-                .append(self.active.document_id, transaction.clone(), state_deltas)
+                .append(self.active.document_id, transaction, state_deltas)
         {
             self.show_error(format!("mutation outbox: {error}"));
-        }
-        if let Some(transaction) = transaction {
-            self.after_text_transaction(transaction);
         }
     }
 
@@ -530,13 +530,13 @@ impl App {
         self.client_state_worker.try_save(self.client_state.clone());
     }
 
-    fn after_text_transaction(&mut self, transaction: Transaction) {
+    fn after_text_transaction(&mut self, transaction: &Transaction) {
         if let Some(semantic) = self.semantic_decorations.get_mut(&self.active.buffer_id)
             && semantic.revision == transaction.base_revision()
         {
-            semantic.map_through(&transaction, self.active.editor.revision());
+            semantic.map_through(transaction, self.active.editor.revision());
         }
-        self.refresh_changed_syntax(&transaction);
+        self.refresh_changed_syntax(transaction);
         if let Some(before) = self.active.git_index_text.as_ref().map(Arc::clone) {
             self.schedule_git_hunk_refresh(GitHunkRequest {
                 buffer_id: self.active.buffer_id,
@@ -644,6 +644,7 @@ pub(super) fn normal_prefix_hint_entries(
             add("s", "horizontal split");
             add("v", "vertical split");
             add("c", "close window");
+            add("q", "close window");
             add("o", "close other windows");
             add("w", "next window");
         }

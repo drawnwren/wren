@@ -313,6 +313,7 @@ pub(super) enum MutationMessage {
     Register {
         document_id: DocumentId,
         text: String,
+        replace_stale: bool,
         reply: mpsc::Sender<Result<(), String>>,
     },
     Append {
@@ -325,13 +326,14 @@ pub(super) enum MutationMessage {
 }
 
 const MAX_MUTATION_BATCH: usize = 512;
+const DURABILITY_QUEUE_CAPACITY: usize = 4_096;
 // Local-durable work is asynchronous relative to the optimistic replica. A
 // short quiet period forms the architecture's batching envelope; Barrier and
 // Stop still cut the batch immediately for save/suspend/exit frontiers.
 const DURABILITY_GROUP_COMMIT_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 pub(super) struct MutationWorker {
-    sender: mpsc::Sender<MutationMessage>,
+    sender: mpsc::SyncSender<MutationMessage>,
     join: Option<JoinHandle<()>>,
     _temporary: Option<tempfile::TempDir>,
 }
@@ -374,7 +376,7 @@ impl MutationWorker {
             SessionId::new(1),
         )?;
         let outbox = MutationOutbox::in_directory(outbox_directory);
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(DURABILITY_QUEUE_CAPACITY);
         let join = thread::Builder::new()
             .name("wren-in-process-session".to_owned())
             .spawn(move || {
@@ -389,12 +391,18 @@ impl MutationWorker {
         })
     }
 
-    pub(super) fn register(&self, document_id: DocumentId, text: String) -> Result<()> {
+    pub(super) fn register(
+        &self,
+        document_id: DocumentId,
+        text: String,
+        replace_stale: bool,
+    ) -> Result<()> {
         let (reply, response) = mpsc::channel();
         self.sender
             .send(MutationMessage::Register {
                 document_id,
                 text,
+                replace_stale,
                 reply,
             })
             .map_err(|_| anyhow!("in-process session stopped"))?;
@@ -462,12 +470,23 @@ pub(super) fn mutation_loop(
             MutationMessage::Register {
                 document_id,
                 text,
+                replace_stale,
                 reply,
             } => {
-                let result =
-                    register_mutation_document(&mut authority, client_id, document_id, text);
+                let result = register_mutation_document(
+                    &mut authority,
+                    &outbox,
+                    client_id,
+                    next_sequence,
+                    document_id,
+                    text,
+                    replace_stale,
+                );
+                if let Ok(sequence) = result {
+                    next_sequence = sequence;
+                }
                 record_persistence_error(&mut error, &result);
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|_| ()));
             }
             MutationMessage::Append {
                 document_id,
@@ -533,18 +552,44 @@ impl<'a, T> DeferredMessages<'a, T> {
 
 fn register_mutation_document(
     authority: &mut SessionAuthority,
+    outbox: &MutationOutbox,
     client_id: ClientId,
+    next_sequence: u64,
     document_id: DocumentId,
     text: String,
-) -> Result<(), String> {
+    replace_stale: bool,
+) -> Result<u64, String> {
     match authority.document(document_id) {
-        Some(document) if document.text_equals(&text) => Ok(()),
+        Some(document) if document.text_equals(&text) => Ok(next_sequence),
+        // Clean disk and generated buffers are current source snapshots, so an
+        // external change may advance their stale authority through the normal
+        // checksummed mutation path. A buffer restored from an unsaved WAL sets
+        // `replace_stale` false: disagreement then remains a real conflict and
+        // never discards recovered user edits.
+        Some(document) if replace_stale => {
+            let replacement = Transaction::new(
+                document.revision,
+                vec![Edit::new(0..document.text().len(), text)],
+            )
+            .map_err(|error| error.to_string())?;
+            submit_local_mutations(
+                authority,
+                outbox,
+                client_id,
+                next_sequence,
+                vec![(document_id, Some(replacement), Vec::new())],
+            )
+            .map_err(|error| error.to_string())?;
+            next_sequence
+                .checked_add(1)
+                .ok_or_else(|| "client mutation sequence overflow".to_owned())
+        }
         Some(_) => Err(format!(
             "durable session text for {document_id:?} differs from local recovery; explicit reconciliation is required"
         )),
         None => authority
             .register_document(document_id, text, client_id)
-            .map(|_| ())
+            .map(|_| next_sequence)
             .map_err(|current| current.to_string()),
     }
 }
@@ -683,13 +728,13 @@ pub(super) enum WalMessage {
 }
 
 pub(super) struct WalWorker {
-    sender: mpsc::Sender<WalMessage>,
+    sender: mpsc::SyncSender<WalMessage>,
     join: Option<JoinHandle<()>>,
 }
 
 impl WalWorker {
     pub(super) fn start(wal: LocalWal) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(DURABILITY_QUEUE_CAPACITY);
         let join = thread::Builder::new()
             .name("wren-wal".to_owned())
             .spawn(move || {
@@ -876,6 +921,7 @@ mod tests {
             .send(MutationMessage::Register {
                 document_id: DocumentId::new(1),
                 text: "base".to_owned(),
+                replace_stale: true,
                 reply,
             })
             .expect("register request");
@@ -916,6 +962,68 @@ mod tests {
                 .expect("document")
                 .text(),
             format!("{}base", "x".repeat(128))
+        );
+    }
+
+    #[test]
+    fn clean_registration_tracks_external_file_replacement_safely() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal = SessionJournal::in_directory(directory.path().join("session"));
+        let mut authority =
+            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("open authority");
+        let outbox = MutationOutbox::in_directory(directory.path().join("outbox"));
+        let client_id = ClientId::new(1);
+        let document_id = DocumentId::new(7);
+        authority
+            .register_document(document_id, "stale", client_id)
+            .expect("register stale snapshot");
+
+        let next_sequence = register_mutation_document(
+            &mut authority,
+            &outbox,
+            client_id,
+            1,
+            document_id,
+            "current disk".to_owned(),
+            true,
+        )
+        .expect("replace stale clean snapshot");
+
+        assert_eq!(next_sequence, 2);
+        assert!(outbox.outstanding().expect("outbox").is_empty());
+        let document = authority.document(document_id).expect("document");
+        assert_eq!(document.revision, DocumentRevision::new(1));
+        assert_eq!(document.text(), "current disk");
+
+        let error = register_mutation_document(
+            &mut authority,
+            &outbox,
+            client_id,
+            next_sequence,
+            document_id,
+            "new conflict".to_owned(),
+            false,
+        )
+        .expect_err("recovered state must not be replaced");
+        assert!(error.contains("explicit reconciliation is required"));
+
+        let next_sequence = register_mutation_document(
+            &mut authority,
+            &outbox,
+            client_id,
+            next_sequence,
+            document_id,
+            "new disk".to_owned(),
+            true,
+        )
+        .expect("a newer clean disk snapshot remains authoritative");
+        assert_eq!(next_sequence, 3);
+
+        let recovered =
+            SessionAuthority::open(journal, SessionId::new(1)).expect("recover authority");
+        assert_eq!(
+            recovered.document(document_id).expect("document").text(),
+            "new disk"
         );
     }
 }

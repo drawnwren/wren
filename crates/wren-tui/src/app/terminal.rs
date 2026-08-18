@@ -96,16 +96,17 @@ impl App {
     pub(super) fn resize_terminal(&mut self, rows: usize, columns: usize) {
         self.viewport_rows = rows.max(1);
         self.viewport_columns = columns.max(1);
-        let Some(terminal) = &mut self.terminal else {
-            return;
-        };
-        let rows = u16::try_from(rows.saturating_sub(1))
-            .unwrap_or(u16::MAX)
-            .max(1);
-        let columns = u16::try_from(columns).unwrap_or(u16::MAX).max(1);
-        if let Err(error) = terminal.resize(rows, columns) {
+        let terminal_error = self.terminal.as_mut().and_then(|terminal| {
+            let rows = u16::try_from(rows.saturating_sub(1))
+                .unwrap_or(u16::MAX)
+                .max(1);
+            let columns = u16::try_from(columns).unwrap_or(u16::MAX).max(1);
+            terminal.resize(rows, columns).err()
+        });
+        if let Some(error) = terminal_error {
             self.show_error(format!("terminal resize: {error}"));
         }
+        self.resize_agent_terminal();
     }
 
     pub(super) fn take_normal_count(&mut self) -> Option<usize> {
@@ -167,7 +168,18 @@ impl App {
             _ => None,
         };
         if let Some(direction) = direction {
+            let previous = self.views.active_window().id;
             self.views.focus_window(direction)?;
+            if direction == WindowDirection::Right
+                && self.agent_sidebar.visible
+                && self.views.active_window().id == previous
+            {
+                self.agent_sidebar.focused = true;
+                self.popup = None;
+                self.popup_deadline = None;
+                self.message = "Oh My Pi window focused".to_owned();
+                return Ok(());
+            }
             self.activate_view_buffer()?;
             self.message.clear();
             return Ok(());
@@ -430,56 +442,13 @@ impl App {
             return grid;
         };
         let surface = terminal.surface();
-        let (_, surface_columns) = surface.size();
         let content_rows = grid.height.saturating_sub(1);
-        let columns = usize::from(surface_columns).min(grid.width);
-        for row in 0..content_rows {
-            let mut cells = Vec::with_capacity(columns);
-            let mut column = 0_usize;
-            while column < columns {
-                let Some(source) = surface.cell(
-                    u16::try_from(row).unwrap_or(u16::MAX),
-                    u16::try_from(column).unwrap_or(u16::MAX),
-                ) else {
-                    break;
-                };
-                if source.wide_continuation {
-                    column = column.saturating_add(1);
-                    continue;
-                }
-                let width = if source.wide { 2 } else { 1 };
-                if column.saturating_add(width) > columns {
-                    break;
-                }
-                cells.push(ViewCell {
-                    grapheme: if source.contents.is_empty() {
-                        " ".into()
-                    } else {
-                        source.contents.into()
-                    },
-                    width: u8::try_from(width).unwrap_or(1),
-                    style: CellStyle {
-                        bold: source.bold,
-                        italic: source.italic,
-                        underline: source.underline,
-                        strikethrough: false,
-                        reverse: source.reverse,
-                        foreground: Some(terminal_cell_color(source.foreground, self.theme.text)),
-                        background: Some(terminal_cell_color(source.background, self.theme.base)),
-                    },
-                });
-                column = column.saturating_add(width);
-            }
-            cells.extend((column..grid.width).map(|_| ViewCell {
-                grapheme: " ".into(),
-                width: 1,
-                style: CellStyle {
-                    foreground: Some(CellColor::Rgb(self.theme.text)),
-                    background: Some(CellColor::Rgb(self.theme.base)),
-                    ..CellStyle::default()
-                },
-            }));
-            grid.rows[row] = Arc::new(CellRow { cells });
+        for (row, cells) in self
+            .terminal_surface_rows(terminal, content_rows, grid.width)
+            .into_iter()
+            .enumerate()
+        {
+            grid.rows[row] = Arc::new(cells);
         }
         let (cursor_row, cursor_column) = surface.cursor_position();
         grid.cursor = (
@@ -487,6 +456,73 @@ impl App {
             usize::from(cursor_row).min(content_rows.saturating_sub(1)),
         );
         grid
+    }
+
+    pub(super) fn terminal_surface_rows(
+        &self,
+        terminal: &PtySession,
+        rows: usize,
+        columns: usize,
+    ) -> Vec<CellRow> {
+        let surface = terminal.surface();
+        let (_, surface_columns) = surface.size();
+        let columns = usize::from(surface_columns).min(columns);
+        (0..rows)
+            .map(|row| {
+                let mut cells = Vec::with_capacity(columns);
+                let mut column = 0_usize;
+                while column < columns {
+                    let Some(source) = surface.cell(
+                        u16::try_from(row).unwrap_or(u16::MAX),
+                        u16::try_from(column).unwrap_or(u16::MAX),
+                    ) else {
+                        break;
+                    };
+                    if source.wide_continuation {
+                        column = column.saturating_add(1);
+                        continue;
+                    }
+                    let width = if source.wide { 2 } else { 1 };
+                    if column.saturating_add(width) > columns {
+                        break;
+                    }
+                    cells.push(ViewCell {
+                        grapheme: if source.contents.is_empty() {
+                            " ".into()
+                        } else {
+                            source.contents.into()
+                        },
+                        width: u8::try_from(width).unwrap_or(1),
+                        style: CellStyle {
+                            bold: source.bold,
+                            italic: source.italic,
+                            underline: source.underline,
+                            strikethrough: false,
+                            reverse: source.reverse,
+                            foreground: Some(terminal_cell_color(
+                                source.foreground,
+                                self.theme.text,
+                            )),
+                            background: Some(terminal_cell_color(
+                                source.background,
+                                self.theme.base,
+                            )),
+                        },
+                    });
+                    column = column.saturating_add(width);
+                }
+                cells.extend((column..columns).map(|_| ViewCell {
+                    grapheme: " ".into(),
+                    width: 1,
+                    style: CellStyle {
+                        foreground: Some(CellColor::Rgb(self.theme.text)),
+                        background: Some(CellColor::Rgb(self.theme.base)),
+                        ..CellStyle::default()
+                    },
+                }));
+                CellRow { cells }
+            })
+            .collect()
     }
 
     pub(super) fn terminal_status(&self) -> String {
@@ -502,117 +538,6 @@ impl App {
                 )
             },
         )
-    }
-
-    pub(super) fn show_ai_transcript(&mut self) {
-        let (text, decorations) = lsp_popup_markdown(&self.ai_transcript, self.theme);
-        self.popup = Some(TextPopup {
-            title: "Avante · Codex".into(),
-            text: text.into(),
-            scroll: 0,
-            cursor: None,
-            decorations,
-        });
-        self.popup_deadline = None;
-    }
-
-    pub(super) fn start_ai_task(&mut self, prompt: &str) -> Result<()> {
-        let prompt = prompt.trim();
-        if prompt.is_empty() {
-            self.prompt = Some(Prompt::new(PromptKind::Ai));
-            return Ok(());
-        }
-        if self.active_task.is_some() {
-            bail!("a TaskCommand is already running");
-        }
-        let task_id = CommandTaskId::new(self.next_task_id);
-        self.next_task_id = self
-            .next_task_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("task ID overflow"))?;
-        let root = self
-            .active
-            .document
-            .presentation_path()
-            .and_then(|path| git_root_for(path).ok())
-            .or_else(|| self.workspace_folders.first().cloned())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let (line, column) = self.active.editor.cursor_line_column();
-        let context = self.active.document.presentation_path().map_or_else(
-            || prompt.to_owned(),
-            |path| {
-                format!(
-                    "The active editor file is {} at line {}, column {}.\n\n{}",
-                    path.display(),
-                    line + 1,
-                    column + 1,
-                    prompt
-                )
-            },
-        );
-        let mut environment = BTreeMap::new();
-        if let Ok(path) = env::var("PATH") {
-            environment.insert("PATH".into(), path.into());
-        }
-        let arguments = vec![
-            "exec".into(),
-            "--sandbox".into(),
-            "read-only".into(),
-            "--color".into(),
-            "never".into(),
-            "--skip-git-repo-check".into(),
-            "-C".into(),
-            root.to_string_lossy().into_owned().into_boxed_str(),
-            context.into_boxed_str(),
-        ];
-        let spec = WorkflowTaskSpec {
-            program: "codex".into(),
-            arguments,
-            environment,
-            visibility: DocumentVisibility::Persisted,
-            save: SavePolicy::Never,
-            max_output_bytes: 4 * 1024 * 1024,
-        };
-        let cancellation = self.tasks.submit(
-            CommandTask {
-                task_id,
-                affected_documents: Vec::new(),
-                label: "Codex assistant".into(),
-            },
-            move |context| {
-                context.checkpoint()?;
-                let token = context.cancellation_token();
-                let output = TaskSupervisor::new(true)
-                    .run_until_cancelled(&spec, || token.is_cancelled())
-                    .map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
-                context.checkpoint()?;
-                if output.cancelled {
-                    return Err(TaskFailure::Cancelled);
-                }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if output.status != Some(0) {
-                    let detail = if stderr.trim().is_empty() {
-                        stdout.trim()
-                    } else {
-                        stderr.trim()
-                    };
-                    return Err(TaskFailure::Failed(
-                        format!("Codex failed: {detail}").into(),
-                    ));
-                }
-                Ok(Effects {
-                    messages: vec![stdout.trim().to_owned().into_boxed_str()],
-                    ..Effects::default()
-                })
-            },
-        )?;
-        self.active_task = Some(cancellation);
-        self.active_ai_task = Some(task_id);
-        self.popup = None;
-        self.popup_deadline = None;
-        self.message = "Codex is thinking…".to_owned();
-        Ok(())
     }
 
     pub(super) fn start_make_task(&mut self, program: &str, arguments: &[Box<str>]) -> Result<()> {

@@ -1,6 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -105,7 +105,7 @@ pub struct SystemTerminalBackend {
     terminal: PlatformTerminal,
     true_color: bool,
     render_buffer: Vec<u8>,
-    style_cache: Vec<(CellStyle, Box<[u8]>)>,
+    style_cache: StyleCache,
     deferred_parser: Parser,
     deferred_input: VecDeque<TerminalInput>,
 }
@@ -130,7 +130,7 @@ impl SystemTerminalBackend {
             terminal,
             true_color: supports_true_color(),
             render_buffer: Vec::with_capacity(64 * 1024),
-            style_cache: Vec::new(),
+            style_cache: StyleCache::default(),
             deferred_parser: Parser::default(),
             deferred_input: VecDeque::new(),
         })
@@ -327,7 +327,7 @@ pub struct TerminaBackend<W> {
     writer: W,
     true_color: bool,
     render_buffer: Vec<u8>,
-    style_cache: Vec<(CellStyle, Box<[u8]>)>,
+    style_cache: StyleCache,
 }
 
 impl<W: Write> TerminaBackend<W> {
@@ -336,7 +336,7 @@ impl<W: Write> TerminaBackend<W> {
             writer,
             true_color: supports_true_color(),
             render_buffer: Vec::with_capacity(64 * 1024),
-            style_cache: Vec::new(),
+            style_cache: StyleCache::default(),
         })
     }
 
@@ -470,7 +470,7 @@ fn render_patches(
     output: &mut impl Write,
     patch: &[TerminalPatch],
     true_color: bool,
-    style_cache: &mut Vec<(CellStyle, Box<[u8]>)>,
+    style_cache: &mut StyleCache,
 ) -> Result<(), TerminalError> {
     let mut active_style = None;
     for change in patch {
@@ -538,20 +538,51 @@ fn write_style_if_changed(
     style: CellStyle,
     true_color: bool,
     active_style: &mut Option<CellStyle>,
-    cache: &mut Vec<(CellStyle, Box<[u8]>)>,
+    cache: &mut StyleCache,
 ) -> io::Result<()> {
     if *active_style == Some(style) {
         return Ok(());
     }
     *active_style = Some(style);
-    if let Some((_, bytes)) = cache.iter().find(|(cached, _)| *cached == style) {
+    let key = style_key(style);
+    if let Some(bytes) = cache.entries.get(&key) {
         return output.write_all(bytes);
     }
     let mut bytes = Vec::with_capacity(48);
     write_style(&mut bytes, style, true_color)?;
     output.write_all(&bytes)?;
-    cache.push((style, bytes.into_boxed_slice()));
+    if cache.entries.len() < STYLE_CACHE_CAPACITY {
+        cache.entries.insert(key, bytes.into_boxed_slice());
+    }
     Ok(())
+}
+
+const STYLE_CACHE_CAPACITY: usize = 65_536;
+
+#[derive(Default)]
+struct StyleCache {
+    entries: HashMap<u128, Box<[u8]>>,
+}
+
+fn style_key(style: CellStyle) -> u128 {
+    let flags = u128::from(style.bold)
+        | (u128::from(style.italic) << 1)
+        | (u128::from(style.underline) << 2)
+        | (u128::from(style.strikethrough) << 3)
+        | (u128::from(style.reverse) << 4);
+    flags
+        | (u128::from(color_key(style.foreground)) << 8)
+        | (u128::from(color_key(style.background)) << 40)
+}
+
+const fn color_key(color: Option<CellColor>) -> u32 {
+    match color {
+        None => 0,
+        Some(CellColor::Palette(index)) => 1 | (index as u32) << 2,
+        Some(CellColor::Rgb(color)) => {
+            2 | (color.red as u32) << 2 | (color.green as u32) << 10 | (color.blue as u32) << 18
+        }
+    }
 }
 
 fn terminal_coordinate(zero_based: usize) -> Result<OneBased, TerminalError> {
@@ -949,7 +980,7 @@ mod tests {
                 TerminalPatch::ShowCursor(true),
             ],
             true,
-            &mut Vec::new(),
+            &mut StyleCache::default(),
         )
         .expect("render");
         assert_eq!(output, b"\x1b[m\x1b[2J\x1b[3;5H\x1b[?25l\x1b[?25h");

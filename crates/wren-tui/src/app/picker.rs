@@ -1,5 +1,110 @@
 use super::*;
 
+const GREP_PICKER_RESULT_LIMIT: usize = 10_000;
+
+fn launch_grep_picker_task(request: GrepPickerRequest) -> Result<GrepPickerTask> {
+    let generation = request.generation;
+    let query = request.query.clone();
+    let child = Arc::new(Mutex::new(None));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_child = Arc::clone(&child);
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("wren-live-grep".to_owned())
+        .spawn(move || {
+            wren_scheduling::mark_background();
+            let result = run_grep_picker_search(request, &worker_child, &worker_cancelled);
+            let _ = sender.send(result);
+        })
+        .context("start repository search worker")?;
+    Ok(GrepPickerTask {
+        generation,
+        query,
+        child,
+        cancelled,
+        receiver,
+    })
+}
+
+fn run_grep_picker_search(
+    request: GrepPickerRequest,
+    child_slot: &Mutex<Option<std::process::Child>>,
+    cancelled: &AtomicBool,
+) -> std::result::Result<Vec<QuickfixEntry>, String> {
+    let root = git_root_for(&request.root).unwrap_or(request.root);
+    if cancelled.load(Ordering::Acquire) {
+        return Err("cancelled".to_owned());
+    }
+    let mut child = Command::new("rg")
+        .current_dir(&root)
+        .args(["--vimgrep", "--no-messages", "--"])
+        .arg(&request.query)
+        .arg(".")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("start rg: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "rg stdout was not captured".to_owned())?;
+    {
+        let mut slot = child_slot
+            .lock()
+            .map_err(|_| "repository search child lock is poisoned".to_owned())?;
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            return Err("cancelled".to_owned());
+        }
+        *slot = Some(child);
+    }
+
+    let mut entries = Vec::new();
+    let mut read_error = None;
+    for line in BufReader::new(stdout).lines() {
+        match line {
+            Ok(line) => {
+                if let Some(mut entry) = parse_vimgrep_line(&line) {
+                    if entry.path.is_relative() {
+                        entry.path = root.join(entry.path);
+                    }
+                    entries.push(entry);
+                    if entries.len() == GREP_PICKER_RESULT_LIMIT {
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                read_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
+    let mut child = child_slot
+        .lock()
+        .map_err(|_| "repository search child lock is poisoned".to_owned())?
+        .take()
+        .ok_or_else(|| "repository search child vanished".to_owned())?;
+    let limited = entries.len() == GREP_PICKER_RESULT_LIMIT;
+    if limited || cancelled.load(Ordering::Acquire) {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for rg: {error}"))?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err("cancelled".to_owned());
+    }
+    if let Some(error) = read_error {
+        return Err(format!("read rg output: {error}"));
+    }
+    if !limited && !status.success() && status.code() != Some(1) {
+        return Err(format!("rg exited with {status}"));
+    }
+    Ok(entries)
+}
+
 impl App {
     pub(super) fn start_file_picker(&mut self, query: &str) -> Result<()> {
         self.picker_directory = None;
@@ -425,7 +530,8 @@ impl App {
             history_index: None,
         });
         self.picker_index = 0;
-        self.update_grep_picker()
+        self.update_grep_picker();
+        Ok(())
     }
 
     pub(super) fn update_prompt_picker(&mut self) -> Result<()> {
@@ -434,7 +540,10 @@ impl App {
                 self.update_file_picker();
                 Ok(())
             }
-            Some(PromptKind::Grep) => self.update_grep_picker(),
+            Some(PromptKind::Grep) => {
+                self.update_grep_picker();
+                Ok(())
+            }
             Some(PromptKind::Location) => {
                 self.update_location_picker();
                 Ok(())
@@ -541,22 +650,99 @@ impl App {
         self.refresh_picker_preview();
     }
 
-    pub(super) fn update_grep_picker(&mut self) -> Result<()> {
+    pub(super) fn update_grep_picker(&mut self) {
         let Some(query) = self
             .prompt
             .as_ref()
             .filter(|prompt| prompt.kind == PromptKind::Grep)
             .map(|prompt| prompt.buffer.clone())
         else {
-            return Ok(());
+            return;
         };
         self.last_picker_query.clone_from(&query);
-        let root = self.workspace_root();
-        self.populate_grep_results(&query, &[], &root)?;
         self.picker_index = 0;
-        self.update_grep_picker_message();
-        self.refresh_picker_preview();
-        Ok(())
+        self.grep_generation = self.grep_generation.saturating_add(1);
+        self.grep_pending = None;
+        self.grep_due = None;
+        if let Some(task) = self.grep_task.take() {
+            task.cancel();
+        }
+        if query.is_empty() {
+            self.quickfix.clear();
+            self.update_grep_picker_message();
+            self.refresh_picker_preview();
+            return;
+        }
+        self.quickfix.clear();
+        self.picker_preview_title = "Searching…".to_owned();
+        self.picker_preview = "Repository search is running in the background".to_owned();
+        self.picker_preview_decorations.clear();
+        self.message = format!("searching for {query:?}…");
+        self.grep_pending = Some(GrepPickerRequest {
+            generation: self.grep_generation,
+            query,
+            root: self
+                .active
+                .document
+                .presentation_path()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root_workspace.clone()),
+        });
+        self.grep_due = Some(Instant::now() + Duration::from_millis(50));
+    }
+
+    pub(super) fn cancel_grep_picker(&mut self) {
+        self.grep_due = None;
+        self.grep_pending = None;
+        if let Some(task) = self.grep_task.take() {
+            task.cancel();
+        }
+    }
+
+    pub(super) fn poll_grep_picker(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(task) = &self.grep_task {
+            let result = match task.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("repository search worker disconnected".to_owned()))
+                }
+            };
+            if let Some(result) = result {
+                let task = self.grep_task.take().expect("grep task exists");
+                let current = task.generation == self.grep_generation
+                    && self.prompt.as_ref().is_some_and(|prompt| {
+                        prompt.kind == PromptKind::Grep && prompt.buffer == task.query
+                    });
+                if current {
+                    match result {
+                        Ok(entries) => {
+                            self.quickfix = entries;
+                            self.picker_index = 0;
+                            self.update_grep_picker_message();
+                            self.refresh_picker_preview();
+                        }
+                        Err(error) => self.show_info(format!("live grep: {error}")),
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if self.grep_task.is_none() && self.grep_due.is_some_and(|due| Instant::now() >= due) {
+            self.grep_due = None;
+            if let Some(request) = self.grep_pending.take() {
+                match launch_grep_picker_task(request) {
+                    Ok(task) => self.grep_task = Some(task),
+                    Err(error) => {
+                        self.show_info(format!("live grep: {error:#}"));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     pub(super) fn open_selected_grep_result(&mut self, query: &str) -> Result<()> {
@@ -768,8 +954,7 @@ impl App {
             | PromptKind::Grep
             | PromptKind::Location
             | PromptKind::Rename
-            | PromptKind::ConditionalBreakpoint
-            | PromptKind::Ai => return,
+            | PromptKind::ConditionalBreakpoint => return,
         };
         if history.is_empty() {
             return;

@@ -3905,6 +3905,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wren-penrose"
+version = "0.1.0"
+
+[[package]]
 name = "wren-position"
 version = "0.1.0"
 dependencies = [
@@ -4078,6 +4082,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wren-tiling-performance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hdrhistogram",
+ "serde_json",
+ "tempfile",
+ "wren-benchmark-support",
+ "wren-tui",
+]
+
+[[package]]
 name = "wren-tui"
 version = "0.1.0"
 dependencies = [
@@ -4092,6 +4108,7 @@ dependencies = [
  "wren-config",
  "wren-engine",
  "wren-grammar",
+ "wren-penrose",
  "wren-presenter",
  "wren-provider",
  "wren-scheduling",

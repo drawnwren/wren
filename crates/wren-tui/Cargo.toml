@@ -20,6 +20,7 @@ wren-client-state = { version = "0.1.0", path = "../wren-client-state" }
 wren-config = { version = "0.1.0", path = "../wren-config" }
 wren-engine = { version = "0.1.0", path = "../wren-engine" }
 wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
+wren-penrose = { version = "0.1.0", path = "../wren-penrose" }
 wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
 wren-provider = { version = "0.1.0", path = "../wren-provider" }
 wren-session = { version = "0.1.0", path = "../wren-session" }

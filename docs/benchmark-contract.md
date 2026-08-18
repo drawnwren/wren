@@ -33,8 +33,20 @@ network/FUSE file; the harness does not mislabel a local path. B2/D disclose
 that portable user-space code does not control kernel cache eviction; the
 bare-metal runner controls that environment.
 
-Both harnesses emit HDR histogram JSON and accept CPU affinity. Macro-replayed
-keys are excluded by construction.
+The latency and startup harnesses emit HDR histogram JSON and accept CPU
+affinity. Macro-replayed keys are excluded by construction.
+
+`wren-tiling-performance` measures the complete empty-startup animation through
+the production `App`: exact Penrose construction/rasterization, half-block cell
+construction, Presenter publication/diffing, and completed Termina byte
+serialization. Its fixed workloads are warm animation at 120×40 and 240×80,
+cold construction at 120×40, and alternating 120×40/160×50 resizes.
+Desired-frame, diff, terminal-write, and complete-path p99 values each have hard
+gates at the floor of 90% of their pre-optimization baselines. The complete path
+also gates its worst observed sample. Its full-path limits are respectively
+19,021,823ns, 170,930,994ns, 15,998,975ns, and 76,795,083ns; a faster component
+cannot hide a regression in another stage or in the aggregate. Every published
+sample must be fully written with no dropped frames.
 
 `--gate` is authoritative only with `WREN_BARE_METAL=1`, an explicit `--cpu`,
 and successful affinity. Hosted CI runs publish non-gating distributions. The

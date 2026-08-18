@@ -1,10 +1,15 @@
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::io::{Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,7 +56,7 @@ use wren_view::{
     CellColor, CellRow, CellStyle, ClientViewModel, CompletionOverlay, CompletionOverlayRow,
     DebugOverlay, DecorationSpan, DesiredGrid, LineDecoration, MessageEntry, MessageSeverity,
     PickerOverlay, PickerOverlayRow, RgbColor, SharedDecorations, SplitAxis, StatusOverlay,
-    StatusSegment, TextPopup, ViewportLayout, WindowDirection,
+    StatusSegment, TerminalSidebar, TextPopup, ViewportLayout, WindowDirection,
 };
 use wren_workflow::{
     DocumentVisibility, GitHunk, LspClient, LspPosition, LspTextEdit, PtySession, SavePolicy,
@@ -77,6 +82,11 @@ use lsp::*;
 mod persistence;
 use persistence::*;
 
+mod startup;
+use startup::{ANIMATION_FRAME_PERIOD as STARTUP_ANIMATION_FRAME_PERIOD, StartupScreen};
+
+#[path = "app/agent.rs"]
+mod app_agent;
 #[path = "app/commands.rs"]
 mod app_commands;
 #[path = "app/editor_state.rs"]
@@ -97,7 +107,10 @@ mod app_providers;
 mod app_terminal;
 
 mod latency;
-pub use latency::{ProductionLatencyReport, ProductionLatencySample, run_production_latency_probe};
+pub use latency::{
+    ProductionLatencyReport, ProductionLatencySample, TilingPerformanceReport,
+    TilingPerformanceSample, run_production_latency_probe, run_tiling_performance_probe,
+};
 
 const HELP: &str = "\
 wren — a small, reliable modal code editor
@@ -122,6 +135,7 @@ DOTFILE KEYS:
     Space ff              fuzzy files   Space fb     file browser
     Space fr / Space fw   grep repo     Space b      buffers
     Space fo/fj/fd        oldfiles/jumps/diagnostics
+    Space a               embedded Oh My Pi terminal pane
     Space jj              Ace jump to a visible character
     Space e               diagnostic    [d / ]d      diagnostic nav
     [c / ]c               Git hunk nav  Space g…     Git hunk actions
@@ -151,7 +165,7 @@ EX COMMANDS:
     :format PROGRAM [ARGS]              revision-safe formatter
     :Git                                 lazygit diff/status interface
     :Git ARGS    :Gwrite  :Gdiffsplit   direct and native Git commands
-    :Codex / :AvanteChat / :AvanteAsk   Codex assistant float
+    :Codex / :AvanteChat / :AvanteAsk   open/send to embedded Oh My Pi
 
 Unsaved edits use a checksummed recovery WAL; undo history and oldfiles persist.
 ";
@@ -195,6 +209,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
     app.schedule_provider_refreshes(layout.height);
     presenter.publish(desired_frame(&mut layout, &app))?;
     let mut pending_input = None;
+    let mut next_startup_frame = Instant::now() + STARTUP_ANIMATION_FRAME_PERIOD;
 
     while !app.quit {
         let mut needs_render = false;
@@ -221,6 +236,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
             break;
         }
         needs_render |= poll_app_work(&mut app)?;
+        needs_render |= startup_animation_due(&app, &mut next_startup_frame);
         app.capture_debug_output();
         presenter.check_failure()?;
         // Provider refinement is independently debounced from rendering. Poll
@@ -234,6 +250,21 @@ fn run_editor(cli: &Cli) -> Result<()> {
     app.flush_wal()?;
     let _stats = presenter.finish()?;
     Ok(())
+}
+
+fn startup_animation_due(app: &App, next_frame: &mut Instant) -> bool {
+    let now = Instant::now();
+    if !app.shows_startup_screen() {
+        *next_frame = now + STARTUP_ANIMATION_FRAME_PERIOD;
+        return false;
+    }
+    if now < *next_frame {
+        return false;
+    }
+    while *next_frame <= now {
+        *next_frame += STARTUP_ANIMATION_FRAME_PERIOD;
+    }
+    true
 }
 
 const fn clipboard_selection(register: char) -> ClipboardSelection {
@@ -328,8 +359,10 @@ fn poll_app_work(app: &mut App) -> Result<bool> {
         return Ok(false);
     }
     let mut changed = app.poll_task_results()?;
+    changed |= app.poll_agent_terminal()?;
     changed |= app.poll_provider_results();
     changed |= app.poll_git_hunk_results();
+    changed |= app.poll_grep_picker();
     app.poll_lsp_start_due();
     changed |= app.poll_lsp_start()?;
     changed |= app.poll_lsp_background()?;
@@ -386,6 +419,7 @@ fn input_requires_render(input: &TerminalInput) -> bool {
 
 fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     layout.set_theme(app.theme);
+    layout.set_terminal_sidebar_visible(app.agent_sidebar.visible && !app.terminal_focused);
     if app.terminal_focused {
         return Arc::new(app.desired_terminal_grid(layout));
     }
@@ -397,8 +431,9 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     add_search_decorations(app, &mut decorations);
     let line_decorations = add_buffer_decorations(app, &mut decorations);
     add_selection_decoration(app, &mut decorations);
-    let decorations = decorations.finish();
-    let grid = layout.desired_workspace_grid_with_shared_decorations(
+    let decoration_layers = decorations.finish();
+    let decorations = layout.compose_shared_decoration_layers(&decoration_layers);
+    let mut grid = layout.desired_workspace_grid_with_shared_decorations(
         &app.views,
         &frames,
         &decorations,
@@ -406,6 +441,12 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
         " ",
         prompt.as_deref(),
     );
+    if app.shows_startup_screen() {
+        grid = app
+            .startup_screen
+            .borrow_mut()
+            .paint(grid, app.started_at.elapsed(), app.theme);
+    }
     prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     prefetch_document_end(layout, app, &frames, &line_decorations);
     Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()))
@@ -434,6 +475,7 @@ fn prepare_realtime_view_updates(
         .find_map(|(buffer_id, lines)| (*buffer_id == window.buffer_id).then_some(lines.as_slice()))
         .unwrap_or_default();
     layout.prepare_workspace_realtime_updates(window.id, frame, spans, lines);
+    app.prepare_realtime_decoration_updates();
 }
 
 fn prefetch_document_end(
@@ -468,6 +510,42 @@ fn prefetch_document_end(
     if window.top_line != 0 {
         return;
     }
+    let Some(frame) = frames
+        .iter()
+        .find_map(|(buffer_id, frame)| (*buffer_id == app.active.buffer_id).then_some(frame))
+    else {
+        return;
+    };
+    let page = rows.saturating_sub(1).checked_div(2).unwrap_or(1).max(1);
+    let previous_top = top_line.saturating_sub(page);
+    let previous_cursor = text.byte_of_line(last_line.saturating_sub(page));
+    for (target_top, cursor_byte) in [
+        (previous_top, previous_cursor),
+        (top_line, app.active.editor.document_end_byte()),
+    ] {
+        prefetch_editor_viewport(
+            layout,
+            app,
+            window.id,
+            frame,
+            target_top,
+            cursor_byte,
+            line_decorations,
+        );
+    }
+}
+
+fn prefetch_editor_viewport(
+    layout: &mut ViewportLayout,
+    app: &App,
+    window_id: wren_types::WindowId,
+    frame: &wren_engine::EngineFrame,
+    top_line: usize,
+    cursor_byte: usize,
+    line_decorations: &[(BufferId, Vec<LineDecoration>)],
+) {
+    let text = app.active.editor.text();
+    let rows = app.viewport_rows.max(1);
     let start = text.byte_of_line(top_line);
     let syntax_end = text
         .byte_of_line(top_line.saturating_add(rows).saturating_add(1))
@@ -482,7 +560,7 @@ fn prefetch_document_end(
     .flatten()
     .filter(|state| state.revision == app.active.editor.revision())
     {
-        decorations.push(app.active.buffer_id, state.spans_in(range.clone()));
+        decorations.push_shared(app.active.buffer_id, state.spans_in_shared(range.clone()));
     }
     if app.search_highlight {
         let search_end = text.byte_of_line(top_line.saturating_add(rows));
@@ -499,22 +577,17 @@ fn prefetch_document_end(
         spans.dedup();
         decorations.push(app.active.buffer_id, spans);
     }
-    let decorations = decorations.finish();
+    let decoration_layers = decorations.finish();
+    let decorations = layout.compose_shared_decoration_layers(&decoration_layers);
     let spans = decorations
         .iter()
         .find_map(|(buffer_id, spans)| {
             (*buffer_id == app.active.buffer_id).then_some(spans.as_slice())
         })
         .unwrap_or_default();
-    let Some(frame) = frames
-        .iter()
-        .find_map(|(buffer_id, frame)| (*buffer_id == app.active.buffer_id).then_some(frame))
-    else {
-        return;
-    };
     let frame = wren_engine::EngineFrame {
         text: frame.text.clone(),
-        cursor_byte: app.active.editor.document_end_byte(),
+        cursor_byte,
     };
     let lines = line_decorations
         .iter()
@@ -522,7 +595,7 @@ fn prefetch_document_end(
             (*buffer_id == app.active.buffer_id).then_some(lines.as_slice())
         })
         .unwrap_or_default();
-    layout.prefetch_workspace_viewport(window.id, &frame, top_line, spans, lines);
+    layout.prefetch_workspace_viewport(window_id, &frame, top_line, spans, lines);
 }
 
 #[cfg(test)]
@@ -566,6 +639,7 @@ fn desired_frame_profiled(
     let total_at = Instant::now();
     let inputs_at = Instant::now();
     layout.set_theme(app.theme);
+    layout.set_terminal_sidebar_visible(app.agent_sidebar.visible);
     let frame = app.active.editor.frame();
     layout.ensure_cursor_visible(&frame, 1);
     let frames = buffer_frames(app, frame);
@@ -585,7 +659,8 @@ fn desired_frame_profiled(
     add_selection_decoration(app, &mut decorations);
     let selection = selection_at.elapsed();
     let decoration_merge_at = Instant::now();
-    let decorations = decorations.finish();
+    let decoration_layers = decorations.finish();
+    let decorations = layout.compose_shared_decoration_layers(&decoration_layers);
     let decoration_merge = decoration_merge_at.elapsed();
 
     let render_at = Instant::now();
@@ -661,7 +736,7 @@ fn decoration_bucket<T>(
 
 #[derive(Default)]
 struct DecorationSetBuilder {
-    buffers: Vec<(BufferId, Vec<Vec<DecorationSpan>>)>,
+    buffers: Vec<(BufferId, Vec<SharedDecorations>)>,
 }
 
 impl DecorationSetBuilder {
@@ -670,14 +745,18 @@ impl DecorationSetBuilder {
             return;
         }
         let layers = decoration_bucket(&mut self.buffers, buffer_id);
-        layers.push(spans);
+        layers.push(Arc::new(spans));
     }
 
-    fn finish(self) -> Vec<(BufferId, SharedDecorations)> {
+    fn push_shared(&mut self, buffer_id: BufferId, spans: SharedDecorations) {
+        if spans.is_empty() {
+            return;
+        }
+        decoration_bucket(&mut self.buffers, buffer_id).push(spans);
+    }
+
+    fn finish(self) -> Vec<(BufferId, Vec<SharedDecorations>)> {
         self.buffers
-            .into_iter()
-            .map(|(buffer_id, layers)| (buffer_id, Arc::new(merge_decoration_layers(layers))))
-            .collect()
     }
 }
 
@@ -688,9 +767,9 @@ fn syntax_decorations(app: &App) -> DecorationSetBuilder {
             (buffer.editor.revision() == state.revision)
                 .then(|| visible_byte_range(app, *buffer_id))
                 .flatten()
-                .map(|range| state.spans_in(range))
+                .map(|range| state.spans_in_shared(range))
         }) {
-            decorations.push(*buffer_id, spans);
+            decorations.push_shared(*buffer_id, spans);
         }
     }
     for (buffer_id, state) in &app.semantic_decorations {
@@ -698,9 +777,9 @@ fn syntax_decorations(app: &App) -> DecorationSetBuilder {
             (buffer.editor.revision() == state.revision)
                 .then(|| visible_byte_range(app, *buffer_id))
                 .flatten()
-                .map(|range| state.spans_in(range))
+                .map(|range| state.spans_in_shared(range))
         }) {
-            decorations.push(*buffer_id, spans);
+            decorations.push_shared(*buffer_id, spans);
         }
     }
     decorations
@@ -922,7 +1001,7 @@ fn add_selection_decoration(app: &App, decorations: &mut DecorationSetBuilder) {
                 strikethrough: false,
                 reverse: false,
                 foreground: None,
-                background: Some(CellColor::Rgb(app.theme.surface1)),
+                background: Some(CellColor::Rgb(app.theme.surface2)),
             },
         }],
     );
@@ -949,6 +1028,7 @@ fn apply_editor_overlays(
     } else {
         grid
     };
+    let grid = app.apply_agent_sidebar(layout, grid);
     if let Some(picker) = app.picker_overlay() {
         layout.apply_picker_overlay(grid, &picker)
     } else if let Some(completion) = app.completion_overlay() {
@@ -1004,7 +1084,6 @@ enum PromptKind {
     Location,
     Rename,
     ConditionalBreakpoint,
-    Ai,
 }
 
 impl PromptKind {
@@ -1055,7 +1134,6 @@ impl Prompt {
             PromptKind::Location => "jump> ",
             PromptKind::Rename => "rename> ",
             PromptKind::ConditionalBreakpoint => "break if> ",
-            PromptKind::Ai => "ask Codex> ",
         }
     }
 }
@@ -1247,6 +1325,7 @@ const DEFAULT_LEADER_BINDINGS: &[(&str, &str, &str)] = &[
     ("w", "file.write", "write"),
     ("x", "search.clear", "clear search"),
     ("b", "picker.buffers", "buffers"),
+    ("a", "ai.chat", "Oh My Pi pane"),
     ("jj", "jump.ace", "visible character"),
     ("f", "format.document", "format"),
     ("ff", "picker.files", "files"),
@@ -1282,9 +1361,9 @@ const DEFAULT_LEADER_BINDINGS: &[(&str, &str, &str)] = &[
     ("rn", "lsp.rename", "rename"),
     ("ca", "lsp.code_action", "code action"),
     ("D", "lsp.type_definition", "type definition"),
-    ("wa", "workspace.add_folder", "add workspace folder"),
-    ("wr", "workspace.remove_folder", "remove workspace folder"),
-    ("wl", "workspace.list_folders", "list workspace folders"),
+    ("Wa", "workspace.add_folder", "add workspace folder"),
+    ("Wr", "workspace.remove_folder", "remove workspace folder"),
+    ("Wl", "workspace.list_folders", "list workspace folders"),
     ("hw", "haskell.hoogle", "Hoogle"),
     ("hs", "haskell.signature", "signature"),
     ("hl", "haskell.code_lens", "code lens"),
@@ -1555,6 +1634,10 @@ struct App {
     picker_preview_scroll: usize,
     picker_preview_highlight_line: Option<usize>,
     picker_preview_decorations: Vec<DecorationSpan>,
+    grep_generation: u64,
+    grep_due: Option<Instant>,
+    grep_pending: Option<GrepPickerRequest>,
+    grep_task: Option<GrepPickerTask>,
     popup: Option<TextPopup>,
     popup_deadline: Option<Instant>,
     ace_jump: Option<AceJumpState>,
@@ -1588,15 +1671,35 @@ struct App {
     root_workspace: PathBuf,
     workspace_folders: Vec<PathBuf>,
     debug_ui_visible: bool,
-    ai_transcript: String,
-    active_ai_task: Option<CommandTaskId>,
+    agent_terminal: Option<PtySession>,
+    agent_terminal_escape_pending: bool,
+    agent_window_prefix_pending: bool,
+    agent_sidebar: AgentSidebarState,
     last_staged_patch: Option<Vec<u8>>,
     theme_flavor: CatppuccinFlavor,
     theme: CatppuccinPalette,
     viewport_rows: usize,
     viewport_columns: usize,
+    realtime_decorations_prepared: Cell<bool>,
+    startup_screen: RefCell<StartupScreen>,
+    started_at: Instant,
     foreground_frame_pending: bool,
     quit: bool,
+}
+
+#[derive(Debug, Default)]
+struct AgentSidebarState {
+    visible: bool,
+    focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedVisibleDecorations {
+    range: Range<usize>,
+    transforms: Vec<Transaction>,
+    overrides: Vec<DecorationSpan>,
+    invalidated: Vec<Range<usize>>,
+    spans: SharedDecorations,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1610,7 +1713,13 @@ struct BufferDecorations {
     transforms: Vec<Transaction>,
     overrides: Vec<DecorationSpan>,
     invalidated: Vec<Range<usize>>,
+    visible_cache: RefCell<Vec<CachedVisibleDecorations>>,
 }
+
+const MAX_CACHED_DECORATION_TRANSFORMS: usize = 2;
+const MAX_CACHED_DECORATION_OVERRIDES: usize = 128;
+const MAX_CACHED_INVALIDATED_RANGES: usize = 8;
+const VISIBLE_DECORATION_CACHE_CAPACITY: usize = 8;
 
 impl BufferDecorations {
     fn new(revision: DocumentRevision, mut spans: Vec<DecorationSpan>) -> Self {
@@ -1623,6 +1732,7 @@ impl BufferDecorations {
             transforms: Vec::with_capacity(4),
             overrides: Vec::with_capacity(64),
             invalidated: Vec::with_capacity(4),
+            visible_cache: RefCell::new(Vec::with_capacity(8)),
         };
         decorations.rebuild_index();
         decorations
@@ -1673,24 +1783,12 @@ impl BufferDecorations {
     }
 
     fn advance_current_coordinates(&mut self, transaction: &Transaction) {
-        self.overrides = std::mem::take(&mut self.overrides)
-            .into_iter()
-            .filter_map(|span| map_decoration_span(span, transaction))
-            .collect();
-        self.invalidated = std::mem::take(&mut self.invalidated)
-            .into_iter()
-            .filter_map(|range| map_range(range, transaction))
-            .collect();
-        let cancels_previous = self
-            .transforms
-            .last()
-            .and_then(|previous| previous.then(transaction).ok())
-            .is_some_and(|composed| composed.is_empty());
-        if cancels_previous {
-            self.transforms.pop();
-        } else {
-            self.transforms.push(transaction.clone());
-        }
+        advance_decoration_coordinates(
+            &mut self.transforms,
+            &mut self.overrides,
+            &mut self.invalidated,
+            transaction,
+        );
     }
 
     fn replace_current_ranges(
@@ -1713,20 +1811,150 @@ impl BufferDecorations {
         merge_ranges(&mut self.invalidated);
     }
 
+    #[cfg(test)]
     fn spans_in(&self, range: Range<usize>) -> Vec<DecorationSpan> {
-        let base_range = self
-            .transforms
-            .iter()
-            .rev()
-            .fold(range.clone(), unmap_range);
+        self.spans_in_shared(range).as_ref().clone()
+    }
+
+    fn spans_in_shared(&self, range: Range<usize>) -> SharedDecorations {
+        if let Some(spans) =
+            self.cached_visible_spans(&range, &self.transforms, &self.overrides, &self.invalidated)
+        {
+            return spans;
+        }
+        let spans = Arc::new(self.spans_in_state(
+            range.clone(),
+            &self.transforms,
+            &self.overrides,
+            &self.invalidated,
+        ));
+        if !decoration_state_is_cacheable(&self.transforms, &self.overrides, &self.invalidated) {
+            return spans;
+        }
+        self.remember_visible_state(CachedVisibleDecorations {
+            range,
+            transforms: self.transforms.clone(),
+            overrides: self.overrides.clone(),
+            invalidated: self.invalidated.clone(),
+            spans: Arc::clone(&spans),
+        });
+        spans
+    }
+
+    fn prepare_mapped_visible(&self, transaction: &Transaction, range: Range<usize>) {
+        let (transforms, overrides, mut invalidated) = self.state_after(transaction);
+        invalidated.extend(transaction_current_edit_ranges(transaction));
+        merge_ranges(&mut invalidated);
+        self.prepare_visible_state(range, transforms, overrides, invalidated);
+    }
+
+    fn prepare_replaced_visible(
+        &self,
+        transaction: &Transaction,
+        ranges: &[Range<usize>],
+        mut replacement: Vec<DecorationSpan>,
+        range: Range<usize>,
+    ) {
+        let (transforms, mut overrides, mut invalidated) = self.state_after(transaction);
+        overrides.retain(|span| {
+            !ranges
+                .iter()
+                .any(|range| ranges_overlap(&span.range, range))
+        });
+        replacement.sort_by(decoration_order);
+        replacement.dedup();
+        overrides = merge_sorted_decorations(overrides.into_iter(), replacement.into_iter());
+        invalidated.extend(ranges.iter().cloned());
+        merge_ranges(&mut invalidated);
+        self.prepare_visible_state(range, transforms, overrides, invalidated);
+    }
+
+    fn state_after(
+        &self,
+        transaction: &Transaction,
+    ) -> (Vec<Transaction>, Vec<DecorationSpan>, Vec<Range<usize>>) {
+        let mut transforms = self.transforms.clone();
+        let mut overrides = self.overrides.clone();
+        let mut invalidated = self.invalidated.clone();
+        advance_decoration_coordinates(
+            &mut transforms,
+            &mut overrides,
+            &mut invalidated,
+            transaction,
+        );
+        (transforms, overrides, invalidated)
+    }
+
+    fn prepare_visible_state(
+        &self,
+        range: Range<usize>,
+        transforms: Vec<Transaction>,
+        overrides: Vec<DecorationSpan>,
+        invalidated: Vec<Range<usize>>,
+    ) {
+        if !decoration_state_is_cacheable(&transforms, &overrides, &invalidated)
+            || self
+                .cached_visible_spans(&range, &transforms, &overrides, &invalidated)
+                .is_some()
+        {
+            return;
+        }
+        let spans =
+            Arc::new(self.spans_in_state(range.clone(), &transforms, &overrides, &invalidated));
+        self.remember_visible_state(CachedVisibleDecorations {
+            range,
+            transforms,
+            overrides,
+            invalidated,
+            spans,
+        });
+    }
+
+    fn cached_visible_spans(
+        &self,
+        range: &Range<usize>,
+        transforms: &[Transaction],
+        overrides: &[DecorationSpan],
+        invalidated: &[Range<usize>],
+    ) -> Option<SharedDecorations> {
+        decoration_state_is_cacheable(transforms, overrides, invalidated).then(|| {
+            self.visible_cache
+                .borrow()
+                .iter()
+                .rev()
+                .find(|cached| {
+                    cached.range == *range
+                        && decoration_transforms_equal(&cached.transforms, transforms)
+                        && cached.overrides == overrides
+                        && cached.invalidated == invalidated
+                })
+                .map(|cached| Arc::clone(&cached.spans))
+        })?
+    }
+
+    fn remember_visible_state(&self, state: CachedVisibleDecorations) {
+        let mut cache = self.visible_cache.borrow_mut();
+        cache.push(state);
+        if cache.len() > VISIBLE_DECORATION_CACHE_CAPACITY {
+            cache.remove(0);
+        }
+    }
+
+    fn spans_in_state(
+        &self,
+        range: Range<usize>,
+        transforms: &[Transaction],
+        overrides: &[DecorationSpan],
+        invalidated: &[Range<usize>],
+    ) -> Vec<DecorationSpan> {
+        let base_range = transforms.iter().rev().fold(range.clone(), unmap_range);
         let first = self
             .prefix_max_end
             .partition_point(|maximum_end| *maximum_end <= base_range.start);
         let last = self
             .spans
             .partition_point(|span| span.range.start < base_range.end);
-        let mappings = self
-            .transforms
+        let mappings = transforms
             .iter()
             .map(Transaction::offset_mapping)
             .collect::<Vec<_>>();
@@ -1736,8 +1964,7 @@ impl BufferDecorations {
             .filter_map(|span| {
                 let span = mappings.iter().try_fold(span, map_decoration_span_with)?;
                 (ranges_overlap(&span.range, &range)
-                    && !self
-                        .invalidated
+                    && !invalidated
                         .iter()
                         .any(|invalidated| ranges_overlap(&span.range, invalidated)))
                 .then_some(span)
@@ -1745,11 +1972,46 @@ impl BufferDecorations {
             .collect::<Vec<_>>();
         merge_sorted_decorations(
             spans.into_iter(),
-            self.overrides
+            overrides
                 .iter()
                 .filter(|span| ranges_overlap(&span.range, &range))
                 .cloned(),
         )
+    }
+}
+
+fn decoration_state_is_cacheable(
+    transforms: &[Transaction],
+    overrides: &[DecorationSpan],
+    invalidated: &[Range<usize>],
+) -> bool {
+    transforms.len() <= MAX_CACHED_DECORATION_TRANSFORMS
+        && overrides.len() <= MAX_CACHED_DECORATION_OVERRIDES
+        && invalidated.len() <= MAX_CACHED_INVALIDATED_RANGES
+}
+
+fn advance_decoration_coordinates(
+    transforms: &mut Vec<Transaction>,
+    overrides: &mut Vec<DecorationSpan>,
+    invalidated: &mut Vec<Range<usize>>,
+    transaction: &Transaction,
+) {
+    *overrides = std::mem::take(overrides)
+        .into_iter()
+        .filter_map(|span| map_decoration_span(span, transaction))
+        .collect();
+    *invalidated = std::mem::take(invalidated)
+        .into_iter()
+        .filter_map(|range| map_range(range, transaction))
+        .collect();
+    let cancels_previous = transforms
+        .last()
+        .and_then(|previous| previous.then(transaction).ok())
+        .is_some_and(|composed| composed.is_empty());
+    if cancels_previous {
+        transforms.pop();
+    } else {
+        transforms.push(transaction.clone());
     }
 }
 
@@ -1773,6 +2035,14 @@ fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Optio
 
 fn map_range(range: Range<usize>, transaction: &Transaction) -> Option<Range<usize>> {
     map_range_with(range, &transaction.offset_mapping())
+}
+
+fn decoration_transforms_equal(left: &[Transaction], right: &[Transaction]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.has_same_mapping_as(right))
 }
 
 fn map_range_with(range: Range<usize>, mapping: &OffsetMapping<'_>) -> Option<Range<usize>> {
@@ -1879,22 +2149,6 @@ fn merge_sorted_decorations(
     merged
 }
 
-fn merge_decoration_layers(layers: Vec<Vec<DecorationSpan>>) -> Vec<DecorationSpan> {
-    let capacity: usize = layers.iter().map(Vec::len).sum();
-    let mut layers = layers.into_iter();
-    let mut merged = layers.next().unwrap_or_default();
-    merged.reserve(capacity.saturating_sub(merged.len()));
-    for mut layer in layers {
-        merged.append(&mut layer);
-    }
-    // Each layer is already ordered. Rust's stable slice sort detects those
-    // natural runs, merging them without the repeated pairwise allocations
-    // that previously copied the largest syntax layer several times.
-    merged.sort_by(decoration_order);
-    merged.dedup();
-    merged
-}
-
 fn ace_jump_labels(count: usize) -> Vec<String> {
     const ALPHABET: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
     let mut width = 1_usize;
@@ -1958,6 +2212,37 @@ struct QuickfixEntry {
     selection_end: Option<QuickfixPosition>,
     column_utf16: bool,
     text: String,
+}
+
+struct GrepPickerRequest {
+    generation: u64,
+    query: String,
+    root: PathBuf,
+}
+
+struct GrepPickerTask {
+    generation: u64,
+    query: String,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    cancelled: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<std::result::Result<Vec<QuickfixEntry>, String>>,
+}
+
+impl GrepPickerTask {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
+        {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Drop for GrepPickerTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 impl QuickfixEntry {

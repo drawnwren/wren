@@ -59,7 +59,9 @@ named buffer.
 - Dotfile formatter profiles, `gq` at textwidth 79, global/buffer-local
   `:FormatToggle[!]`, and format-on-save
 - Debug breakpoints/UI controls and debugger REPL workflows; Hoogle, Haskell
-  package/file REPL, and selection evaluation; `:Codex`/Avante command aliases
+  package/file REPL, and selection evaluation; `Space+a` and the
+  `:Codex`/Avante command aliases embed Oh My Pi's own terminal UI rather than
+  reconstructing its output
 - `:terminal`, cancellable `:make`, and revision-safe `:format`
 - `unnamedplus` clipboard routing with bounded OSC 52 copy and paste for both
   `+` and `*`, plus platform-command fallback when a terminal declines queries
@@ -83,6 +85,7 @@ cargo run -p wren-conformance --locked -- --check-determinism
 cargo run -p wren-conformance --locked -- --check-wren
 cargo run -p wren-latency --locked --release -- --iterations 10000 --gate
 cargo run -p wren-startup --locked --release -- --iterations 1000 --gate
+cargo run -p wren-tiling-performance --locked --release -- --iterations 1000 --output target/tiling-performance.json
 cargo run -p wren-system-gates --locked --release -- --iterations 1000 --gate
 ```
 

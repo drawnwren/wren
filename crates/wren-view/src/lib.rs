@@ -962,6 +962,18 @@ pub struct TextPopup {
     pub decorations: Vec<DecorationSpan>,
 }
 
+/// A terminal-native application docked at the right edge of the editor.
+///
+/// The cells have already been interpreted by the terminal emulator, so the
+/// view must preserve their graphemes and styles instead of re-rendering their
+/// contents as editor text.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalSidebar<'a> {
+    pub rows: &'a [CellRow],
+    pub cursor: (usize, usize),
+    pub focused: bool,
+}
+
 impl TextPopup {
     /// Widths of the display rows used by popup rendering. Keeping navigation
     /// on this calculation prevents the focused cursor from drifting away from
@@ -1170,6 +1182,13 @@ struct CachedEditorViewport {
     rows: Vec<Arc<CellRow>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedDecorationComposition {
+    buffer_id: BufferId,
+    layers: Vec<SharedDecorations>,
+    merged: SharedDecorations,
+}
+
 #[derive(Clone, Copy)]
 struct EditorGridLayout {
     content_height: usize,
@@ -1239,8 +1258,10 @@ pub struct ViewportLayout {
     cached_logical_rows: BTreeMap<usize, CachedLogicalRow>,
     cached_editor_render: Option<CachedEditorRender>,
     cached_editor_viewports: Vec<CachedEditorViewport>,
+    cached_decoration_compositions: Vec<CachedDecorationComposition>,
     cached_status_rows: Vec<(StatusOverlay, Arc<CellRow>)>,
     pane_layouts: BTreeMap<WindowId, Box<ViewportLayout>>,
+    workspace_right_margin: usize,
     realtime_updates_prepared: bool,
 }
 
@@ -1263,8 +1284,10 @@ impl ViewportLayout {
             cached_logical_rows: BTreeMap::new(),
             cached_editor_render: None,
             cached_editor_viewports: Vec::new(),
+            cached_decoration_compositions: Vec::new(),
             cached_status_rows: Vec::new(),
             pane_layouts: BTreeMap::new(),
+            workspace_right_margin: 0,
             realtime_updates_prepared: false,
         }
     }
@@ -1300,13 +1323,92 @@ impl ViewportLayout {
         self.clear_cached_rendering();
     }
 
+    /// Reserves the right-hand dock before workspace panes are laid out. This
+    /// makes the harness behave like an editor split: text wraps before the sidebar
+    /// and no source cells are merely hidden underneath it.
+    pub fn set_terminal_sidebar_visible(&mut self, visible: bool) {
+        let margin = if visible {
+            self.terminal_sidebar_column()
+                .map_or(0, |column| self.width.saturating_sub(column))
+        } else {
+            0
+        };
+        if self.workspace_right_margin != margin {
+            self.workspace_right_margin = margin;
+            self.clear_cached_rendering();
+            self.epoch = self.epoch.saturating_add(1);
+        }
+    }
+
+    fn workspace_width(&self) -> usize {
+        self.width
+            .saturating_sub(self.workspace_right_margin)
+            .max(1)
+    }
+
     fn clear_cached_rendering(&mut self) {
         self.cached_rows.clear();
         self.cached_logical_rows.clear();
         self.cached_editor_render = None;
         self.cached_editor_viewports.clear();
+        self.cached_decoration_compositions.clear();
         self.cached_status_rows.clear();
         self.pane_layouts.clear();
+    }
+
+    /// Canonicalizes separately owned decoration layers without rebuilding an
+    /// identical flattened span list on every cursor-only frame. Layer values
+    /// are compared when their allocations differ, so cache reuse cannot make
+    /// changed search, diagnostic, semantic, or selection styling stale.
+    #[must_use]
+    pub fn compose_shared_decoration_layers(
+        &mut self,
+        decorations: &[(BufferId, Vec<SharedDecorations>)],
+    ) -> Vec<(BufferId, SharedDecorations)> {
+        decorations
+            .iter()
+            .map(|(buffer_id, layers)| {
+                (
+                    *buffer_id,
+                    self.compose_shared_decoration_buffer(*buffer_id, layers),
+                )
+            })
+            .collect()
+    }
+
+    fn compose_shared_decoration_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        layers: &[SharedDecorations],
+    ) -> SharedDecorations {
+        if layers.len() == 1 {
+            return Arc::clone(&layers[0]);
+        }
+        if let Some(index) = self
+            .cached_decoration_compositions
+            .iter()
+            .position(|cached| {
+                cached.buffer_id == buffer_id
+                    && shared_decoration_layers_equal(&cached.layers, layers)
+            })
+        {
+            let cached = self.cached_decoration_compositions.swap_remove(index);
+            let merged = Arc::clone(&cached.merged);
+            self.cached_decoration_compositions.push(cached);
+            return merged;
+        }
+        let merged = Arc::new(merge_shared_decoration_layers(layers));
+        self.cached_decoration_compositions
+            .push(CachedDecorationComposition {
+                buffer_id,
+                layers: layers.iter().map(Arc::clone).collect(),
+                merged: Arc::clone(&merged),
+            });
+        const DECORATION_COMPOSITION_CACHE_CAPACITY: usize = 16;
+        if self.cached_decoration_compositions.len() > DECORATION_COMPOSITION_CACHE_CAPACITY {
+            self.cached_decoration_compositions.remove(0);
+        }
+        merged
     }
 
     /// Maps a terminal cell back through the same pane, gutter, tab, Unicode,
@@ -1325,7 +1427,8 @@ impl ViewportLayout {
             return None;
         }
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        if column >= self.width || row >= content_height {
+        let workspace_width = self.workspace_width();
+        if column >= workspace_width || row >= content_height {
             return None;
         }
         let mut panes = Vec::new();
@@ -1334,7 +1437,7 @@ impl ViewportLayout {
             Rect {
                 column: 0,
                 row: 0,
-                width: self.width,
+                width: workspace_width,
                 height: content_height,
             },
             &mut panes,
@@ -1540,12 +1643,18 @@ impl ViewportLayout {
             prompt,
             decorations,
             line_decorations,
+            shared,
         ) {
             return Some(grid);
         }
-        if let Some(grid) =
-            self.update_cached_editor_viewport(frame, status, prompt, decorations, line_decorations)
-        {
+        if let Some(grid) = self.update_cached_editor_viewport(
+            frame,
+            status,
+            prompt,
+            decorations,
+            line_decorations,
+            shared,
+        ) {
             return Some(grid);
         }
         if let Some(grid) = self.update_cached_editor_decorations(
@@ -2093,6 +2202,7 @@ impl ViewportLayout {
         prompt: Option<&str>,
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
+        shared: Option<&SharedDecorations>,
     ) -> Option<DesiredGrid> {
         let shift = self.viewport_shift(frame, status, prompt, decorations, line_decorations)?;
         let introduced = self.shift_introduced_rows(frame, decorations, line_decorations, &shift);
@@ -2101,7 +2211,7 @@ impl ViewportLayout {
         }
         self.stash_shift_displaced_rows(frame, &shift);
         self.install_shift_rows(&shift, introduced);
-        self.commit_viewport_shift(&shift, decorations, line_decorations)?;
+        self.commit_viewport_shift(&shift, decorations, line_decorations, shared)?;
         self.prune_cached_logical_rows(shift.content_height);
         Some(self.reuse_editor_render(frame, status, prompt))
     }
@@ -2269,6 +2379,7 @@ impl ViewportLayout {
         shift: &ViewportShift,
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
+        shared: Option<&SharedDecorations>,
     ) -> Option<()> {
         let cached = self.cached_editor_render.as_mut()?;
         cached.top_line = self.top_line;
@@ -2276,7 +2387,7 @@ impl ViewportLayout {
             *line = Some(self.top_line.saturating_add(offset));
         }
         cached.relative_cursor_line = self.relative_numbers.then_some(shift.cursor_line);
-        cached.decorations = Arc::new(decorations.to_vec());
+        cached.decorations = retain_decorations(decorations, shared);
         if self.relative_numbers {
             for (row, logical_line) in self
                 .cached_rows
@@ -2306,6 +2417,7 @@ impl ViewportLayout {
         prompt: Option<&str>,
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
+        shared: Option<&SharedDecorations>,
     ) -> Option<DesiredGrid> {
         let content_height =
             self.distant_viewport_height(frame, status, prompt, line_decorations)?;
@@ -2336,7 +2448,7 @@ impl ViewportLayout {
             *line = Some(self.top_line.saturating_add(offset));
         }
         cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
-        cached.decorations = Arc::new(decorations.to_vec());
+        cached.decorations = retain_decorations(decorations, shared);
         self.prune_cached_logical_rows(content_height);
         Some(self.reuse_editor_render(frame, status, prompt))
     }
@@ -2440,10 +2552,9 @@ impl ViewportLayout {
         }
         let cached = self.cached_editor_render.as_ref()?;
         let change = single_line_change(&cached.text, &frame.text)?;
-        if !decorations_match_outside_change(&cached.decorations, decorations, change) {
-            return None;
-        }
-        self.cached_logical_rows.clear();
+        let decoration_start =
+            matching_decorations_outside_change(&cached.decorations, decorations, change)?;
+        self.cached_logical_rows.remove(&change.line);
         let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
         if change.line < self.top_line
@@ -2485,7 +2596,7 @@ impl ViewportLayout {
                 content_height,
                 new_rows,
             },
-            decorations,
+            &decorations[decoration_start..],
             line_decorations,
         )?;
         let cached = self.cached_editor_render.as_mut()?;
@@ -2748,7 +2859,14 @@ impl ViewportLayout {
             &panes,
             tab.active_window,
         );
-        draw_split_borders(&tab.root, 0, 0, self.width, content_height, &mut rows);
+        draw_split_borders(
+            &tab.root,
+            0,
+            0,
+            self.workspace_width(),
+            content_height,
+            &mut rows,
+        );
         self.paint_workspace_footer(&mut rows, &mut cursor, status, prompt);
         self.finish_workspace_grid(rows, cursor)
     }
@@ -2915,7 +3033,7 @@ impl ViewportLayout {
             Rect {
                 column: 0,
                 row: 0,
-                width: self.width,
+                width: self.workspace_width(),
                 height: content_height,
             },
             &mut panes,
@@ -2937,7 +3055,7 @@ impl ViewportLayout {
             == Rect {
                 column: 0,
                 row: 0,
-                width: self.width,
+                width: self.workspace_width(),
                 height: content_height,
             })
         .then_some(*pane)
@@ -3676,6 +3794,73 @@ impl ViewportLayout {
         self.finish_overlay(grid, rows, cursor)
     }
 
+    /// Composites a terminal-emulator surface into the docked right pane.
+    #[must_use]
+    pub fn apply_terminal_sidebar(
+        &mut self,
+        grid: DesiredGrid,
+        sidebar: TerminalSidebar<'_>,
+    ) -> DesiredGrid {
+        let Some(column) = self.terminal_sidebar_column() else {
+            return grid;
+        };
+        let inner_width = self.width.saturating_sub(column.saturating_add(1));
+        let mut rows = overlay_rows(&grid);
+        for row in &mut rows {
+            materialize_row_tail(row, column);
+        }
+        let border = CellStyle {
+            foreground: Some(CellColor::Rgb(self.theme.blue)),
+            background: Some(CellColor::Rgb(self.theme.base)),
+            ..CellStyle::default()
+        };
+        let terminal_base = CellStyle {
+            foreground: Some(CellColor::Rgb(self.theme.text)),
+            background: Some(CellColor::Rgb(self.theme.base)),
+            ..CellStyle::default()
+        };
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            paint_text(row, column, 1, "│", border);
+            paint_cells(
+                row,
+                column.saturating_add(1),
+                inner_width,
+                sidebar
+                    .rows
+                    .get(row_index)
+                    .map_or(&[], |source| source.cells.as_slice()),
+                terminal_base,
+            );
+        }
+        let cursor = if sidebar.focused {
+            (
+                column
+                    .saturating_add(1)
+                    .saturating_add(sidebar.cursor.0.min(inner_width.saturating_sub(1))),
+                sidebar.cursor.1.min(self.height.saturating_sub(1)),
+            )
+        } else {
+            grid.cursor
+        };
+        self.finish_overlay(grid, rows, cursor)
+    }
+
+    /// Starting column of the docked terminal surface for this terminal size.
+    #[must_use]
+    pub fn terminal_sidebar_column(&self) -> Option<usize> {
+        Self::terminal_sidebar_column_for_size(self.width, self.height)
+    }
+
+    #[must_use]
+    pub fn terminal_sidebar_column_for_size(width: usize, height: usize) -> Option<usize> {
+        if width < 36 || height < 6 {
+            return None;
+        }
+        let preferred = width.saturating_mul(2).checked_div(5).unwrap_or(32);
+        let sidebar_width = preferred.clamp(32, 64).min(width.saturating_sub(12));
+        Some(width.saturating_sub(sidebar_width))
+    }
+
     /// The default nvim-dap-ui layout: scopes/breakpoints/stacks/watches on
     /// the left and REPL/console panels across the bottom.
     #[must_use]
@@ -3800,7 +3985,7 @@ impl ViewportLayout {
             Rect {
                 column: 0,
                 row: 0,
-                width: self.width,
+                width: self.workspace_width(),
                 height: self.height.saturating_sub(1).max(1),
             },
             &mut panes,
@@ -3996,10 +4181,9 @@ impl ViewportLayout {
     fn finish_overlay(
         &mut self,
         grid: DesiredGrid,
-        mut rows: Vec<CellRow>,
+        rows: Vec<CellRow>,
         cursor: (usize, usize),
     ) -> DesiredGrid {
-        apply_theme_to_rows(&mut rows, self.theme);
         self.epoch = self.epoch.saturating_add(1);
         DesiredGrid {
             epoch: self.epoch,
@@ -4264,6 +4448,56 @@ fn paint_text(row: &mut CellRow, column: usize, width: usize, text: &str, style:
             style,
         }));
     before.append(&mut replacement.cells);
+    before.extend(after);
+    row.cells = before;
+}
+
+fn paint_cells(
+    row: &mut CellRow,
+    column: usize,
+    width: usize,
+    cells: &[Cell],
+    fill_style: CellStyle,
+) {
+    if width == 0 {
+        return;
+    }
+    let end = column.saturating_add(width);
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    let mut display_column = 0_usize;
+    for cell in &row.cells {
+        let cell_end = display_column.saturating_add(usize::from(cell.width));
+        if cell_end <= column {
+            before.push(cell.clone());
+        } else if display_column >= end {
+            after.push(cell.clone());
+        }
+        display_column = cell_end;
+    }
+    let before_width = before
+        .iter()
+        .map(|cell| usize::from(cell.width))
+        .sum::<usize>();
+    before.extend((before_width..column).map(|_| Cell {
+        grapheme: " ".into(),
+        width: 1,
+        style: fill_style,
+    }));
+    let mut replacement_width = 0_usize;
+    for cell in cells {
+        let next = replacement_width.saturating_add(usize::from(cell.width));
+        if next > width {
+            break;
+        }
+        before.push(cell.clone());
+        replacement_width = next;
+    }
+    before.extend((replacement_width..width).map(|_| Cell {
+        grapheme: " ".into(),
+        width: 1,
+        style: fill_style,
+    }));
     before.extend(after);
     row.cells = before;
 }
@@ -4911,7 +5145,7 @@ impl GridBuilder {
             return;
         }
         let mut absolute_byte = self.document_start;
-        let mut decoration_resolver = DecorationResolver::new(decorations);
+        let mut decoration_resolver = DecorationResolver::new_at(decorations, self.document_start);
         if cursor_byte < self.document_start {
             self.cursor = Some((0, 0));
         }
@@ -4934,7 +5168,7 @@ impl GridBuilder {
         decorations: &[DecorationSpan],
     ) {
         let mut absolute_byte = self.document_start;
-        let mut decoration_resolver = DecorationResolver::new(decorations);
+        let mut decoration_resolver = DecorationResolver::new_at(decorations, self.document_start);
         if cursor_byte < self.document_start {
             self.cursor = Some((0, 0));
         }
@@ -5058,7 +5292,12 @@ struct DecorationResolver<'a> {
 }
 
 impl<'a> DecorationResolver<'a> {
+    #[cfg(test)]
     fn new(decorations: &'a [DecorationSpan]) -> Self {
+        Self::new_at(decorations, 0)
+    }
+
+    fn new_at(decorations: &'a [DecorationSpan], start: usize) -> Self {
         let starts = (!decorations
             .windows(2)
             .all(|pair| pair[0].range.start <= pair[1].range.start))
@@ -5067,11 +5306,21 @@ impl<'a> DecorationResolver<'a> {
             starts.sort_by_key(|index| (decorations[*index].range.start, *index));
             starts
         });
+        let next = starts.as_ref().map_or_else(
+            || decorations.partition_point(|span| span.range.start < start),
+            |starts| starts.partition_point(|index| decorations[*index].range.start < start),
+        );
+        let active = (0..next)
+            .filter_map(|position| {
+                let index = starts.as_ref().map_or(position, |starts| starts[position]);
+                (decorations[index].range.end > start).then_some(index)
+            })
+            .collect();
         Self {
             decorations,
             starts,
-            next: 0,
-            active: Vec::new(),
+            next,
+            active,
             cached_style: CellStyle::default(),
             valid_until: 0,
         }
@@ -5500,25 +5749,33 @@ fn single_line_change(old: &FrameText, new: &FrameText) -> Option<SingleLineChan
     })
 }
 
-fn decorations_match_outside_change(
+fn matching_decorations_outside_change(
     old: &[DecorationSpan],
     new: &[DecorationSpan],
     change: SingleLineChange,
-) -> bool {
-    let mut old_index = 0;
-    let mut new_index = 0;
-    while old_index < old.len() && new_index < new.len() {
-        let old_span = &old[old_index];
-        let new_span = &new[new_index];
-        if old_span.range.end > change.old_start || new_span.range.end > change.new_start {
-            break;
-        }
-        if old_span != new_span {
-            return false;
-        }
-        old_index += 1;
-        new_index += 1;
-    }
+) -> Option<usize> {
+    let old_prefix = old.partition_point(|span| span.range.start < change.old_start);
+    let new_prefix = new.partition_point(|span| span.range.start < change.new_start);
+    let (mut old_index, mut new_index) =
+        if old_prefix == new_prefix && old[..old_prefix] == new[..new_prefix] {
+            (old_prefix, new_prefix)
+        } else {
+            let mut old_index = 0;
+            let mut new_index = 0;
+            while old_index < old.len() && new_index < new.len() {
+                let old_span = &old[old_index];
+                let new_span = &new[new_index];
+                if old_span.range.end > change.old_start || new_span.range.end > change.new_start {
+                    break;
+                }
+                if old_span != new_span {
+                    return None;
+                }
+                old_index += 1;
+                new_index += 1;
+            }
+            (old_index, new_index)
+        };
     if old
         .get(old_index)
         .is_some_and(|span| span.range.end <= change.old_start)
@@ -5526,8 +5783,9 @@ fn decorations_match_outside_change(
             .get(new_index)
             .is_some_and(|span| span.range.end <= change.new_start)
     {
-        return false;
+        return None;
     }
+    let repaint_start = new_index;
 
     let skip_changed = |spans: &[DecorationSpan], index: &mut usize, start, end| {
         while *index < spans.len() && spans[*index].range.start < end {
@@ -5543,7 +5801,7 @@ fn decorations_match_outside_change(
         || !skip_changed(new, &mut new_index, change.new_start, change.new_end)
         || old.len().saturating_sub(old_index) != new.len().saturating_sub(new_index)
     {
-        return false;
+        return None;
     }
 
     let old = &old[old_index..];
@@ -5565,6 +5823,7 @@ fn decorations_match_outside_change(
                 && old.range.end.checked_sub(delta) == Some(new.range.end)
         })
     }
+    .then_some(repaint_start)
 }
 
 fn retain_decorations(
@@ -5572,6 +5831,31 @@ fn retain_decorations(
     shared: Option<&SharedDecorations>,
 ) -> SharedDecorations {
     shared.map_or_else(|| Arc::new(decorations.to_vec()), Arc::clone)
+}
+
+fn shared_decoration_layers_equal(left: &[SharedDecorations], right: &[SharedDecorations]) -> bool {
+    const SMALL_DYNAMIC_LAYER_LIMIT: usize = 128;
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            Arc::ptr_eq(left, right)
+                || (left.len() <= SMALL_DYNAMIC_LAYER_LIMIT
+                    && right.len() == left.len()
+                    && left == right)
+        })
+}
+
+fn merge_shared_decoration_layers(layers: &[SharedDecorations]) -> Vec<DecorationSpan> {
+    let capacity = layers.iter().map(|layer| layer.len()).sum();
+    let mut merged = Vec::with_capacity(capacity);
+    for layer in layers {
+        merged.extend(layer.iter().cloned());
+    }
+    merged.sort_by(|left, right| {
+        (left.range.start, std::cmp::Reverse(left.range.end))
+            .cmp(&(right.range.start, std::cmp::Reverse(right.range.end)))
+    });
+    merged.dedup();
+    merged
 }
 
 fn decorations_match_range(
@@ -5679,24 +5963,39 @@ fn advance_visual_cell(row: &mut usize, column: &mut usize, width: usize, cell_w
 #[must_use]
 pub fn diff(previous: Option<&DesiredGrid>, desired: &DesiredGrid) -> Vec<TerminalPatch> {
     let mut patches = Vec::with_capacity(desired.height.saturating_mul(3).saturating_add(4));
-    patches.push(TerminalPatch::ShowCursor(false));
-    if previous.is_none_or(|old| old.width != desired.width || old.height != desired.height) {
-        patches.push(TerminalPatch::Clear);
+    diff_into(previous, desired, &mut patches);
+    patches
+}
+
+/// Reuses caller-owned patch storage for successive terminal frames.
+pub fn diff_into(
+    previous: Option<&DesiredGrid>,
+    desired: &DesiredGrid,
+    patches: &mut Vec<TerminalPatch>,
+) {
+    patches.clear();
+    let required_capacity = desired.height.saturating_mul(3).saturating_add(4);
+    if patches.capacity() < required_capacity {
+        patches.reserve(required_capacity);
     }
-    for row_index in 0..desired.height {
-        let row = desired.rows.get(row_index).cloned().unwrap_or_default();
-        let changed = previous.and_then(|old| old.rows.get(row_index)) != Some(&row);
-        if changed {
-            patches.push(TerminalPatch::MoveTo {
-                column: 0,
-                row: row_index,
-            });
-            patches.push(TerminalPatch::PutRow(Arc::clone(&row)));
-            let clear_style = row
-                .cells
-                .last()
-                .map_or_else(CellStyle::default, |cell| cell.style);
-            patches.push(TerminalPatch::ClearToEndOfLine(clear_style));
+    patches.push(TerminalPatch::ShowCursor(false));
+    let full_refresh =
+        previous.is_none_or(|old| old.width != desired.width || old.height != desired.height);
+    if full_refresh {
+        patches.push(TerminalPatch::Clear);
+        let present_rows = desired.rows.len().min(desired.height);
+        for (row_index, row) in desired.rows.iter().take(present_rows).enumerate() {
+            append_row_patches(patches, row_index, Arc::clone(row));
+        }
+        for row_index in present_rows..desired.height {
+            append_row_patches(patches, row_index, Arc::default());
+        }
+    } else if let Some(previous) = previous {
+        for row_index in 0..desired.height {
+            let row = desired.rows.get(row_index).cloned().unwrap_or_default();
+            if previous.rows.get(row_index) != Some(&row) {
+                append_row_patches(patches, row_index, row);
+            }
         }
     }
     patches.push(TerminalPatch::MoveTo {
@@ -5704,7 +6003,19 @@ pub fn diff(previous: Option<&DesiredGrid>, desired: &DesiredGrid) -> Vec<Termin
         row: desired.cursor.1.min(desired.height.saturating_sub(1)),
     });
     patches.push(TerminalPatch::ShowCursor(true));
-    patches
+}
+
+fn append_row_patches(patches: &mut Vec<TerminalPatch>, row_index: usize, row: Arc<CellRow>) {
+    let clear_style = row
+        .cells
+        .last()
+        .map_or_else(CellStyle::default, |cell| cell.style);
+    patches.push(TerminalPatch::MoveTo {
+        column: 0,
+        row: row_index,
+    });
+    patches.push(TerminalPatch::PutRow(row));
+    patches.push(TerminalPatch::ClearToEndOfLine(clear_style));
 }
 
 #[cfg(test)]
@@ -5790,6 +6101,63 @@ mod tests {
         assert!(first_row.contains('│'));
         assert!(first_row.contains("right"));
         assert!(grid.cursor.0 > 7);
+    }
+
+    #[test]
+    fn terminal_sidebar_preserves_harness_cells_and_owns_focused_cursor() {
+        let model = ClientViewModel::new(DocumentId::new(1), "terminal harness");
+        let buffer_id = model.active_buffer();
+        let frame = EngineFrame {
+            text: "editor contents".into(),
+            cursor_byte: 0,
+        };
+        let mut layout = ViewportLayout::new(80, 10);
+        layout.set_terminal_sidebar_visible(true);
+        let grid = layout.desired_workspace_grid(&model, &[(buffer_id, frame)], "NORMAL", None);
+        let column = layout.terminal_sidebar_column().expect("sidebar geometry");
+        let harness_style = CellStyle {
+            bold: true,
+            foreground: Some(CellColor::Rgb(RgbColor::new(240, 10, 20))),
+            background: Some(CellColor::Rgb(RgbColor::new(10, 20, 120))),
+            ..CellStyle::default()
+        };
+        let harness_rows = vec![CellRow {
+            cells: vec![Cell {
+                grapheme: "界".into(),
+                width: 2,
+                style: harness_style,
+            }],
+        }];
+        let grid = layout.apply_terminal_sidebar(
+            grid,
+            TerminalSidebar {
+                rows: &harness_rows,
+                cursor: (2, 0),
+                focused: true,
+            },
+        );
+        let mut display_column = 0;
+        let harness_cell = grid.rows[0]
+            .cells
+            .iter()
+            .find(|cell| {
+                let found = display_column == column + 1;
+                display_column += usize::from(cell.width);
+                found
+            })
+            .expect("harness cell");
+        assert_eq!(harness_cell.grapheme.as_ref(), "界");
+        assert_eq!(harness_cell.width, 2);
+        assert_eq!(harness_cell.style, harness_style);
+        assert_eq!(grid.cursor, (column + 3, 0));
+        assert_eq!(
+            grid.rows[0]
+                .cells
+                .iter()
+                .map(|cell| usize::from(cell.width))
+                .sum::<usize>(),
+            80
+        );
     }
 
     #[test]
@@ -5925,6 +6293,47 @@ mod tests {
         assert!(rendered.contains("println!(\"wren\")"));
         assert!(rendered.contains("❯ main"));
         assert_eq!(grid.cursor.1, 25);
+    }
+
+    #[test]
+    fn picker_overlay_preserves_the_already_themed_editor_background() {
+        let mut theme = CatppuccinPalette::LATTE;
+        // Deliberately overlap a customized slot with a Mocha source color.
+        // Applying the theme a second time would reinterpret this background
+        // as `surface0` and visibly recolor the editor behind the picker.
+        theme.base = CatppuccinPalette::MOCHA.surface0;
+        let mut layout = ViewportLayout::new(80, 24);
+        layout.set_theme(theme);
+        let base = layout.desired_editor_grid(
+            &EngineFrame {
+                text: "editor background".into(),
+                cursor_byte: 0,
+            },
+            "NORMAL",
+            None,
+        );
+        let outside = base.rows[0].cells[0].style;
+        let grid = layout.apply_picker_overlay(
+            base,
+            &PickerOverlay {
+                title: "Find Files".into(),
+                prompt: "".into(),
+                rows: Vec::new(),
+                selected: 0,
+                preview_title: "No preview".into(),
+                preview: "".into(),
+                preview_scroll: 0,
+                preview_highlight_line: None,
+                preview_decorations: Vec::new(),
+                footer: "Esc close".into(),
+            },
+        );
+
+        assert_eq!(grid.rows[0].cells[0].style, outside);
+        assert_eq!(
+            grid.rows[0].cells[0].style.background,
+            Some(CellColor::Rgb(theme.base))
+        );
     }
 
     #[test]
@@ -6870,5 +7279,50 @@ mod tests {
                 decoration_style(&decorations, range)
             );
         }
+        let mut resolver = DecorationResolver::new_at(&decorations, 7);
+        for start in 7..14 {
+            let range = start..start + 1;
+            assert_eq!(
+                resolver.style(range.clone()),
+                decoration_style(&decorations, range)
+            );
+        }
+    }
+
+    #[test]
+    fn shared_decoration_composition_reuses_equal_layers_by_value() {
+        let span = |range, priority| DecorationSpan {
+            range,
+            priority,
+            style: CellStyle::default(),
+        };
+        let buffer_id = BufferId::new(1);
+        let mut layout = ViewportLayout::new(80, 24);
+        let first_layers = vec![(
+            buffer_id,
+            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])],
+        )];
+        let first = layout.compose_shared_decoration_layers(&first_layers);
+        assert_eq!(first[0].1.len(), 2);
+
+        let equal_layers = vec![(
+            buffer_id,
+            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])],
+        )];
+        let equal = layout.compose_shared_decoration_layers(&equal_layers);
+        assert!(Arc::ptr_eq(&first[0].1, &equal[0].1));
+
+        let changed_layers = vec![(
+            buffer_id,
+            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(2..4, 2)])],
+        )];
+        let changed = layout.compose_shared_decoration_layers(&changed_layers);
+        assert!(!Arc::ptr_eq(&first[0].1, &changed[0].1));
+        assert_eq!(changed[0].1[1].range, 2..4);
+
+        let only = Arc::new(vec![span(4..5, 3)]);
+        let single =
+            layout.compose_shared_decoration_layers(&[(buffer_id, vec![Arc::clone(&only)])]);
+        assert!(Arc::ptr_eq(&only, &single[0].1));
     }
 }

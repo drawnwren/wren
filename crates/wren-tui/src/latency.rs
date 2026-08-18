@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -9,11 +10,11 @@ use wren_presenter::{PresentationObserver, Presenter};
 use wren_term::{
     TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode,
 };
-use wren_view::{CellColor, CellStyle, TerminalPatch, ViewportLayout};
+use wren_view::{CellColor, CellStyle, DesiredGrid, TerminalPatch, ViewportLayout, diff_into};
 
 use super::{
-    App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, desired_frame,
-    poll_app_work,
+    App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, StartupScreen,
+    desired_frame, poll_app_work,
 };
 
 const WIDTH: usize = 120;
@@ -53,6 +54,31 @@ pub struct ProductionLatencyReport {
     pub samples: Vec<ProductionLatencySample>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TilingPerformanceSample {
+    pub scenario: Box<str>,
+    pub width: usize,
+    pub height: usize,
+    pub desired_frame_nanos: u64,
+    pub diff_nanos: u64,
+    pub terminal_write_nanos: u64,
+    pub full_render_nanos: u64,
+    pub terminal_patches: usize,
+    pub terminal_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TilingPerformanceReport {
+    pub schema: u64,
+    pub workload: Box<str>,
+    pub requested_iterations: u64,
+    pub setup_presentations: u64,
+    pub published_frames: u64,
+    pub dropped_frames: u64,
+    pub presented_frames: u64,
+    pub samples: Vec<TilingPerformanceSample>,
+}
+
 #[derive(Default)]
 struct CountingWriter {
     bytes: u64,
@@ -90,6 +116,252 @@ impl TerminalBackend for MeasuringBackend {
     fn submit(&mut self, patches: &[TerminalPatch]) -> Result<(), Self::Error> {
         self.terminal.submit(patches)
     }
+}
+
+#[derive(Clone, Default)]
+struct SharedCountingWriter {
+    bytes: Arc<AtomicU64>,
+}
+
+impl Write for SharedCountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        std::hint::black_box(buffer);
+        self.bytes.fetch_add(
+            u64::try_from(buffer.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TilingProbe {
+    app: App,
+    layout: ViewportLayout,
+    diagnostic_terminal: TerminaBackend<CountingWriter>,
+    presenter: Presenter<TerminaBackend<SharedCountingWriter>>,
+    presented: mpsc::Receiver<u64>,
+    presenter_bytes: Arc<AtomicU64>,
+    previous: Option<Arc<DesiredGrid>>,
+    diagnostic_patches: Vec<TerminalPatch>,
+    setup_presentations: u64,
+    samples: Vec<TilingPerformanceSample>,
+}
+
+impl TilingProbe {
+    fn new() -> Result<Self> {
+        let mut app = App::open(None, None).context("open empty tiling performance app")?;
+        anyhow::ensure!(
+            app.shows_startup_screen(),
+            "tiling performance app did not open on the startup screen"
+        );
+        let mut layout = ViewportLayout::new(WIDTH, HEIGHT);
+        layout.configure_dotfile_profile();
+        app.resize_terminal(HEIGHT, WIDTH);
+        let diagnostic_terminal = TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)?;
+        let presenter_writer = SharedCountingWriter::default();
+        let presenter_bytes = Arc::clone(&presenter_writer.bytes);
+        let backend = Arc::new(Mutex::new(TerminaBackend::new(
+            presenter_writer,
+            WIDTH,
+            HEIGHT,
+        )?));
+        let (presented_sender, presented) = mpsc::sync_channel(1);
+        let observer: PresentationObserver = Arc::new(move |epoch| {
+            let _ = presented_sender.send(epoch);
+        });
+        let presenter = Presenter::start_observed(backend, Some(observer))?;
+        Ok(Self {
+            app,
+            layout,
+            diagnostic_terminal,
+            presenter,
+            presented,
+            presenter_bytes,
+            previous: None,
+            diagnostic_patches: Vec::new(),
+            setup_presentations: 0,
+            samples: Vec::new(),
+        })
+    }
+
+    fn configure_size(&mut self, width: usize, height: usize) {
+        self.layout.resize(width, height);
+        self.layout.configure_dotfile_profile();
+        self.app.resize_terminal(height, width);
+        self.diagnostic_terminal.resize(width, height);
+    }
+
+    fn set_animation_time(&mut self, elapsed: Duration) {
+        self.app.started_at = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
+    }
+
+    fn reset_tiling_cache(&mut self) {
+        *self.app.startup_screen.borrow_mut() = StartupScreen::default();
+    }
+
+    fn present_setup(&mut self, elapsed: Duration) -> Result<()> {
+        self.set_animation_time(elapsed);
+        let frame = desired_frame(&mut self.layout, &self.app);
+        let epoch = frame.epoch;
+        self.presenter.publish(Arc::clone(&frame))?;
+        let presented = self
+            .presented
+            .recv_timeout(Duration::from_secs(5))
+            .context("tiling performance setup presentation timed out")?;
+        anyhow::ensure!(
+            presented == epoch,
+            "presenter completed an unexpected epoch"
+        );
+        diff_into(
+            self.previous.as_deref(),
+            &frame,
+            &mut self.diagnostic_patches,
+        );
+        self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
+        self.previous = Some(frame);
+        self.setup_presentations = self.setup_presentations.saturating_add(1);
+        Ok(())
+    }
+
+    fn measure(&mut self, scenario: &str, elapsed: Duration) -> Result<()> {
+        self.set_animation_time(elapsed);
+        let width = self.layout.width;
+        let height = self.layout.height;
+        let bytes_before = self.presenter_bytes.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let frame = desired_frame(&mut self.layout, &self.app);
+        let desired_frame_nanos = elapsed_nanos(started);
+        let epoch = frame.epoch;
+        self.presenter.publish(Arc::clone(&frame))?;
+        let presented = self
+            .presented
+            .recv_timeout(Duration::from_secs(5))
+            .context("tiling performance presentation timed out")?;
+        anyhow::ensure!(
+            presented == epoch,
+            "presenter completed an unexpected epoch"
+        );
+        let full_render_nanos = elapsed_nanos(started);
+        let terminal_bytes = self
+            .presenter_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(bytes_before);
+
+        // These component clocks replay the same diff/write against a private
+        // backend after the production presenter has completed. They expose
+        // regressions by stage without adding duplicate work to the aggregate
+        // desired-frame-to-fully-written clock above.
+        // Drop the preceding diagnostic patch contents before the component
+        // clock, matching the allocation-returning `diff` baseline whose
+        // result was dropped after its measured interval.
+        self.diagnostic_patches.clear();
+        let diff_started = Instant::now();
+        diff_into(
+            self.previous.as_deref(),
+            &frame,
+            &mut self.diagnostic_patches,
+        );
+        let diff_nanos = elapsed_nanos(diff_started);
+        let terminal_started = Instant::now();
+        self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
+        let terminal_write_nanos = elapsed_nanos(terminal_started);
+        anyhow::ensure!(
+            frame
+                .rows
+                .first()
+                .and_then(|row| row.cells.first())
+                .is_some_and(|cell| cell.grapheme.as_ref() == "▀"),
+            "tiling performance sample did not render the startup tiling"
+        );
+        self.samples.push(TilingPerformanceSample {
+            scenario: scenario.into(),
+            width,
+            height,
+            desired_frame_nanos,
+            diff_nanos,
+            terminal_write_nanos,
+            full_render_nanos,
+            terminal_patches: self.diagnostic_patches.len(),
+            terminal_bytes,
+        });
+        self.previous = Some(frame);
+        Ok(())
+    }
+}
+
+/// Measures the complete no-buffer tiling path through the production `App`,
+/// desired grid construction, Presenter diffing, and completed Termina byte
+/// serialization. Component diff/write clocks replay the already-presented
+/// frame against a private backend and are excluded from the aggregate clock.
+/// Geometry/cache resets and viewport resizes happen before their timed
+/// `desired_frame` call only where the named scenario requires them.
+pub fn run_tiling_performance_probe(iterations: u64) -> Result<TilingPerformanceReport> {
+    let iterations = iterations.max(1);
+    let scenario_span_millis = iterations.saturating_add(1).saturating_mul(83);
+    let mut probe = TilingProbe::new()?;
+    probe.present_setup(Duration::ZERO)?;
+
+    for sample in 0..iterations {
+        let elapsed = Duration::from_millis(sample.saturating_add(1).saturating_mul(83));
+        probe.measure("animated_120x40", elapsed)?;
+    }
+
+    probe.configure_size(240, 80);
+    probe.previous = None;
+    probe.present_setup(Duration::from_millis(scenario_span_millis))?;
+    for sample in 0..iterations {
+        let elapsed = Duration::from_millis(
+            scenario_span_millis.saturating_add(sample.saturating_add(1).saturating_mul(83)),
+        );
+        probe.measure("animated_240x80", elapsed)?;
+    }
+
+    probe.configure_size(WIDTH, HEIGHT);
+    for sample in 0..iterations {
+        probe.reset_tiling_cache();
+        probe.previous = None;
+        let elapsed = Duration::from_millis(
+            scenario_span_millis
+                .saturating_mul(2)
+                .saturating_add(sample.saturating_add(1).saturating_mul(83)),
+        );
+        probe.measure("cold_120x40", elapsed)?;
+    }
+
+    for sample in 0..iterations {
+        let (width, height) = if sample % 2 == 0 {
+            (160, 50)
+        } else {
+            (120, 40)
+        };
+        probe.configure_size(width, height);
+        let elapsed = Duration::from_millis(
+            scenario_span_millis
+                .saturating_mul(3)
+                .saturating_add(sample.saturating_add(1).saturating_mul(83)),
+        );
+        probe.measure("resize_120x40_160x50", elapsed)?;
+    }
+
+    let samples = std::mem::take(&mut probe.samples);
+    let setup_presentations = probe.setup_presentations;
+    let stats = probe.presenter.finish()?;
+    Ok(TilingPerformanceReport {
+        schema: 1,
+        workload: "full_tui_empty_startup_tiling_desired_grid_presenter_diff_termina".into(),
+        requested_iterations: iterations,
+        setup_presentations,
+        published_frames: stats.published_frames,
+        dropped_frames: stats.dropped_frames,
+        presented_frames: stats.presented_frames,
+        samples,
+    })
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {

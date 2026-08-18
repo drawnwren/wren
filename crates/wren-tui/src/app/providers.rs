@@ -39,26 +39,10 @@ impl App {
             return;
         }
         let mapping = transaction.offset_mapping();
-        let text_store = self.active.editor.text();
-        let text_len = text_store.len_bytes();
-        let mut targets = transaction
-            .edits()
-            .iter()
-            .filter_map(|edit| {
-                let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
-                let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
-                let start_line = text_store.line_of_byte(start.min(text_len));
-                let end_line = text_store.line_of_byte(end.min(text_len));
-                let target_start_line = start_line.saturating_sub(1);
-                let target_end_line = end_line.saturating_add(2);
-                let target = text_store.byte_of_line(target_start_line)
-                    ..text_store
-                        .byte_of_line(target_end_line)
-                        .max(start)
-                        .min(text_len);
-                Some(target)
-            })
-            .collect::<Vec<_>>();
+        let frame = self.active.editor.frame();
+        let language_id = language_bundle(self.active.document.presentation_path()).language_id;
+        let (mut targets, replacement) =
+            changed_syntax(&frame.text, transaction, &language_id, self.theme);
         if targets.is_empty() {
             return;
         }
@@ -73,21 +57,6 @@ impl App {
             .chain(targets.iter().cloned())
             .collect();
         merge_ranges(pending);
-        let frame = self.active.editor.frame();
-        let mut replacement = Vec::new();
-        for target in &targets {
-            let source = frame.text.slice(target.clone());
-            replacement.extend(
-                lexical_highlight_text(&source)
-                    .into_iter()
-                    .map(|mut span| {
-                        span.range.start = span.range.start.saturating_add(target.start);
-                        span.range.end = span.range.end.saturating_add(target.start);
-                        span
-                    })
-                    .map(|span| provider_decoration(span, self.theme)),
-            );
-        }
         let revision = self.active.editor.revision();
         let state = self
             .decorations
@@ -102,6 +71,76 @@ impl App {
             self.active.document_id,
             Instant::now() + Duration::from_millis(50),
         );
+    }
+
+    /// Prepare the exact first-insert decoration states for both the active
+    /// viewport and the prefetched document end. This fills only the retained
+    /// visible-slice cache; document text, provider authority, and revisions
+    /// remain unchanged.
+    pub(super) fn prepare_realtime_decoration_updates(&self) {
+        if self.realtime_decorations_prepared.get()
+            || self.active.editor.mode() != Mode::Normal
+            || self.views.windows.len() != 1
+            || !self.active.class.policy().whole_document_syntax
+        {
+            return;
+        }
+        self.realtime_decorations_prepared.set(true);
+
+        let revision = self.active.editor.revision();
+        let frame = self.active.editor.frame();
+        let language_id = language_bundle(self.active.document.presentation_path()).language_id;
+        let rows = self.viewport_rows.max(1);
+        let margin = 3.min(rows.saturating_sub(1) / 2);
+        let initial_top = self.views.active_window().top_line;
+        let end = self.active.editor.document_end_byte();
+        let end_line = frame.text.line_of_byte(end);
+        let end_line_start = frame.text.byte_of_line(end_line);
+        let previous_line = end_line.checked_sub(1).map(|line| {
+            let start = frame.text.byte_of_line(line);
+            let content_end = end_line_start.saturating_sub(1).max(start);
+            start + (end - end_line_start).min(content_end - start)
+        });
+        let mut candidates = vec![self.active.editor.primary_cursor(), end];
+        candidates.extend(previous_line);
+        candidates.sort_unstable();
+        candidates.dedup();
+        for cursor in candidates {
+            let Ok(transaction) = Transaction::new(revision, vec![Edit::new(cursor..cursor, "x")])
+            else {
+                continue;
+            };
+            let Ok(preview) = frame.text.edited(&transaction) else {
+                continue;
+            };
+            let cursor_line = preview.line_of_byte(cursor.saturating_add(1).min(preview.len()));
+            let top_line = viewport_top_with_margin(initial_top, cursor_line, rows, margin);
+            let start = preview.byte_of_line(top_line);
+            let visible =
+                start..preview.byte_of_line(top_line.saturating_add(rows).saturating_add(1));
+
+            if let Some(syntax) = self
+                .decorations
+                .get(&self.active.buffer_id)
+                .filter(|state| state.revision == revision)
+            {
+                let (targets, replacement) =
+                    changed_syntax(&preview, &transaction, &language_id, self.theme);
+                syntax.prepare_replaced_visible(
+                    &transaction,
+                    &targets,
+                    replacement,
+                    visible.clone(),
+                );
+            }
+            if let Some(semantic) = self
+                .semantic_decorations
+                .get(&self.active.buffer_id)
+                .filter(|state| state.revision == revision)
+            {
+                semantic.prepare_mapped_visible(&transaction, visible);
+            }
+        }
     }
 
     pub(super) fn schedule_provider_refreshes(&mut self, viewport_height: usize) {
@@ -657,6 +696,55 @@ impl App {
             self.active.editor.set_selection_range(range);
         }
     }
+}
+
+fn changed_syntax(
+    text: &FrameText,
+    transaction: &Transaction,
+    language_id: &str,
+    theme: CatppuccinPalette,
+) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
+    let mapping = transaction.offset_mapping();
+    let text_len = text.len();
+    let mut targets = transaction
+        .edits()
+        .iter()
+        .filter_map(|edit| {
+            let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
+            let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
+            let start_line = text.line_of_byte(start.min(text_len));
+            let end_line = text.line_of_byte(end.min(text_len));
+            let target_start_line = start_line.saturating_sub(1);
+            let target_end_line = end_line.saturating_add(2);
+            Some(
+                text.byte_of_line(target_start_line)
+                    ..text.byte_of_line(target_end_line).max(start).min(text_len),
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| target.start);
+    let replacement = targets
+        .iter()
+        .flat_map(|target| {
+            let slice = text.slice(target.clone());
+            let spans = if language_id == "markdown" {
+                // Markdown prose has no code keywords. Structural and inline
+                // Markdown styling is painted by `markdown_decorations`, while
+                // the provider refresh supplies fenced-language captures.
+                // Keeping this parser-free also preserves the realtime edit
+                // path's latency contract.
+                Vec::new()
+            } else {
+                lexical_highlight_text(slice.as_ref())
+            };
+            spans.into_iter().map(|mut span| {
+                span.range.start = span.range.start.saturating_add(target.start);
+                span.range.end = span.range.end.saturating_add(target.start);
+                provider_decoration(span, theme)
+            })
+        })
+        .collect();
+    (targets, replacement)
 }
 
 fn viewport_top_with_margin(

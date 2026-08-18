@@ -149,7 +149,11 @@ impl App {
         let lsp = match result {
             Ok(lsp) => lsp,
             Err(error) => {
-                self.show_error(format!("language server: {error}"));
+                // Server availability is environmental: an incomplete build
+                // tree may legitimately make clangd or another analyzer
+                // decline startup. Keep the detail in :messages without
+                // blocking ordinary editing with an error float.
+                self.show_info(format!("language server unavailable: {error}"));
                 return Ok(true);
             }
         };
@@ -178,7 +182,7 @@ impl App {
             // A protocol failure invalidates the selected client. This is the
             // sole owner of that recovery policy.
             self.lsp = None;
-            self.show_error(format!("language server: {error}"));
+            self.show_info(format!("language server unavailable: {error}"));
             return false;
         }
         true
@@ -585,7 +589,7 @@ impl App {
         Ok(true)
     }
 
-    fn apply_lsp_background_outcome(
+    pub(super) fn apply_lsp_background_outcome(
         &mut self,
         operation: LspBackgroundOperation,
         outcome: Result<LspBackgroundPayload, String>,
@@ -633,10 +637,10 @@ impl App {
                     "{label}: background worker returned the wrong result"
                 ));
             }
-            (operation, Err(error)) => {
-                let label = operation.label();
-                self.show_error(format!("{label}: {error}"));
-            }
+            (LspBackgroundOperation::Semantic { .. }, Err(error)) => self.show_info(format!(
+                "textDocument/semanticTokens/full unavailable: {error}"
+            )),
+            (operation, Err(error)) => self.show_error(format!("{}: {error}", operation.label())),
         }
     }
 

@@ -1,0 +1,16 @@
+[package]
+name = "wren-tiling-performance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hdrhistogram.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
+wren-tui = { version = "0.1.0", path = "../../crates/wren-tui" }
+
+[lints]
+workspace = true

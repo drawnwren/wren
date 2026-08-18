@@ -227,6 +227,35 @@ fn app_opens_edits_and_safely_saves_a_real_file() {
 }
 
 #[test]
+fn space_w_uses_the_same_write_path_without_quitting_a_new_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("new-file.txt");
+    let (document, opened) = LocalDocument::open_or_new(&path).expect("open new file");
+    let mut app = App::from_opened(document, opened, None, None).expect("create app");
+    app.dispatch_key(KeyEvent::character('i'));
+    for character in "new contents".chars() {
+        app.dispatch_key(KeyEvent::character(character));
+    }
+    app.dispatch_key(KeyEvent::plain(KeyCode::Escape));
+
+    app.handle_editor_key(terminal_character(' '))
+        .expect("leader");
+    app.handle_editor_key(terminal_character('w'))
+        .expect("write");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("saved source"),
+        "new contents"
+    );
+    assert!(!app.active.editor.is_dirty());
+    assert!(!app.quit);
+    assert!(
+        app.leader_keys.is_none(),
+        "Space-w must execute immediately"
+    );
+}
+
+#[test]
 fn realtime_path_preparation_cannot_mutate_the_live_buffer() {
     let (document, mut opened) = LocalDocument::unnamed();
     opened.text = "fn live() { let untouched = 1; }\n".to_owned();
@@ -332,6 +361,131 @@ fn dotfile_leader_q_and_ff_are_exact_native_sequences() {
             .prompt
             .as_ref()
             .is_some_and(|prompt| prompt.kind == PromptKind::FilePicker)
+    );
+}
+
+#[test]
+fn leader_a_is_the_embedded_agent_terminal_binding() {
+    let keymap = RuntimeKeymap::defaults();
+    let binding = keymap.leader.get("a").expect("leader-a binding");
+    assert_eq!(binding.invocation.command.as_ref(), "ai.chat");
+    assert_eq!(binding.description.as_ref(), "Oh My Pi pane");
+}
+
+#[test]
+#[cfg(unix)]
+fn focused_agent_sidebar_forwards_input_and_terminal_escape_returns_to_editor() {
+    let mut app = App::open(None, None).expect("app");
+    app.resize_terminal(12, 80);
+    app.open_agent_sidebar_in(
+        "sh",
+        &[
+            "-c",
+            "stty -echo; IFS= read -r line; printf 'HARNESS:%s' \"$line\"; sleep 1",
+        ],
+    )
+    .expect("open embedded harness");
+    app.handle_input(TerminalInput::Paste("a界b".to_owned()))
+        .expect("paste into harness");
+    app.handle_input(TerminalInput::Key(terminal_key(TerminalKeyCode::Enter)))
+        .expect("submit harness input");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.poll_agent_terminal().expect("poll harness");
+        if app
+            .agent_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.surface().contents().contains("HARNESS:a界b"))
+        {
+            break;
+        }
+        thread::yield_now();
+    }
+    assert!(
+        app.agent_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.surface().contents().contains("HARNESS:a界b"))
+    );
+    let mut layout = ViewportLayout::new(80, 12);
+    layout.configure_dotfile_profile();
+    let rendered = desired_frame(&mut layout, &app)
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter().map(|cell| cell.grapheme.as_ref()))
+        .collect::<String>();
+    assert!(rendered.contains("HARNESS:a界b"));
+
+    app.handle_input(TerminalInput::Key(terminal_control('\\')))
+        .expect("terminal escape prefix");
+    app.handle_input(TerminalInput::Key(terminal_control('n')))
+        .expect("return focus to editor");
+    assert!(app.agent_sidebar.visible);
+    assert!(!app.agent_sidebar.focused);
+}
+
+#[test]
+fn embedded_agent_mouse_coordinates_are_relative_to_the_harness_surface() {
+    let mut app = App::open(None, None).expect("app");
+    app.resize_terminal(20, 100);
+    let start = ViewportLayout::terminal_sidebar_column_for_size(100, 20)
+        .expect("sidebar")
+        .saturating_add(1);
+    assert_eq!(
+        app.agent_local_mouse_event(&TerminalInput::MouseScroll {
+            lines: -3,
+            column: start + 7,
+            row: 4,
+        }),
+        Some(TerminalInput::MouseScroll {
+            lines: -3,
+            column: 7,
+            row: 4,
+        })
+    );
+    assert_eq!(
+        app.agent_local_mouse_event(&TerminalInput::MouseClick {
+            column: start + 2,
+            row: 9,
+        }),
+        Some(TerminalInput::MouseClick { column: 2, row: 9 })
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn embedded_agent_participates_in_ctrl_w_window_navigation() {
+    let mut app = App::open(None, None).expect("app");
+    app.resize_terminal(20, 100);
+    app.open_agent_sidebar_in("sh", &["-c", "sleep 5"])
+        .expect("open embedded harness");
+
+    app.handle_input(TerminalInput::Key(terminal_character('q')))
+        .expect("ordinary q reaches harness");
+    assert!(app.agent_sidebar.visible && app.agent_sidebar.focused);
+
+    app.handle_input(TerminalInput::Key(terminal_control('w')))
+        .expect("window prefix in harness");
+    app.handle_input(TerminalInput::Key(terminal_character('h')))
+        .expect("focus editor");
+    assert!(app.agent_sidebar.visible);
+    assert!(!app.agent_sidebar.focused);
+
+    app.handle_input(TerminalInput::Key(terminal_control('w')))
+        .expect("window prefix in editor");
+    app.handle_input(TerminalInput::Key(terminal_character('l')))
+        .expect("focus harness");
+    assert!(app.agent_sidebar.focused);
+
+    app.handle_input(TerminalInput::Key(terminal_control('w')))
+        .expect("window prefix in harness");
+    app.handle_input(TerminalInput::Key(terminal_character('q')))
+        .expect("hide harness window");
+    assert!(!app.agent_sidebar.visible);
+    assert!(!app.agent_sidebar.focused);
+    assert!(
+        app.agent_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.exit_code().is_none())
     );
 }
 
@@ -684,6 +838,46 @@ fn full_syntax_is_ready_on_file_open_viewport_change_and_buffer_change() {
     );
 }
 
+fn assert_prepared_edit_decorations(app: &App, edit_range: Range<usize>) {
+    for (label, state) in [
+        (
+            "syntax",
+            app.decorations
+                .get(&app.active.buffer_id)
+                .expect("syntax decorations"),
+        ),
+        (
+            "semantic",
+            app.semantic_decorations
+                .get(&app.active.buffer_id)
+                .expect("semantic decorations"),
+        ),
+    ] {
+        let cache = state.visible_cache.borrow();
+        assert!(
+            cache.iter().any(|cached| {
+                cached.range == edit_range
+                    && decoration_transforms_equal(&cached.transforms, &state.transforms)
+                    && cached.overrides == state.overrides
+                    && cached.invalidated == state.invalidated
+            }),
+            "{label} prepared cache missing: wanted={edit_range:?} transforms={} overrides={} invalidated={:?}, cached={:?}",
+            state.transforms.len(),
+            state.overrides.len(),
+            state.invalidated,
+            cache
+                .iter()
+                .map(|cached| (
+                    &cached.range,
+                    cached.transforms.len(),
+                    cached.overrides.len(),
+                    &cached.invalidated
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 #[test]
 fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -758,6 +952,15 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     })
     .expect("half-page viewport motion");
     let (_frame, viewport_frame) = desired_frame_profiled(&mut layout, &app);
+    app.handle_editor_key(TerminalKey {
+        code: TerminalKeyCode::Char('d'),
+        shift: false,
+        control: true,
+        alt: false,
+        super_key: false,
+    })
+    .expect("return to the document-end viewport");
+    let before_edit = desired_frame(&mut layout, &app);
     app.dispatch_key(KeyEvent::character('i'));
     let edit_input_at = Instant::now();
     app.dispatch_key(KeyEvent::character('x'));
@@ -765,13 +968,26 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     let edit_schedule_at = Instant::now();
     app.schedule_provider_refreshes(layout.height);
     let edit_schedule_elapsed = edit_schedule_at.elapsed();
-    let (_frame, edit_frame) = desired_frame_profiled(&mut layout, &app);
+    let edit_range = visible_byte_range(&app, app.active.buffer_id).expect("edit viewport");
+    assert_prepared_edit_decorations(&app, edit_range);
+    let (edited_grid, edit_frame) = desired_frame_profiled(&mut layout, &app);
+    let retained_edit_rows = before_edit
+        .rows
+        .iter()
+        .zip(&edited_grid.rows)
+        .filter(|(before, after)| Arc::ptr_eq(before, after))
+        .count();
+    assert!(
+        retained_edit_rows >= layout.height.saturating_sub(3),
+        "same-line edit rebuilt too many rows: retained {retained_edit_rows} of {}",
+        layout.height
+    );
     app.dispatch_key(KeyEvent::plain(KeyCode::Escape));
     app.dispatch_key(KeyEvent::character('v'));
     app.dispatch_key(KeyEvent::character('h'));
     let (_frame, selection_frame) = desired_frame_profiled(&mut layout, &app);
     eprintln!(
-        "large Rust gate: open={open_elapsed:?} first_frame=[{first_frame}] navigation_input={navigation_input_elapsed:?} navigation_schedule={navigation_schedule_elapsed:?} navigation_frame=[{navigation_frame}] local_motion_frame=[{local_motion_frame}] viewport_frame=[{viewport_frame}] edit_input={edit_input_elapsed:?} edit_schedule={edit_schedule_elapsed:?} edit_frame=[{edit_frame}] selection_frame=[{selection_frame}] spans={span_count}"
+        "large Rust gate: open={open_elapsed:?} first_frame=[{first_frame}] navigation_input={navigation_input_elapsed:?} navigation_schedule={navigation_schedule_elapsed:?} navigation_frame=[{navigation_frame}] local_motion_frame=[{local_motion_frame}] viewport_frame=[{viewport_frame}] edit_input={edit_input_elapsed:?} edit_schedule={edit_schedule_elapsed:?} edit_frame=[{edit_frame}] retained_edit_rows={retained_edit_rows} selection_frame=[{selection_frame}] spans={span_count}"
     );
     assert!(
         span_count >= 42_000,
@@ -1709,6 +1925,31 @@ fn gd_queues_behind_in_progress_startup_instead_of_starting_a_second_server() {
 }
 
 #[test]
+fn automatic_lsp_failures_are_logged_without_error_popups() {
+    let mut app = App::open(None, None).expect("app");
+    app.apply_lsp_background_outcome(
+        LspBackgroundOperation::Semantic {
+            buffer_id: app.active.buffer_id,
+            revision: app.active.editor.revision(),
+        },
+        Err("compile_commands.json is incomplete".to_owned()),
+    );
+    assert!(app.popup.is_none());
+    assert!(app.message.contains("semanticTokens/full unavailable"));
+
+    let (sender, receiver) = mpsc::channel();
+    sender
+        .send(Err(
+            "clangd could not initialize this partial project".to_owned()
+        ))
+        .expect("startup result");
+    app.lsp_start = Some(receiver);
+    assert!(app.poll_lsp_start().expect("poll startup"));
+    assert!(app.popup.is_none());
+    assert!(app.message.contains("language server unavailable"));
+}
+
+#[test]
 fn first_hover_queues_behind_workspace_startup_without_starting_another_server() {
     let mut app = App::open(None, None).expect("app");
     let (_sender, receiver) = mpsc::channel::<Result<PersistentLsp, String>>();
@@ -1847,7 +2088,7 @@ fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
         .rows
         .iter()
         .flat_map(|row| row.cells.iter())
-        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface1)))
+        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface2)))
         .collect::<Vec<_>>();
     assert_eq!(
         selected
@@ -1864,6 +2105,86 @@ fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
         normal_foregrounds,
         "Visual background must compose with the maximum-priority highlight foreground"
     );
+}
+
+#[test]
+fn markdown_plain_words_do_not_gain_code_keyword_highlights_after_editing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("notes.md");
+    fs::write(&path, "").expect("Markdown file");
+    let mut app = App::open(Some(&path), None).expect("app");
+
+    app.handle_editor_key(terminal_character('i'))
+        .expect("insert");
+    for character in "use for".chars() {
+        app.handle_editor_key(terminal_character(character))
+            .expect("type Markdown");
+    }
+    app.handle_editor_key(TerminalKey {
+        code: TerminalKeyCode::Escape,
+        shift: false,
+        control: false,
+        alt: false,
+        super_key: false,
+    })
+    .expect("normal mode");
+
+    let spans = app
+        .decorations
+        .get(&app.active.buffer_id)
+        .expect("syntax state")
+        .spans_in(0..app.active.editor.text().len_bytes());
+    assert!(
+        spans.iter().all(|span| {
+            span.style.foreground != Some(CellColor::Rgb(app.theme.mauve)) || !span.style.bold
+        }),
+        "plain Markdown was classified as a code keyword: {spans:?}"
+    );
+}
+
+#[test]
+fn entering_visual_mode_does_not_move_a_markdown_viewport() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("viewport.md");
+    let text = (0..40)
+        .map(|line| {
+            format!(
+                "paragraph {line}: this is a deliberately long Markdown line that wraps in a narrow terminal\n"
+            )
+        })
+        .collect::<String>();
+    fs::write(&path, &text).expect("Markdown file");
+    let mut app = App::open(Some(&path), None).expect("app");
+    let cursor = text.find("paragraph 25").expect("target paragraph");
+    app.active.editor.set_cursor(cursor);
+    let mut layout = ViewportLayout::new(42, 10);
+    layout.configure_dotfile_profile();
+    let normal = desired_frame(&mut layout, &app);
+    let normal_rows = normal.rows[..normal.height - 1]
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    app.handle_editor_key(terminal_character('v'))
+        .expect("Visual mode");
+    let visual = desired_frame(&mut layout, &app);
+    let visual_rows = visual.rows[..visual.height - 1]
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.grapheme.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(visual.cursor, normal.cursor);
+    assert_eq!(visual_rows, normal_rows);
 }
 
 #[test]
@@ -1888,6 +2209,180 @@ fn inverse_edits_do_not_accumulate_decoration_coordinate_transforms() {
 
     assert!(decorations.transforms.is_empty());
     assert_eq!(decorations.spans_in(0..32), vec![expected]);
+}
+
+#[test]
+fn visible_decoration_slices_are_shared_until_the_state_changes() {
+    let revision = DocumentRevision::new(1);
+    let mut decorations = BufferDecorations::new(
+        revision,
+        vec![DecorationSpan {
+            range: 10..13,
+            style: CellStyle::default(),
+            priority: 1,
+        }],
+    );
+    let first = decorations.spans_in_shared(0..32);
+    let second = decorations.spans_in_shared(0..32);
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let insert = Transaction::new(revision, vec![Edit::new(0..0, "x")]).expect("insert");
+    decorations.map_through(&insert, revision.next().expect("next revision"));
+    let changed = decorations.spans_in_shared(0..32);
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(changed[0].range, 11..14);
+}
+
+#[test]
+fn equivalent_recent_decoration_mapping_states_reuse_visible_slices() {
+    let mut revision = DocumentRevision::new(1);
+    let mut decorations = BufferDecorations::new(
+        revision,
+        vec![DecorationSpan {
+            range: 10..13,
+            style: CellStyle::default(),
+            priority: 1,
+        }],
+    );
+
+    let insert = Transaction::new(revision, vec![Edit::new(0..0, "x")]).expect("first insert");
+    revision = revision.next().expect("insert revision");
+    decorations.map_through(&insert, revision);
+    let first_insert = decorations.spans_in_shared(0..33);
+    let delete = Transaction::new(revision, vec![Edit::new(0..1, "")]).expect("first delete");
+    revision = revision.next().expect("delete revision");
+    decorations.map_through(&delete, revision);
+    let first_delete = decorations.spans_in_shared(0..32);
+
+    let insert = Transaction::new(revision, vec![Edit::new(0..0, "x")]).expect("second insert");
+    revision = revision.next().expect("insert revision");
+    decorations.map_through(&insert, revision);
+    let second_insert = decorations.spans_in_shared(0..33);
+    let delete = Transaction::new(revision, vec![Edit::new(0..1, "")]).expect("second delete");
+    revision = revision.next().expect("delete revision");
+    decorations.map_through(&delete, revision);
+    let second_delete = decorations.spans_in_shared(0..32);
+
+    assert!(Arc::ptr_eq(&first_insert, &second_insert));
+    assert!(Arc::ptr_eq(&first_delete, &second_delete));
+}
+
+#[test]
+fn prepared_replacement_state_is_reused_by_the_first_real_edit() {
+    let revision = DocumentRevision::new(1);
+    let mut decorations = BufferDecorations::new(
+        revision,
+        vec![DecorationSpan {
+            range: 10..13,
+            style: CellStyle::default(),
+            priority: 1,
+        }],
+    );
+    let insert = Transaction::new(revision, vec![Edit::new(0..0, "x")]).expect("insert");
+    let changed = 0..2;
+    let replacement = vec![DecorationSpan {
+        range: 0..1,
+        style: CellStyle::default(),
+        priority: 1,
+    }];
+
+    decorations.prepare_replaced_visible(
+        &insert,
+        std::slice::from_ref(&changed),
+        replacement.clone(),
+        0..33,
+    );
+    let prepared = Arc::clone(
+        &decorations
+            .visible_cache
+            .borrow()
+            .last()
+            .expect("prepared visible state")
+            .spans,
+    );
+    decorations.replace_after_transaction(
+        &insert,
+        revision.next().expect("next revision"),
+        &[changed],
+        replacement,
+    );
+    let actual = decorations.spans_in_shared(0..33);
+
+    assert!(Arc::ptr_eq(&prepared, &actual));
+    assert_eq!(actual[0].range, 0..1);
+    assert_eq!(actual[1].range, 11..14);
+}
+
+#[test]
+fn first_document_end_insert_reuses_the_prepared_visible_syntax() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("prepared.rs");
+    let text = (0..200)
+        .map(|line| format!("pub fn item_{line}() {{ let value = {line}; }}\n"))
+        .collect::<String>();
+    fs::write(&path, text).expect("fixture");
+    let mut app = App::open(Some(&path), None).expect("app");
+    let semantic = app
+        .decorations
+        .get(&app.active.buffer_id)
+        .expect("syntax decorations")
+        .spans
+        .iter()
+        .step_by(6)
+        .cloned()
+        .collect();
+    app.semantic_decorations.insert(
+        app.active.buffer_id,
+        BufferDecorations::new(app.active.editor.revision(), semantic),
+    );
+    app.resize_terminal(40, 120);
+    let mut layout = ViewportLayout::new(120, 40);
+    layout.configure_dotfile_profile();
+    app.schedule_provider_refreshes(layout.height);
+    let _ = desired_frame(&mut layout, &app);
+
+    app.dispatch_key(KeyEvent::character('G'));
+    app.schedule_provider_refreshes(layout.height);
+    let _ = desired_frame(&mut layout, &app);
+    for code in ['u', 'd'] {
+        app.handle_editor_key(TerminalKey {
+            code: TerminalKeyCode::Char(code),
+            shift: false,
+            control: true,
+            alt: false,
+            super_key: false,
+        })
+        .expect("half-page viewport motion");
+        let _ = desired_frame(&mut layout, &app);
+    }
+    app.dispatch_key(KeyEvent::character('i'));
+    app.dispatch_key(KeyEvent::character('x'));
+    app.schedule_provider_refreshes(layout.height);
+
+    let range = visible_byte_range(&app, app.active.buffer_id).expect("visible range");
+    for state in [
+        app.decorations
+            .get(&app.active.buffer_id)
+            .expect("syntax decorations"),
+        app.semantic_decorations
+            .get(&app.active.buffer_id)
+            .expect("semantic decorations"),
+    ] {
+        let prepared = state
+            .visible_cache
+            .borrow()
+            .iter()
+            .find(|cached| {
+                cached.range == range
+                    && decoration_transforms_equal(&cached.transforms, &state.transforms)
+                    && cached.overrides == state.overrides
+                    && cached.invalidated == state.invalidated
+            })
+            .map(|cached| Arc::clone(&cached.spans))
+            .expect("prepared document-end decoration state");
+        let actual = state.spans_in_shared(range.clone());
+        assert!(Arc::ptr_eq(&prepared, &actual));
+    }
 }
 
 #[test]
@@ -1924,7 +2419,7 @@ fn click_drag_enters_visual_mode_and_selects_rendered_cells() {
         .rows
         .iter()
         .flat_map(|row| row.cells.iter())
-        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface1)))
+        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface2)))
         .map(|cell| cell.grapheme.as_ref())
         .collect::<String>();
     assert_eq!(selected, "bcde");
@@ -1996,7 +2491,17 @@ fn dotfile_live_grep_picker_searches_the_buffer_workspace_and_opens_result() {
     fs::write(&second, "fn needle() {}\n").expect("second source");
     let mut app = App::open(Some(&first), None).expect("app");
 
+    let scheduled = Instant::now();
     app.start_grep_picker("needle").expect("grep picker");
+    assert!(scheduled.elapsed() < Duration::from_millis(100));
+    assert!(app.quickfix.is_empty());
+    assert!(app.grep_pending.is_some());
+    app.grep_due = Some(Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while app.quickfix.is_empty() && Instant::now() < deadline {
+        app.poll_grep_picker();
+        thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(app.quickfix.len(), 1);
     app.handle_prompt_key(TerminalKey {
         code: TerminalKeyCode::Enter,

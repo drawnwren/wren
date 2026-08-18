@@ -32,7 +32,7 @@ impl App {
             "Git" => self.open_git_terminal(words),
             "Gwrite" => self.git_stage_buffer(),
             "Gdiffsplit" => self.git_diff_index(),
-            "AvanteToggle" => self.toggle_ai_transcript(),
+            "AvanteToggle" => self.toggle_agent_sidebar(),
             "Codex" | "AvanteChat" | "AvanteAsk" => self.open_ai_prompt(words),
             "RustLsp" => self.open_rust_lsp_action(words.next()),
             _ => return Ok(false),
@@ -91,27 +91,10 @@ impl App {
         self.open_terminal_in(Some(git_ex_program(&arguments)), &arguments, &root)
     }
 
-    fn toggle_ai_transcript(&mut self) -> Result<()> {
-        if self
-            .popup
-            .as_ref()
-            .is_some_and(|popup| popup.title.as_ref() == "Avante · Codex")
-        {
-            self.popup = None;
-            self.popup_deadline = None;
-        } else if self.ai_transcript.is_empty() {
-            self.prompt = Some(Prompt::new(PromptKind::Ai));
-        } else {
-            self.show_ai_transcript();
-        }
-        Ok(())
-    }
-
     fn open_ai_prompt<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> Result<()> {
         let prompt = words.collect::<Vec<_>>().join(" ");
         if prompt.is_empty() {
-            self.prompt = Some(Prompt::new(PromptKind::Ai));
-            return Ok(());
+            return self.open_agent_sidebar();
         }
         self.start_ai_task(&prompt)
     }
@@ -542,8 +525,9 @@ impl App {
                 .editor
                 .restore_search(pattern.clone(), self.last_search_direction)?;
         }
+        let replace_stale = !buffer.editor.is_dirty();
         self.mutations
-            .register(document_id, buffer.editor.contents())?;
+            .register(document_id, buffer.editor.contents(), replace_stale)?;
         self.autosave_active_if_named()?;
         let previous = std::mem::replace(&mut self.active, buffer);
         self.inactive.push(previous);

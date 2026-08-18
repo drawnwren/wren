@@ -4,6 +4,7 @@ use super::*;
 enum InputLayer {
     Terminal,
     SubstituteConfirmation,
+    Agent,
     Prompt,
     Editor,
 }
@@ -14,6 +15,7 @@ impl App {
         match self.input_layer() {
             InputLayer::Terminal => self.handle_terminal_input(input),
             InputLayer::SubstituteConfirmation => self.handle_confirmation_input(input),
+            InputLayer::Agent => self.handle_agent_input(input),
             InputLayer::Prompt => self.handle_prompt_input(input),
             InputLayer::Editor => self.handle_editor_input(input),
         }
@@ -24,6 +26,8 @@ impl App {
             InputLayer::Terminal
         } else if self.substitute_confirmation.is_some() {
             InputLayer::SubstituteConfirmation
+        } else if self.agent_sidebar.visible && self.agent_sidebar.focused {
+            InputLayer::Agent
         } else if self.prompt.is_some() {
             InputLayer::Prompt
         } else {
@@ -49,7 +53,9 @@ impl App {
                 }
                 self.update_prompt_picker()
             }
-            TerminalInput::MouseScroll { lines, .. } => self.handle_mouse_scroll(lines),
+            TerminalInput::MouseScroll { lines, column, row } => {
+                self.handle_mouse_scroll_at(lines, column, row)
+            }
             TerminalInput::MouseClick { .. }
             | TerminalInput::MouseDrag { .. }
             | TerminalInput::MouseRelease { .. }
@@ -70,7 +76,9 @@ impl App {
                 }
                 Ok(())
             }
-            TerminalInput::MouseScroll { lines, .. } => self.handle_mouse_scroll(lines),
+            TerminalInput::MouseScroll { lines, column, row } => {
+                self.handle_mouse_scroll_at(lines, column, row)
+            }
             // The application loop owns rendered geometry and handles clicks
             // through `handle_mouse_click` before generic input dispatch.
             TerminalInput::MouseClick { .. }
@@ -100,6 +108,19 @@ impl App {
         Ok(())
     }
 
+    fn handle_mouse_scroll_at(&mut self, lines: isize, column: usize, row: usize) -> Result<()> {
+        let over_sidebar = self.agent_sidebar.visible
+            && ViewportLayout::terminal_sidebar_column_for_size(
+                self.viewport_columns,
+                self.viewport_rows,
+            )
+            .is_some_and(|start| column >= start);
+        if over_sidebar {
+            return self.send_agent_mouse_input(&TerminalInput::MouseScroll { lines, column, row });
+        }
+        self.handle_mouse_scroll(lines)
+    }
+
     pub(super) fn handle_mouse_click(
         &mut self,
         layout: &ViewportLayout,
@@ -107,6 +128,17 @@ impl App {
         row: usize,
     ) -> Result<()> {
         self.mouse_selection = None;
+        if self.agent_sidebar.visible
+            && layout
+                .terminal_sidebar_column()
+                .is_some_and(|start| column >= start)
+        {
+            self.agent_sidebar.focused = true;
+            self.popup = None;
+            self.popup_deadline = None;
+            return self.send_agent_mouse_input(&TerminalInput::MouseClick { column, row });
+        }
+        self.agent_sidebar.focused = false;
         if self
             .popup
             .as_ref()
@@ -154,6 +186,13 @@ impl App {
         column: usize,
         row: usize,
     ) -> Result<()> {
+        if self.agent_sidebar.visible
+            && layout
+                .terminal_sidebar_column()
+                .is_some_and(|start| column >= start)
+        {
+            return self.send_agent_mouse_input(&TerminalInput::MouseDrag { column, row });
+        }
         let Some(origin) = self.mouse_selection else {
             return Ok(());
         };
@@ -199,6 +238,13 @@ impl App {
         column: usize,
         row: usize,
     ) -> Result<()> {
+        if self.agent_sidebar.visible
+            && layout
+                .terminal_sidebar_column()
+                .is_some_and(|start| column >= start)
+        {
+            return self.send_agent_mouse_input(&TerminalInput::MouseRelease { column, row });
+        }
         if self
             .mouse_selection
             .is_some_and(|selection| selection.dragged)
@@ -294,6 +340,13 @@ impl App {
         if self.search_prompt_origin.is_some() {
             return self.cancel_search_prompt();
         }
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.kind == PromptKind::Grep)
+        {
+            self.cancel_grep_picker();
+        }
         self.prompt = None;
         self.message.clear();
         Ok(())
@@ -314,6 +367,9 @@ impl App {
             .prompt
             .take()
             .ok_or_else(|| anyhow!("prompt vanished"))?;
+        if prompt.kind == PromptKind::Grep {
+            self.cancel_grep_picker();
+        }
         if let Err(error) = self.execute_prompt(prompt) {
             self.show_error(error);
         }
@@ -644,7 +700,6 @@ impl App {
                 self.toggle_breakpoint(Some(prompt.buffer));
                 Ok(())
             }
-            PromptKind::Ai => self.start_ai_task(&prompt.buffer),
         }
     }
 
@@ -1230,6 +1285,7 @@ impl App {
                 self.message.clear();
             }
             "picker.buffers" => self.start_buffer_picker()?,
+            "ai.chat" => self.toggle_agent_sidebar()?,
             "jump.ace" => self.start_ace_jump(),
             "format.document" => self.format_active_language()?,
             "picker.files" => self.start_file_picker("")?,

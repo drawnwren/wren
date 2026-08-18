@@ -209,11 +209,6 @@ impl GpuLexical {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wren lexical classifier"),
             });
-        encoder.clear_buffer(
-            &buffers.output,
-            0,
-            Some(u64::try_from(size.output).map_err(|error| error.to_string())?),
-        );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wren lexical classifier"),
@@ -292,9 +287,7 @@ impl GpuLexical {
         let output = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wren lexical output"),
             size: output_capacity,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -371,11 +364,11 @@ fn dispatch_dimensions(text_len: usize, max_workgroups: u32) -> Option<(u32, u32
     if total == 0 || maximum == 0 {
         return None;
     }
-    let x = total.min(maximum);
-    let y = total.div_ceil(x);
+    let y = total.div_ceil(maximum);
     if y > maximum {
         return None;
     }
+    let x = total.div_ceil(y);
     Some((u32::try_from(x).ok()?, u32::try_from(y).ok()?))
 }
 
@@ -400,4 +393,26 @@ fn keyword_length_at(text: &[u8], start: usize) -> Option<usize> {
     .into_iter()
     .find(|keyword| text.get(start..start + keyword.len()) == Some(*keyword))
     .map(<[u8]>::len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WORKGROUP_SIZE, dispatch_dimensions};
+
+    #[test]
+    fn two_dimensional_dispatch_has_at_most_one_partial_row() {
+        let maximum = 65_535;
+        let total_workgroups = maximum * 2 + 2;
+        let text_len = usize::try_from(total_workgroups)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(usize::try_from(WORKGROUP_SIZE).unwrap_or(256));
+
+        let (x, y) = dispatch_dimensions(text_len, maximum).expect("valid dispatch");
+        let dispatched = u64::from(x) * u64::from(y);
+
+        assert!(x <= maximum);
+        assert!(y <= maximum);
+        assert!(dispatched >= u64::from(total_workgroups));
+        assert!(dispatched - u64::from(total_workgroups) < u64::from(y));
+    }
 }

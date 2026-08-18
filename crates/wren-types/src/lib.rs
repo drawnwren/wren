@@ -179,6 +179,23 @@ impl Transaction {
         &self.edits
     }
 
+    /// Reports whether two transactions produce the same anchor mapping even
+    /// when they belong to different document revisions. Composition
+    /// provenance remains part of the comparison because collapsed-edge bias
+    /// can differ despite identical final byte edits.
+    #[must_use]
+    pub fn has_same_mapping_as(&self, other: &Self) -> bool {
+        self.edits == other.edits
+            && match (&self.composition, &other.composition) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    left.first.has_same_mapping_as(&right.first)
+                        && left.second.has_same_mapping_as(&right.second)
+                }
+                (None, Some(_)) | (Some(_), None) => false,
+            }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
@@ -1489,6 +1506,19 @@ mod tests {
             .expect("valid transaction");
         assert_eq!(transaction.map_offset(2, Bias::Left), Ok(2));
         assert_eq!(transaction.map_offset(2, Bias::Right), Ok(5));
+    }
+
+    #[test]
+    fn mapping_equivalence_ignores_only_the_base_revision() {
+        let first = Transaction::new(DocumentRevision::new(4), vec![Edit::new(2..2, "xyz")])
+            .expect("first transaction");
+        let same_mapping = Transaction::new(DocumentRevision::new(9), vec![Edit::new(2..2, "xyz")])
+            .expect("equivalent transaction");
+        let different = Transaction::new(DocumentRevision::new(9), vec![Edit::new(2..2, "xy")])
+            .expect("different transaction");
+
+        assert!(first.has_same_mapping_as(&same_mapping));
+        assert!(!first.has_same_mapping_as(&different));
     }
 
     #[test]

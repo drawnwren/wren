@@ -313,6 +313,10 @@
             cargo run -p wren-startup --locked --release -- --iterations 1000 --output "$TMPDIR/startup.json"
             test -s "$TMPDIR/startup.json"
           '';
+          tiling-performance = scope.mkCargoCheck "tiling-performance" ''
+            cargo run -p wren-tiling-performance --locked --release -- --iterations 1000 --output "$TMPDIR/tiling-performance.json"
+            test -s "$TMPDIR/tiling-performance.json"
+          '';
           system-gates = scope.mkCargoCheck "system-gates" ''
             cargo run -p wren-system-gates --locked --release -- --iterations 1000 --output "$TMPDIR/system-gates.json"
             test -s "$TMPDIR/system-gates.json"

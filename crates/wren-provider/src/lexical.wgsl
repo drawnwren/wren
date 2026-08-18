@@ -9,10 +9,15 @@ struct Params {
 var<storage, read> input_words: array<u32>;
 
 @group(0) @binding(1)
-var<storage, read_write> output_words: array<atomic<u32>>;
+var<storage, read_write> output_words: array<u32>;
 
 @group(0) @binding(2)
 var<uniform> params: Params;
+
+// Every 256-byte workgroup owns eight disjoint output words. Threads classify
+// bytes concurrently into workgroup memory, then eight lanes publish the
+// finished words without contending on device-memory atomics.
+var<workgroup> workgroup_starts: array<atomic<u32>, 8>;
 
 fn byte_at(index: u32) -> u32 {
     if index >= params.text_len {
@@ -157,16 +162,26 @@ fn keyword_length(start: u32) -> u32 {
 }
 
 @compute @workgroup_size(256)
-fn classify(@builtin(global_invocation_id) invocation: vec3<u32>) {
+fn classify(
+    @builtin(global_invocation_id) invocation: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+) {
     let byte_index = invocation.x + invocation.y * params.invocations_per_row;
-    if byte_index >= params.text_len {
-        return;
+    if local_index < 8u {
+        atomicStore(&workgroup_starts[local_index], 0u);
     }
+    workgroupBarrier();
 
-    if keyword_length(byte_index) != 0u {
+    if byte_index < params.text_len && keyword_length(byte_index) != 0u {
         atomicOr(
-            &output_words[byte_index / 32u],
-            1u << (byte_index % 32u),
+            &workgroup_starts[local_index / 32u],
+            1u << (local_index % 32u),
         );
+    }
+    workgroupBarrier();
+
+    let output_index = (byte_index - local_index) / 32u + local_index;
+    if local_index < 8u && output_index * 32u < params.text_len {
+        output_words[output_index] = atomicLoad(&workgroup_starts[local_index]);
     }
 }
