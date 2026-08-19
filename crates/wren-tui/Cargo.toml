@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+ls-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -21,6 +22,7 @@ wren-config = { version = "0.1.0", path = "../wren-config" }
 wren-engine = { version = "0.1.0", path = "../wren-engine" }
 wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
 wren-penrose = { version = "0.1.0", path = "../wren-penrose" }
+wren-position = { version = "0.1.0", path = "../wren-position" }
 wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
 wren-provider = { version = "0.1.0", path = "../wren-provider" }
 wren-session = { version = "0.1.0", path = "../wren-session" }

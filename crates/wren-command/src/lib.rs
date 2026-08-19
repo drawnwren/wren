@@ -14,11 +14,7 @@ use wren_types::{CommandTask, CommandTaskId, DocumentId, Effects};
 type TaskWork = Box<dyn FnOnce(&mut TaskContext) -> Result<Effects, TaskFailure> + Send + 'static>;
 
 enum WorkerMessage {
-    Run {
-        task: CommandTask,
-        cancellation: CancellationToken,
-        work: TaskWork,
-    },
+    Run { task: CommandTask, cancellation: CancellationToken, work: TaskWork },
     Stop,
 }
 
@@ -60,9 +56,7 @@ impl Default for CancellationToken {
 impl CancellationToken {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
+        Self { cancelled: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn cancel(&self) {
@@ -85,12 +79,7 @@ pub struct TaskContext {
 
 impl TaskContext {
     fn new(cancellation: CancellationToken) -> Self {
-        Self {
-            cancellation,
-            last_checkpoint: Instant::now(),
-            max_checkpoint_gap: Duration::ZERO,
-            checkpoints: 0,
-        }
+        Self { cancellation, last_checkpoint: Instant::now(), max_checkpoint_gap: Duration::ZERO, checkpoints: 0 }
     }
 
     pub fn checkpoint(&mut self) -> Result<(), TaskFailure> {
@@ -99,9 +88,7 @@ impl TaskContext {
 
     fn checkpoint_with(&mut self, yield_worker: impl FnOnce()) -> Result<(), TaskFailure> {
         let now = Instant::now();
-        self.max_checkpoint_gap = self
-            .max_checkpoint_gap
-            .max(now.saturating_duration_since(self.last_checkpoint));
+        self.max_checkpoint_gap = self.max_checkpoint_gap.max(now.saturating_duration_since(self.last_checkpoint));
         self.checkpoints = self.checkpoints.saturating_add(1);
         if self.cancellation.is_cancelled() {
             return Err(TaskFailure::Cancelled);
@@ -158,12 +145,7 @@ impl TaskRunner {
                 .map_err(TaskRunnerError::Spawn)?;
             workers.push(worker);
         }
-        Ok(Self {
-            sender,
-            results,
-            barriers,
-            workers,
-        })
+        Ok(Self { sender, results, barriers, workers })
     }
 
     pub fn submit(
@@ -172,26 +154,17 @@ impl TaskRunner {
         work: impl FnOnce(&mut TaskContext) -> Result<Effects, TaskFailure> + Send + 'static,
     ) -> Result<CancellationToken, TaskRunnerError> {
         {
-            let mut barriers = self
-                .barriers
-                .lock()
-                .map_err(|_| TaskRunnerError::Poisoned)?;
+            let mut barriers = self.barriers.lock().map_err(|_| TaskRunnerError::Poisoned)?;
             if barriers.tasks.contains_key(&task.task_id) {
                 return Err(TaskRunnerError::DuplicateTask(task.task_id));
             }
             for document_id in &task.affected_documents {
                 *barriers.documents.entry(*document_id).or_default() += 1;
             }
-            barriers
-                .tasks
-                .insert(task.task_id, task.affected_documents.clone());
+            barriers.tasks.insert(task.task_id, task.affected_documents.clone());
         }
         let cancellation = CancellationToken::new();
-        match self.sender.try_send(WorkerMessage::Run {
-            task: task.clone(),
-            cancellation: cancellation.clone(),
-            work: Box::new(work),
-        }) {
+        match self.sender.try_send(WorkerMessage::Run { task: task.clone(), cancellation: cancellation.clone(), work: Box::new(work) }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 release_barrier(&self.barriers, task.task_id);
@@ -215,10 +188,7 @@ impl TaskRunner {
 
     #[must_use]
     pub fn is_document_blocked(&self, document_id: DocumentId) -> bool {
-        self.barriers
-            .lock()
-            .ok()
-            .is_some_and(|barriers| barriers.documents.contains_key(&document_id))
+        self.barriers.lock().ok().is_some_and(|barriers| barriers.documents.contains_key(&document_id))
     }
 }
 
@@ -233,11 +203,7 @@ impl Drop for TaskRunner {
     }
 }
 
-fn worker_loop(
-    receiver: &Mutex<mpsc::Receiver<WorkerMessage>>,
-    results: &mpsc::Sender<TaskResult>,
-    barriers: &Mutex<BarrierState>,
-) {
+fn worker_loop(receiver: &Mutex<mpsc::Receiver<WorkerMessage>>, results: &mpsc::Sender<TaskResult>, barriers: &Mutex<BarrierState>) {
     loop {
         let message = match receiver.lock() {
             Ok(receiver) => receiver.recv(),
@@ -246,27 +212,15 @@ fn worker_loop(
         let Ok(message) = message else {
             return;
         };
-        let WorkerMessage::Run {
-            task,
-            cancellation,
-            work,
-        } = message
-        else {
+        let WorkerMessage::Run { task, cancellation, work } = message else {
             return;
         };
         let started = Instant::now();
         let mut context = TaskContext::new(cancellation);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut context)))
-            .unwrap_or(Err(TaskFailure::Panicked));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut context))).unwrap_or(Err(TaskFailure::Panicked));
         let elapsed = started.elapsed();
         release_barrier_direct(barriers, task.task_id);
-        let _ = results.send(TaskResult {
-            task,
-            outcome,
-            elapsed,
-            max_checkpoint_gap: context.max_checkpoint_gap,
-            checkpoints: context.checkpoints,
-        });
+        let _ = results.send(TaskResult { task, outcome, elapsed, max_checkpoint_gap: context.max_checkpoint_gap, checkpoints: context.checkpoints });
     }
 }
 
@@ -304,11 +258,7 @@ mod tests {
     use super::*;
 
     fn task(id: u64) -> CommandTask {
-        CommandTask {
-            task_id: CommandTaskId::new(id),
-            affected_documents: vec![DocumentId::new(4)],
-            label: "test".into(),
-        }
+        CommandTask { task_id: CommandTaskId::new(id), affected_documents: vec![DocumentId::new(4)], label: "test".into() }
     }
 
     fn wait_result(runner: &TaskRunner) -> TaskResult {
@@ -332,20 +282,14 @@ mod tests {
                 started.send(()).expect("started");
                 released.recv().expect("release");
                 context.checkpoint()?;
-                Ok(Effects {
-                    messages: vec!["complete".into()],
-                    ..Effects::default()
-                })
+                Ok(Effects { messages: vec!["complete".into()], ..Effects::default() })
             })
             .expect("submit");
         wait.recv().expect("task started");
         assert!(runner.is_document_blocked(DocumentId::new(4)));
         release.send(()).expect("release task");
         let result = wait_result(&runner);
-        assert_eq!(
-            result.outcome.expect("success").messages,
-            vec![Box::<str>::from("complete")]
-        );
+        assert_eq!(result.outcome.expect("success").messages, vec![Box::<str>::from("complete")]);
         assert!(!runner.is_document_blocked(DocumentId::new(4)));
     }
 
@@ -353,9 +297,7 @@ mod tests {
     fn checkpoint_gap_restarts_after_the_worker_yields() {
         let mut context = TaskContext::new(CancellationToken::new());
         let yielded_at = Cell::new(None);
-        context
-            .checkpoint_with(|| yielded_at.set(Some(Instant::now())))
-            .expect("checkpoint");
+        context.checkpoint_with(|| yielded_at.set(Some(Instant::now()))).expect("checkpoint");
 
         assert!(context.last_checkpoint >= yielded_at.get().expect("yield timestamp"));
     }
@@ -383,9 +325,7 @@ mod tests {
     #[test]
     fn panics_are_contained_at_the_task_failure_boundary() {
         let runner = TaskRunner::new(1, 1).expect("runner");
-        runner
-            .submit(task(3), |_| panic!("provider bug"))
-            .expect("submit");
+        runner.submit(task(3), |_| panic!("provider bug")).expect("submit");
         let result = wait_result(&runner);
         assert_eq!(result.outcome, Err(TaskFailure::Panicked));
     }

@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -9,11 +8,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use wren_engine::{EngineFrame, FrameText};
-use wren_types::{
-    Bias, BufferId, DocumentId, DocumentRevision, Edit, FloatingSurfaceId, TabId, Transaction,
-    ViewId, WindowId,
-};
+use wren_engine::{EngineFrame, FrameText, FrameTextChange};
+pub use wren_types::RgbColor;
+use wren_types::{Bias, BufferId, DocumentId, DocumentRevision, Edit, FloatingSurfaceId, TabId, Transaction, ViewId, WindowId, ranges_overlap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitAxis {
@@ -32,12 +29,7 @@ pub enum WindowDirection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitTree {
     Window(WindowId),
-    Split {
-        axis: SplitAxis,
-        ratio_milli: u16,
-        first: Box<SplitTree>,
-        second: Box<SplitTree>,
-    },
+    Split { axis: SplitAxis, ratio_milli: u16, first: Box<SplitTree>, second: Box<SplitTree> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +98,17 @@ pub enum MessageSeverity {
     Error,
 }
 
+impl MessageSeverity {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "INFO",
+            Self::Warning => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageEntry {
     pub sequence: u64,
@@ -163,23 +166,9 @@ impl ClientViewModel {
         let window_id = WindowId::new(2);
         let tab_id = TabId::new(4);
         Self {
-            buffers: vec![BufferView {
-                id: buffer_id,
-                document_id,
-                name: name.into(),
-            }],
-            windows: vec![WindowView {
-                id: window_id,
-                view_id: ViewId::new(3),
-                buffer_id,
-                cursor_byte: 0,
-                top_line: 0,
-            }],
-            tabs: vec![TabView {
-                id: tab_id,
-                root: SplitTree::Window(window_id),
-                active_window: window_id,
-            }],
+            buffers: vec![BufferView { id: buffer_id, document_id, name: name.into() }],
+            windows: vec![WindowView { id: window_id, view_id: ViewId::new(3), buffer_id, cursor_byte: 0, top_line: 0 }],
+            tabs: vec![TabView { id: tab_id, root: SplitTree::Window(window_id), active_window: window_id }],
             active_tab: tab_id,
             floating: Vec::new(),
             extmarks: Vec::new(),
@@ -193,28 +182,18 @@ impl ClientViewModel {
     #[must_use]
     pub fn active_tab(&self) -> &TabView {
         // The constructor and all mutators preserve this invariant.
-        self.tabs
-            .iter()
-            .find(|tab| tab.id == self.active_tab)
-            .unwrap_or_else(|| &self.tabs[0])
+        &self.tabs[self.active_tab_index().unwrap_or_default()]
     }
 
     #[must_use]
     pub fn active_window(&self) -> &WindowView {
         let id = self.active_tab().active_window;
-        self.windows
-            .iter()
-            .find(|window| window.id == id)
-            .unwrap_or_else(|| &self.windows[0])
+        self.windows.iter().find(|window| window.id == id).unwrap_or_else(|| &self.windows[0])
     }
 
     pub fn active_window_mut(&mut self) -> &mut WindowView {
         let id = self.active_tab().active_window;
-        let index = self
-            .windows
-            .iter()
-            .position(|window| window.id == id)
-            .unwrap_or(0);
+        let index = self.window_index(id).unwrap_or_default();
         &mut self.windows[index]
     }
 
@@ -225,37 +204,25 @@ impl ClientViewModel {
 
     pub fn add_buffer(&mut self, document_id: DocumentId, name: impl Into<Box<str>>) -> BufferId {
         let id = BufferId::new(self.allocate());
-        self.buffers.push(BufferView {
-            id,
-            document_id,
-            name: name.into(),
-        });
+        self.buffers.push(BufferView { id, document_id, name: name.into() });
         id
     }
 
     pub fn set_active_buffer(&mut self, buffer_id: BufferId) -> Result<(), ViewModelError> {
-        if !self.buffers.iter().any(|buffer| buffer.id == buffer_id) {
+        if !self.has_buffer(buffer_id) {
             return Err(ViewModelError::UnknownBuffer(buffer_id));
         }
         let window_id = self.active_tab().active_window;
-        let window = self
-            .windows
-            .iter_mut()
-            .find(|window| window.id == window_id)
-            .ok_or(ViewModelError::UnknownWindow(window_id))?;
-        window.buffer_id = buffer_id;
+        let window_index = self.window_index(window_id)?;
+        self.windows[window_index].buffer_id = buffer_id;
         Ok(())
     }
 
-    pub fn remove_buffer(
-        &mut self,
-        buffer_id: BufferId,
-        replacement: BufferId,
-    ) -> Result<(), ViewModelError> {
-        if !self.buffers.iter().any(|buffer| buffer.id == replacement) {
+    pub fn remove_buffer(&mut self, buffer_id: BufferId, replacement: BufferId) -> Result<(), ViewModelError> {
+        if !self.has_buffer(replacement) {
             return Err(ViewModelError::UnknownBuffer(replacement));
         }
-        if !self.buffers.iter().any(|buffer| buffer.id == buffer_id) {
+        if !self.has_buffer(buffer_id) {
             return Err(ViewModelError::UnknownBuffer(buffer_id));
         }
         for window in &mut self.windows {
@@ -270,134 +237,74 @@ impl ClientViewModel {
     pub fn split_active(&mut self, axis: SplitAxis) -> Result<WindowId, ViewModelError> {
         let active = self.active_tab().active_window;
         let buffer_id = self.active_window().buffer_id;
-        let window_id = WindowId::new(self.allocate());
-        let view_id = ViewId::new(self.allocate());
-        self.windows.push(WindowView {
-            id: window_id,
-            view_id,
-            buffer_id,
-            cursor_byte: 0,
-            top_line: 0,
-        });
-        let tab_id = self.active_tab;
-        let tab = self
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-            .ok_or(ViewModelError::UnknownTab(tab_id))?;
+        let window_id = self.add_window(buffer_id);
+        let tab_index = self.active_tab_index()?;
+        let tab = &mut self.tabs[tab_index];
         replace_window_with_split(&mut tab.root, active, window_id, axis)?;
         tab.active_window = window_id;
         Ok(window_id)
     }
 
     pub fn close_active_window(&mut self) -> Result<(), ViewModelError> {
-        let tab_id = self.active_tab;
         let active = self.active_tab().active_window;
-        let tab = self
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-            .ok_or(ViewModelError::UnknownTab(tab_id))?;
-        let replacement =
-            remove_window(&mut tab.root, active).ok_or(ViewModelError::FinalWindow)?;
+        let tab_index = self.active_tab_index()?;
+        let tab = &mut self.tabs[tab_index];
+        let replacement = remove_window(&mut tab.root, active).ok_or(ViewModelError::FinalWindow)?;
         tab.active_window = replacement;
         self.windows.retain(|window| window.id != active);
         Ok(())
     }
 
     pub fn new_tab(&mut self, buffer_id: BufferId) -> Result<TabId, ViewModelError> {
-        if !self.buffers.iter().any(|buffer| buffer.id == buffer_id) {
+        if !self.has_buffer(buffer_id) {
             return Err(ViewModelError::UnknownBuffer(buffer_id));
         }
-        let window_id = WindowId::new(self.allocate());
-        let view_id = ViewId::new(self.allocate());
+        let window_id = self.add_window(buffer_id);
         let tab_id = TabId::new(self.allocate());
-        self.windows.push(WindowView {
-            id: window_id,
-            view_id,
-            buffer_id,
-            cursor_byte: 0,
-            top_line: 0,
-        });
-        self.tabs.push(TabView {
-            id: tab_id,
-            root: SplitTree::Window(window_id),
-            active_window: window_id,
-        });
+        self.tabs.push(TabView { id: tab_id, root: SplitTree::Window(window_id), active_window: window_id });
         self.active_tab = tab_id;
         Ok(tab_id)
     }
 
     pub fn cycle_tab(&mut self, delta: isize) {
-        let current = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.active_tab)
-            .unwrap_or(0);
+        let current = self.active_tab_index().unwrap_or_default();
         let len = self.tabs.len();
         let next = current.wrapping_add_signed(delta).rem_euclid(len);
         self.active_tab = self.tabs[next].id;
     }
 
     pub fn focus_window(&mut self, direction: WindowDirection) -> Result<(), ViewModelError> {
-        let tab_index = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
+        let tab_index = self.active_tab_index()?;
         let active = self.tabs[tab_index].active_window;
         let mut panes = Vec::new();
-        split_rectangles(
-            &self.tabs[tab_index].root,
-            Rect {
-                column: 0,
-                row: 0,
-                width: 1_000_000,
-                height: 1_000_000,
-            },
-            &mut panes,
-        );
-        let current = panes
-            .iter()
-            .find(|(window, _)| *window == active)
-            .map(|(_, rectangle)| *rectangle)
-            .ok_or(ViewModelError::UnknownWindow(active))?;
-        let current_x = current.column.saturating_mul(2) + current.width;
-        let current_y = current.row.saturating_mul(2) + current.height;
+        split_rectangles(&self.tabs[tab_index].root, Rect { column: 0, row: 0, width: 1_000_000, height: 1_000_000 }, &mut panes);
+        let current = panes.iter().find(|(window, _)| *window == active).map(|(_, rectangle)| *rectangle).ok_or(ViewModelError::UnknownWindow(active))?;
+        let horizontal = matches!(direction, WindowDirection::Left | WindowDirection::Right);
+        let increasing = matches!(direction, WindowDirection::Right | WindowDirection::Down);
+        let coordinates = |rectangle: Rect| {
+            let x = rectangle.column.saturating_mul(2) + rectangle.width;
+            let y = rectangle.row.saturating_mul(2) + rectangle.height;
+            if horizontal { (x, y) } else { (y, x) }
+        };
+        let perpendicular_span = |rectangle: Rect| {
+            if horizontal {
+                rectangle.row..rectangle.row.saturating_add(rectangle.height)
+            } else {
+                rectangle.column..rectangle.column.saturating_add(rectangle.width)
+            }
+        };
+        let (current_primary, current_perpendicular) = coordinates(current);
+        let current_span = perpendicular_span(current);
         let candidate = panes
             .into_iter()
             .filter(|(window, _)| *window != active)
             .filter_map(|(window, rectangle)| {
-                let x = rectangle.column.saturating_mul(2) + rectangle.width;
-                let y = rectangle.row.saturating_mul(2) + rectangle.height;
-                let in_direction = match direction {
-                    WindowDirection::Left => x < current_x,
-                    WindowDirection::Right => x > current_x,
-                    WindowDirection::Up => y < current_y,
-                    WindowDirection::Down => y > current_y,
-                };
-                if !in_direction {
+                let (primary, perpendicular) = coordinates(rectangle);
+                if increasing != (primary > current_primary) {
                     return None;
                 }
-                let perpendicular_overlap = match direction {
-                    WindowDirection::Left | WindowDirection::Right => ranges_overlap(
-                        current.row..current.row.saturating_add(current.height),
-                        rectangle.row..rectangle.row.saturating_add(rectangle.height),
-                    ),
-                    WindowDirection::Up | WindowDirection::Down => ranges_overlap(
-                        current.column..current.column.saturating_add(current.width),
-                        rectangle.column..rectangle.column.saturating_add(rectangle.width),
-                    ),
-                };
-                let (primary, perpendicular) = match direction {
-                    WindowDirection::Left | WindowDirection::Right => {
-                        (x.abs_diff(current_x), y.abs_diff(current_y))
-                    }
-                    WindowDirection::Up | WindowDirection::Down => {
-                        (y.abs_diff(current_y), x.abs_diff(current_x))
-                    }
-                };
-                Some((window, (!perpendicular_overlap, primary, perpendicular)))
+                let overlaps = ranges_overlap(&current_span, &perpendicular_span(rectangle));
+                Some((window, (!overlaps, primary.abs_diff(current_primary), perpendicular.abs_diff(current_perpendicular))))
             })
             .min_by_key(|(_, score)| *score)
             .map(|(window, _)| window);
@@ -408,11 +315,8 @@ impl ClientViewModel {
     }
 
     pub fn focus_window_id(&mut self, window_id: WindowId) -> Result<(), ViewModelError> {
-        let tab = self
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
+        let tab_index = self.active_tab_index()?;
+        let tab = &mut self.tabs[tab_index];
         if !window_ids(&tab.root).contains(&window_id) {
             return Err(ViewModelError::UnknownWindow(window_id));
         }
@@ -421,46 +325,27 @@ impl ClientViewModel {
     }
 
     pub fn cycle_window(&mut self, delta: isize) -> Result<(), ViewModelError> {
-        let tab_index = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
+        let tab_index = self.active_tab_index()?;
         let ids = window_ids(&self.tabs[tab_index].root);
-        let current = ids
-            .iter()
-            .position(|id| *id == self.tabs[tab_index].active_window)
-            .ok_or(ViewModelError::UnknownWindow(
-                self.tabs[tab_index].active_window,
-            ))?;
+        let current =
+            ids.iter().position(|id| *id == self.tabs[tab_index].active_window).ok_or(ViewModelError::UnknownWindow(self.tabs[tab_index].active_window))?;
         let next = current.wrapping_add_signed(delta).rem_euclid(ids.len());
         self.tabs[tab_index].active_window = ids[next];
         Ok(())
     }
 
     pub fn only_active_window(&mut self) -> Result<(), ViewModelError> {
-        let tab_index = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
+        let tab_index = self.active_tab_index()?;
         let active = self.tabs[tab_index].active_window;
-        let removed = window_ids(&self.tabs[tab_index].root)
-            .into_iter()
-            .filter(|window| *window != active)
-            .collect::<Vec<_>>();
+        let removed = window_ids(&self.tabs[tab_index].root).into_iter().filter(|window| *window != active).collect::<Vec<_>>();
         self.tabs[tab_index].root = SplitTree::Window(active);
         self.windows.retain(|window| !removed.contains(&window.id));
         Ok(())
     }
 
     pub fn equalize_windows(&mut self) -> Result<(), ViewModelError> {
-        let tab = self
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
-        equalize_split_tree(&mut tab.root);
+        let tab_index = self.active_tab_index()?;
+        equalize_split_tree(&mut self.tabs[tab_index].root);
         Ok(())
     }
 
@@ -468,15 +353,10 @@ impl ClientViewModel {
         if self.tabs.len() == 1 {
             return Err(ViewModelError::FinalTab);
         }
-        let current = self
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.active_tab)
-            .ok_or(ViewModelError::UnknownTab(self.active_tab))?;
+        let current = self.active_tab_index()?;
         let removed = self.tabs.remove(current);
         let removed_windows = window_ids(&removed.root);
-        self.windows
-            .retain(|window| !removed_windows.contains(&window.id));
+        self.windows.retain(|window| !removed_windows.contains(&window.id));
         self.active_tab = self.tabs[current.min(self.tabs.len() - 1)].id;
         Ok(())
     }
@@ -486,28 +366,36 @@ impl ClientViewModel {
         self.next_id = self.next_id.saturating_add(1);
         id
     }
+
+    fn active_tab_index(&self) -> Result<usize, ViewModelError> {
+        self.tabs.iter().position(|tab| tab.id == self.active_tab).ok_or(ViewModelError::UnknownTab(self.active_tab))
+    }
+
+    fn window_index(&self, id: WindowId) -> Result<usize, ViewModelError> {
+        self.windows.iter().position(|window| window.id == id).ok_or(ViewModelError::UnknownWindow(id))
+    }
+
+    fn has_buffer(&self, id: BufferId) -> bool {
+        self.buffers.iter().any(|buffer| buffer.id == id)
+    }
+
+    fn add_window(&mut self, buffer_id: BufferId) -> WindowId {
+        let id = WindowId::new(self.allocate());
+        let view_id = ViewId::new(self.allocate());
+        self.windows.push(WindowView { id, view_id, buffer_id, cursor_byte: 0, top_line: 0 });
+        id
+    }
 }
 
-fn replace_window_with_split(
-    tree: &mut SplitTree,
-    target: WindowId,
-    new: WindowId,
-    axis: SplitAxis,
-) -> Result<(), ViewModelError> {
+fn replace_window_with_split(tree: &mut SplitTree, target: WindowId, new: WindowId, axis: SplitAxis) -> Result<(), ViewModelError> {
     match tree {
         SplitTree::Window(id) if *id == target => {
-            *tree = SplitTree::Split {
-                axis,
-                ratio_milli: 500,
-                first: Box::new(SplitTree::Window(target)),
-                second: Box::new(SplitTree::Window(new)),
-            };
+            *tree = SplitTree::Split { axis, ratio_milli: 500, first: Box::new(SplitTree::Window(target)), second: Box::new(SplitTree::Window(new)) };
             Ok(())
         }
         SplitTree::Window(_) => Err(ViewModelError::UnknownWindow(target)),
         SplitTree::Split { first, second, .. } => {
-            replace_window_with_split(first, target, new, axis)
-                .or_else(|_| replace_window_with_split(second, target, new, axis))
+            replace_window_with_split(first, target, new, axis).or_else(|_| replace_window_with_split(second, target, new, axis))
         }
     }
 }
@@ -550,41 +438,10 @@ fn window_ids(tree: &SplitTree) -> Vec<WindowId> {
 }
 
 fn equalize_split_tree(tree: &mut SplitTree) {
-    if let SplitTree::Split {
-        ratio_milli,
-        first,
-        second,
-        ..
-    } = tree
-    {
+    if let SplitTree::Split { ratio_milli, first, second, .. } = tree {
         *ratio_milli = 500;
         equalize_split_tree(first);
         equalize_split_tree(second);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RgbColor {
-    pub red: u8,
-    pub green: u8,
-    pub blue: u8,
-}
-
-impl RgbColor {
-    #[must_use]
-    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
-    }
-
-    #[must_use]
-    pub fn from_hex(value: &str) -> Option<Self> {
-        let value = value.strip_prefix('#').unwrap_or(value);
-        (value.len() == 6).then_some(())?;
-        Some(Self {
-            red: u8::from_str_radix(&value[0..2], 16).ok()?,
-            green: u8::from_str_radix(&value[2..4], 16).ok()?,
-            blue: u8::from_str_radix(&value[4..6], 16).ok()?,
-        })
     }
 }
 
@@ -632,161 +489,73 @@ impl CatppuccinFlavor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatppuccinPalette {
-    pub rosewater: RgbColor,
-    pub flamingo: RgbColor,
-    pub pink: RgbColor,
-    pub mauve: RgbColor,
-    pub red: RgbColor,
-    pub maroon: RgbColor,
-    pub peach: RgbColor,
-    pub yellow: RgbColor,
-    pub green: RgbColor,
-    pub teal: RgbColor,
-    pub sky: RgbColor,
-    pub sapphire: RgbColor,
-    pub blue: RgbColor,
-    pub lavender: RgbColor,
-    pub text: RgbColor,
-    pub subtext1: RgbColor,
-    pub subtext0: RgbColor,
-    pub overlay2: RgbColor,
-    pub overlay1: RgbColor,
-    pub overlay0: RgbColor,
-    pub surface2: RgbColor,
-    pub surface1: RgbColor,
-    pub surface0: RgbColor,
-    pub base: RgbColor,
-    pub mantle: RgbColor,
-    pub crust: RgbColor,
-}
-
 macro_rules! rgb {
     ($value:literal) => {{
         let value: u32 = $value;
-        RgbColor::new(
-            ((value >> 16) & 0xff) as u8,
-            ((value >> 8) & 0xff) as u8,
-            (value & 0xff) as u8,
-        )
+        RgbColor::new(((value >> 16) & 0xff) as u8, ((value >> 8) & 0xff) as u8, (value & 0xff) as u8)
     }};
 }
 
-impl CatppuccinPalette {
-    pub const LATTE: Self = Self {
-        rosewater: rgb!(0xdc8a78),
-        flamingo: rgb!(0xdd7878),
-        pink: rgb!(0xea76cb),
-        mauve: rgb!(0x8839ef),
-        red: rgb!(0xd20f39),
-        maroon: rgb!(0xe64553),
-        peach: rgb!(0xfe640b),
-        yellow: rgb!(0xdf8e1d),
-        green: rgb!(0x40a02b),
-        teal: rgb!(0x179299),
-        sky: rgb!(0x04a5e5),
-        sapphire: rgb!(0x209fb5),
-        blue: rgb!(0x1e66f5),
-        lavender: rgb!(0x7287fd),
-        text: rgb!(0x4c4f69),
-        subtext1: rgb!(0x5c5f77),
-        subtext0: rgb!(0x6c6f85),
-        overlay2: rgb!(0x7c7f93),
-        overlay1: rgb!(0x8c8fa1),
-        overlay0: rgb!(0x9ca0b0),
-        surface2: rgb!(0xacb0be),
-        surface1: rgb!(0xbcc0cc),
-        surface0: rgb!(0xccd0da),
-        base: rgb!(0xeff1f5),
-        mantle: rgb!(0xe6e9ef),
-        crust: rgb!(0xdce0e8),
-    };
-    pub const FRAPPE: Self = Self {
-        rosewater: rgb!(0xf2d5cf),
-        flamingo: rgb!(0xeebebe),
-        pink: rgb!(0xf4b8e4),
-        mauve: rgb!(0xca9ee6),
-        red: rgb!(0xe78284),
-        maroon: rgb!(0xea999c),
-        peach: rgb!(0xef9f76),
-        yellow: rgb!(0xe5c890),
-        green: rgb!(0xa6d189),
-        teal: rgb!(0x81c8be),
-        sky: rgb!(0x99d1db),
-        sapphire: rgb!(0x85c1dc),
-        blue: rgb!(0x8caaee),
-        lavender: rgb!(0xbabbf1),
-        text: rgb!(0xc6d0f5),
-        subtext1: rgb!(0xb5bfe2),
-        subtext0: rgb!(0xa5adce),
-        overlay2: rgb!(0x949cbb),
-        overlay1: rgb!(0x838ba7),
-        overlay0: rgb!(0x737994),
-        surface2: rgb!(0x626880),
-        surface1: rgb!(0x51576d),
-        surface0: rgb!(0x414559),
-        base: rgb!(0x303446),
-        mantle: rgb!(0x292c3c),
-        crust: rgb!(0x232634),
-    };
-    pub const MACCHIATO: Self = Self {
-        rosewater: rgb!(0xf4dbd6),
-        flamingo: rgb!(0xf0c6c6),
-        pink: rgb!(0xf5bde6),
-        mauve: rgb!(0xc6a0f6),
-        red: rgb!(0xed8796),
-        maroon: rgb!(0xee99a0),
-        peach: rgb!(0xf5a97f),
-        yellow: rgb!(0xeed49f),
-        green: rgb!(0xa6da95),
-        teal: rgb!(0x8bd5ca),
-        sky: rgb!(0x91d7e3),
-        sapphire: rgb!(0x7dc4e4),
-        blue: rgb!(0x8aadf4),
-        lavender: rgb!(0xb7bdf8),
-        text: rgb!(0xcad3f5),
-        subtext1: rgb!(0xb8c0e0),
-        subtext0: rgb!(0xa5adcb),
-        overlay2: rgb!(0x939ab7),
-        overlay1: rgb!(0x8087a2),
-        overlay0: rgb!(0x6e738d),
-        surface2: rgb!(0x5b6078),
-        surface1: rgb!(0x494d64),
-        surface0: rgb!(0x363a4f),
-        base: rgb!(0x24273a),
-        mantle: rgb!(0x1e2030),
-        crust: rgb!(0x181926),
-    };
-    pub const MOCHA: Self = Self {
-        rosewater: rgb!(0xf5e0dc),
-        flamingo: rgb!(0xf2cdcd),
-        pink: rgb!(0xf5c2e7),
-        mauve: rgb!(0xcba6f7),
-        red: rgb!(0xf38ba8),
-        maroon: rgb!(0xeba0ac),
-        peach: rgb!(0xfab387),
-        yellow: rgb!(0xf9e2af),
-        green: rgb!(0xa6e3a1),
-        teal: rgb!(0x94e2d5),
-        sky: rgb!(0x89dceb),
-        sapphire: rgb!(0x74c7ec),
-        blue: rgb!(0x89b4fa),
-        lavender: rgb!(0xb4befe),
-        text: rgb!(0xcdd6f4),
-        subtext1: rgb!(0xbac2de),
-        subtext0: rgb!(0xa6adc8),
-        overlay2: rgb!(0x9399b2),
-        overlay1: rgb!(0x7f849c),
-        overlay0: rgb!(0x6c7086),
-        surface2: rgb!(0x585b70),
-        surface1: rgb!(0x45475a),
-        surface0: rgb!(0x313244),
-        base: rgb!(0x1e1e2e),
-        mantle: rgb!(0x181825),
-        crust: rgb!(0x11111b),
-    };
+macro_rules! catppuccin_palette {
+    ($($slot:ident: [$latte:literal, $frappe:literal, $macchiato:literal, $mocha:literal]),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct CatppuccinPalette {
+            $(pub $slot: RgbColor),+
+        }
 
+        impl CatppuccinPalette {
+            #[must_use]
+            pub fn set(&mut self, name: &str, color: RgbColor) -> bool {
+                let slot = match name {
+                    $(stringify!($slot) => &mut self.$slot,)+
+                    _ => return false,
+                };
+                *slot = color;
+                true
+            }
+
+            fn slots(self) -> [RgbColor; 26] {
+                [$(self.$slot),+]
+            }
+
+            pub const LATTE: Self = Self { $($slot: rgb!($latte)),+ };
+            pub const FRAPPE: Self = Self { $($slot: rgb!($frappe)),+ };
+            pub const MACCHIATO: Self = Self { $($slot: rgb!($macchiato)),+ };
+            pub const MOCHA: Self = Self { $($slot: rgb!($mocha)),+ };
+        }
+    };
+}
+
+catppuccin_palette! {
+    rosewater: [0xdc8a78, 0xf2d5cf, 0xf4dbd6, 0xf5e0dc],
+    flamingo: [0xdd7878, 0xeebebe, 0xf0c6c6, 0xf2cdcd],
+    pink: [0xea76cb, 0xf4b8e4, 0xf5bde6, 0xf5c2e7],
+    mauve: [0x8839ef, 0xca9ee6, 0xc6a0f6, 0xcba6f7],
+    red: [0xd20f39, 0xe78284, 0xed8796, 0xf38ba8],
+    maroon: [0xe64553, 0xea999c, 0xee99a0, 0xeba0ac],
+    peach: [0xfe640b, 0xef9f76, 0xf5a97f, 0xfab387],
+    yellow: [0xdf8e1d, 0xe5c890, 0xeed49f, 0xf9e2af],
+    green: [0x40a02b, 0xa6d189, 0xa6da95, 0xa6e3a1],
+    teal: [0x179299, 0x81c8be, 0x8bd5ca, 0x94e2d5],
+    sky: [0x04a5e5, 0x99d1db, 0x91d7e3, 0x89dceb],
+    sapphire: [0x209fb5, 0x85c1dc, 0x7dc4e4, 0x74c7ec],
+    blue: [0x1e66f5, 0x8caaee, 0x8aadf4, 0x89b4fa],
+    lavender: [0x7287fd, 0xbabbf1, 0xb7bdf8, 0xb4befe],
+    text: [0x4c4f69, 0xc6d0f5, 0xcad3f5, 0xcdd6f4],
+    subtext1: [0x5c5f77, 0xb5bfe2, 0xb8c0e0, 0xbac2de],
+    subtext0: [0x6c6f85, 0xa5adce, 0xa5adcb, 0xa6adc8],
+    overlay2: [0x7c7f93, 0x949cbb, 0x939ab7, 0x9399b2],
+    overlay1: [0x8c8fa1, 0x838ba7, 0x8087a2, 0x7f849c],
+    overlay0: [0x9ca0b0, 0x737994, 0x6e738d, 0x6c7086],
+    surface2: [0xacb0be, 0x626880, 0x5b6078, 0x585b70],
+    surface1: [0xbcc0cc, 0x51576d, 0x494d64, 0x45475a],
+    surface0: [0xccd0da, 0x414559, 0x363a4f, 0x313244],
+    base: [0xeff1f5, 0x303446, 0x24273a, 0x1e1e2e],
+    mantle: [0xe6e9ef, 0x292c3c, 0x1e2030, 0x181825],
+    crust: [0xdce0e8, 0x232634, 0x181926, 0x11111b],
+}
+
+impl CatppuccinPalette {
     #[must_use]
     pub const fn for_flavor(flavor: CatppuccinFlavor) -> Self {
         match flavor {
@@ -797,82 +566,11 @@ impl CatppuccinPalette {
         }
     }
 
-    #[must_use]
-    pub fn set(&mut self, name: &str, color: RgbColor) -> bool {
-        let slot = match name {
-            "rosewater" => &mut self.rosewater,
-            "flamingo" => &mut self.flamingo,
-            "pink" => &mut self.pink,
-            "mauve" => &mut self.mauve,
-            "red" => &mut self.red,
-            "maroon" => &mut self.maroon,
-            "peach" => &mut self.peach,
-            "yellow" => &mut self.yellow,
-            "green" => &mut self.green,
-            "teal" => &mut self.teal,
-            "sky" => &mut self.sky,
-            "sapphire" => &mut self.sapphire,
-            "blue" => &mut self.blue,
-            "lavender" => &mut self.lavender,
-            "text" => &mut self.text,
-            "subtext1" => &mut self.subtext1,
-            "subtext0" => &mut self.subtext0,
-            "overlay2" => &mut self.overlay2,
-            "overlay1" => &mut self.overlay1,
-            "overlay0" => &mut self.overlay0,
-            "surface2" => &mut self.surface2,
-            "surface1" => &mut self.surface1,
-            "surface0" => &mut self.surface0,
-            "base" => &mut self.base,
-            "mantle" => &mut self.mantle,
-            "crust" => &mut self.crust,
-            _ => return false,
-        };
-        *slot = color;
-        true
-    }
-
-    fn slots(self) -> [RgbColor; 26] {
-        [
-            self.rosewater,
-            self.flamingo,
-            self.pink,
-            self.mauve,
-            self.red,
-            self.maroon,
-            self.peach,
-            self.yellow,
-            self.green,
-            self.teal,
-            self.sky,
-            self.sapphire,
-            self.blue,
-            self.lavender,
-            self.text,
-            self.subtext1,
-            self.subtext0,
-            self.overlay2,
-            self.overlay1,
-            self.overlay0,
-            self.surface2,
-            self.surface1,
-            self.surface0,
-            self.base,
-            self.mantle,
-            self.crust,
-        ]
-    }
-
     fn remap_from_mocha(self, color: CellColor) -> CellColor {
         let CellColor::Rgb(rgb) = color else {
             return color;
         };
-        Self::MOCHA
-            .slots()
-            .into_iter()
-            .zip(self.slots())
-            .find_map(|(source, target)| (source == rgb).then_some(CellColor::Rgb(target)))
-            .unwrap_or(color)
+        Self::MOCHA.slots().into_iter().zip(self.slots()).find_map(|(source, target)| (source == rgb).then_some(CellColor::Rgb(target))).unwrap_or(color)
     }
 }
 
@@ -899,6 +597,52 @@ impl Default for CellStyle {
             foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.text)),
             background: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.base)),
         }
+    }
+}
+
+macro_rules! style_methods {
+    (value: $($method:ident($field:ident): $ty:ty => $value:expr),+; flag: $($flag:ident($flag_field:ident) => $flag_value:expr),+) => {
+        $(
+            #[must_use]
+            pub const fn $method(mut self, value: $ty) -> Self {
+                self.$field = $value(value);
+                self
+            }
+        )+
+        $(
+            #[must_use]
+            pub const fn $flag(mut self) -> Self {
+                self.$flag_field = $flag_value;
+                self
+            }
+        )+
+    };
+}
+
+impl CellStyle {
+    #[must_use]
+    pub const fn rgb(foreground: RgbColor, background: RgbColor) -> Self {
+        Self {
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            reverse: false,
+            foreground: Some(CellColor::Rgb(foreground)),
+            background: Some(CellColor::Rgb(background)),
+        }
+    }
+
+    style_methods! {
+        value: with_foreground(foreground): CellColor => Some,
+               with_background(background): CellColor => Some;
+        flag: without_foreground(foreground) => None,
+              without_background(background) => None,
+              with_bold(bold) => true,
+              with_italic(italic) => true,
+              with_underline(underline) => true,
+              with_strikethrough(strikethrough) => true,
+              with_reverse(reverse) => true
     }
 }
 
@@ -975,15 +719,29 @@ pub struct TerminalSidebar<'a> {
 }
 
 impl TextPopup {
+    #[must_use]
+    pub fn new(title: impl Into<Box<str>>, text: impl Into<Box<str>>) -> Self {
+        Self { title: title.into(), text: text.into(), scroll: 0, cursor: None, decorations: Vec::new() }
+    }
+
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: (usize, usize)) -> Self {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_decorations(mut self, decorations: Vec<DecorationSpan>) -> Self {
+        self.decorations = decorations;
+        self
+    }
+
     /// Widths of the display rows used by popup rendering. Keeping navigation
     /// on this calculation prevents the focused cursor from drifting away from
     /// long lines after they wrap.
     #[must_use]
     pub fn navigation_line_widths(&self, terminal_width: usize, tab_width: usize) -> Vec<usize> {
-        wrap_popup_text(&self.text, popup_max_inner_width(terminal_width), tab_width)
-            .iter()
-            .map(|line| display_width(&line.text, tab_width))
-            .collect()
+        wrap_popup_text(&self.text, popup_max_inner_width(terminal_width), tab_width).iter().map(|line| display_width(&line.text, tab_width)).collect()
     }
 }
 
@@ -1043,6 +801,13 @@ pub struct DecorationSpan {
     pub priority: u32,
 }
 
+impl DecorationSpan {
+    #[must_use]
+    pub const fn new(range: Range<usize>, style: CellStyle, priority: u32) -> Self {
+        Self { range, style, priority }
+    }
+}
+
 pub type SharedDecorations = Arc<Vec<DecorationSpan>>;
 
 const fn default_decoration_priority() -> u32 {
@@ -1069,10 +834,7 @@ const INLINE_GRAPHEME_BYTES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CellGrapheme {
-    Inline {
-        len: u8,
-        bytes: [u8; INLINE_GRAPHEME_BYTES],
-    },
+    Inline { len: u8, bytes: [u8; INLINE_GRAPHEME_BYTES] },
     Heap(Box<str>),
 }
 
@@ -1081,10 +843,7 @@ impl From<&str> for CellGrapheme {
         if grapheme.len() <= INLINE_GRAPHEME_BYTES {
             let mut bytes = [0; INLINE_GRAPHEME_BYTES];
             bytes[..grapheme.len()].copy_from_slice(grapheme.as_bytes());
-            return Self::Inline {
-                len: u8::try_from(grapheme.len()).unwrap_or(0),
-                bytes,
-            };
+            return Self::Inline { len: u8::try_from(grapheme.len()).unwrap_or(0), bytes };
         }
         Self::Heap(Box::from(grapheme))
     }
@@ -1102,9 +861,7 @@ impl From<String> for CellGrapheme {
 impl AsRef<str> for CellGrapheme {
     fn as_ref(&self) -> &str {
         match self {
-            Self::Inline { len, bytes } => {
-                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
-            }
+            Self::Inline { len, bytes } => std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default(),
             Self::Heap(grapheme) => grapheme,
         }
     }
@@ -1141,6 +898,13 @@ pub struct CellRow {
     pub cells: Vec<Cell>,
 }
 
+impl CellRow {
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.cells.iter().map(|cell| cell.grapheme.as_ref()).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredGrid {
     pub epoch: u64,
@@ -1148,13 +912,64 @@ pub struct DesiredGrid {
     pub height: usize,
     pub rows: Vec<Arc<CellRow>>,
     pub cursor: (usize, usize),
+    #[serde(skip)]
+    pub raster_overlay: Option<Arc<RasterOverlay>>,
 }
+
+impl DesiredGrid {
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.rows.iter().map(|row| row.text()).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// A raster image or vector source that a capable terminal paints over cells.
+/// Text cells remain available as the portable fallback.
+#[derive(Debug, Clone)]
+pub struct RasterOverlay {
+    pub frame_id: u64,
+    pub width: usize,
+    pub height: usize,
+    pub columns: usize,
+    pub rows: usize,
+    pub source: RasterSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum RasterSource {
+    Rgb(Arc<Vec<u8>>),
+    Quads { background: RgbColor, quads: Arc<Vec<RasterQuad>> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RasterQuad {
+    pub vertices: [[f32; 2]; 4],
+    pub color: RgbColor,
+}
+
+impl PartialEq for RasterOverlay {
+    fn eq(&self, other: &Self) -> bool {
+        self.frame_id == other.frame_id && self.width == other.width && self.height == other.height && self.columns == other.columns && self.rows == other.rows
+    }
+}
+
+impl Eq for RasterOverlay {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedEditorRender {
     text: FrameText,
     content_row_lines: Vec<Option<usize>>,
     top_line: usize,
+    settings: EditorRenderSettings,
+    status: Box<str>,
+    prompt: Option<Box<str>>,
+    decorations: SharedDecorations,
+    line_decorations: Vec<LineDecoration>,
+    relative_cursor_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorRenderSettings {
     width: usize,
     height: usize,
     tab_width: usize,
@@ -1163,11 +978,6 @@ struct CachedEditorRender {
     number_width: usize,
     color_column: Option<usize>,
     theme: CatppuccinPalette,
-    status: Box<str>,
-    prompt: Option<Box<str>>,
-    decorations: SharedDecorations,
-    line_decorations: Vec<LineDecoration>,
-    relative_cursor_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1201,6 +1011,7 @@ struct RenderedEditorContent {
     cursor: (usize, usize),
 }
 
+#[derive(Clone, Copy)]
 struct EditorRenderRequest<'a> {
     frame: &'a EngineFrame,
     status: &'a str,
@@ -1238,6 +1049,7 @@ pub enum TerminalPatch {
     SetStyle(CellStyle),
     Put(Cell),
     PutRow(Arc<CellRow>),
+    SetRasterOverlay(Option<Arc<RasterOverlay>>),
     ShowCursor(bool),
 }
 
@@ -1327,12 +1139,7 @@ impl ViewportLayout {
     /// makes the harness behave like an editor split: text wraps before the sidebar
     /// and no source cells are merely hidden underneath it.
     pub fn set_terminal_sidebar_visible(&mut self, visible: bool) {
-        let margin = if visible {
-            self.terminal_sidebar_column()
-                .map_or(0, |column| self.width.saturating_sub(column))
-        } else {
-            0
-        };
+        let margin = if visible { self.terminal_sidebar_column().map_or(0, |column| self.width.saturating_sub(column)) } else { 0 };
         if self.workspace_right_margin != margin {
             self.workspace_right_margin = margin;
             self.clear_cached_rendering();
@@ -1341,9 +1148,7 @@ impl ViewportLayout {
     }
 
     fn workspace_width(&self) -> usize {
-        self.width
-            .saturating_sub(self.workspace_right_margin)
-            .max(1)
+        self.width.saturating_sub(self.workspace_right_margin).max(1)
     }
 
     fn clear_cached_rendering(&mut self) {
@@ -1361,36 +1166,18 @@ impl ViewportLayout {
     /// are compared when their allocations differ, so cache reuse cannot make
     /// changed search, diagnostic, semantic, or selection styling stale.
     #[must_use]
-    pub fn compose_shared_decoration_layers(
-        &mut self,
-        decorations: &[(BufferId, Vec<SharedDecorations>)],
-    ) -> Vec<(BufferId, SharedDecorations)> {
-        decorations
-            .iter()
-            .map(|(buffer_id, layers)| {
-                (
-                    *buffer_id,
-                    self.compose_shared_decoration_buffer(*buffer_id, layers),
-                )
-            })
-            .collect()
+    pub fn compose_shared_decoration_layers(&mut self, decorations: &[(BufferId, Vec<SharedDecorations>)]) -> Vec<(BufferId, SharedDecorations)> {
+        decorations.iter().map(|(buffer_id, layers)| (*buffer_id, self.compose_shared_decoration_buffer(*buffer_id, layers))).collect()
     }
 
-    fn compose_shared_decoration_buffer(
-        &mut self,
-        buffer_id: BufferId,
-        layers: &[SharedDecorations],
-    ) -> SharedDecorations {
+    fn compose_shared_decoration_buffer(&mut self, buffer_id: BufferId, layers: &[SharedDecorations]) -> SharedDecorations {
         if layers.len() == 1 {
             return Arc::clone(&layers[0]);
         }
         if let Some(index) = self
             .cached_decoration_compositions
             .iter()
-            .position(|cached| {
-                cached.buffer_id == buffer_id
-                    && shared_decoration_layers_equal(&cached.layers, layers)
-            })
+            .position(|cached| cached.buffer_id == buffer_id && shared_decoration_layers_equal(&cached.layers, layers))
         {
             let cached = self.cached_decoration_compositions.swap_remove(index);
             let merged = Arc::clone(&cached.merged);
@@ -1398,12 +1185,11 @@ impl ViewportLayout {
             return merged;
         }
         let merged = Arc::new(merge_shared_decoration_layers(layers));
-        self.cached_decoration_compositions
-            .push(CachedDecorationComposition {
-                buffer_id,
-                layers: layers.iter().map(Arc::clone).collect(),
-                merged: Arc::clone(&merged),
-            });
+        self.cached_decoration_compositions.push(CachedDecorationComposition {
+            buffer_id,
+            layers: layers.iter().map(Arc::clone).collect(),
+            merged: Arc::clone(&merged),
+        });
         const DECORATION_COMPOSITION_CACHE_CAPACITY: usize = 16;
         if self.cached_decoration_compositions.len() > DECORATION_COMPOSITION_CACHE_CAPACITY {
             self.cached_decoration_compositions.remove(0);
@@ -1432,16 +1218,7 @@ impl ViewportLayout {
             return None;
         }
         let mut panes = Vec::new();
-        split_rectangles(
-            &model.active_tab().root,
-            Rect {
-                column: 0,
-                row: 0,
-                width: workspace_width,
-                height: content_height,
-            },
-            &mut panes,
-        );
+        split_rectangles(&model.active_tab().root, Rect { column: 0, row: 0, width: workspace_width, height: content_height }, &mut panes);
         let (window_id, rectangle) = panes.into_iter().find(|(_, rectangle)| {
             column >= rectangle.column
                 && column < rectangle.column.saturating_add(rectangle.width)
@@ -1449,9 +1226,7 @@ impl ViewportLayout {
                 && row < rectangle.row.saturating_add(rectangle.height)
         })?;
         let window = model.windows.iter().find(|window| window.id == window_id)?;
-        let (_, frame) = frames
-            .iter()
-            .find(|(buffer_id, _)| *buffer_id == window.buffer_id)?;
+        let (_, frame) = frames.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id)?;
         let mut pane = Self::new(rectangle.width.max(1), rectangle.height.max(1));
         pane.top_line = window.top_line;
         pane.tab_width = self.tab_width;
@@ -1462,83 +1237,37 @@ impl ViewportLayout {
         pane.color_column = self.color_column;
         pane.theme = self.theme;
         pane.ensure_cursor_visible(frame, 0);
-        let gutter = if pane.line_numbers {
-            pane.number_width.min(pane.width.saturating_sub(1))
-        } else {
-            0
-        };
+        let gutter = if pane.line_numbers { pane.number_width.min(pane.width.saturating_sub(1)) } else { 0 };
         let content_width = pane.width.saturating_sub(gutter).max(1);
-        let local_column = column
-            .saturating_sub(rectangle.column)
-            .saturating_sub(gutter);
+        let local_column = column.saturating_sub(rectangle.column).saturating_sub(gutter);
         let local_row = row.saturating_sub(rectangle.row);
-        let start_byte = self.cached_frame_byte_of_line(frame, pane.top_line);
-        let byte = byte_at_visual_cell(
-            &frame.text,
-            start_byte,
-            content_width,
-            pane.tab_width,
-            local_column,
-            local_row,
-        )?;
-        Some(EditorHit {
-            window_id,
-            buffer_id: window.buffer_id,
-            byte,
-        })
+        let start_byte = frame.text.byte_of_line(pane.top_line);
+        let byte = byte_at_visual_cell(&frame.text, start_byte, content_width, pane.tab_width, local_column, local_row)?;
+        Some(EditorHit { window_id, buffer_id: window.buffer_id, byte })
     }
 
     pub fn ensure_cursor_visible(&mut self, frame: &EngineFrame, reserved_rows: usize) {
         let cursor = frame.cursor_byte.min(frame.text.len());
-        let cursor_line = self.cached_frame_line_of_byte(frame, cursor);
+        let cursor_line = frame.text.line_of_byte(cursor);
         let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        let margin = self
-            .scrolloff
-            .min(content_height.saturating_sub(1).checked_div(2).unwrap_or(0));
+        let margin = self.scrolloff.min(content_height.saturating_sub(1).checked_div(2).unwrap_or(0));
         if cursor_line < self.top_line.saturating_add(margin) {
             self.top_line = cursor_line.saturating_sub(margin);
             self.epoch = self.epoch.saturating_add(1);
         } else if cursor_line.saturating_add(margin) >= self.top_line + content_height {
-            self.top_line = cursor_line
-                .saturating_add(margin)
-                .saturating_add(1)
-                .saturating_sub(content_height);
+            self.top_line = cursor_line.saturating_add(margin).saturating_add(1).saturating_sub(content_height);
             self.epoch = self.epoch.saturating_add(1);
         }
     }
 
-    fn cached_frame_byte_of_line(&self, frame: &EngineFrame, line: usize) -> usize {
-        frame.text.byte_of_line(line)
-    }
-
-    fn cached_frame_line_of_byte(&self, frame: &EngineFrame, byte: usize) -> usize {
-        frame.text.line_of_byte(byte)
-    }
-
     #[must_use]
     pub fn desired_grid(&mut self, frame: &EngineFrame) -> DesiredGrid {
-        self.desired_editor_grid_with_decorations(frame, "", None, &[])
+        self.desired_editor_grid_with_line_decorations(frame, "", None, &[], &[])
     }
 
     #[must_use]
-    pub fn desired_editor_grid(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-    ) -> DesiredGrid {
-        self.desired_editor_grid_with_decorations(frame, status, prompt, &[])
-    }
-
-    #[must_use]
-    pub fn desired_editor_grid_with_decorations(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-    ) -> DesiredGrid {
-        self.desired_editor_grid_with_line_decorations(frame, status, prompt, decorations, &[])
+    pub fn desired_editor_grid(&mut self, frame: &EngineFrame, status: &str, prompt: Option<&str>) -> DesiredGrid {
+        self.desired_editor_grid_with_line_decorations(frame, status, prompt, &[], &[])
     }
 
     #[must_use]
@@ -1550,14 +1279,7 @@ impl ViewportLayout {
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
     ) -> DesiredGrid {
-        self.desired_editor_grid_retaining_decorations(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            None,
-        )
+        self.desired_editor_grid_retaining_decorations(frame, status, prompt, decorations, line_decorations, None)
     }
 
     #[must_use]
@@ -1569,14 +1291,7 @@ impl ViewportLayout {
         decorations: &SharedDecorations,
         line_decorations: &[LineDecoration],
     ) -> DesiredGrid {
-        self.desired_editor_grid_retaining_decorations(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            Some(decorations),
-        )
+        self.desired_editor_grid_retaining_decorations(frame, status, prompt, decorations, line_decorations, Some(decorations))
     }
 
     fn desired_editor_grid_retaining_decorations(
@@ -1588,146 +1303,77 @@ impl ViewportLayout {
         line_decorations: &[LineDecoration],
         shared: Option<&SharedDecorations>,
     ) -> DesiredGrid {
-        if let Some(grid) = self.reuse_cached_editor_grid(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            shared,
-        ) {
+        let request = EditorRenderRequest { frame, status, prompt, decorations, line_decorations, shared };
+        if let Some(grid) = self.reuse_cached_editor_grid(request) {
             return grid;
         }
-        self.render_editor_grid(frame, status, prompt, decorations, line_decorations, shared)
+        self.render_editor_grid(request)
     }
 
-    fn reuse_cached_editor_grid(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<DesiredGrid> {
+    fn reuse_cached_editor_grid(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
         // Text changes and presentation-only changes have disjoint reuse
         // strategies. Classify that state once so an edit does not walk every
         // viewport, decoration, and cursor-only cache before reaching the
         // incremental line renderer.
-        if self
-            .cached_editor_render
-            .as_ref()
-            .is_some_and(|cached| !cached.text.same_snapshot(&frame.text))
-        {
-            return self.update_cached_editor_line(
-                frame,
-                status,
-                prompt,
-                decorations,
-                line_decorations,
-                shared,
-            );
+        if self.cached_editor_render.as_ref().is_some_and(|cached| !cached.text.same_snapshot(&request.frame.text)) {
+            return self.update_cached_editor_line(request);
         }
-        if self.editor_render_is_cached(frame, status, prompt, decorations, line_decorations) {
-            return Some(self.reuse_editor_render(frame, status, prompt));
+        if self.editor_render_is_cached(request) {
+            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
         }
-        if let Some(grid) =
-            self.reuse_recent_editor_viewport(frame, status, prompt, decorations, line_decorations)
-        {
+        if let Some(grid) = self.reuse_recent_editor_viewport(request) {
             return Some(grid);
         }
-        self.stash_current_editor_viewport(frame);
-        if let Some(grid) = self.update_cached_editor_distant_viewport(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            shared,
-        ) {
-            return Some(grid);
-        }
-        if let Some(grid) = self.update_cached_editor_viewport(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            shared,
-        ) {
-            return Some(grid);
-        }
-        if let Some(grid) = self.update_cached_editor_decorations(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-            shared,
-        ) {
-            return Some(grid);
-        }
-        if let Some(grid) = self.update_cached_editor_relative_numbers(
-            frame,
-            status,
-            prompt,
-            decorations,
-            line_decorations,
-        ) {
-            return Some(grid);
+        self.stash_current_editor_viewport(request.frame);
+        for reuse in [
+            Self::update_cached_editor_distant_viewport,
+            Self::update_cached_editor_viewport,
+            Self::update_cached_editor_decorations,
+            Self::update_cached_editor_relative_numbers,
+        ] {
+            if let Some(grid) = reuse(self, request) {
+                return Some(grid);
+            }
         }
         None
     }
 
-    fn render_editor_grid(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> DesiredGrid {
-        let preserve_logical_rows = self.cached_editor_render.as_ref().is_some_and(|cached| {
-            cached.text.same_snapshot(&frame.text)
-                && self.editor_render_static_structure_is_cached(status, prompt, line_decorations)
-        });
+    fn render_editor_grid(&mut self, request: EditorRenderRequest<'_>) -> DesiredGrid {
+        let preserve_logical_rows = self
+            .cached_editor_render
+            .as_ref()
+            .is_some_and(|cached| cached.text.same_snapshot(&request.frame.text) && self.editor_render_static_structure_is_cached(request));
         if !preserve_logical_rows {
             self.cached_logical_rows.clear();
         }
-        let layout = self.editor_grid_layout(status, prompt);
-        let mut content = self.render_editor_content(frame, decorations, line_decorations, layout);
-        self.append_editor_footer(
-            &mut content.rows,
-            &mut content.cursor,
-            layout.content_height,
-            status,
-            prompt,
-        );
-        self.finish_editor_grid(
-            EditorRenderRequest {
-                frame,
-                status,
-                prompt,
-                decorations,
-                line_decorations,
-                shared,
-            },
-            content,
-        )
+        let layout = self.editor_grid_layout(request.status, request.prompt);
+        let mut content = self.render_editor_content(request.frame, request.decorations, request.line_decorations, layout);
+        self.append_editor_footer(&mut content.rows, &mut content.cursor, layout.content_height, request.status, request.prompt);
+        self.finish_editor_grid(request, content)
     }
 
     fn editor_grid_layout(&self, status: &str, prompt: Option<&str>) -> EditorGridLayout {
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        let gutter = if self.line_numbers {
-            self.number_width.min(self.width.saturating_sub(1))
-        } else {
-            0
-        };
-        EditorGridLayout {
-            content_height,
-            gutter,
+        EditorGridLayout { content_height: self.editor_content_height(status, prompt), gutter: self.editor_gutter(self.width) }
+    }
+
+    fn editor_content_height(&self, status: &str, prompt: Option<&str>) -> usize {
+        self.height.saturating_sub(usize::from(!status.is_empty() || prompt.is_some())).max(1)
+    }
+
+    fn editor_gutter(&self, width: usize) -> usize {
+        if self.line_numbers { self.number_width.min(width.saturating_sub(1)) } else { 0 }
+    }
+
+    fn editor_render_settings(&self) -> EditorRenderSettings {
+        EditorRenderSettings {
+            width: self.width,
+            height: self.height,
+            tab_width: self.tab_width,
+            line_numbers: self.line_numbers,
+            relative_numbers: self.relative_numbers,
+            number_width: self.number_width,
+            color_column: self.color_column,
+            theme: self.theme,
         }
     }
 
@@ -1738,17 +1384,9 @@ impl ViewportLayout {
         line_decorations: &[LineDecoration],
         layout: EditorGridLayout,
     ) -> RenderedEditorContent {
-        let start_byte = self.cached_frame_byte_of_line(frame, self.top_line);
-        let mut builder = GridBuilder::new(
-            self.width.saturating_sub(layout.gutter),
-            layout.content_height,
-            self.tab_width,
-            start_byte,
-            self.top_line,
-        );
-        let end_byte = frame
-            .text
-            .byte_of_line(self.top_line.saturating_add(layout.content_height));
+        let start_byte = frame.text.byte_of_line(self.top_line);
+        let mut builder = GridBuilder::new(self.width.saturating_sub(layout.gutter), layout.content_height, self.tab_width, start_byte, self.top_line);
+        let end_byte = frame.text.byte_of_line(self.top_line.saturating_add(layout.content_height));
         let visible = frame.text.slice(start_byte..end_byte);
         builder.push_grapheme_document(&visible, frame.cursor_byte, decorations);
         let mut row_lines = builder.row_lines.clone();
@@ -1757,40 +1395,17 @@ impl ViewportLayout {
         let mut rows = builder.rows;
         let mut cursor = builder.cursor.unwrap_or((0, 0));
         if layout.gutter > 0 {
-            let cursor_line = self.cached_frame_line_of_byte(frame, frame.cursor_byte);
-            prepend_line_numbers(
-                &mut rows,
-                &builder.row_lines,
-                cursor_line,
-                layout.gutter,
-                self.relative_numbers,
-                line_decorations,
-            );
+            let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
+            prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, layout.gutter, self.relative_numbers, line_decorations);
             cursor.0 = cursor.0.saturating_add(layout.gutter);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(
-                &mut rows,
-                layout.gutter.saturating_add(column.saturating_sub(1)),
-                self.width,
-                self.theme.mantle,
-            );
+            mark_color_column(&mut rows, layout.gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.mantle);
         }
-        RenderedEditorContent {
-            rows,
-            row_lines,
-            cursor,
-        }
+        RenderedEditorContent { rows, row_lines, cursor }
     }
 
-    fn append_editor_footer(
-        &self,
-        rows: &mut Vec<CellRow>,
-        cursor: &mut (usize, usize),
-        content_height: usize,
-        status: &str,
-        prompt: Option<&str>,
-    ) {
+    fn append_editor_footer(&self, rows: &mut Vec<CellRow>, cursor: &mut (usize, usize), content_height: usize, status: &str, prompt: Option<&str>) {
         let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
             return;
         };
@@ -1802,11 +1417,7 @@ impl ViewportLayout {
         }
     }
 
-    fn finish_editor_grid(
-        &mut self,
-        request: EditorRenderRequest<'_>,
-        mut content: RenderedEditorContent,
-    ) -> DesiredGrid {
+    fn finish_editor_grid(&mut self, request: EditorRenderRequest<'_>, mut content: RenderedEditorContent) -> DesiredGrid {
         content.rows.resize_with(self.height, CellRow::default);
         content.rows.truncate(self.height);
         ensure_row_backgrounds(&mut content.rows);
@@ -1815,118 +1426,62 @@ impl ViewportLayout {
             .rows
             .into_iter()
             .enumerate()
-            .map(|(index, row)| {
-                self.cached_rows
-                    .get(index)
-                    .filter(|cached| cached.as_ref() == &row)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(row))
-            })
+            .map(|(index, row)| self.cached_rows.get(index).filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)))
             .collect();
         self.cached_rows.clone_from(&rows);
         self.cached_editor_render = Some(CachedEditorRender {
             text: request.frame.text.clone(),
             content_row_lines: content.row_lines,
             top_line: self.top_line,
-            width: self.width,
-            height: self.height,
-            tab_width: self.tab_width,
-            line_numbers: self.line_numbers,
-            relative_numbers: self.relative_numbers,
-            number_width: self.number_width,
-            color_column: self.color_column,
-            theme: self.theme,
+            settings: self.editor_render_settings(),
             status: request.status.into(),
             prompt: request.prompt.map(Into::into),
             decorations: retain_decorations(request.decorations, request.shared),
             line_decorations: request.line_decorations.to_vec(),
-            relative_cursor_line: self
-                .relative_numbers
-                .then(|| self.cached_frame_line_of_byte(request.frame, request.frame.cursor_byte)),
+            relative_cursor_line: self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)),
         });
         self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: self.width,
-            height: self.height,
-            rows,
-            cursor: content.cursor,
-        }
+        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor: content.cursor, raster_overlay: None }
     }
 
     fn prompt_cursor(&self, label: &str) -> (usize, usize) {
         let input = label.split("  │  ").next().unwrap_or(label);
-        (
-            display_width(input, self.tab_width).min(self.width.saturating_sub(1)),
-            self.height.saturating_sub(1),
-        )
+        (display_width(input, self.tab_width).min(self.width.saturating_sub(1)), self.height.saturating_sub(1))
     }
 
-    fn editor_render_is_cached(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> bool {
+    fn editor_render_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
-        cached.text.same_snapshot(&frame.text)
-            && self.editor_render_context_is_cached(
-                frame,
-                status,
-                prompt,
-                decorations,
-                line_decorations,
-            )
+        cached.text.same_snapshot(&request.frame.text) && self.editor_render_context_is_cached(request)
     }
 
-    fn reuse_recent_editor_viewport(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> Option<DesiredGrid> {
-        self.cached_editor_viewports
-            .retain(|viewport| viewport.render.text.same_snapshot(&frame.text));
-        let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
+    fn reuse_recent_editor_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        self.cached_editor_viewports.retain(|viewport| viewport.render.text.same_snapshot(&request.frame.text));
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
         let index = self.cached_editor_viewports.iter().position(|viewport| {
             let cached = &viewport.render;
             viewport.rows.len() == self.height
                 && cached.top_line == self.top_line
-                && cached.text.same_snapshot(&frame.text)
-                && cached.width == self.width
-                && cached.height == self.height
-                && cached.tab_width == self.tab_width
-                && cached.line_numbers == self.line_numbers
-                && cached.relative_numbers == self.relative_numbers
-                && cached.number_width == self.number_width
-                && cached.color_column == self.color_column
-                && cached.theme == self.theme
-                && cached.status.as_ref() == status
-                && cached.prompt.as_deref() == prompt
-                && cached.decorations.as_ref() == decorations
-                && cached.line_decorations == line_decorations
+                && cached.text.same_snapshot(&request.frame.text)
+                && cached.settings == self.editor_render_settings()
+                && cached.status.as_ref() == request.status
+                && cached.prompt.as_deref() == request.prompt
+                && cached.decorations.as_ref() == request.decorations
+                && cached.line_decorations == request.line_decorations
                 && cached.relative_cursor_line == self.relative_numbers.then_some(cursor_line)
         })?;
         let viewport = self.cached_editor_viewports.swap_remove(index);
         if let Some(render) = self.cached_editor_render.take()
             && self.cached_rows.len() == self.height
-            && render.text.same_snapshot(&frame.text)
+            && render.text.same_snapshot(&request.frame.text)
         {
-            self.cached_editor_viewports.push(CachedEditorViewport {
-                render,
-                rows: std::mem::take(&mut self.cached_rows),
-            });
+            self.cached_editor_viewports.push(CachedEditorViewport { render, rows: std::mem::take(&mut self.cached_rows) });
         }
         self.cached_editor_render = Some(viewport.render);
         self.cached_rows = viewport.rows;
         self.prune_recent_editor_viewports();
-        Some(self.reuse_editor_render(frame, status, prompt))
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
     fn stash_current_editor_viewport(&mut self, frame: &EngineFrame) {
@@ -1934,8 +1489,7 @@ impl ViewportLayout {
             return;
         };
         if self.cached_rows.len() != self.height || !cached.text.same_snapshot(&frame.text) {
-            self.cached_editor_viewports
-                .retain(|viewport| viewport.render.text.same_snapshot(&frame.text));
+            self.cached_editor_viewports.retain(|viewport| viewport.render.text.same_snapshot(&frame.text));
             return;
         }
         let duplicate = self.cached_editor_viewports.iter().any(|viewport| {
@@ -1947,10 +1501,7 @@ impl ViewportLayout {
                 && viewport.render.prompt == cached.prompt
         });
         if !duplicate {
-            self.cached_editor_viewports.push(CachedEditorViewport {
-                render: cached.clone(),
-                rows: self.cached_rows.clone(),
-            });
+            self.cached_editor_viewports.push(CachedEditorViewport { render: cached.clone(), rows: self.cached_rows.clone() });
             self.prune_recent_editor_viewports();
         }
     }
@@ -1958,222 +1509,115 @@ impl ViewportLayout {
     fn prune_recent_editor_viewports(&mut self) {
         const RECENT_VIEWPORT_CAPACITY: usize = 8;
         if self.cached_editor_viewports.len() > RECENT_VIEWPORT_CAPACITY {
-            self.cached_editor_viewports
-                .drain(..self.cached_editor_viewports.len() - RECENT_VIEWPORT_CAPACITY);
+            self.cached_editor_viewports.drain(..self.cached_editor_viewports.len() - RECENT_VIEWPORT_CAPACITY);
         }
     }
 
-    fn editor_render_context_is_cached(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> bool {
+    fn editor_render_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
-        self.cached_rows.len() == self.height
-            && cached.top_line == self.top_line
-            && self.editor_render_stable_context_is_cached(
-                frame,
-                status,
-                prompt,
-                decorations,
-                line_decorations,
-            )
+        self.cached_rows.len() == self.height && cached.top_line == self.top_line && self.editor_render_stable_context_is_cached(request)
     }
 
-    fn editor_render_stable_context_is_cached(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> bool {
+    fn editor_render_stable_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
-        self.editor_render_structure_is_cached(frame, status, prompt, line_decorations)
-            && cached.decorations.as_ref() == decorations
+        self.editor_render_structure_is_cached(request) && cached.decorations.as_ref() == request.decorations
     }
 
-    fn editor_render_structure_is_cached(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        line_decorations: &[LineDecoration],
-    ) -> bool {
-        self.editor_render_static_structure_is_cached(status, prompt, line_decorations)
-            && self.cached_editor_render.as_ref().is_some_and(|cached| {
-                cached.relative_cursor_line
-                    == self
-                        .relative_numbers
-                        .then(|| frame.text.line_of_byte(frame.cursor_byte))
-            })
-    }
-
-    fn editor_render_static_structure_is_cached(
-        &self,
-        status: &str,
-        prompt: Option<&str>,
-        line_decorations: &[LineDecoration],
-    ) -> bool {
-        self.editor_render_shape_is_cached(prompt, line_decorations)
+    fn editor_render_structure_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
+        self.editor_render_static_structure_is_cached(request)
             && self
                 .cached_editor_render
                 .as_ref()
-                .is_some_and(|cached| cached.status.as_ref() == status)
+                .is_some_and(|cached| cached.relative_cursor_line == self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)))
     }
 
-    fn editor_render_shape_is_cached(
-        &self,
-        prompt: Option<&str>,
-        line_decorations: &[LineDecoration],
-    ) -> bool {
+    fn editor_render_static_structure_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
+        self.editor_render_shape_is_cached(request) && self.cached_editor_render.as_ref().is_some_and(|cached| cached.status.as_ref() == request.status)
+    }
+
+    fn editor_render_shape_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
         self.cached_rows.len() == self.height
-            && cached.width == self.width
-            && cached.height == self.height
-            && cached.tab_width == self.tab_width
-            && cached.line_numbers == self.line_numbers
-            && cached.relative_numbers == self.relative_numbers
-            && cached.number_width == self.number_width
-            && cached.color_column == self.color_column
-            && cached.theme == self.theme
-            && cached.prompt.as_deref() == prompt
-            && cached.line_decorations == line_decorations
+            && cached.settings == self.editor_render_settings()
+            && cached.prompt.as_deref() == request.prompt
+            && cached.line_decorations == request.line_decorations
     }
 
-    fn editor_line_update_context_is_cached(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        line_decorations: &[LineDecoration],
-    ) -> bool {
+    fn editor_line_update_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
-        self.editor_render_shape_is_cached(prompt, line_decorations)
+        self.editor_render_shape_is_cached(request)
             && cached.top_line == self.top_line
-            && cached.status.is_empty() == status.is_empty()
-            && cached.relative_cursor_line
-                == self
-                    .relative_numbers
-                    .then(|| frame.text.line_of_byte(frame.cursor_byte))
+            && cached.status.is_empty() == request.status.is_empty()
+            && cached.relative_cursor_line == self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte))
     }
 
-    fn update_cached_editor_decorations(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<DesiredGrid> {
+    fn update_cached_editor_decorations(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
         let cached = self.cached_editor_render.as_ref()?;
-        if !cached.text.same_snapshot(&frame.text)
+        if !cached.text.same_snapshot(&request.frame.text)
             || cached.top_line != self.top_line
-            || cached.decorations.as_ref() == decorations
-            || !self.editor_render_structure_is_cached(frame, status, prompt, line_decorations)
+            || cached.decorations.as_ref() == request.decorations
+            || !self.editor_render_structure_is_cached(request)
         {
             return None;
         }
-        let prefix = cached
-            .decorations
-            .iter()
-            .zip(decorations)
-            .take_while(|(old, new)| old == new)
-            .count();
+        let prefix = cached.decorations.iter().zip(request.decorations).take_while(|(old, new)| old == new).count();
         let suffix = cached.decorations[prefix..]
             .iter()
             .rev()
-            .zip(decorations[prefix.min(decorations.len())..].iter().rev())
+            .zip(request.decorations[prefix.min(request.decorations.len())..].iter().rev())
             .take_while(|(old, new)| old == new)
             .count();
         let old_end = cached.decorations.len().saturating_sub(suffix);
-        let new_end = decorations.len().saturating_sub(suffix);
-        let changed = cached.decorations[prefix.min(old_end)..old_end]
-            .iter()
-            .chain(decorations[prefix.min(new_end)..new_end].iter());
+        let new_end = request.decorations.len().saturating_sub(suffix);
+        let changed = cached.decorations[prefix.min(old_end)..old_end].iter().chain(request.decorations[prefix.min(new_end)..new_end].iter());
         let affected = changed.fold(None::<Range<usize>>, |affected, span| {
-            Some(affected.map_or_else(
-                || span.range.clone(),
-                |affected| affected.start.min(span.range.start)..affected.end.max(span.range.end),
-            ))
+            Some(affected.map_or_else(|| span.range.clone(), |affected| affected.start.min(span.range.start)..affected.end.max(span.range.end)))
         })?;
-        let logical_line = frame.text.line_of_byte(affected.start);
-        if frame
-            .text
-            .line_of_byte(affected.end.saturating_sub(1).max(affected.start))
-            != logical_line
-        {
+        let logical_line = request.frame.text.line_of_byte(affected.start);
+        if request.frame.text.line_of_byte(affected.end.saturating_sub(1).max(affected.start)) != logical_line {
             return None;
         }
         self.cached_logical_rows.remove(&logical_line);
-        let Some(screen_row) = cached
-            .content_row_lines
-            .iter()
-            .position(|line| *line == Some(logical_line))
-        else {
-            self.cached_editor_render.as_mut()?.decorations =
-                retain_decorations(decorations, shared);
-            return Some(self.reuse_editor_render(frame, status, prompt));
+        let Some(screen_row) = cached.content_row_lines.iter().position(|line| *line == Some(logical_line)) else {
+            self.cached_editor_render.as_mut()?.decorations = retain_decorations(request.decorations, request.shared);
+            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
         };
-        let visible_rows = cached.content_row_lines[screen_row..]
-            .iter()
-            .take_while(|line| **line == Some(logical_line))
-            .count()
-            .max(1);
-        let start = frame.text.byte_of_line(logical_line);
-        let mut end = frame.text.byte_of_line(logical_line.saturating_add(1));
-        if end > start && frame.text.slice(end - 1..end).as_ref() == "\n" {
+        let visible_rows = cached.content_row_lines[screen_row..].iter().take_while(|line| **line == Some(logical_line)).count().max(1);
+        let start = request.frame.text.byte_of_line(logical_line);
+        let mut end = request.frame.text.byte_of_line(logical_line.saturating_add(1));
+        if end > start && request.frame.text.slice(end - 1..end).as_ref() == "\n" {
             end -= 1;
         }
-        let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
-        let rendered = self.render_editor_line(
-            &frame.text,
-            logical_line,
-            cursor_line,
-            start,
-            end,
-            visible_rows,
-            decorations,
-            line_decorations,
-        );
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
+        let rendered =
+            self.render_editor_line(&request.frame.text, logical_line, cursor_line, start, end, visible_rows, request.decorations, request.line_decorations);
         if rendered.len() != visible_rows {
             return None;
         }
         for (offset, row) in rendered.into_iter().enumerate() {
             self.cached_rows[screen_row + offset] = Arc::new(row);
         }
-        self.cached_editor_render.as_mut()?.decorations = retain_decorations(decorations, shared);
-        Some(self.reuse_editor_render(frame, status, prompt))
+        self.cached_editor_render.as_mut()?.decorations = retain_decorations(request.decorations, request.shared);
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
-    fn update_cached_editor_relative_numbers(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> Option<DesiredGrid> {
+    fn update_cached_editor_relative_numbers(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
         let cached = self.cached_editor_render.as_ref()?;
-        let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
         if !self.relative_numbers
-            || !cached.text.same_snapshot(&frame.text)
+            || !cached.text.same_snapshot(&request.frame.text)
             || cached.top_line != self.top_line
-            || cached.decorations.as_ref() != decorations
+            || cached.decorations.as_ref() != request.decorations
             || cached.relative_cursor_line == Some(cursor_line)
-            || !self.editor_render_static_structure_is_cached(status, prompt, line_decorations)
+            || !self.editor_render_static_structure_is_cached(request)
         {
             return None;
         }
@@ -2182,104 +1626,56 @@ impl ViewportLayout {
             let Some(logical_line) = logical_line else {
                 continue;
             };
-            replace_line_number(
-                Arc::make_mut(row),
-                logical_line,
-                cursor_line,
-                self.number_width,
-                true,
-                line_decorations,
-            );
+            replace_line_number(Arc::make_mut(row), logical_line, cursor_line, self.number_width, true, request.line_decorations);
         }
         self.cached_editor_render.as_mut()?.relative_cursor_line = Some(cursor_line);
-        Some(self.reuse_editor_render(frame, status, prompt))
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
-    fn update_cached_editor_viewport(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<DesiredGrid> {
-        let shift = self.viewport_shift(frame, status, prompt, decorations, line_decorations)?;
-        let introduced = self.shift_introduced_rows(frame, decorations, line_decorations, &shift);
+    fn update_cached_editor_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        let shift = self.viewport_shift(request)?;
+        let introduced = self.shift_introduced_rows(request.frame, request.decorations, request.line_decorations, &shift);
         if introduced.len() != shift.line_delta {
             return None;
         }
-        self.stash_shift_displaced_rows(frame, &shift);
+        self.stash_shift_displaced_rows(request.frame, &shift);
         self.install_shift_rows(&shift, introduced);
-        self.commit_viewport_shift(&shift, decorations, line_decorations, shared)?;
+        self.commit_viewport_shift(&shift, request.decorations, request.line_decorations, request.shared)?;
         self.prune_cached_logical_rows(shift.content_height);
-        Some(self.reuse_editor_render(frame, status, prompt))
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
-    fn viewport_shift(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> Option<ViewportShift> {
+    fn viewport_shift(&self, request: EditorRenderRequest<'_>) -> Option<ViewportShift> {
         let cached = self.cached_editor_render.as_ref()?;
         let cached_top_line = cached.top_line;
         let moving_down = self.top_line >= cached_top_line;
         let line_delta = self.top_line.abs_diff(cached_top_line);
-        if !cached.text.same_snapshot(&frame.text)
-            || line_delta == 0
-            || !self.editor_render_static_structure_is_cached(status, prompt, line_decorations)
-        {
+        if !cached.text.same_snapshot(&request.frame.text) || line_delta == 0 || !self.editor_render_static_structure_is_cached(request) {
             return None;
         }
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        let content_height = self.editor_content_height(request.status, request.prompt);
         if line_delta >= content_height
             || cached.content_row_lines.len() != content_height
-            || !cached
-                .content_row_lines
-                .iter()
-                .enumerate()
-                .all(|(offset, line)| *line == Some(cached_top_line.saturating_add(offset)))
+            || !cached.content_row_lines.iter().enumerate().all(|(offset, line)| *line == Some(cached_top_line.saturating_add(offset)))
         {
             return None;
         }
         let cached_content_row_lines = cached.content_row_lines.clone();
         let cached_decorations = cached.decorations.clone();
         let overlap_start_line = self.top_line.max(cached_top_line);
-        let overlap_end_line = self
-            .top_line
-            .saturating_add(content_height)
-            .min(cached_top_line.saturating_add(content_height));
-        let overlap =
-            frame.text.byte_of_line(overlap_start_line)..frame.text.byte_of_line(overlap_end_line);
-        if !decorations_match_range(&cached_decorations, decorations, &overlap) {
+        let overlap_end_line = self.top_line.saturating_add(content_height).min(cached_top_line.saturating_add(content_height));
+        let overlap = request.frame.text.byte_of_line(overlap_start_line)..request.frame.text.byte_of_line(overlap_end_line);
+        if !decorations_match_range(&cached_decorations, request.decorations, &overlap) {
             return None;
         }
-        let cursor_line = self.cached_frame_line_of_byte(frame, frame.cursor_byte);
-        let introduced_start = if moving_down {
-            self.top_line
-                .saturating_add(content_height.saturating_sub(line_delta))
-        } else {
-            self.top_line
-        };
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
+        let introduced_start = if moving_down { self.top_line.saturating_add(content_height.saturating_sub(line_delta)) } else { self.top_line };
         let introduced_end = introduced_start.saturating_add(line_delta);
-        let start = self.cached_frame_byte_of_line(frame, introduced_start);
-        let end = frame
-            .text
-            .byte_of_line(introduced_end)
-            .min(frame.text.len());
-        let text = frame.text.slice(start..end);
-        let content_width = self
-            .width
-            .saturating_sub(self.editor_grid_layout(status, prompt).gutter)
-            .max(1);
-        if text
-            .split_terminator('\n')
-            .any(|line| visual_line_rows(line, content_width, self.tab_width) != 1)
-        {
+        let start = request.frame.text.byte_of_line(introduced_start);
+        let end = request.frame.text.byte_of_line(introduced_end).min(request.frame.text.len());
+        let text = request.frame.text.slice(start..end);
+        let content_width = self.width.saturating_sub(self.editor_grid_layout(request.status, request.prompt).gutter).max(1);
+        if text.split_terminator('\n').any(|line| visual_line_rows(line, content_width, self.tab_width) != 1) {
             return None;
         }
         Some(ViewportShift {
@@ -2305,11 +1701,9 @@ impl ViewportLayout {
     ) -> Vec<Arc<CellRow>> {
         (shift.introduced_start..shift.introduced_end)
             .map(|line| {
-                let range =
-                    frame.text.byte_of_line(line)..frame.text.byte_of_line(line.saturating_add(1));
+                let range = frame.text.byte_of_line(line)..frame.text.byte_of_line(line.saturating_add(1));
                 let cached = self.cached_logical_rows.remove(&line)?;
-                decorations_match_range(&cached.decorations, decorations, &range)
-                    .then_some(cached.row)
+                decorations_match_range(&cached.decorations, decorations, &range).then_some(cached.row)
             })
             .collect::<Option<Vec<_>>>()
             .unwrap_or_else(|| {
@@ -2330,18 +1724,10 @@ impl ViewportLayout {
     }
 
     fn stash_shift_displaced_rows(&mut self, frame: &EngineFrame, shift: &ViewportShift) {
-        let displaced = if shift.moving_down {
-            0..shift.line_delta
-        } else {
-            shift.content_height.saturating_sub(shift.line_delta)..shift.content_height
-        };
+        let displaced = if shift.moving_down { 0..shift.line_delta } else { shift.content_height.saturating_sub(shift.line_delta)..shift.content_height };
         for index in displaced {
-            if let (Some(Some(line)), Some(row)) = (
-                shift.cached_row_lines.get(index),
-                self.cached_rows.get(index),
-            ) {
-                let range =
-                    frame.text.byte_of_line(*line)..frame.text.byte_of_line(line.saturating_add(1));
+            if let (Some(Some(line)), Some(row)) = (shift.cached_row_lines.get(index), self.cached_rows.get(index)) {
+                let range = frame.text.byte_of_line(*line)..frame.text.byte_of_line(line.saturating_add(1));
                 self.cached_logical_rows.insert(
                     *line,
                     CachedLogicalRow {
@@ -2349,9 +1735,7 @@ impl ViewportLayout {
                         decorations: shift
                             .cached_decorations
                             .iter()
-                            .filter(|span| {
-                                span.range.start < range.end && range.start < span.range.end
-                            })
+                            .filter(|span| span.range.start < range.end && range.start < span.range.end)
                             .cloned()
                             .collect(),
                     },
@@ -2389,57 +1773,27 @@ impl ViewportLayout {
         cached.relative_cursor_line = self.relative_numbers.then_some(shift.cursor_line);
         cached.decorations = retain_decorations(decorations, shared);
         if self.relative_numbers {
-            for (row, logical_line) in self
-                .cached_rows
-                .iter_mut()
-                .zip(cached.content_row_lines.iter().copied())
-            {
+            for (row, logical_line) in self.cached_rows.iter_mut().zip(cached.content_row_lines.iter().copied()) {
                 let Some(logical_line) = logical_line else {
                     continue;
                 };
-                replace_line_number(
-                    Arc::make_mut(row),
-                    logical_line,
-                    shift.cursor_line,
-                    self.number_width,
-                    true,
-                    line_decorations,
-                );
+                replace_line_number(Arc::make_mut(row), logical_line, shift.cursor_line, self.number_width, true, line_decorations);
             }
         }
         Some(())
     }
 
-    fn update_cached_editor_distant_viewport(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<DesiredGrid> {
-        let content_height =
-            self.distant_viewport_height(frame, status, prompt, line_decorations)?;
-        self.stash_current_viewport_rows(frame);
-        let target_rows = self.cached_viewport_rows(frame, decorations, content_height)?;
-        for (target, row) in self.cached_rows[..content_height]
-            .iter_mut()
-            .zip(target_rows)
-        {
+    fn update_cached_editor_distant_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        let content_height = self.distant_viewport_height(request)?;
+        self.stash_current_viewport_rows(request.frame);
+        let target_rows = self.cached_viewport_rows(request.frame, request.decorations, content_height)?;
+        for (target, row) in self.cached_rows[..content_height].iter_mut().zip(target_rows) {
             *target = row;
         }
-        let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
         if self.relative_numbers {
             for (offset, row) in self.cached_rows[..content_height].iter_mut().enumerate() {
-                replace_line_number(
-                    Arc::make_mut(row),
-                    self.top_line.saturating_add(offset),
-                    cursor_line,
-                    self.number_width,
-                    true,
-                    line_decorations,
-                );
+                replace_line_number(Arc::make_mut(row), self.top_line.saturating_add(offset), cursor_line, self.number_width, true, request.line_decorations);
             }
         }
         let cached = self.cached_editor_render.as_mut()?;
@@ -2448,36 +1802,23 @@ impl ViewportLayout {
             *line = Some(self.top_line.saturating_add(offset));
         }
         cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
-        cached.decorations = retain_decorations(decorations, shared);
+        cached.decorations = retain_decorations(request.decorations, request.shared);
         self.prune_cached_logical_rows(content_height);
-        Some(self.reuse_editor_render(frame, status, prompt))
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
-    fn distant_viewport_height(
-        &self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        line_decorations: &[LineDecoration],
-    ) -> Option<usize> {
+    fn distant_viewport_height(&self, request: EditorRenderRequest<'_>) -> Option<usize> {
         let cached = self.cached_editor_render.as_ref()?;
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        let content_height = self.editor_content_height(request.status, request.prompt);
         if !(self.top_line.abs_diff(cached.top_line) >= content_height
-            && cached.text.same_snapshot(&frame.text)
+            && cached.text.same_snapshot(&request.frame.text)
             && cached.content_row_lines.len() == content_height
-            && self.editor_render_static_structure_is_cached(status, prompt, line_decorations)
-            && cached
-                .content_row_lines
-                .iter()
-                .enumerate()
-                .all(|(offset, line)| *line == Some(cached.top_line.saturating_add(offset))))
+            && self.editor_render_static_structure_is_cached(request)
+            && cached.content_row_lines.iter().enumerate().all(|(offset, line)| *line == Some(cached.top_line.saturating_add(offset))))
         {
             return None;
         }
-        (self.top_line..self.top_line.saturating_add(content_height))
-            .all(|line| self.cached_logical_rows.contains_key(&line))
-            .then_some(content_height)
+        (self.top_line..self.top_line.saturating_add(content_height)).all(|line| self.cached_logical_rows.contains_key(&line)).then_some(content_height)
     }
 
     fn stash_current_viewport_rows(&mut self, frame: &EngineFrame) {
@@ -2485,40 +1826,26 @@ impl ViewportLayout {
             return;
         };
         for (index, logical_line) in cached.content_row_lines.iter().copied().enumerate() {
-            let (Some(logical_line), Some(row)) = (logical_line, self.cached_rows.get(index))
-            else {
+            let (Some(logical_line), Some(row)) = (logical_line, self.cached_rows.get(index)) else {
                 continue;
             };
-            let range = frame.text.byte_of_line(logical_line)
-                ..frame.text.byte_of_line(logical_line.saturating_add(1));
+            let range = frame.text.byte_of_line(logical_line)..frame.text.byte_of_line(logical_line.saturating_add(1));
             self.cached_logical_rows.insert(
                 logical_line,
                 CachedLogicalRow {
                     row: Arc::clone(row),
-                    decorations: cached
-                        .decorations
-                        .iter()
-                        .filter(|span| span.range.start < range.end && range.start < span.range.end)
-                        .cloned()
-                        .collect(),
+                    decorations: cached.decorations.iter().filter(|span| span.range.start < range.end && range.start < span.range.end).cloned().collect(),
                 },
             );
         }
     }
 
-    fn cached_viewport_rows(
-        &self,
-        frame: &EngineFrame,
-        decorations: &[DecorationSpan],
-        content_height: usize,
-    ) -> Option<Vec<Arc<CellRow>>> {
+    fn cached_viewport_rows(&self, frame: &EngineFrame, decorations: &[DecorationSpan], content_height: usize) -> Option<Vec<Arc<CellRow>>> {
         (self.top_line..self.top_line.saturating_add(content_height))
             .map(|logical_line| {
-                let range = frame.text.byte_of_line(logical_line)
-                    ..frame.text.byte_of_line(logical_line.saturating_add(1));
+                let range = frame.text.byte_of_line(logical_line)..frame.text.byte_of_line(logical_line.saturating_add(1));
                 let row = self.cached_logical_rows.get(&logical_line)?;
-                decorations_match_range(&row.decorations, decorations, &range)
-                    .then(|| Arc::clone(&row.row))
+                decorations_match_range(&row.decorations, decorations, &range).then(|| Arc::clone(&row.row))
             })
             .collect()
     }
@@ -2526,86 +1853,48 @@ impl ViewportLayout {
     fn prune_cached_logical_rows(&mut self, content_height: usize) {
         let capacity = content_height.saturating_mul(8).max(content_height);
         while self.cached_logical_rows.len() > capacity {
-            let Some(farthest) = self
-                .cached_logical_rows
-                .keys()
-                .max_by_key(|line| line.abs_diff(self.top_line))
-                .copied()
-            else {
+            let Some(farthest) = self.cached_logical_rows.keys().max_by_key(|line| line.abs_diff(self.top_line)).copied() else {
                 break;
             };
             self.cached_logical_rows.remove(&farthest);
         }
     }
 
-    fn update_cached_editor_line(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<DesiredGrid> {
-        if !self.editor_line_update_context_is_cached(frame, status, prompt, line_decorations) {
+    fn update_cached_editor_line(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        if !self.editor_line_update_context_is_cached(request) {
             return None;
         }
         let cached = self.cached_editor_render.as_ref()?;
-        let change = single_line_change(&cached.text, &frame.text)?;
-        let decoration_start =
-            matching_decorations_outside_change(&cached.decorations, decorations, change)?;
+        let change = single_line_change(&cached.text, &request.frame.text)?;
+        let decoration_start = matching_decorations_outside_change(&cached.decorations, request.decorations, change)?;
         self.cached_logical_rows.remove(&change.line);
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        if change.line < self.top_line
-            || change.line >= self.top_line.saturating_add(content_height)
-        {
-            self.cached_editor_render
-                .as_mut()?
-                .text
-                .clone_from(&frame.text);
-            return Some(self.reuse_editor_render(frame, status, prompt));
+        let content_height = self.editor_content_height(request.status, request.prompt);
+        if change.line < self.top_line || change.line >= self.top_line.saturating_add(content_height) {
+            self.cached_editor_render.as_mut()?.text.clone_from(&request.frame.text);
+            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
         }
-        let gutter = if self.line_numbers {
-            self.number_width.min(self.width.saturating_sub(1))
-        } else {
-            0
-        };
+        let gutter = self.editor_gutter(self.width);
         let content_width = self.width.saturating_sub(gutter).max(1);
-        let screen_row = cached
-            .content_row_lines
-            .iter()
-            .position(|line| *line == Some(change.line))?;
-        let old_rows = visual_line_rows(
-            &change.old_text(&cached.text),
-            content_width,
-            self.tab_width,
-        );
-        let new_rows =
-            visual_line_rows(&change.new_text(&frame.text), content_width, self.tab_width);
+        let screen_row = cached.content_row_lines.iter().position(|line| *line == Some(change.line))?;
+        let old_rows = visual_line_rows(&cached.text.slice(change.old_start..change.old_end), content_width, self.tab_width);
+        let new_rows = visual_line_rows(&request.frame.text.slice(change.new_start..change.new_end), content_width, self.tab_width);
         if old_rows != new_rows {
             return None;
         }
-        let cursor_line = self.cached_frame_line_of_byte(frame, frame.cursor_byte);
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
         self.repaint_cached_editor_line(
-            frame,
-            LineRepaint {
-                change,
-                cursor_line,
-                screen_row,
-                content_height,
-                new_rows,
-            },
-            &decorations[decoration_start..],
-            line_decorations,
+            request.frame,
+            LineRepaint { change, cursor_line, screen_row, content_height, new_rows },
+            &request.decorations[decoration_start..],
+            request.line_decorations,
         )?;
         let cached = self.cached_editor_render.as_mut()?;
-        cached.text.clone_from(&frame.text);
-        cached.status = status.into();
-        cached.decorations = retain_decorations(decorations, shared);
+        cached.text.clone_from(&request.frame.text);
+        cached.status = request.status.into();
+        cached.decorations = retain_decorations(request.decorations, request.shared);
         cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
-        self.update_cached_editor_footer(status, prompt);
-        Some(self.reuse_editor_render(frame, status, prompt))
+        self.update_cached_editor_footer(request.status, request.prompt);
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
     fn repaint_cached_editor_line(
@@ -2618,10 +1907,7 @@ impl ViewportLayout {
         if repaint.screen_row >= repaint.content_height {
             return Some(());
         }
-        let visible_rows = repaint
-            .content_height
-            .saturating_sub(repaint.screen_row)
-            .min(repaint.new_rows);
+        let visible_rows = repaint.content_height.saturating_sub(repaint.screen_row).min(repaint.new_rows);
         let rendered = self.render_editor_line(
             &frame.text,
             repaint.change.line,
@@ -2642,21 +1928,10 @@ impl ViewportLayout {
     }
 
     fn update_cached_editor_footer(&mut self, status: &str, prompt: Option<&str>) {
-        if !status.is_empty() || prompt.is_some() {
-            let label = prompt.unwrap_or(status);
-            let style = if prompt.is_some() {
-                CellStyle::default()
-            } else {
-                CellStyle {
-                    bold: true,
-                    reverse: true,
-                    ..CellStyle::default()
-                }
-            };
-            let status_row = self.height.saturating_sub(1);
-            self.cached_rows[status_row] =
-                Arc::new(row_from_text(label, self.width, style, self.tab_width));
-        }
+        let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
+            return;
+        };
+        self.cached_rows[self.height.saturating_sub(1)] = Arc::new(row_from_text(label, self.width, prompt_style(prompt.is_some()), self.tab_width));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2671,112 +1946,45 @@ impl ViewportLayout {
         decorations: &[DecorationSpan],
         line_decorations: &[LineDecoration],
     ) -> Vec<CellRow> {
-        let gutter = if self.line_numbers {
-            self.number_width.min(self.width.saturating_sub(1))
-        } else {
-            0
-        };
-        let mut builder = GridBuilder::new(
-            self.width.saturating_sub(gutter),
-            height.max(1),
-            self.tab_width,
-            start,
-            logical_line,
-        );
+        let gutter = self.editor_gutter(self.width);
+        let mut builder = GridBuilder::new(self.width.saturating_sub(gutter), height.max(1), self.tab_width, start, logical_line);
         let visible = text.slice(start..end);
         builder.push_grapheme_document(&visible, usize::MAX, decorations);
         let mut rows = builder.rows;
         if gutter > 0 {
-            prepend_line_numbers(
-                &mut rows,
-                &builder.row_lines,
-                cursor_line,
-                gutter,
-                self.relative_numbers,
-                line_decorations,
-            );
+            prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, gutter, self.relative_numbers, line_decorations);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(
-                &mut rows,
-                gutter.saturating_add(column.saturating_sub(1)),
-                self.width,
-                self.theme.mantle,
-            );
+            mark_color_column(&mut rows, gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.mantle);
         }
         ensure_row_backgrounds(&mut rows);
         apply_theme_to_rows(&mut rows, self.theme);
         rows
     }
 
-    fn reuse_editor_render(
-        &mut self,
-        frame: &EngineFrame,
-        status: &str,
-        prompt: Option<&str>,
-    ) -> DesiredGrid {
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
-        let gutter = if self.line_numbers {
-            self.number_width.min(self.width.saturating_sub(1))
-        } else {
-            0
-        };
+    fn reuse_editor_render(&mut self, frame: &EngineFrame, status: &str, prompt: Option<&str>) -> DesiredGrid {
+        let content_height = self.editor_content_height(status, prompt);
+        let gutter = self.editor_gutter(self.width);
         let cursor_byte = frame.cursor_byte.min(frame.text.len());
         let cursor_line = frame.text.line_of_byte(cursor_byte);
         let line_start = frame.text.byte_of_line(cursor_line);
         let visible = frame.text.slice(line_start..cursor_byte.max(line_start));
-        let (column, wrapped_row) = cursor_visual_position(
-            &visible,
-            0,
-            visible.len(),
-            self.width.saturating_sub(gutter).max(1),
-            content_height,
-            self.tab_width,
-        );
-        let base_row = self
-            .cached_editor_render
-            .as_ref()
-            .and_then(|cached| {
-                cached
-                    .content_row_lines
-                    .iter()
-                    .position(|line| *line == Some(cursor_line))
-            })
-            .unwrap_or(0);
-        let mut cursor = (
-            column,
-            base_row
-                .saturating_add(wrapped_row)
-                .min(content_height.saturating_sub(1)),
-        );
+        let (column, wrapped_row) =
+            cursor_visual_position(&visible, 0, visible.len(), self.width.saturating_sub(gutter).max(1), content_height, self.tab_width);
+        let base_row =
+            self.cached_editor_render.as_ref().and_then(|cached| cached.content_row_lines.iter().position(|line| *line == Some(cursor_line))).unwrap_or(0);
+        let mut cursor = (column, base_row.saturating_add(wrapped_row).min(content_height.saturating_sub(1)));
         cursor.0 = cursor.0.saturating_add(gutter);
         if let Some(label) = prompt {
-            let input = label.split("  │  ").next().unwrap_or(label);
-            cursor = (
-                display_width(input, self.tab_width).min(self.width.saturating_sub(1)),
-                self.height.saturating_sub(1),
-            );
+            cursor = self.prompt_cursor(label);
         }
         self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: self.width,
-            height: self.height,
-            rows: self.cached_rows.clone(),
-            cursor,
-        }
+        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows: self.cached_rows.clone(), cursor, raster_overlay: None }
     }
 
     #[must_use]
-    pub fn desired_workspace_grid(
-        &mut self,
-        model: &ClientViewModel,
-        frames: &[(BufferId, EngineFrame)],
-        status: &str,
-        prompt: Option<&str>,
-    ) -> DesiredGrid {
-        self.desired_workspace_grid_with_decorations(model, frames, &[], status, prompt)
+    pub fn desired_workspace_grid(&mut self, model: &ClientViewModel, frames: &[(BufferId, EngineFrame)], status: &str, prompt: Option<&str>) -> DesiredGrid {
+        self.desired_workspace_grid_with_shared_decorations(model, frames, &[], &[], status, prompt)
     }
 
     #[must_use]
@@ -2788,38 +1996,8 @@ impl ViewportLayout {
         status: &str,
         prompt: Option<&str>,
     ) -> DesiredGrid {
-        self.desired_workspace_grid_with_line_decorations(
-            model,
-            frames,
-            decorations,
-            &[],
-            status,
-            prompt,
-        )
-    }
-
-    #[must_use]
-    pub fn desired_workspace_grid_with_line_decorations(
-        &mut self,
-        model: &ClientViewModel,
-        frames: &[(BufferId, EngineFrame)],
-        decorations: &[(BufferId, Vec<DecorationSpan>)],
-        line_decorations: &[(BufferId, Vec<LineDecoration>)],
-        status: &str,
-        prompt: Option<&str>,
-    ) -> DesiredGrid {
-        let decorations = decorations
-            .iter()
-            .map(|(buffer_id, spans)| (*buffer_id, Arc::new(spans.clone())))
-            .collect::<Vec<_>>();
-        self.desired_workspace_grid_with_shared_decorations(
-            model,
-            frames,
-            &decorations,
-            line_decorations,
-            status,
-            prompt,
-        )
+        let decorations = decorations.iter().map(|(buffer_id, spans)| (*buffer_id, Arc::new(spans.clone()))).collect::<Vec<_>>();
+        self.desired_workspace_grid_with_shared_decorations(model, frames, &decorations, &[], status, prompt)
     }
 
     #[must_use]
@@ -2832,41 +2010,18 @@ impl ViewportLayout {
         status: &str,
         prompt: Option<&str>,
     ) -> DesiredGrid {
-        let reserved_rows = usize::from(!status.is_empty() || prompt.is_some());
-        let content_height = self.height.saturating_sub(reserved_rows).max(1);
+        let content_height = self.editor_content_height(status, prompt);
         let tab = model.active_tab();
         let panes = self.workspace_panes(&tab.root, content_height);
         if let Some((window_id, rectangle)) = self.full_workspace_pane(&panes, content_height)
-            && let Some(source) =
-                workspace_pane_source(model, frames, decorations, line_decorations, window_id)
+            && let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, window_id)
         {
-            let grid = self.render_workspace_pane(
-                window_id,
-                rectangle,
-                source.window.top_line,
-                source.frame,
-                source.decorations,
-                source.line_decorations,
-            );
+            let grid = self.render_workspace_pane(window_id, rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
             return self.finish_single_pane_workspace(grid, status, prompt);
         }
 
-        let (mut rows, mut cursor) = self.compose_workspace_panes(
-            model,
-            frames,
-            decorations,
-            line_decorations,
-            &panes,
-            tab.active_window,
-        );
-        draw_split_borders(
-            &tab.root,
-            0,
-            0,
-            self.workspace_width(),
-            content_height,
-            &mut rows,
-        );
+        let (mut rows, mut cursor) = self.compose_workspace_panes(model, frames, decorations, line_decorations, &panes, tab.active_window);
+        draw_split_borders(&tab.root, 0, 0, self.workspace_width(), content_height, &mut rows);
         self.paint_workspace_footer(&mut rows, &mut cursor, status, prompt);
         self.finish_workspace_grid(rows, cursor)
     }
@@ -2904,20 +2059,14 @@ impl ViewportLayout {
         pane.prepare_editor_realtime_updates(frame, decorations, line_decorations);
     }
 
-    fn prepare_editor_realtime_updates(
-        &mut self,
-        frame: &EngineFrame,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) {
+    fn prepare_editor_realtime_updates(&mut self, frame: &EngineFrame, decorations: &[DecorationSpan], line_decorations: &[LineDecoration]) {
         if self.realtime_updates_prepared || self.cached_editor_render.is_none() {
             return;
         }
         self.realtime_updates_prepared = true;
 
         let byte = frame.cursor_byte.min(frame.text.len());
-        if let Ok(transaction) =
-            Transaction::new(DocumentRevision::new(0), vec![Edit::new(byte..byte, "x")])
+        if let Ok(transaction) = Transaction::new(DocumentRevision::new(0), vec![Edit::new(byte..byte, "x")])
             && let Ok(text) = frame.text.edited(&transaction)
         {
             let mapped = decorations
@@ -2925,71 +2074,31 @@ impl ViewportLayout {
                 .filter_map(|span| {
                     let start = transaction.map_offset(span.range.start, Bias::Left).ok()?;
                     let end = transaction.map_offset(span.range.end, Bias::Right).ok()?;
-                    (start < end).then_some(DecorationSpan {
-                        range: start..end,
-                        style: span.style,
-                        priority: span.priority,
-                    })
+                    (start < end).then_some(DecorationSpan::new(start..end, span.style, span.priority))
                 })
                 .collect::<Vec<_>>();
             let mut preview = self.clone();
-            let grid = preview.desired_editor_grid_with_line_decorations(
-                &EngineFrame {
-                    text,
-                    cursor_byte: byte.saturating_add(1),
-                },
-                "",
-                None,
-                &mapped,
-                line_decorations,
-            );
+            let grid = preview.desired_editor_grid_with_line_decorations(&EngineFrame::new(text, byte.saturating_add(1)), "", None, &mapped, line_decorations);
             std::hint::black_box(grid);
         }
 
         let amount = self.height.saturating_sub(1).checked_div(2).unwrap_or(1);
-        let target_line = frame
-            .text
-            .line_of_byte(frame.cursor_byte)
-            .saturating_add(amount);
+        let target_line = frame.text.line_of_byte(frame.cursor_byte).saturating_add(amount);
         if target_line <= frame.text.line_of_byte(frame.text.len()) {
             let mut preview = self.clone();
             preview.top_line = preview.top_line.saturating_add(amount);
-            let moved = EngineFrame {
-                text: frame.text.clone(),
-                cursor_byte: frame.text.byte_of_line(target_line),
-            };
-            let grid = preview.desired_editor_grid_with_line_decorations(
-                &moved,
-                "",
-                None,
-                decorations,
-                line_decorations,
-            );
+            let moved = EngineFrame::new(frame.text.clone(), frame.text.byte_of_line(target_line));
+            let grid = preview.desired_editor_grid_with_line_decorations(&moved, "", None, decorations, line_decorations);
             std::hint::black_box(grid);
             preview.top_line = self.top_line;
-            let grid = preview.desired_editor_grid_with_line_decorations(
-                frame,
-                "",
-                None,
-                decorations,
-                line_decorations,
-            );
+            let grid = preview.desired_editor_grid_with_line_decorations(frame, "", None, decorations, line_decorations);
             std::hint::black_box(grid);
         }
     }
 
-    fn prefetch_editor_viewport(
-        &mut self,
-        frame: &EngineFrame,
-        top_line: usize,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) {
-        let already_cached = self.cached_editor_render.as_ref().is_some_and(|cached| {
-            cached.top_line == top_line && cached.text.same_snapshot(&frame.text)
-        }) || self.cached_editor_viewports.iter().any(|viewport| {
-            viewport.render.top_line == top_line && viewport.render.text.same_snapshot(&frame.text)
-        });
+    fn prefetch_editor_viewport(&mut self, frame: &EngineFrame, top_line: usize, decorations: &[DecorationSpan], line_decorations: &[LineDecoration]) {
+        let already_cached = self.cached_editor_render.as_ref().is_some_and(|cached| cached.top_line == top_line && cached.text.same_snapshot(&frame.text))
+            || self.cached_editor_viewports.iter().any(|viewport| viewport.render.top_line == top_line && viewport.render.text.same_snapshot(&frame.text));
         if already_cached {
             return;
         }
@@ -3003,62 +2112,28 @@ impl ViewportLayout {
         preview.color_column = self.color_column;
         preview.theme = self.theme;
         preview.ensure_cursor_visible(frame, 0);
-        let _ = preview.desired_editor_grid_with_line_decorations(
-            frame,
-            "",
-            None,
-            decorations,
-            line_decorations,
-        );
+        let _ = preview.desired_editor_grid_with_line_decorations(frame, "", None, decorations, line_decorations);
         preview.prepare_editor_realtime_updates(frame, decorations, line_decorations);
         if let Some(render) = preview.cached_editor_render
             && preview.cached_rows.len() == self.height
         {
-            self.cached_editor_viewports.push(CachedEditorViewport {
-                render,
-                rows: preview.cached_rows,
-            });
+            self.cached_editor_viewports.push(CachedEditorViewport { render, rows: preview.cached_rows });
             self.prune_recent_editor_viewports();
         }
     }
 
-    fn workspace_panes(
-        &mut self,
-        root: &SplitTree,
-        content_height: usize,
-    ) -> Vec<(WindowId, Rect)> {
+    fn workspace_panes(&mut self, root: &SplitTree, content_height: usize) -> Vec<(WindowId, Rect)> {
         let mut panes = Vec::new();
-        split_rectangles(
-            root,
-            Rect {
-                column: 0,
-                row: 0,
-                width: self.workspace_width(),
-                height: content_height,
-            },
-            &mut panes,
-        );
-        self.pane_layouts
-            .retain(|window_id, _| panes.iter().any(|(visible, _)| visible == window_id));
+        split_rectangles(root, Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height }, &mut panes);
+        self.pane_layouts.retain(|window_id, _| panes.iter().any(|(visible, _)| visible == window_id));
         panes
     }
 
-    fn full_workspace_pane(
-        &self,
-        panes: &[(WindowId, Rect)],
-        content_height: usize,
-    ) -> Option<(WindowId, Rect)> {
+    fn full_workspace_pane(&self, panes: &[(WindowId, Rect)], content_height: usize) -> Option<(WindowId, Rect)> {
         let [pane] = panes else {
             return None;
         };
-        (pane.1
-            == Rect {
-                column: 0,
-                row: 0,
-                width: self.workspace_width(),
-                height: content_height,
-            })
-        .then_some(*pane)
+        (pane.1 == Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height }).then_some(*pane)
     }
 
     fn compose_workspace_panes(
@@ -3073,79 +2148,40 @@ impl ViewportLayout {
         let mut rows = vec![CellRow::default(); self.height];
         let mut cursor = (0, 0);
         for &(window_id, rectangle) in panes {
-            let Some(source) =
-                workspace_pane_source(model, frames, decorations, line_decorations, window_id)
-            else {
+            let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, window_id) else {
                 continue;
             };
-            let grid = self.render_workspace_pane(
-                window_id,
-                rectangle,
-                source.window.top_line,
-                source.frame,
-                source.decorations,
-                source.line_decorations,
-            );
+            let grid = self.render_workspace_pane(window_id, rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
             merge_pane_rows(&mut rows, rectangle, &grid.rows);
             if window_id == active_window {
-                cursor = (
-                    rectangle.column + grid.cursor.0,
-                    rectangle.row + grid.cursor.1,
-                );
+                cursor = (rectangle.column + grid.cursor.0, rectangle.row + grid.cursor.1);
             }
         }
         (rows, cursor)
     }
 
-    fn paint_workspace_footer(
-        &self,
-        rows: &mut [CellRow],
-        cursor: &mut (usize, usize),
-        status: &str,
-        prompt: Option<&str>,
-    ) {
+    fn paint_workspace_footer(&self, rows: &mut [CellRow], cursor: &mut (usize, usize), status: &str, prompt: Option<&str>) {
         let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
             return;
         };
         let status_row = self.height.saturating_sub(1);
-        rows[status_row] = row_from_text(
-            label,
-            self.width,
-            prompt_style(prompt.is_some()),
-            self.tab_width,
-        );
+        rows[status_row] = row_from_text(label, self.width, prompt_style(prompt.is_some()), self.tab_width);
         if prompt.is_some() {
             *cursor = self.prompt_cursor(label);
         }
     }
 
-    fn finish_workspace_grid(
-        &mut self,
-        mut rows: Vec<CellRow>,
-        cursor: (usize, usize),
-    ) -> DesiredGrid {
+    fn finish_workspace_grid(&mut self, mut rows: Vec<CellRow>, cursor: (usize, usize)) -> DesiredGrid {
         ensure_row_backgrounds(&mut rows);
         apply_theme_to_rows(&mut rows, self.theme);
         let rows: Vec<_> = rows
             .into_iter()
             .enumerate()
-            .map(|(index, row)| {
-                self.cached_rows
-                    .get(index)
-                    .filter(|cached| cached.as_ref() == &row)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(row))
-            })
+            .map(|(index, row)| self.cached_rows.get(index).filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)))
             .collect();
         self.cached_rows.clone_from(&rows);
         self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: self.width,
-            height: self.height,
-            rows,
-            cursor,
-        }
+        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor, raster_overlay: None }
     }
 
     fn render_workspace_pane(
@@ -3157,9 +2193,7 @@ impl ViewportLayout {
         decorations: &SharedDecorations,
         line_decorations: &[LineDecoration],
     ) -> DesiredGrid {
-        let pane = self.pane_layouts.entry(window_id).or_insert_with(|| {
-            Box::new(Self::new(rectangle.width.max(1), rectangle.height.max(1)))
-        });
+        let pane = self.pane_layouts.entry(window_id).or_insert_with(|| Box::new(Self::new(rectangle.width.max(1), rectangle.height.max(1))));
         let pane_width = rectangle.width.max(1);
         let pane_height = rectangle.height.max(1);
         if pane.width != pane_width || pane.height != pane_height {
@@ -3174,75 +2208,37 @@ impl ViewportLayout {
         pane.color_column = self.color_column;
         pane.set_theme(self.theme);
         pane.ensure_cursor_visible(frame, 0);
-        pane.desired_editor_grid_with_shared_decorations(
-            frame,
-            "",
-            None,
-            decorations,
-            line_decorations,
-        )
+        pane.desired_editor_grid_with_shared_decorations(frame, "", None, decorations, line_decorations)
     }
 
-    fn finish_single_pane_workspace(
-        &mut self,
-        grid: DesiredGrid,
-        status: &str,
-        prompt: Option<&str>,
-    ) -> DesiredGrid {
+    fn finish_single_pane_workspace(&mut self, grid: DesiredGrid, status: &str, prompt: Option<&str>) -> DesiredGrid {
         let mut rows = grid.rows;
         let mut cursor = grid.cursor;
         if !status.is_empty() || prompt.is_some() {
             let label = prompt.unwrap_or(status);
-            let style = if prompt.is_some() {
-                CellStyle::default()
-            } else {
-                CellStyle {
-                    bold: true,
-                    reverse: true,
-                    ..CellStyle::default()
-                }
-            };
+            let style = if prompt.is_some() { CellStyle::default() } else { CellStyle::default().with_bold().with_reverse() };
             let mut status_rows = vec![row_from_text(label, self.width, style, self.tab_width)];
             ensure_row_backgrounds(&mut status_rows);
             apply_theme_to_rows(&mut status_rows, self.theme);
             let row = status_rows.pop().unwrap_or_default();
-            rows.push(
-                self.cached_rows
-                    .last()
-                    .filter(|cached| cached.as_ref() == &row)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(row)),
-            );
+            rows.push(self.cached_rows.last().filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)));
             if prompt.is_some() {
                 let input = label.split("  │  ").next().unwrap_or(label);
-                cursor = (
-                    display_width(input, self.tab_width).min(self.width.saturating_sub(1)),
-                    self.height.saturating_sub(1),
-                );
+                cursor = (display_width(input, self.tab_width).min(self.width.saturating_sub(1)), self.height.saturating_sub(1));
             }
         }
         rows.resize_with(self.height, || Arc::new(CellRow::default()));
         rows.truncate(self.height);
         self.cached_rows.clone_from(&rows);
         self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width: self.width,
-            height: self.height,
-            rows,
-            cursor,
-        }
+        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor, raster_overlay: None }
     }
 
     /// Draws Telescope's horizontal results/preview layout as a floating surface.
     /// The overlay deliberately lives above the editor grid so picker interaction
     /// never mutates buffer or split state.
     #[must_use]
-    pub fn apply_picker_overlay(
-        &mut self,
-        grid: DesiredGrid,
-        picker: &PickerOverlay,
-    ) -> DesiredGrid {
+    pub fn apply_picker_overlay(&mut self, grid: DesiredGrid, picker: &PickerOverlay) -> DesiredGrid {
         if self.width < 20 || self.height < 8 {
             return grid;
         }
@@ -3256,11 +2252,7 @@ impl ViewportLayout {
             grid,
             rows,
             (
-                geometry
-                    .column
-                    .saturating_add(3)
-                    .saturating_add(display_width(&picker.prompt, self.tab_width))
-                    .min(geometry.column + geometry.width - 2),
+                geometry.column.saturating_add(3).saturating_add(display_width(&picker.prompt, self.tab_width)).min(geometry.column + geometry.width - 2),
                 geometry.prompt_row,
             ),
         )
@@ -3268,20 +2260,12 @@ impl ViewportLayout {
 
     fn picker_geometry(&self) -> PickerGeometry {
         let width = self.width.saturating_sub(4).clamp(16, 120);
-        let height = self
-            .height
-            .saturating_sub(2)
-            .min(self.height.saturating_mul(4) / 5)
-            .max(8);
+        let height = self.height.saturating_sub(2).min(self.height.saturating_mul(4) / 5).max(8);
         let column = self.width.saturating_sub(width) / 2;
         let row = self.height.saturating_sub(height) / 2;
         let preview_visible = width >= 64;
         let inner_width = width.saturating_sub(2);
-        let result_width = if preview_visible {
-            inner_width.saturating_mul(2) / 5
-        } else {
-            inner_width
-        };
+        let result_width = if preview_visible { inner_width.saturating_mul(2) / 5 } else { inner_width };
         let prompt_row = row + height - 2;
         let content_start = row + 2;
         PickerGeometry {
@@ -3301,202 +2285,58 @@ impl ViewportLayout {
 
     fn picker_styles(&self) -> PickerStyles {
         PickerStyles {
-            base: CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.mantle)),
-                ..CellStyle::default()
-            },
-            border: CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.blue)),
-                background: Some(CellColor::Rgb(self.theme.mantle)),
-                ..CellStyle::default()
-            },
-            title: CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.lavender)),
-                background: Some(CellColor::Rgb(self.theme.mantle)),
-                ..CellStyle::default()
-            },
-            selected: CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.surface2)),
-                ..CellStyle::default()
-            },
-            detail: CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.subtext0)),
-                background: Some(CellColor::Rgb(self.theme.mantle)),
-                ..CellStyle::default()
-            },
+            base: CellStyle::rgb(self.theme.text, self.theme.mantle),
+            border: CellStyle::rgb(self.theme.blue, self.theme.mantle).with_bold(),
+            title: CellStyle::rgb(self.theme.lavender, self.theme.mantle).with_bold(),
+            selected: CellStyle::rgb(self.theme.text, self.theme.surface2).with_bold(),
+            detail: CellStyle::rgb(self.theme.subtext0, self.theme.mantle),
         }
     }
 
-    fn draw_picker_shell(
-        &self,
-        rows: &mut [CellRow],
-        picker: &PickerOverlay,
-        geometry: PickerGeometry,
-        styles: PickerStyles,
-    ) {
-        for target_row in geometry.row..geometry.row.saturating_add(geometry.height).min(rows.len())
-        {
-            paint_text(
-                &mut rows[target_row],
-                geometry.column,
-                geometry.width,
-                "",
-                styles.base,
-            );
-        }
-        let top = format!("╭{}╮", "─".repeat(geometry.width.saturating_sub(2)));
-        let bottom = format!("╰{}╯", "─".repeat(geometry.width.saturating_sub(2)));
-        paint_text(
-            &mut rows[geometry.row],
-            geometry.column,
-            geometry.width,
-            &top,
-            styles.border,
-        );
-        paint_text(
-            &mut rows[geometry.row + geometry.height - 1],
-            geometry.column,
-            geometry.width,
-            &bottom,
-            styles.border,
-        );
-        for target in rows
-            .iter_mut()
-            .take(geometry.row + geometry.height - 1)
-            .skip(geometry.row + 1)
-        {
-            paint_text(target, geometry.column, 1, "│", styles.border);
-            paint_text(
-                target,
-                geometry.column + geometry.width - 1,
-                1,
-                "│",
-                styles.border,
-            );
-        }
+    fn draw_picker_shell(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
+        draw_popup_frame(rows, geometry.column, geometry.row, geometry.width, geometry.height, styles.base, styles.border, "");
         let title = format!(" {} ({}) ", picker.title, picker.rows.len());
-        paint_text(
-            &mut rows[geometry.row],
-            geometry.column + 2,
-            title.len().min(geometry.width.saturating_sub(4)),
-            &title,
-            styles.title,
-        );
+        paint_text(&mut rows[geometry.row], geometry.column + 2, title.len().min(geometry.width.saturating_sub(4)), &title, styles.title);
         let prompt = format!("❯ {}", picker.prompt);
-        paint_text(
-            &mut rows[geometry.prompt_row],
-            geometry.column + 1,
-            geometry.inner_width,
-            &prompt,
-            CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.surface0)),
-                ..CellStyle::default()
-            },
-        );
-        let footer_width =
-            display_width(&picker.footer, 1).min(geometry.result_width.saturating_sub(2));
+        paint_text(&mut rows[geometry.prompt_row], geometry.column + 1, geometry.inner_width, &prompt, CellStyle::rgb(self.theme.text, self.theme.surface0));
+        let footer_width = display_width(&picker.footer, 1).min(geometry.result_width.saturating_sub(2));
         if footer_width > 0 {
-            paint_text(
-                &mut rows[geometry.row + 1],
-                geometry.column + 2,
-                footer_width,
-                &picker.footer,
-                styles.detail,
-            );
+            paint_text(&mut rows[geometry.row + 1], geometry.column + 2, footer_width, &picker.footer, styles.detail);
         }
     }
 
-    fn draw_picker_results(
-        &self,
-        rows: &mut [CellRow],
-        picker: &PickerOverlay,
-        geometry: PickerGeometry,
-        styles: PickerStyles,
-    ) {
+    fn draw_picker_results(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
         let selected = picker.selected.min(picker.rows.len().saturating_sub(1));
-        let result_start = selected
-            .saturating_sub(geometry.content_height.saturating_sub(1) / 2)
-            .min(picker.rows.len().saturating_sub(geometry.content_height));
-        for (screen_index, item) in picker
-            .rows
-            .iter()
-            .skip(result_start)
-            .take(geometry.content_height)
-            .enumerate()
-        {
+        let result_start =
+            selected.saturating_sub(geometry.content_height.saturating_sub(1) / 2).min(picker.rows.len().saturating_sub(geometry.content_height));
+        for (screen_index, item) in picker.rows.iter().skip(result_start).take(geometry.content_height).enumerate() {
             let item_index = result_start + screen_index;
             let marker = if item_index == selected { "❯ " } else { "  " };
-            let label = if item.detail.is_empty() {
-                format!("{marker}{}", item.label)
-            } else {
-                format!("{marker}{}  {}", item.label, item.detail)
-            };
+            let label = if item.detail.is_empty() { format!("{marker}{}", item.label) } else { format!("{marker}{}  {}", item.label, item.detail) };
             paint_text(
                 &mut rows[geometry.content_start + screen_index],
                 geometry.column + 1,
                 geometry.result_width,
                 &label,
-                if item_index == selected {
-                    styles.selected
-                } else {
-                    styles.base
-                },
+                if item_index == selected { styles.selected } else { styles.base },
             );
         }
     }
 
-    fn draw_picker_preview(
-        &self,
-        rows: &mut [CellRow],
-        picker: &PickerOverlay,
-        geometry: PickerGeometry,
-        styles: PickerStyles,
-    ) {
+    fn draw_picker_preview(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
         if !geometry.preview_visible {
             return;
         }
         let divider_column = geometry.column + 1 + geometry.result_width;
-        for target in rows
-            .iter_mut()
-            .take(geometry.prompt_row)
-            .skip(geometry.row + 1)
-        {
+        for target in rows.iter_mut().take(geometry.prompt_row).skip(geometry.row + 1) {
             paint_text(target, divider_column, 1, "│", styles.border);
         }
         let preview_column = divider_column + 1;
-        paint_text(
-            &mut rows[geometry.row + 1],
-            preview_column,
-            geometry.preview_width,
-            &format!(" {} ", picker.preview_title),
-            styles.title,
-        );
-        let preview_lines =
-            wrap_popup_text(&picker.preview, geometry.preview_width, self.tab_width);
-        for (line_offset, line) in preview_lines
-            .iter()
-            .filter(|line| line.source_line >= picker.preview_scroll)
-            .take(geometry.content_height)
-            .enumerate()
-        {
-            let style = if picker.preview_highlight_line == Some(line.source_line) {
-                styles.selected
-            } else {
-                styles.base
-            };
-            paint_text(
-                &mut rows[geometry.content_start + line_offset],
-                preview_column,
-                geometry.preview_width,
-                &line.text,
-                style,
-            );
+        paint_text(&mut rows[geometry.row + 1], preview_column, geometry.preview_width, &format!(" {} ", picker.preview_title), styles.title);
+        let preview_lines = wrap_popup_text(&picker.preview, geometry.preview_width, self.tab_width);
+        for (line_offset, line) in preview_lines.iter().filter(|line| line.source_line >= picker.preview_scroll).take(geometry.content_height).enumerate() {
+            let style = if picker.preview_highlight_line == Some(line.source_line) { styles.selected } else { styles.base };
+            paint_text(&mut rows[geometry.content_start + line_offset], preview_column, geometry.preview_width, &line.text, style);
             paint_decorated_popup_text(
                 &mut rows[geometry.content_start + line_offset],
                 preview_column,
@@ -3511,11 +2351,7 @@ impl ViewportLayout {
     /// Draws an nvim-cmp compatible popup menu at the active cursor and a
     /// documentation window alongside it when the selected item has docs.
     #[must_use]
-    pub fn apply_completion_overlay(
-        &mut self,
-        grid: DesiredGrid,
-        completion: &CompletionOverlay,
-    ) -> DesiredGrid {
+    pub fn apply_completion_overlay(&mut self, grid: DesiredGrid, completion: &CompletionOverlay) -> DesiredGrid {
         if completion.rows.is_empty() || self.width < 12 || self.height < 4 {
             return grid;
         }
@@ -3524,88 +2360,38 @@ impl ViewportLayout {
         let menu = self.completion_menu(cursor, completion);
         let styles = self.completion_styles();
         self.draw_completion_menu(&mut rows, completion, menu, styles);
-        self.draw_completion_documentation(
-            &mut rows,
-            completion,
-            menu.rectangle,
-            styles.base,
-            styles.border,
-        );
+        self.draw_completion_documentation(&mut rows, completion, menu.rectangle, styles.base, styles.border);
         self.finish_overlay(grid, rows, cursor)
     }
 
-    fn completion_menu(
-        &self,
-        cursor: (usize, usize),
-        completion: &CompletionOverlay,
-    ) -> CompletionMenu {
+    fn completion_menu(&self, cursor: (usize, usize), completion: &CompletionOverlay) -> CompletionMenu {
         let visible_rows = completion.rows.len().min(10);
         let menu_height = visible_rows + 2;
         let longest = completion
             .rows
             .iter()
             .map(|row| {
-                display_width(&row.label, 1)
-                    .saturating_add(display_width(&row.detail, 1))
-                    .saturating_add(display_width(&row.source, 1))
-                    .saturating_add(7)
+                display_width(&row.label, 1).saturating_add(display_width(&row.detail, 1)).saturating_add(display_width(&row.source, 1)).saturating_add(7)
             })
             .max()
             .unwrap_or(20);
         let menu_width = longest.clamp(20, 52).min(self.width.saturating_sub(1));
         let menu_column = cursor.0.min(self.width.saturating_sub(menu_width));
-        let menu_row = if cursor.1 + menu_height + 1 < self.height {
-            cursor.1 + 1
-        } else {
-            cursor.1.saturating_sub(menu_height)
-        };
-        let selected = completion
-            .selected
-            .unwrap_or(0)
-            .min(completion.rows.len().saturating_sub(1));
-        let start = selected
-            .saturating_sub(visible_rows.saturating_sub(1) / 2)
-            .min(completion.rows.len().saturating_sub(visible_rows));
-        CompletionMenu {
-            rectangle: Rect {
-                column: menu_column,
-                row: menu_row,
-                width: menu_width,
-                height: menu_height,
-            },
-            visible_rows,
-            start,
-        }
+        let menu_row = if cursor.1 + menu_height + 1 < self.height { cursor.1 + 1 } else { cursor.1.saturating_sub(menu_height) };
+        let selected = completion.selected.unwrap_or(0).min(completion.rows.len().saturating_sub(1));
+        let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2).min(completion.rows.len().saturating_sub(visible_rows));
+        CompletionMenu { rectangle: Rect { column: menu_column, row: menu_row, width: menu_width, height: menu_height }, visible_rows, start }
     }
 
     fn completion_styles(&self) -> CompletionStyles {
         CompletionStyles {
-            base: CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.surface0)),
-                ..CellStyle::default()
-            },
-            border: CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.blue)),
-                background: Some(CellColor::Rgb(self.theme.base)),
-                ..CellStyle::default()
-            },
-            selected: CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.surface2)),
-                ..CellStyle::default()
-            },
+            base: CellStyle::rgb(self.theme.text, self.theme.surface0),
+            border: CellStyle::rgb(self.theme.blue, self.theme.base),
+            selected: CellStyle::rgb(self.theme.text, self.theme.surface2).with_bold(),
         }
     }
 
-    fn draw_completion_menu(
-        &self,
-        rows: &mut [CellRow],
-        completion: &CompletionOverlay,
-        menu: CompletionMenu,
-        styles: CompletionStyles,
-    ) {
+    fn draw_completion_menu(&self, rows: &mut [CellRow], completion: &CompletionOverlay, menu: CompletionMenu, styles: CompletionStyles) {
         draw_popup_frame(
             rows,
             menu.rectangle.column,
@@ -3616,13 +2402,7 @@ impl ViewportLayout {
             styles.border,
             "completion",
         );
-        for (offset, item) in completion
-            .rows
-            .iter()
-            .skip(menu.start)
-            .take(menu.visible_rows)
-            .enumerate()
-        {
+        for (offset, item) in completion.rows.iter().skip(menu.start).take(menu.visible_rows).enumerate() {
             let item_index = menu.start + offset;
             let is_selected = completion.selected == Some(item_index);
             paint_text(
@@ -3630,78 +2410,27 @@ impl ViewportLayout {
                 menu.rectangle.column + 1,
                 menu.rectangle.width.saturating_sub(2),
                 &completion_label(item, is_selected),
-                if is_selected {
-                    styles.selected
-                } else {
-                    styles.base
-                },
+                if is_selected { styles.selected } else { styles.base },
             );
         }
     }
 
-    fn draw_completion_documentation(
-        &self,
-        rows: &mut [CellRow],
-        completion: &CompletionOverlay,
-        menu: Rect,
-        base_style: CellStyle,
-        border_style: CellStyle,
-    ) {
+    fn draw_completion_documentation(&self, rows: &mut [CellRow], completion: &CompletionOverlay, menu: Rect, base_style: CellStyle, border_style: CellStyle) {
         if completion.documentation.is_empty() || self.width < 48 {
             return;
         }
         let available_right = self.width.saturating_sub(menu.column + menu.width + 1);
-        let docs_width = 50
-            .min(self.width.saturating_sub(2))
-            .min(if available_right >= 24 {
-                available_right
-            } else {
-                menu.column.saturating_sub(1)
-            });
+        let docs_width = 50.min(self.width.saturating_sub(2)).min(if available_right >= 24 { available_right } else { menu.column.saturating_sub(1) });
         if docs_width < 20 {
             return;
         }
-        let docs_column = if available_right >= docs_width {
-            menu.column + menu.width + 1
-        } else {
-            menu.column.saturating_sub(docs_width + 1)
-        };
-        let docs_height = (completion
-            .documentation
-            .lines()
-            .skip(completion.documentation_scroll)
-            .count()
-            .min(12)
-            + 2)
-        .clamp(4, self.height.saturating_sub(menu.row).max(4));
-        let docs_style = CellStyle {
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..base_style
-        };
-        draw_popup_frame(
-            rows,
-            docs_column,
-            menu.row,
-            docs_width,
-            docs_height,
-            docs_style,
-            border_style,
-            "documentation",
-        );
-        for (offset, line) in completion
-            .documentation
-            .lines()
-            .skip(completion.documentation_scroll)
-            .take(docs_height.saturating_sub(2))
-            .enumerate()
-        {
-            paint_text(
-                &mut rows[menu.row + 1 + offset],
-                docs_column + 1,
-                docs_width.saturating_sub(2),
-                line,
-                docs_style,
-            );
+        let docs_column = if available_right >= docs_width { menu.column + menu.width + 1 } else { menu.column.saturating_sub(docs_width + 1) };
+        let docs_height =
+            (completion.documentation.lines().skip(completion.documentation_scroll).count().min(12) + 2).clamp(4, self.height.saturating_sub(menu.row).max(4));
+        let docs_style = base_style.with_background(CellColor::Rgb(self.theme.mantle));
+        draw_popup_frame(rows, docs_column, menu.row, docs_width, docs_height, docs_style, border_style, "documentation");
+        for (offset, line) in completion.documentation.lines().skip(completion.documentation_scroll).take(docs_height.saturating_sub(2)).enumerate() {
+            paint_text(&mut rows[menu.row + 1 + offset], docs_column + 1, docs_width.saturating_sub(2), line, docs_style);
         }
     }
 
@@ -3715,12 +2444,7 @@ impl ViewportLayout {
         let cursor = grid.cursor;
         let max_inner_width = popup_max_inner_width(self.width);
         let lines = wrap_popup_text(&popup.text, max_inner_width, self.tab_width);
-        let inner_width = lines
-            .iter()
-            .map(|line| display_width(&line.text, self.tab_width))
-            .max()
-            .unwrap_or(1)
-            .clamp(1, max_inner_width);
+        let inner_width = lines.iter().map(|line| display_width(&line.text, self.tab_width)).max().unwrap_or(1).clamp(1, max_inner_width);
         let width = inner_width + 2;
         let visible_capacity = lines.len().min(self.height.saturating_sub(3).max(1));
         let maximum_scroll = lines.len().saturating_sub(visible_capacity);
@@ -3741,16 +2465,8 @@ impl ViewportLayout {
         let column = placement.column;
         let row = placement.row;
         let mut rows = overlay_rows(&grid);
-        let base_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-        let border_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.blue)),
-            background: Some(CellColor::Rgb(self.theme.base)),
-            ..CellStyle::default()
-        };
+        let base_style = CellStyle::rgb(self.theme.text, self.theme.mantle);
+        let border_style = CellStyle::rgb(self.theme.blue, self.theme.base);
         // A popup can extend past the final explicit cell in a short editor
         // row. Preserve that row's implicit tail before painting the float;
         // otherwise the terminal diff uses the popup border as the style for
@@ -3758,49 +2474,20 @@ impl ViewportLayout {
         for target in rows.iter_mut().skip(row).take(height) {
             materialize_row_tail(target, grid.width);
         }
-        draw_popup_frame(
-            &mut rows,
-            column,
-            row,
-            width,
-            height,
-            base_style,
-            border_style,
-            &popup.title,
-        );
+        draw_popup_frame(&mut rows, column, row, width, height, base_style, border_style, &popup.title);
         for (offset, line) in lines.iter().skip(scroll).take(visible_lines).enumerate() {
-            paint_text(
-                &mut rows[row + 1 + offset],
-                column + 1,
-                inner_width,
-                &line.text,
-                base_style,
-            );
-            paint_decorated_popup_text(
-                &mut rows[row + 1 + offset],
-                column + 1,
-                line,
-                &popup.decorations,
-                base_style,
-                self.tab_width,
-            );
+            paint_text(&mut rows[row + 1 + offset], column + 1, inner_width, &line.text, base_style);
+            paint_decorated_popup_text(&mut rows[row + 1 + offset], column + 1, line, &popup.decorations, base_style, self.tab_width);
         }
         let cursor = popup_cursor.map_or(cursor, |(cursor_row, cursor_column)| {
-            (
-                column.saturating_add(1).saturating_add(cursor_column),
-                row.saturating_add(1).saturating_add(cursor_row - scroll),
-            )
+            (column.saturating_add(1).saturating_add(cursor_column), row.saturating_add(1).saturating_add(cursor_row - scroll))
         });
         self.finish_overlay(grid, rows, cursor)
     }
 
     /// Composites a terminal-emulator surface into the docked right pane.
     #[must_use]
-    pub fn apply_terminal_sidebar(
-        &mut self,
-        grid: DesiredGrid,
-        sidebar: TerminalSidebar<'_>,
-    ) -> DesiredGrid {
+    pub fn apply_terminal_sidebar(&mut self, grid: DesiredGrid, sidebar: TerminalSidebar<'_>) -> DesiredGrid {
         let Some(column) = self.terminal_sidebar_column() else {
             return grid;
         };
@@ -3809,36 +2496,14 @@ impl ViewportLayout {
         for row in &mut rows {
             materialize_row_tail(row, column);
         }
-        let border = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.blue)),
-            background: Some(CellColor::Rgb(self.theme.base)),
-            ..CellStyle::default()
-        };
-        let terminal_base = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.base)),
-            ..CellStyle::default()
-        };
+        let border = CellStyle::rgb(self.theme.blue, self.theme.base);
+        let terminal_base = CellStyle::rgb(self.theme.text, self.theme.base);
         for (row_index, row) in rows.iter_mut().enumerate() {
             paint_text(row, column, 1, "│", border);
-            paint_cells(
-                row,
-                column.saturating_add(1),
-                inner_width,
-                sidebar
-                    .rows
-                    .get(row_index)
-                    .map_or(&[], |source| source.cells.as_slice()),
-                terminal_base,
-            );
+            paint_cells(row, column.saturating_add(1), inner_width, sidebar.rows.get(row_index).map_or(&[], |source| source.cells.as_slice()), terminal_base);
         }
         let cursor = if sidebar.focused {
-            (
-                column
-                    .saturating_add(1)
-                    .saturating_add(sidebar.cursor.0.min(inner_width.saturating_sub(1))),
-                sidebar.cursor.1.min(self.height.saturating_sub(1)),
-            )
+            (column.saturating_add(1).saturating_add(sidebar.cursor.0.min(inner_width.saturating_sub(1))), sidebar.cursor.1.min(self.height.saturating_sub(1)))
         } else {
             grid.cursor
         };
@@ -3873,12 +2538,7 @@ impl ViewportLayout {
         let usable_height = self.height.saturating_sub(status_rows);
         let bottom_height = usable_height.clamp(6, 10);
         let upper_height = usable_height.saturating_sub(bottom_height).max(4);
-        let left_width = self
-            .width
-            .saturating_mul(3)
-            .checked_div(10)
-            .unwrap_or(30)
-            .clamp(24, 40);
+        let left_width = self.width.saturating_mul(3).checked_div(10).unwrap_or(30).clamp(24, 40);
         for row in rows.iter_mut().take(upper_height.min(usable_height)) {
             let source = std::mem::take(&mut row.cells);
             pad_row_to(row, left_width);
@@ -3889,16 +2549,8 @@ impl ViewportLayout {
         if cursor.1 < upper_height {
             cursor.0 = cursor.0.saturating_add(left_width).min(self.width - 1);
         }
-        let base_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.text)),
-            background: Some(CellColor::Rgb(self.theme.mantle)),
-            ..CellStyle::default()
-        };
-        let border_style = CellStyle {
-            foreground: Some(CellColor::Rgb(self.theme.blue)),
-            background: Some(CellColor::Rgb(self.theme.base)),
-            ..CellStyle::default()
-        };
+        let base_style = CellStyle::rgb(self.theme.text, self.theme.mantle);
+        let border_style = CellStyle::rgb(self.theme.blue, self.theme.base);
         let panel_height = (upper_height / 4).max(3);
         for (index, (title, text)) in [
             ("Scopes", debug.scopes.as_ref()),
@@ -3910,36 +2562,12 @@ impl ViewportLayout {
         .enumerate()
         {
             let row = index.saturating_mul(panel_height);
-            let height = if index == 3 {
-                upper_height.saturating_sub(row).max(3)
-            } else {
-                panel_height
-            };
-            draw_text_panel(
-                &mut rows,
-                0,
-                row,
-                left_width,
-                height,
-                title,
-                text,
-                base_style,
-                border_style,
-            );
+            let height = if index == 3 { upper_height.saturating_sub(row).max(3) } else { panel_height };
+            draw_text_panel(&mut rows, 0, row, left_width, height, title, text, base_style, border_style);
         }
         let right_width = self.width.saturating_sub(left_width);
         let repl_width = right_width / 2;
-        draw_text_panel(
-            &mut rows,
-            left_width,
-            upper_height,
-            repl_width,
-            bottom_height,
-            "REPL",
-            &debug.repl,
-            base_style,
-            border_style,
-        );
+        draw_text_panel(&mut rows, left_width, upper_height, repl_width, bottom_height, "REPL", &debug.repl, base_style, border_style);
         draw_text_panel(
             &mut rows,
             left_width + repl_width,
@@ -3957,13 +2585,7 @@ impl ViewportLayout {
     /// Paints AceJump-style labels directly over visible matches in the active
     /// pane using the same split, gutter, tab, and wrap geometry as the buffer.
     #[must_use]
-    pub fn apply_ace_jump_overlay(
-        &mut self,
-        grid: DesiredGrid,
-        model: &ClientViewModel,
-        frame: &EngineFrame,
-        overlay: &AceJumpOverlay,
-    ) -> DesiredGrid {
+    pub fn apply_ace_jump_overlay(&mut self, grid: DesiredGrid, model: &ClientViewModel, frame: &EngineFrame, overlay: &AceJumpOverlay) -> DesiredGrid {
         if overlay.targets.is_empty() {
             return grid;
         }
@@ -3980,48 +2602,17 @@ impl ViewportLayout {
     fn ace_jump_pane(&self, model: &ClientViewModel, frame: &EngineFrame) -> Option<AceJumpPane> {
         let tab = model.active_tab();
         let mut panes = Vec::new();
-        split_rectangles(
-            &tab.root,
-            Rect {
-                column: 0,
-                row: 0,
-                width: self.workspace_width(),
-                height: self.height.saturating_sub(1).max(1),
-            },
-            &mut panes,
-        );
-        let (_, rectangle) = panes
-            .into_iter()
-            .find(|(window_id, _)| *window_id == tab.active_window)?;
-        let window = model
-            .windows
-            .iter()
-            .find(|window| window.id == tab.active_window)?;
-        let gutter = if self.line_numbers {
-            self.number_width.min(rectangle.width.saturating_sub(1))
-        } else {
-            0
-        };
+        split_rectangles(&tab.root, Rect { column: 0, row: 0, width: self.workspace_width(), height: self.height.saturating_sub(1).max(1) }, &mut panes);
+        let (_, rectangle) = panes.into_iter().find(|(window_id, _)| *window_id == tab.active_window)?;
+        let window = model.windows.iter().find(|window| window.id == tab.active_window)?;
+        let gutter = self.editor_gutter(rectangle.width);
         let content_width = rectangle.width.saturating_sub(gutter).max(1);
-        let start_byte = self.cached_frame_byte_of_line(frame, window.top_line);
-        let end_byte = frame
-            .text
-            .byte_of_line(window.top_line.saturating_add(rectangle.height.max(1)));
-        Some(AceJumpPane {
-            rectangle,
-            gutter,
-            content_width,
-            start_byte,
-            end_byte,
-        })
+        let start_byte = frame.text.byte_of_line(window.top_line);
+        let end_byte = frame.text.byte_of_line(window.top_line.saturating_add(rectangle.height.max(1)));
+        Some(AceJumpPane { rectangle, gutter, content_width, start_byte, end_byte })
     }
 
-    fn ace_jump_positions<'a>(
-        &self,
-        frame: &EngineFrame,
-        overlay: &'a AceJumpOverlay,
-        pane: AceJumpPane,
-    ) -> Vec<AceJumpPosition<'a>> {
+    fn ace_jump_positions<'a>(&self, frame: &EngineFrame, overlay: &'a AceJumpOverlay, pane: AceJumpPane) -> Vec<AceJumpPosition<'a>> {
         let wanted = overlay
             .targets
             .iter()
@@ -4037,19 +2628,9 @@ impl ViewportLayout {
             if let Some(label) = wanted.get(&byte)
                 && screen_row < pane.rectangle.height
             {
-                positions.push(AceJumpPosition {
-                    row: screen_row,
-                    column: screen_column,
-                    label,
-                });
+                positions.push(AceJumpPosition { row: screen_row, column: screen_column, label });
             }
-            advance_visual_position(
-                grapheme,
-                pane.content_width,
-                self.tab_width,
-                &mut screen_row,
-                &mut screen_column,
-            );
+            advance_visual_position(grapheme, pane.content_width, self.tab_width, &mut screen_row, &mut screen_column);
             byte = byte.saturating_add(grapheme.len());
             if screen_row >= pane.rectangle.height {
                 break;
@@ -4058,132 +2639,64 @@ impl ViewportLayout {
         positions
     }
 
-    fn paint_ace_jump_positions(
-        &self,
-        rows: &mut [CellRow],
-        pane: AceJumpPane,
-        positions: &[AceJumpPosition<'_>],
-    ) {
-        let style = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(self.theme.base)),
-            background: Some(CellColor::Rgb(self.theme.peach)),
-            ..CellStyle::default()
-        };
+    fn paint_ace_jump_positions(&self, rows: &mut [CellRow], pane: AceJumpPane, positions: &[AceJumpPosition<'_>]) {
+        let style = CellStyle::rgb(self.theme.base, self.theme.peach).with_bold();
         for position in positions {
             let row = pane.rectangle.row.saturating_add(position.row);
-            let column = pane
-                .rectangle
-                .column
-                .saturating_add(pane.gutter)
-                .saturating_add(position.column);
-            let available = pane
-                .rectangle
-                .column
-                .saturating_add(pane.rectangle.width)
-                .saturating_sub(column);
+            let column = pane.rectangle.column.saturating_add(pane.gutter).saturating_add(position.column);
+            let available = pane.rectangle.column.saturating_add(pane.rectangle.width).saturating_sub(column);
             if let Some(target) = rows.get_mut(row) {
-                paint_text(
-                    target,
-                    column,
-                    display_width(position.label, self.tab_width).min(available),
-                    position.label,
-                    style,
-                );
+                paint_text(target, column, display_width(position.label, self.tab_width).min(available), position.label, style);
             }
         }
     }
 
     #[must_use]
-    pub fn apply_status_overlay(
-        &mut self,
-        grid: DesiredGrid,
-        status: &StatusOverlay,
-    ) -> DesiredGrid {
+    pub fn apply_status_overlay(&mut self, grid: DesiredGrid, status: &StatusOverlay) -> DesiredGrid {
         if self.height == 0 {
             return grid;
         }
         let width = grid.width;
         let height = grid.height;
         let cursor = grid.cursor;
+        let raster_overlay = grid.raster_overlay;
         let mut rows = grid.rows;
         let row_index = self.height - 1;
-        let row = self
-            .cached_status_rows
-            .iter()
-            .rev()
-            .find(|(cached, _)| cached == status)
-            .map(|(_, row)| Arc::clone(row))
-            .unwrap_or_else(|| {
-                let base_style = CellStyle {
-                    foreground: Some(CellColor::Rgb(self.theme.subtext1)),
-                    background: Some(CellColor::Rgb(self.theme.mantle)),
-                    ..CellStyle::default()
-                };
-                let mut row = CellRow {
-                    cells: Vec::with_capacity(self.width),
-                };
-                let mut left_column = 0;
-                for segment in &status.left {
-                    let width =
-                        display_width(&segment.text, 1).min(self.width.saturating_sub(left_column));
-                    row.cells
-                        .extend(row_from_text(&segment.text, width, segment.style, 1).cells);
-                    left_column = left_column.saturating_add(width);
-                }
-                let right_width = status
-                    .right
-                    .iter()
-                    .map(|segment| display_width(&segment.text, 1))
-                    .sum::<usize>()
-                    .min(self.width.saturating_sub(left_column));
-                let mut right_column = self.width.saturating_sub(right_width);
-                row.cells.extend((left_column..right_column).map(|_| Cell {
-                    grapheme: single_byte_grapheme(b' '),
-                    width: 1,
-                    style: base_style,
-                }));
-                for segment in &status.right {
-                    let width = display_width(&segment.text, 1)
-                        .min(self.width.saturating_sub(right_column));
-                    row.cells
-                        .extend(row_from_text(&segment.text, width, segment.style, 1).cells);
-                    right_column = right_column.saturating_add(width);
-                }
-                row.cells.extend((right_column..self.width).map(|_| Cell {
-                    grapheme: single_byte_grapheme(b' '),
-                    width: 1,
-                    style: base_style,
-                }));
-                apply_theme_to_rows(std::slice::from_mut(&mut row), self.theme);
-                let row = Arc::new(row);
-                self.cached_status_rows
-                    .push((status.clone(), Arc::clone(&row)));
-                const STATUS_ROW_CACHE_CAPACITY: usize = 8;
-                if self.cached_status_rows.len() > STATUS_ROW_CACHE_CAPACITY {
-                    self.cached_status_rows.remove(0);
-                }
-                row
-            });
+        let row = self.cached_status_rows.iter().rev().find(|(cached, _)| cached == status).map(|(_, row)| Arc::clone(row)).unwrap_or_else(|| {
+            let base_style = CellStyle::rgb(self.theme.subtext1, self.theme.mantle);
+            let mut row = CellRow { cells: Vec::with_capacity(self.width) };
+            let mut left_column = 0;
+            for segment in &status.left {
+                let width = display_width(&segment.text, 1).min(self.width.saturating_sub(left_column));
+                row.cells.extend(row_from_text(&segment.text, width, segment.style, 1).cells);
+                left_column = left_column.saturating_add(width);
+            }
+            let right_width = status.right.iter().map(|segment| display_width(&segment.text, 1)).sum::<usize>().min(self.width.saturating_sub(left_column));
+            let mut right_column = self.width.saturating_sub(right_width);
+            row.cells.extend((left_column..right_column).map(|_| Cell { grapheme: single_byte_grapheme(b' '), width: 1, style: base_style }));
+            for segment in &status.right {
+                let width = display_width(&segment.text, 1).min(self.width.saturating_sub(right_column));
+                row.cells.extend(row_from_text(&segment.text, width, segment.style, 1).cells);
+                right_column = right_column.saturating_add(width);
+            }
+            row.cells.extend((right_column..self.width).map(|_| Cell { grapheme: single_byte_grapheme(b' '), width: 1, style: base_style }));
+            apply_theme_to_rows(std::slice::from_mut(&mut row), self.theme);
+            let row = Arc::new(row);
+            self.cached_status_rows.push((status.clone(), Arc::clone(&row)));
+            const STATUS_ROW_CACHE_CAPACITY: usize = 8;
+            if self.cached_status_rows.len() > STATUS_ROW_CACHE_CAPACITY {
+                self.cached_status_rows.remove(0);
+            }
+            row
+        });
         if let Some(target) = rows.get_mut(row_index) {
             *target = row;
         }
         self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid {
-            epoch: self.epoch,
-            width,
-            height,
-            rows,
-            cursor,
-        }
+        DesiredGrid { epoch: self.epoch, width, height, rows, cursor, raster_overlay }
     }
 
-    fn finish_overlay(
-        &mut self,
-        grid: DesiredGrid,
-        rows: Vec<CellRow>,
-        cursor: (usize, usize),
-    ) -> DesiredGrid {
+    fn finish_overlay(&mut self, grid: DesiredGrid, rows: Vec<CellRow>, cursor: (usize, usize)) -> DesiredGrid {
         self.epoch = self.epoch.saturating_add(1);
         DesiredGrid {
             epoch: self.epoch,
@@ -4191,6 +2704,7 @@ impl ViewportLayout {
             height: grid.height,
             rows: rows.into_iter().map(Arc::new).collect(),
             cursor,
+            raster_overlay: grid.raster_overlay,
         }
     }
 }
@@ -4231,6 +2745,40 @@ struct Rect {
     height: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RectSplit {
+    first: Rect,
+    border: Rect,
+    second: Rect,
+    border_grapheme: &'static str,
+}
+
+impl Rect {
+    fn split(self, axis: SplitAxis, ratio_milli: u16) -> RectSplit {
+        let extent = match axis {
+            SplitAxis::Vertical => self.width,
+            SplitAxis::Horizontal => self.height,
+        };
+        let available = extent.saturating_sub(1);
+        let first_extent =
+            available.saturating_mul(usize::from(ratio_milli)).checked_div(1000).unwrap_or_default().clamp(1, available.saturating_sub(1).max(1));
+        match axis {
+            SplitAxis::Vertical => RectSplit {
+                first: Rect { width: first_extent, ..self },
+                border: Rect { column: self.column + first_extent, width: 1, ..self },
+                second: Rect { column: self.column + first_extent + 1, width: available.saturating_sub(first_extent), ..self },
+                border_grapheme: "│",
+            },
+            SplitAxis::Horizontal => RectSplit {
+                first: Rect { height: first_extent, ..self },
+                border: Rect { row: self.row + first_extent, height: 1, ..self },
+                second: Rect { row: self.row + first_extent + 1, height: available.saturating_sub(first_extent), ..self },
+                border_grapheme: "─",
+            },
+        }
+    }
+}
+
 fn workspace_pane_source<'a>(
     model: &'a ClientViewModel,
     frames: &'a [(BufferId, EngineFrame)],
@@ -4239,26 +2787,11 @@ fn workspace_pane_source<'a>(
     window_id: WindowId,
 ) -> Option<WorkspacePaneSource<'a>> {
     let window = model.windows.iter().find(|window| window.id == window_id)?;
-    let frame = frames
-        .iter()
-        .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
-        .map(|(_, frame)| frame)?;
-    static EMPTY_DECORATIONS: std::sync::LazyLock<SharedDecorations> =
-        std::sync::LazyLock::new(|| Arc::new(Vec::new()));
-    let decorations = decorations
-        .iter()
-        .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
-        .map_or(&*EMPTY_DECORATIONS, |(_, spans)| spans);
-    let line_decorations = line_decorations
-        .iter()
-        .find(|(buffer_id, _)| *buffer_id == window.buffer_id)
-        .map_or(&[][..], |(_, spans)| spans.as_slice());
-    Some(WorkspacePaneSource {
-        window,
-        frame,
-        decorations,
-        line_decorations,
-    })
+    let frame = frames.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id).map(|(_, frame)| frame)?;
+    static EMPTY_DECORATIONS: std::sync::LazyLock<SharedDecorations> = std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+    let decorations = decorations.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id).map_or(&*EMPTY_DECORATIONS, |(_, spans)| spans);
+    let line_decorations = line_decorations.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id).map_or(&[][..], |(_, spans)| spans.as_slice());
+    Some(WorkspacePaneSource { window, frame, decorations, line_decorations })
 }
 
 fn merge_pane_rows(rows: &mut [CellRow], rectangle: Rect, pane_rows: &[Arc<CellRow>]) {
@@ -4295,22 +2828,10 @@ fn text_popup_placement(grid: &DesiredGrid, width: usize, height: usize) -> Popu
     // not make a visible float follow ordinary cursor movement. Cursor-local
     // placements remain useful when both sides of the editor contain text.
     let cursor_local_candidates = [
-        PopupPlacement {
-            column: right_of_cursor,
-            row: below_cursor,
-        },
-        PopupPlacement {
-            column: left_of_cursor,
-            row: below_cursor,
-        },
-        PopupPlacement {
-            column: right_of_cursor,
-            row: above_cursor,
-        },
-        PopupPlacement {
-            column: left_of_cursor,
-            row: above_cursor,
-        },
+        PopupPlacement { column: right_of_cursor, row: below_cursor },
+        PopupPlacement { column: left_of_cursor, row: below_cursor },
+        PopupPlacement { column: right_of_cursor, row: above_cursor },
+        PopupPlacement { column: left_of_cursor, row: above_cursor },
     ];
 
     (0..=bottom)
@@ -4319,39 +2840,23 @@ fn text_popup_placement(grid: &DesiredGrid, width: usize, height: usize) -> Popu
         .chain(cursor_local_candidates)
         .enumerate()
         .min_by_key(|(preference, placement)| {
-            (
-                occupied_cells_under_popup(grid, *placement, width, height),
-                popup_contains_cursor(*placement, width, height, grid.cursor),
-                *preference,
-            )
+            (occupied_cells_under_popup(grid, *placement, width, height), popup_contains_cursor(*placement, width, height, grid.cursor), *preference)
         })
-        .map_or(PopupPlacement { column: 0, row: 0 }, |(_, placement)| {
-            placement
-        })
+        .map_or(PopupPlacement { column: 0, row: 0 }, |(_, placement)| placement)
 }
 
 fn popup_max_inner_width(terminal_width: usize) -> usize {
     terminal_width.saturating_sub(4).clamp(4, 80)
 }
 
-fn popup_contains_cursor(
-    placement: PopupPlacement,
-    width: usize,
-    height: usize,
-    cursor: (usize, usize),
-) -> bool {
+fn popup_contains_cursor(placement: PopupPlacement, width: usize, height: usize, cursor: (usize, usize)) -> bool {
     cursor.0 >= placement.column
         && cursor.0 < placement.column.saturating_add(width)
         && cursor.1 >= placement.row
         && cursor.1 < placement.row.saturating_add(height)
 }
 
-fn occupied_cells_under_popup(
-    grid: &DesiredGrid,
-    placement: PopupPlacement,
-    width: usize,
-    height: usize,
-) -> usize {
+fn occupied_cells_under_popup(grid: &DesiredGrid, placement: PopupPlacement, width: usize, height: usize) -> usize {
     let popup_end = placement.column.saturating_add(width);
     grid.rows
         .iter()
@@ -4368,11 +2873,7 @@ fn occupied_cells_under_popup(
                     break;
                 }
                 if !cell.grapheme.chars().all(char::is_whitespace) {
-                    occupied = occupied.saturating_add(
-                        cell_end
-                            .min(popup_end)
-                            .saturating_sub(cell_start.max(placement.column)),
-                    );
+                    occupied = occupied.saturating_add(cell_end.min(popup_end).saturating_sub(cell_start.max(placement.column)));
                 }
             }
             occupied
@@ -4385,80 +2886,28 @@ fn apply_theme_to_rows(rows: &mut [CellRow], theme: CatppuccinPalette) {
         return;
     }
     for cell in rows.iter_mut().flat_map(|row| &mut row.cells) {
-        cell.style.foreground = cell
-            .style
-            .foreground
-            .map(|color| theme.remap_from_mocha(color));
-        cell.style.background = cell
-            .style
-            .background
-            .map(|color| theme.remap_from_mocha(color));
+        cell.style.foreground = cell.style.foreground.map(|color| theme.remap_from_mocha(color));
+        cell.style.background = cell.style.background.map(|color| theme.remap_from_mocha(color));
     }
 }
 
 fn ensure_row_backgrounds(rows: &mut [CellRow]) {
     for row in rows {
         if row.cells.is_empty() {
-            row.cells.push(Cell {
-                grapheme: " ".into(),
-                width: 1,
-                style: CellStyle::default(),
-            });
+            row.cells.push(Cell { grapheme: " ".into(), width: 1, style: CellStyle::default() });
         }
     }
 }
 
 fn paint_text(row: &mut CellRow, column: usize, width: usize, text: &str, style: CellStyle) {
-    if width == 0 {
-        return;
-    }
-    let end = column.saturating_add(width);
-    let mut before = Vec::new();
-    let mut after = Vec::new();
-    let mut display_column = 0_usize;
-    for cell in &row.cells {
-        let cell_end = display_column.saturating_add(usize::from(cell.width));
-        if cell_end <= column {
-            before.push(cell.clone());
-        } else if display_column >= end {
-            after.push(cell.clone());
-        }
-        display_column = cell_end;
-    }
-    let before_width = before
-        .iter()
-        .map(|cell| usize::from(cell.width))
-        .sum::<usize>();
-    before.extend((before_width..column).map(|_| Cell {
-        grapheme: " ".into(),
-        width: 1,
-        style,
-    }));
-    let mut replacement = row_from_text(text, width, style, 1);
-    let replacement_width = replacement
-        .cells
-        .iter()
-        .map(|cell| usize::from(cell.width))
-        .sum::<usize>();
-    replacement
-        .cells
-        .extend((replacement_width..width).map(|_| Cell {
-            grapheme: " ".into(),
-            width: 1,
-            style,
-        }));
-    before.append(&mut replacement.cells);
-    before.extend(after);
-    row.cells = before;
+    replace_cells(row, column, width, row_from_text(text, width, style, 1).cells, style);
 }
 
-fn paint_cells(
-    row: &mut CellRow,
-    column: usize,
-    width: usize,
-    cells: &[Cell],
-    fill_style: CellStyle,
-) {
+fn paint_cells(row: &mut CellRow, column: usize, width: usize, cells: &[Cell], fill_style: CellStyle) {
+    replace_cells(row, column, width, cells.iter().cloned(), fill_style);
+}
+
+fn replace_cells(row: &mut CellRow, column: usize, width: usize, replacement: impl IntoIterator<Item = Cell>, fill_style: CellStyle) {
     if width == 0 {
         return;
     }
@@ -4475,29 +2924,18 @@ fn paint_cells(
         }
         display_column = cell_end;
     }
-    let before_width = before
-        .iter()
-        .map(|cell| usize::from(cell.width))
-        .sum::<usize>();
-    before.extend((before_width..column).map(|_| Cell {
-        grapheme: " ".into(),
-        width: 1,
-        style: fill_style,
-    }));
+    let before_width = before.iter().map(|cell| usize::from(cell.width)).sum::<usize>();
+    before.extend((before_width..column).map(|_| Cell { grapheme: " ".into(), width: 1, style: fill_style }));
     let mut replacement_width = 0_usize;
-    for cell in cells {
+    for cell in replacement {
         let next = replacement_width.saturating_add(usize::from(cell.width));
         if next > width {
             break;
         }
-        before.push(cell.clone());
+        before.push(cell);
         replacement_width = next;
     }
-    before.extend((replacement_width..width).map(|_| Cell {
-        grapheme: " ".into(),
-        width: 1,
-        style: fill_style,
-    }));
+    before.extend((replacement_width..width).map(|_| Cell { grapheme: " ".into(), width: 1, style: fill_style }));
     before.extend(after);
     row.cells = before;
 }
@@ -4521,52 +2959,22 @@ fn truncate_row(row: &mut CellRow, width: usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_popup_frame(
-    rows: &mut [CellRow],
-    column: usize,
-    row: usize,
-    width: usize,
-    height: usize,
-    base_style: CellStyle,
-    border_style: CellStyle,
-    title: &str,
-) {
+fn draw_popup_frame(rows: &mut [CellRow], column: usize, row: usize, width: usize, height: usize, base_style: CellStyle, border_style: CellStyle, title: &str) {
     if width < 2 || height < 2 || row.saturating_add(height) > rows.len() {
         return;
     }
     for target in rows.iter_mut().skip(row).take(height) {
         paint_text(target, column, width, "", base_style);
     }
-    paint_text(
-        &mut rows[row],
-        column,
-        width,
-        &format!("╭{}╮", "─".repeat(width.saturating_sub(2))),
-        border_style,
-    );
-    paint_text(
-        &mut rows[row + height - 1],
-        column,
-        width,
-        &format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
-        border_style,
-    );
+    paint_text(&mut rows[row], column, width, &format!("╭{}╮", "─".repeat(width.saturating_sub(2))), border_style);
+    paint_text(&mut rows[row + height - 1], column, width, &format!("╰{}╯", "─".repeat(width.saturating_sub(2))), border_style);
     for target in rows.iter_mut().take(row + height - 1).skip(row + 1) {
         paint_text(target, column, 1, "│", border_style);
         paint_text(target, column + width - 1, 1, "│", border_style);
     }
     if !title.is_empty() {
         let title = format!(" {title} ");
-        paint_text(
-            &mut rows[row],
-            column + 2,
-            display_width(&title, 1).min(width.saturating_sub(4)),
-            &title,
-            CellStyle {
-                bold: true,
-                ..border_style
-            },
-        );
+        paint_text(&mut rows[row], column + 2, display_width(&title, 1).min(width.saturating_sub(4)), &title, border_style.with_bold());
     }
 }
 
@@ -4585,24 +2993,9 @@ fn draw_text_panel(
     if width < 4 || height < 3 {
         return;
     }
-    draw_popup_frame(
-        rows,
-        column,
-        row,
-        width,
-        height,
-        base_style,
-        border_style,
-        title,
-    );
+    draw_popup_frame(rows, column, row, width, height, base_style, border_style, title);
     for (offset, line) in text.lines().take(height.saturating_sub(2)).enumerate() {
-        paint_text(
-            &mut rows[row + 1 + offset],
-            column + 1,
-            width.saturating_sub(2),
-            line,
-            base_style,
-        );
+        paint_text(&mut rows[row + 1 + offset], column + 1, width.saturating_sub(2), line, base_style);
     }
 }
 
@@ -4617,76 +3010,39 @@ fn wrap_popup_text(text: &str, width: usize, tab_width: usize) -> Vec<WrappedPop
     let mut output = Vec::new();
     let mut source_offset = 0;
     for (source_line_number, source_with_newline) in text.split_inclusive('\n').enumerate() {
-        let without_newline = source_with_newline
-            .strip_suffix('\n')
-            .unwrap_or(source_with_newline);
-        let source_line = without_newline
-            .strip_suffix('\r')
-            .unwrap_or(without_newline);
-        output.extend(wrap_popup_line(
-            source_line,
-            source_offset,
-            source_line_number,
-            width,
-            tab_width,
-        ));
+        let without_newline = source_with_newline.strip_suffix('\n').unwrap_or(source_with_newline);
+        let source_line = without_newline.strip_suffix('\r').unwrap_or(without_newline);
+        output.extend(wrap_popup_line(source_line, source_offset, source_line_number, width, tab_width));
         source_offset += source_with_newline.len();
     }
     if output.is_empty() {
-        output.push(WrappedPopupLine {
-            text: String::new(),
-            source_start: 0,
-            source_line: 0,
-        });
+        output.push(WrappedPopupLine { text: String::new(), source_start: 0, source_line: 0 });
     }
     output
 }
 
-fn wrap_popup_line(
-    source: &str,
-    source_offset: usize,
-    source_line: usize,
-    width: usize,
-    tab_width: usize,
-) -> Vec<WrappedPopupLine> {
+fn wrap_popup_line(source: &str, source_offset: usize, source_line: usize, width: usize, tab_width: usize) -> Vec<WrappedPopupLine> {
     if source.is_empty() || display_width(source, tab_width) <= width {
-        return vec![WrappedPopupLine {
-            text: source.to_owned(),
-            source_start: source_offset,
-            source_line,
-        }];
+        return vec![WrappedPopupLine { text: source.to_owned(), source_start: source_offset, source_line }];
     }
     let mut output = Vec::new();
     let mut start = 0;
     while start < source.len() {
         let (display_end, next) = popup_wrap_boundary(source, start, width, tab_width);
-        output.push(WrappedPopupLine {
-            text: source[start..display_end].trim_end().to_owned(),
-            source_start: source_offset + start,
-            source_line,
-        });
+        output.push(WrappedPopupLine { text: source[start..display_end].trim_end().to_owned(), source_start: source_offset + start, source_line });
         start = skip_grapheme_whitespace(source, next);
     }
     output
 }
 
-fn popup_wrap_boundary(
-    source: &str,
-    start: usize,
-    width: usize,
-    tab_width: usize,
-) -> (usize, usize) {
+fn popup_wrap_boundary(source: &str, start: usize, width: usize, tab_width: usize) -> (usize, usize) {
     let mut used = 0_usize;
     let mut end = start;
     let mut whitespace = None;
     for (relative, grapheme) in source[start..].grapheme_indices(true) {
         let grapheme_start = start + relative;
         let grapheme_end = grapheme_start + grapheme.len();
-        let grapheme_width = if grapheme == "\t" {
-            tab_width.max(1) - (used % tab_width.max(1))
-        } else {
-            display_width(grapheme, 1)
-        };
+        let grapheme_width = if grapheme == "\t" { tab_width.max(1) - (used % tab_width.max(1)) } else { display_width(grapheme, 1) };
         if used.saturating_add(grapheme_width) > width && end > start {
             break;
         }
@@ -4699,24 +3055,15 @@ fn popup_wrap_boundary(
             break;
         }
     }
-    let end = if end == start {
-        first_grapheme_end(source, start)
-    } else {
-        end
-    };
+    let end = if end == start { first_grapheme_end(source, start) } else { end };
     match whitespace {
-        Some((space_start, space_end)) if space_start > start && end < source.len() => {
-            (space_start, space_end)
-        }
+        Some((space_start, space_end)) if space_start > start && end < source.len() => (space_start, space_end),
         _ => (end, end),
     }
 }
 
 fn first_grapheme_end(source: &str, start: usize) -> usize {
-    source[start..]
-        .graphemes(true)
-        .next()
-        .map_or(source.len(), |grapheme| start + grapheme.len())
+    source[start..].graphemes(true).next().map_or(source.len(), |grapheme| start + grapheme.len())
 }
 
 fn skip_grapheme_whitespace(source: &str, mut start: usize) -> usize {
@@ -4741,17 +3088,8 @@ fn paint_decorated_popup_text(
     for (relative, grapheme) in line.text.grapheme_indices(true) {
         let range = line.source_start + relative..line.source_start + relative + grapheme.len();
         if let Some(overlay) = decoration_overlay_style(decorations, range) {
-            let width = if grapheme == "\t" {
-                tab_width - ((display_column - column) % tab_width)
-            } else {
-                display_width(grapheme, 1)
-            };
-            apply_style_to_columns(
-                row,
-                display_column,
-                display_column.saturating_add(width),
-                merge_styles(base_style, overlay),
-            );
+            let width = if grapheme == "\t" { tab_width - ((display_column - column) % tab_width) } else { display_width(grapheme, 1) };
+            apply_style_to_columns(row, display_column, display_column.saturating_add(width), merge_styles(base_style, overlay));
             display_column = display_column.saturating_add(width);
         } else {
             display_column = display_column.saturating_add(display_width(grapheme, tab_width));
@@ -4777,112 +3115,33 @@ const fn merge_styles(base: CellStyle, overlay: CellStyle) -> CellStyle {
         underline: base.underline || overlay.underline,
         strikethrough: base.strikethrough || overlay.strikethrough,
         reverse: base.reverse || overlay.reverse,
-        foreground: if overlay.foreground.is_some() {
-            overlay.foreground
-        } else {
-            base.foreground
-        },
-        background: if overlay.background.is_some() {
-            overlay.background
-        } else {
-            base.background
-        },
+        foreground: if overlay.foreground.is_some() { overlay.foreground } else { base.foreground },
+        background: if overlay.background.is_some() { overlay.background } else { base.background },
     }
-}
-
-fn ranges_overlap(left: Range<usize>, right: Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 fn split_rectangles(tree: &SplitTree, rectangle: Rect, panes: &mut Vec<(WindowId, Rect)>) {
     match tree {
         SplitTree::Window(window) => panes.push((*window, rectangle)),
-        SplitTree::Split {
-            axis,
-            ratio_milli,
-            first,
-            second,
-        } => match axis {
-            SplitAxis::Vertical => {
-                let available = rectangle.width.saturating_sub(1);
-                let first_width = available
-                    .saturating_mul(usize::from(*ratio_milli))
-                    .checked_div(1000)
-                    .unwrap_or(0)
-                    .clamp(1, available.saturating_sub(1).max(1));
-                split_rectangles(
-                    first,
-                    Rect {
-                        width: first_width,
-                        ..rectangle
-                    },
-                    panes,
-                );
-                split_rectangles(
-                    second,
-                    Rect {
-                        column: rectangle.column + first_width + 1,
-                        width: available.saturating_sub(first_width),
-                        ..rectangle
-                    },
-                    panes,
-                );
-            }
-            SplitAxis::Horizontal => {
-                let available = rectangle.height.saturating_sub(1);
-                let first_height = available
-                    .saturating_mul(usize::from(*ratio_milli))
-                    .checked_div(1000)
-                    .unwrap_or(0)
-                    .clamp(1, available.saturating_sub(1).max(1));
-                split_rectangles(
-                    first,
-                    Rect {
-                        height: first_height,
-                        ..rectangle
-                    },
-                    panes,
-                );
-                split_rectangles(
-                    second,
-                    Rect {
-                        row: rectangle.row + first_height + 1,
-                        height: available.saturating_sub(first_height),
-                        ..rectangle
-                    },
-                    panes,
-                );
-            }
-        },
+        SplitTree::Split { axis, ratio_milli, first, second } => {
+            let split = rectangle.split(*axis, *ratio_milli);
+            split_rectangles(first, split.first, panes);
+            split_rectangles(second, split.second, panes);
+        }
     }
 }
 
 fn pad_row_to(row: &mut CellRow, column: usize) {
     let width: usize = row.cells.iter().map(|cell| usize::from(cell.width)).sum();
     for _ in width..column {
-        row.cells.push(Cell {
-            grapheme: " ".into(),
-            width: 1,
-            style: CellStyle::default(),
-        });
+        row.cells.push(Cell { grapheme: " ".into(), width: 1, style: CellStyle::default() });
     }
 }
 
 fn materialize_row_tail(row: &mut CellRow, width: usize) {
-    let current = row
-        .cells
-        .iter()
-        .map(|cell| usize::from(cell.width))
-        .sum::<usize>();
-    let style = row
-        .cells
-        .last()
-        .map_or_else(CellStyle::default, |cell| cell.style);
-    row.cells.extend((current..width).map(|_| Cell {
-        grapheme: " ".into(),
-        width: 1,
-        style,
-    }));
+    let current = row.cells.iter().map(|cell| usize::from(cell.width)).sum::<usize>();
+    let style = row.cells.last().map_or_else(CellStyle::default, |cell| cell.style);
+    row.cells.extend((current..width).map(|_| Cell { grapheme: " ".into(), width: 1, style }));
 }
 
 fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: RgbColor) {
@@ -4904,14 +3163,7 @@ fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: R
         }
         if display_column <= column {
             pad_row_to(row, column);
-            row.cells.push(Cell {
-                grapheme: " ".into(),
-                width: 1,
-                style: CellStyle {
-                    background: Some(CellColor::Rgb(color)),
-                    ..CellStyle::default()
-                },
-            });
+            row.cells.push(Cell { grapheme: " ".into(), width: 1, style: CellStyle::default().with_background(CellColor::Rgb(color)) });
         }
     }
 }
@@ -4920,14 +3172,7 @@ fn put_border(rows: &mut [CellRow], column: usize, row_index: usize, grapheme: &
     let Some(row) = rows.get_mut(row_index) else {
         return;
     };
-    let border = Cell {
-        grapheme: grapheme.into(),
-        width: 1,
-        style: CellStyle {
-            reverse: true,
-            ..CellStyle::default()
-        },
-    };
+    let border = Cell { grapheme: grapheme.into(), width: 1, style: CellStyle::default().with_reverse() };
     let mut display_column = 0;
     for cell in &mut row.cells {
         if display_column == column {
@@ -4940,77 +3185,21 @@ fn put_border(rows: &mut [CellRow], column: usize, row_index: usize, grapheme: &
     row.cells.push(border);
 }
 
-fn draw_split_borders(
-    tree: &SplitTree,
-    column: usize,
-    row: usize,
-    width: usize,
-    height: usize,
-    rows: &mut [CellRow],
-) {
-    let SplitTree::Split {
-        axis,
-        ratio_milli,
-        first,
-        second,
-    } = tree
-    else {
+fn draw_split_borders(tree: &SplitTree, column: usize, row: usize, width: usize, height: usize, rows: &mut [CellRow]) {
+    let SplitTree::Split { axis, ratio_milli, first, second } = tree else {
         return;
     };
-    match axis {
-        SplitAxis::Vertical => {
-            let available = width.saturating_sub(1);
-            let first_width = available
-                .saturating_mul(usize::from(*ratio_milli))
-                .checked_div(1000)
-                .unwrap_or(0)
-                .clamp(1, available.saturating_sub(1).max(1));
-            let border = column + first_width;
-            for row_index in row..row.saturating_add(height) {
-                put_border(rows, border, row_index, "│");
-            }
-            draw_split_borders(first, column, row, first_width, height, rows);
-            draw_split_borders(
-                second,
-                border + 1,
-                row,
-                available.saturating_sub(first_width),
-                height,
-                rows,
-            );
-        }
-        SplitAxis::Horizontal => {
-            let available = height.saturating_sub(1);
-            let first_height = available
-                .saturating_mul(usize::from(*ratio_milli))
-                .checked_div(1000)
-                .unwrap_or(0)
-                .clamp(1, available.saturating_sub(1).max(1));
-            let border = row + first_height;
-            for target_column in column..column.saturating_add(width) {
-                put_border(rows, target_column, border, "─");
-            }
-            draw_split_borders(first, column, row, width, first_height, rows);
-            draw_split_borders(
-                second,
-                column,
-                border + 1,
-                width,
-                available.saturating_sub(first_height),
-                rows,
-            );
+    let split = Rect { column, row, width, height }.split(*axis, *ratio_milli);
+    for row in split.border.row..split.border.row.saturating_add(split.border.height) {
+        for column in split.border.column..split.border.column.saturating_add(split.border.width) {
+            put_border(rows, column, row, split.border_grapheme);
         }
     }
+    draw_split_borders(first, split.first.column, split.first.row, split.first.width, split.first.height, rows);
+    draw_split_borders(second, split.second.column, split.second.row, split.second.width, split.second.height, rows);
 }
 
-fn byte_at_visual_cell(
-    text: &FrameText,
-    document_start: usize,
-    width: usize,
-    tab_width: usize,
-    target_column: usize,
-    target_row: usize,
-) -> Option<usize> {
+fn byte_at_visual_cell(text: &FrameText, document_start: usize, width: usize, tab_width: usize, target_column: usize, target_row: usize) -> Option<usize> {
     let start_line = text.line_of_byte(document_start);
     let end = text.byte_of_line(start_line.saturating_add(target_row).saturating_add(1));
     let visible = text.slice(document_start..end);
@@ -5036,11 +3225,7 @@ fn byte_at_visual_cell(
             }
             continue;
         }
-        let displayed = if grapheme == "\t" {
-            vec![" ".to_owned(); tab_width - (column % tab_width)]
-        } else {
-            escape_grapheme(grapheme)
-        };
+        let displayed = if grapheme == "\t" { vec![" ".to_owned(); tab_width - (column % tab_width)] } else { escape_grapheme(grapheme) };
         for cell in displayed {
             let cell_width = UnicodeWidthStr::width(cell.as_str()).max(1);
             if column.saturating_add(cell_width) > width && column > 0 {
@@ -5053,10 +3238,7 @@ fn byte_at_visual_cell(
                     return None;
                 }
             }
-            if row == target_row
-                && target_column >= column
-                && target_column < column.saturating_add(cell_width)
-            {
+            if row == target_row && target_column >= column && target_column < column.saturating_add(cell_width) {
                 return Some(grapheme_start);
             }
             column = column.saturating_add(cell_width);
@@ -5066,23 +3248,13 @@ fn byte_at_visual_cell(
     (row <= target_row).then_some(last_grapheme_on_row.unwrap_or(absolute_byte))
 }
 
-fn advance_visual_position(
-    grapheme: &str,
-    width: usize,
-    tab_width: usize,
-    row: &mut usize,
-    column: &mut usize,
-) {
+fn advance_visual_position(grapheme: &str, width: usize, tab_width: usize, row: &mut usize, column: &mut usize) {
     if grapheme == "\n" {
         *row = row.saturating_add(1);
         *column = 0;
         return;
     }
-    let cells = if grapheme == "\t" {
-        vec![" ".to_owned(); tab_width - (*column % tab_width)]
-    } else {
-        escape_grapheme(grapheme)
-    };
+    let cells = if grapheme == "\t" { vec![" ".to_owned(); tab_width - (*column % tab_width)] } else { escape_grapheme(grapheme) };
     for cell in cells {
         let cell_width = UnicodeWidthStr::width(cell.as_str()).max(1);
         if column.saturating_add(cell_width) > width && *column > 0 {
@@ -5107,17 +3279,9 @@ struct GridBuilder {
 }
 
 impl GridBuilder {
-    fn new(
-        width: usize,
-        height: usize,
-        tab_width: usize,
-        document_start: usize,
-        start_line: usize,
-    ) -> Self {
+    fn new(width: usize, height: usize, tab_width: usize, document_start: usize, start_line: usize) -> Self {
         let mut rows = Vec::with_capacity(height.max(1));
-        rows.push(CellRow {
-            cells: Vec::with_capacity(width.min(256)),
-        });
+        rows.push(CellRow { cells: Vec::with_capacity(width.min(256)) });
         let mut row_lines = Vec::with_capacity(height.max(1));
         row_lines.push(Some(start_line));
         Self {
@@ -5134,12 +3298,7 @@ impl GridBuilder {
         }
     }
 
-    fn push_grapheme_document(
-        &mut self,
-        visible: &str,
-        cursor_byte: usize,
-        decorations: &[DecorationSpan],
-    ) {
+    fn push_grapheme_document(&mut self, visible: &str, cursor_byte: usize, decorations: &[DecorationSpan]) {
         if visible.is_ascii() {
             self.push_ascii_document(visible.as_bytes(), cursor_byte, decorations);
             return;
@@ -5161,12 +3320,7 @@ impl GridBuilder {
         self.mark_cursor(absolute_byte, cursor_byte);
     }
 
-    fn push_ascii_document(
-        &mut self,
-        visible: &[u8],
-        cursor_byte: usize,
-        decorations: &[DecorationSpan],
-    ) {
+    fn push_ascii_document(&mut self, visible: &[u8], cursor_byte: usize, decorations: &[DecorationSpan]) {
         let mut absolute_byte = self.document_start;
         let mut decoration_resolver = DecorationResolver::new_at(decorations, self.document_start);
         if cursor_byte < self.document_start {
@@ -5174,8 +3328,7 @@ impl GridBuilder {
         }
         for byte in visible.iter().copied() {
             self.mark_cursor(absolute_byte, cursor_byte);
-            let style = decoration_resolver
-                .style_or_default(absolute_byte..absolute_byte.saturating_add(1));
+            let style = decoration_resolver.style_or_default(absolute_byte..absolute_byte.saturating_add(1));
             absolute_byte = absolute_byte.saturating_add(1);
             if !self.push_document_ascii(byte, style) {
                 break;
@@ -5197,12 +3350,8 @@ impl GridBuilder {
                 self.next_row(Some(self.logical_line))
             }
             "\t" => self.push_tab(style),
-            _ if grapheme.chars().all(|character| !character.is_control()) => {
-                self.push_cell(grapheme, style)
-            }
-            _ => escape_grapheme(grapheme)
-                .iter()
-                .all(|escaped| self.push_cell(escaped, style)),
+            _ if grapheme.chars().all(|character| !character.is_control()) => self.push_cell(grapheme, style),
+            _ => escape_grapheme(grapheme).iter().all(|escaped| self.push_cell(escaped, style)),
         }
     }
 
@@ -5239,11 +3388,7 @@ impl GridBuilder {
             return false;
         }
         if let Some(row) = self.rows.get_mut(self.row) {
-            row.cells.push(Cell {
-                grapheme: single_byte_grapheme(byte),
-                width: 1,
-                style,
-            });
+            row.cells.push(Cell { grapheme: single_byte_grapheme(byte), width: 1, style });
         }
         self.column += 1;
         true
@@ -5258,11 +3403,7 @@ impl GridBuilder {
             return false;
         }
         if let Some(row) = self.rows.get_mut(self.row) {
-            row.cells.push(Cell {
-                grapheme: grapheme.into(),
-                width: u8::try_from(width).unwrap_or(u8::MAX),
-                style,
-            });
+            row.cells.push(Cell { grapheme: grapheme.into(), width: u8::try_from(width).unwrap_or(u8::MAX), style });
         }
         self.column += width;
         true
@@ -5274,9 +3415,7 @@ impl GridBuilder {
         if self.row >= self.height {
             return false;
         }
-        self.rows.push(CellRow {
-            cells: Vec::with_capacity(self.width.min(256)),
-        });
+        self.rows.push(CellRow { cells: Vec::with_capacity(self.width.min(256)) });
         self.row_lines.push(logical_line);
         true
     }
@@ -5298,10 +3437,7 @@ impl<'a> DecorationResolver<'a> {
     }
 
     fn new_at(decorations: &'a [DecorationSpan], start: usize) -> Self {
-        let starts = (!decorations
-            .windows(2)
-            .all(|pair| pair[0].range.start <= pair[1].range.start))
-        .then(|| {
+        let starts = (!decorations.windows(2).all(|pair| pair[0].range.start <= pair[1].range.start)).then(|| {
             let mut starts = (0..decorations.len()).collect::<Vec<_>>();
             starts.sort_by_key(|index| (decorations[*index].range.start, *index));
             starts
@@ -5316,59 +3452,33 @@ impl<'a> DecorationResolver<'a> {
                 (decorations[index].range.end > start).then_some(index)
             })
             .collect();
-        Self {
-            decorations,
-            starts,
-            next,
-            active,
-            cached_style: CellStyle::default(),
-            valid_until: 0,
-        }
+        Self { decorations, starts, next, active, cached_style: CellStyle::default(), valid_until: 0 }
     }
 
     fn style(&mut self, range: Range<usize>) -> CellStyle {
         if range.end <= self.valid_until {
             return self.cached_style;
         }
-        self.active
-            .retain(|index| self.decorations[*index].range.end > range.start);
+        self.active.retain(|index| self.decorations[*index].range.end > range.start);
         while let Some(index) = self.next_decoration()
             && self.decorations[index].range.start < range.end
         {
             self.active.push(index);
             self.next += 1;
         }
-        self.cached_style = decoration_style_from_indices(
-            self.decorations,
-            self.active.iter().copied(),
-            range.clone(),
-        );
-        let next_start = self
-            .next_decoration()
-            .map_or(usize::MAX, |index| self.decorations[index].range.start);
-        let active_end = self
-            .active
-            .iter()
-            .map(|index| self.decorations[*index].range.end)
-            .min()
-            .unwrap_or(usize::MAX);
+        self.cached_style = decoration_style_from_indices(self.decorations, self.active.iter().copied(), range.clone());
+        let next_start = self.next_decoration().map_or(usize::MAX, |index| self.decorations[index].range.start);
+        let active_end = self.active.iter().map(|index| self.decorations[*index].range.end).min().unwrap_or(usize::MAX);
         self.valid_until = next_start.min(active_end).max(range.end);
         self.cached_style
     }
 
     fn style_or_default(&mut self, range: Range<usize>) -> CellStyle {
-        if self.decorations.is_empty() {
-            CellStyle::default()
-        } else {
-            self.style(range)
-        }
+        if self.decorations.is_empty() { CellStyle::default() } else { self.style(range) }
     }
 
     fn next_decoration(&self) -> Option<usize> {
-        self.starts.as_ref().map_or_else(
-            || (self.next < self.decorations.len()).then_some(self.next),
-            |starts| starts.get(self.next).copied(),
-        )
+        self.starts.as_ref().map_or_else(|| (self.next < self.decorations.len()).then_some(self.next), |starts| starts.get(self.next).copied())
     }
 }
 
@@ -5381,13 +3491,7 @@ fn prepend_line_numbers(
     line_decorations: &[LineDecoration],
 ) {
     for (index, row) in rows.iter_mut().enumerate() {
-        let prefix = line_number_prefix(
-            row_lines.get(index).copied().flatten(),
-            cursor_line,
-            width,
-            relative,
-            line_decorations,
-        );
+        let prefix = line_number_prefix(row_lines.get(index).copied().flatten(), cursor_line, width, relative, line_decorations);
         let prefix_len = prefix.cells.len();
         row.cells.reserve(prefix_len);
         row.cells.extend(prefix.cells);
@@ -5395,61 +3499,20 @@ fn prepend_line_numbers(
     }
 }
 
-fn replace_line_number(
-    row: &mut CellRow,
-    logical_line: usize,
-    cursor_line: usize,
-    width: usize,
-    relative: bool,
-    line_decorations: &[LineDecoration],
-) {
-    let prefix = line_number_prefix(
-        Some(logical_line),
-        cursor_line,
-        width,
-        relative,
-        line_decorations,
-    );
+fn replace_line_number(row: &mut CellRow, logical_line: usize, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) {
+    let prefix = line_number_prefix(Some(logical_line), cursor_line, width, relative, line_decorations);
     for (target, replacement) in row.cells.iter_mut().zip(prefix.cells) {
         *target = replacement;
     }
 }
 
-fn line_number_prefix(
-    logical_line: Option<usize>,
-    cursor_line: usize,
-    width: usize,
-    relative: bool,
-    line_decorations: &[LineDecoration],
-) -> CellRow {
+fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) -> CellRow {
     let style = logical_line
-        .and_then(|line| {
-            line_decorations
-                .iter()
-                .rev()
-                .find(|decoration| decoration.line == line)
-        })
-        .map_or(
-            CellStyle {
-                foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.overlay1)),
-                ..CellStyle::default()
-            },
-            |decoration| decoration.style,
-        );
-    let mut cells = vec![
-        Cell {
-            grapheme: single_byte_grapheme(b' '),
-            width: 1,
-            style,
-        };
-        width
-    ];
+        .and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line))
+        .map_or(CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.overlay1)), |decoration| decoration.style);
+    let mut cells = vec![Cell { grapheme: single_byte_grapheme(b' '), width: 1, style }; width];
     if let Some(line) = logical_line {
-        let mut number = if relative && line != cursor_line {
-            line.abs_diff(cursor_line)
-        } else {
-            line.saturating_add(1)
-        };
+        let mut number = if relative && line != cursor_line { line.abs_diff(cursor_line) } else { line.saturating_add(1) };
         let mut reversed = [0_u8; 20];
         let mut digits = 0;
         loop {
@@ -5482,24 +3545,12 @@ fn decoration_style(decorations: &[DecorationSpan], range: Range<usize>) -> Cell
     decoration_style_from_indices(decorations, 0..decorations.len(), range)
 }
 
-fn decoration_style_from_indices(
-    decorations: &[DecorationSpan],
-    indices: impl IntoIterator<Item = usize>,
-    range: Range<usize>,
-) -> CellStyle {
+fn decoration_style_from_indices(decorations: &[DecorationSpan], indices: impl IntoIterator<Item = usize>, range: Range<usize>) -> CellStyle {
     resolve_decoration_style(decorations, indices, range, CellStyle::default()).0
 }
 
-fn decoration_overlay_style(
-    decorations: &[DecorationSpan],
-    range: Range<usize>,
-) -> Option<CellStyle> {
-    let (style, overlaps) = resolve_decoration_style(
-        decorations,
-        0..decorations.len(),
-        range,
-        transparent_cell_style(),
-    );
+fn decoration_overlay_style(decorations: &[DecorationSpan], range: Range<usize>) -> Option<CellStyle> {
+    let (style, overlaps) = resolve_decoration_style(decorations, 0..decorations.len(), range, transparent_cell_style());
     overlaps.then_some(style)
 }
 
@@ -5541,15 +3592,7 @@ fn resolve_decoration_style(
 }
 
 const fn transparent_cell_style() -> CellStyle {
-    CellStyle {
-        bold: false,
-        italic: false,
-        underline: false,
-        strikethrough: false,
-        reverse: false,
-        foreground: None,
-        background: None,
-    }
+    CellStyle { bold: false, italic: false, underline: false, strikethrough: false, reverse: false, foreground: None, background: None }
 }
 
 fn escape_grapheme(grapheme: &str) -> Vec<String> {
@@ -5577,40 +3620,20 @@ fn prompt_style(is_prompt: bool) -> CellStyle {
     if is_prompt {
         return CellStyle::default();
     }
-    CellStyle {
-        bold: true,
-        reverse: true,
-        ..CellStyle::default()
-    }
+    CellStyle::default().with_bold().with_reverse()
 }
 
 fn completion_label(item: &CompletionOverlayRow, selected: bool) -> String {
     let marker = if selected { "❯" } else { " " };
-    let detail = if item.detail.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", item.detail)
-    };
+    let detail = if item.detail.is_empty() { String::new() } else { format!(" · {}", item.detail) };
     format!("{marker} {}{detail} [{}]", item.label, item.source)
 }
 
 fn row_from_text(text: &str, width: usize, style: CellStyle, tab_width: usize) -> CellRow {
     if text.bytes().all(|byte| matches!(byte, 0x20..=0x7e)) {
-        return CellRow {
-            cells: text
-                .bytes()
-                .take(width)
-                .map(|byte| Cell {
-                    grapheme: single_byte_grapheme(byte),
-                    width: 1,
-                    style,
-                })
-                .collect(),
-        };
+        return CellRow { cells: text.bytes().take(width).map(|byte| Cell { grapheme: single_byte_grapheme(byte), width: 1, style }).collect() };
     }
-    let mut row = CellRow {
-        cells: Vec::with_capacity(width.min(text.len())),
-    };
+    let mut row = CellRow { cells: Vec::with_capacity(width.min(text.len())) };
     let mut column = 0;
     for grapheme in text.graphemes(true) {
         if grapheme != "\t" && grapheme.chars().all(|character| !character.is_control()) {
@@ -5618,29 +3641,17 @@ fn row_from_text(text: &str, width: usize, style: CellStyle, tab_width: usize) -
             if column + cell_width > width {
                 return row;
             }
-            row.cells.push(Cell {
-                grapheme: grapheme.into(),
-                width: u8::try_from(cell_width).unwrap_or(u8::MAX),
-                style,
-            });
+            row.cells.push(Cell { grapheme: grapheme.into(), width: u8::try_from(cell_width).unwrap_or(u8::MAX), style });
             column += cell_width;
             continue;
         }
-        let representations = if grapheme == "\t" {
-            vec![" ".to_owned(); tab_width - (column % tab_width)]
-        } else {
-            escape_grapheme(grapheme)
-        };
+        let representations = if grapheme == "\t" { vec![" ".to_owned(); tab_width - (column % tab_width)] } else { escape_grapheme(grapheme) };
         for representation in representations {
             let cell_width = UnicodeWidthStr::width(representation.as_str()).max(1);
             if column + cell_width > width {
                 return row;
             }
-            row.cells.push(Cell {
-                grapheme: representation.into(),
-                width: u8::try_from(cell_width).unwrap_or(u8::MAX),
-                style,
-            });
+            row.cells.push(Cell { grapheme: representation.into(), width: u8::try_from(cell_width).unwrap_or(u8::MAX), style });
             column += cell_width;
         }
     }
@@ -5656,133 +3667,65 @@ fn display_width(text: &str, tab_width: usize) -> usize {
         if grapheme == "\t" {
             width += tab_width - (width % tab_width);
         } else {
-            width += escape_grapheme(grapheme)
-                .iter()
-                .map(|value| UnicodeWidthStr::width(value.as_str()).max(1))
-                .sum::<usize>();
+            width += escape_grapheme(grapheme).iter().map(|value| UnicodeWidthStr::width(value.as_str()).max(1)).sum::<usize>();
         }
     }
     width
 }
 
-fn line_of_byte(text: &str, byte: usize) -> usize {
-    text.get(..byte.min(text.len()))
-        .unwrap_or_default()
-        .bytes()
-        .filter(|value| *value == b'\n')
-        .count()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SingleLineChange {
-    line: usize,
-    old_start: usize,
-    old_end: usize,
-    new_start: usize,
-    new_end: usize,
-}
-
 #[derive(Clone, Copy)]
 struct LineRepaint {
-    change: SingleLineChange,
+    change: FrameTextChange,
     cursor_line: usize,
     screen_row: usize,
     content_height: usize,
     new_rows: usize,
 }
 
-impl SingleLineChange {
-    fn old_text(self, text: &FrameText) -> Cow<'_, str> {
-        text.slice(self.old_start..self.old_end)
-    }
-
-    fn new_text(self, text: &FrameText) -> Cow<'_, str> {
-        text.slice(self.new_start..self.new_end)
-    }
-}
-
-fn single_line_change(old: &FrameText, new: &FrameText) -> Option<SingleLineChange> {
+fn single_line_change(old: &FrameText, new: &FrameText) -> Option<FrameTextChange> {
     if let Some(change) = new.single_line_change_from(old) {
-        return Some(SingleLineChange {
-            line: change.line,
-            old_start: change.old_start,
-            old_end: change.old_end,
-            new_start: change.new_start,
-            new_end: change.new_end,
-        });
+        return Some(change);
     }
-    let mut difference = old
-        .bytes()
-        .zip(new.bytes())
-        .position(|(left, right)| left != right)
-        .unwrap_or_else(|| old.len().min(new.len()));
+    let mut difference = old.bytes().zip(new.bytes()).position(|(left, right)| left != right).unwrap_or_else(|| old.len().min(new.len()));
     if old == new {
         return None;
     }
-    while difference > 0 && (!old.is_char_boundary(difference) || !new.is_char_boundary(difference))
-    {
+    while difference > 0 && (!old.is_char_boundary(difference) || !new.is_char_boundary(difference)) {
         difference -= 1;
     }
-    let old_start = old
-        .get(..difference)?
-        .rfind('\n')
-        .map_or(0, |offset| offset + 1);
-    let new_start = new
-        .get(..difference)?
-        .rfind('\n')
-        .map_or(0, |offset| offset + 1);
-    let old_end = old[difference..]
-        .find('\n')
-        .map_or(old.len(), |offset| difference + offset);
-    let new_end = new[difference..]
-        .find('\n')
-        .map_or(new.len(), |offset| difference + offset);
+    let old_start = old.get(..difference)?.rfind('\n').map_or(0, |offset| offset + 1);
+    let new_start = new.get(..difference)?.rfind('\n').map_or(0, |offset| offset + 1);
+    let old_end = old[difference..].find('\n').map_or(old.len(), |offset| difference + offset);
+    let new_end = new[difference..].find('\n').map_or(new.len(), |offset| difference + offset);
     if old.get(..old_start) != new.get(..new_start) || old.get(old_end..) != new.get(new_end..) {
         return None;
     }
-    Some(SingleLineChange {
-        line: line_of_byte(old, old_start),
-        old_start,
-        old_end,
-        new_start,
-        new_end,
-    })
+    Some(FrameTextChange { line: old.line_of_byte(old_start), old_start, old_end, new_start, new_end })
 }
 
-fn matching_decorations_outside_change(
-    old: &[DecorationSpan],
-    new: &[DecorationSpan],
-    change: SingleLineChange,
-) -> Option<usize> {
+fn matching_decorations_outside_change(old: &[DecorationSpan], new: &[DecorationSpan], change: FrameTextChange) -> Option<usize> {
     let old_prefix = old.partition_point(|span| span.range.start < change.old_start);
     let new_prefix = new.partition_point(|span| span.range.start < change.new_start);
-    let (mut old_index, mut new_index) =
-        if old_prefix == new_prefix && old[..old_prefix] == new[..new_prefix] {
-            (old_prefix, new_prefix)
-        } else {
-            let mut old_index = 0;
-            let mut new_index = 0;
-            while old_index < old.len() && new_index < new.len() {
-                let old_span = &old[old_index];
-                let new_span = &new[new_index];
-                if old_span.range.end > change.old_start || new_span.range.end > change.new_start {
-                    break;
-                }
-                if old_span != new_span {
-                    return None;
-                }
-                old_index += 1;
-                new_index += 1;
+    let (mut old_index, mut new_index) = if old_prefix == new_prefix && old[..old_prefix] == new[..new_prefix] {
+        (old_prefix, new_prefix)
+    } else {
+        let mut old_index = 0;
+        let mut new_index = 0;
+        while old_index < old.len() && new_index < new.len() {
+            let old_span = &old[old_index];
+            let new_span = &new[new_index];
+            if old_span.range.end > change.old_start || new_span.range.end > change.new_start {
+                break;
             }
-            (old_index, new_index)
-        };
-    if old
-        .get(old_index)
-        .is_some_and(|span| span.range.end <= change.old_start)
-        || new
-            .get(new_index)
-            .is_some_and(|span| span.range.end <= change.new_start)
-    {
+            if old_span != new_span {
+                return None;
+            }
+            old_index += 1;
+            new_index += 1;
+        }
+        (old_index, new_index)
+    };
+    if old.get(old_index).is_some_and(|span| span.range.end <= change.old_start) || new.get(new_index).is_some_and(|span| span.range.end <= change.new_start) {
         return None;
     }
     let repaint_start = new_index;
@@ -5826,22 +3769,17 @@ fn matching_decorations_outside_change(
     .then_some(repaint_start)
 }
 
-fn retain_decorations(
-    decorations: &[DecorationSpan],
-    shared: Option<&SharedDecorations>,
-) -> SharedDecorations {
+fn retain_decorations(decorations: &[DecorationSpan], shared: Option<&SharedDecorations>) -> SharedDecorations {
     shared.map_or_else(|| Arc::new(decorations.to_vec()), Arc::clone)
 }
 
 fn shared_decoration_layers_equal(left: &[SharedDecorations], right: &[SharedDecorations]) -> bool {
     const SMALL_DYNAMIC_LAYER_LIMIT: usize = 128;
     left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            Arc::ptr_eq(left, right)
-                || (left.len() <= SMALL_DYNAMIC_LAYER_LIMIT
-                    && right.len() == left.len()
-                    && left == right)
-        })
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| Arc::ptr_eq(left, right) || (left.len() <= SMALL_DYNAMIC_LAYER_LIMIT && right.len() == left.len() && left == right))
 }
 
 fn merge_shared_decoration_layers(layers: &[SharedDecorations]) -> Vec<DecorationSpan> {
@@ -5850,106 +3788,58 @@ fn merge_shared_decoration_layers(layers: &[SharedDecorations]) -> Vec<Decoratio
     for layer in layers {
         merged.extend(layer.iter().cloned());
     }
-    merged.sort_by(|left, right| {
-        (left.range.start, std::cmp::Reverse(left.range.end))
-            .cmp(&(right.range.start, std::cmp::Reverse(right.range.end)))
-    });
+    merged.sort_by_key(|span| (span.range.start, std::cmp::Reverse(span.range.end)));
     merged.dedup();
     merged
 }
 
-fn decorations_match_range(
-    left: &[DecorationSpan],
-    right: &[DecorationSpan],
-    range: &Range<usize>,
-) -> bool {
-    let overlaps =
-        |span: &&DecorationSpan| span.range.start < range.end && range.start < span.range.end;
-    left.iter()
-        .filter(overlaps)
-        .eq(right.iter().filter(overlaps))
+fn decorations_match_range(left: &[DecorationSpan], right: &[DecorationSpan], range: &Range<usize>) -> bool {
+    let overlaps = |span: &&DecorationSpan| span.range.start < range.end && range.start < span.range.end;
+    left.iter().filter(overlaps).eq(right.iter().filter(overlaps))
 }
 
 fn visual_line_rows(text: &str, width: usize, tab_width: usize) -> usize {
     let mut row = 0;
     let mut column = 0;
     for grapheme in text.graphemes(true) {
-        if grapheme == "\t" {
-            let spaces = tab_width.max(1) - (column % tab_width.max(1));
-            for _ in 0..spaces {
-                advance_visual_cell(&mut row, &mut column, width, 1);
-            }
-        } else if grapheme.chars().all(|character| !character.is_control()) {
-            advance_visual_cell(
-                &mut row,
-                &mut column,
-                width,
-                UnicodeWidthStr::width(grapheme).max(1),
-            );
-        } else {
-            for escaped in escape_grapheme(grapheme) {
-                advance_visual_cell(
-                    &mut row,
-                    &mut column,
-                    width,
-                    UnicodeWidthStr::width(escaped.as_str()).max(1),
-                );
-            }
-        }
+        advance_visual_grapheme(&mut row, &mut column, width, tab_width, grapheme);
     }
     row.saturating_add(1)
 }
 
-fn cursor_visual_position(
-    text: &str,
-    start_byte: usize,
-    cursor_byte: usize,
-    width: usize,
-    height: usize,
-    tab_width: usize,
-) -> (usize, usize) {
+fn cursor_visual_position(text: &str, start_byte: usize, cursor_byte: usize, width: usize, height: usize, tab_width: usize) -> (usize, usize) {
     if cursor_byte <= start_byte {
         return (0, 0);
     }
-    let visible = text
-        .get(start_byte..cursor_byte.min(text.len()))
-        .unwrap_or_default();
+    let visible = text.get(start_byte..cursor_byte.min(text.len())).unwrap_or_default();
     let mut row = 0_usize;
     let mut column = 0_usize;
     for grapheme in visible.graphemes(true) {
-        if grapheme == "\n" {
-            row = row.saturating_add(1);
-            column = 0;
-        } else if grapheme == "\t" {
-            let spaces = tab_width.max(1) - (column % tab_width.max(1));
-            for _ in 0..spaces {
-                advance_visual_cell(&mut row, &mut column, width, 1);
-            }
-        } else if grapheme.chars().all(|character| !character.is_control()) {
-            advance_visual_cell(
-                &mut row,
-                &mut column,
-                width,
-                UnicodeWidthStr::width(grapheme).max(1),
-            );
-        } else {
-            for escaped in escape_grapheme(grapheme) {
-                advance_visual_cell(
-                    &mut row,
-                    &mut column,
-                    width,
-                    UnicodeWidthStr::width(escaped.as_str()).max(1),
-                );
-            }
-        }
+        advance_visual_grapheme(&mut row, &mut column, width, tab_width, grapheme);
         if row >= height {
             break;
         }
     }
-    (
-        column.min(width.saturating_sub(1)),
-        row.min(height.saturating_sub(1)),
-    )
+    (column.min(width.saturating_sub(1)), row.min(height.saturating_sub(1)))
+}
+
+fn advance_visual_grapheme(row: &mut usize, column: &mut usize, width: usize, tab_width: usize, grapheme: &str) {
+    if grapheme == "\n" {
+        *row = row.saturating_add(1);
+        *column = 0;
+        return;
+    }
+    if grapheme == "\t" {
+        for _ in 0..tab_width.max(1) - (*column % tab_width.max(1)) {
+            advance_visual_cell(row, column, width, 1);
+        }
+    } else if grapheme.chars().all(|character| !character.is_control()) {
+        advance_visual_cell(row, column, width, UnicodeWidthStr::width(grapheme).max(1));
+    } else {
+        for escaped in escape_grapheme(grapheme) {
+            advance_visual_cell(row, column, width, UnicodeWidthStr::width(escaped.as_str()).max(1));
+        }
+    }
 }
 
 fn advance_visual_cell(row: &mut usize, column: &mut usize, width: usize, cell_width: usize) {
@@ -5968,26 +3858,22 @@ pub fn diff(previous: Option<&DesiredGrid>, desired: &DesiredGrid) -> Vec<Termin
 }
 
 /// Reuses caller-owned patch storage for successive terminal frames.
-pub fn diff_into(
-    previous: Option<&DesiredGrid>,
-    desired: &DesiredGrid,
-    patches: &mut Vec<TerminalPatch>,
-) {
+pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, patches: &mut Vec<TerminalPatch>) {
     patches.clear();
     let required_capacity = desired.height.saturating_mul(3).saturating_add(4);
     if patches.capacity() < required_capacity {
         patches.reserve(required_capacity);
     }
     patches.push(TerminalPatch::ShowCursor(false));
-    let full_refresh =
-        previous.is_none_or(|old| old.width != desired.width || old.height != desired.height);
+    let full_refresh = previous.is_none_or(|old| old.width != desired.width || old.height != desired.height);
+    let raster_rows = desired.raster_overlay.as_ref().map_or(0, |overlay| overlay.rows.min(desired.height));
     if full_refresh {
         patches.push(TerminalPatch::Clear);
         let present_rows = desired.rows.len().min(desired.height);
-        for (row_index, row) in desired.rows.iter().take(present_rows).enumerate() {
+        for (row_index, row) in desired.rows.iter().take(present_rows).enumerate().skip(raster_rows) {
             append_row_patches(patches, row_index, Arc::clone(row));
         }
-        for row_index in present_rows..desired.height {
+        for row_index in present_rows.max(raster_rows)..desired.height {
             append_row_patches(patches, row_index, Arc::default());
         }
     } else if let Some(previous) = previous {
@@ -5998,6 +3884,10 @@ pub fn diff_into(
             }
         }
     }
+    let previous_overlay = previous.and_then(|grid| grid.raster_overlay.as_ref());
+    if previous_overlay != desired.raster_overlay.as_ref() {
+        patches.push(TerminalPatch::SetRasterOverlay(desired.raster_overlay.clone()));
+    }
     patches.push(TerminalPatch::MoveTo {
         column: desired.cursor.0.min(desired.width.saturating_sub(1)),
         row: desired.cursor.1.min(desired.height.saturating_sub(1)),
@@ -6006,14 +3896,8 @@ pub fn diff_into(
 }
 
 fn append_row_patches(patches: &mut Vec<TerminalPatch>, row_index: usize, row: Arc<CellRow>) {
-    let clear_style = row
-        .cells
-        .last()
-        .map_or_else(CellStyle::default, |cell| cell.style);
-    patches.push(TerminalPatch::MoveTo {
-        column: 0,
-        row: row_index,
-    });
+    let clear_style = row.cells.last().map_or_else(CellStyle::default, |cell| cell.style);
+    patches.push(TerminalPatch::MoveTo { column: 0, row: row_index });
     patches.push(TerminalPatch::PutRow(row));
     patches.push(TerminalPatch::ClearToEndOfLine(clear_style));
 }
@@ -6033,23 +3917,15 @@ mod tests {
         let split = model.split_active(SplitAxis::Vertical).expect("split");
         assert_ne!(split, first_window);
         assert_eq!(model.windows.len(), 2);
-        model
-            .focus_window(WindowDirection::Left)
-            .expect("focus left");
+        model.focus_window(WindowDirection::Left).expect("focus left");
         assert_eq!(model.active_window().id, first_window);
-        let lower = model
-            .split_active(SplitAxis::Horizontal)
-            .expect("lower split");
+        let lower = model.split_active(SplitAxis::Horizontal).expect("lower split");
         model.focus_window(WindowDirection::Up).expect("focus up");
         assert_eq!(model.active_window().id, first_window);
-        model
-            .focus_window(WindowDirection::Down)
-            .expect("focus down");
+        model.focus_window(WindowDirection::Down).expect("focus down");
         assert_eq!(model.active_window().id, lower);
         model.close_active_window().expect("close lower split");
-        model
-            .focus_window(WindowDirection::Right)
-            .expect("focus right");
+        model.focus_window(WindowDirection::Right).expect("focus right");
         assert_eq!(model.active_window().id, split);
         model.close_active_window().expect("close split");
         assert_eq!(model.active_window().id, first_window);
@@ -6073,30 +3949,11 @@ mod tests {
         let first = model.buffers[0].id;
         let grid = ViewportLayout::new(15, 4).desired_workspace_grid(
             &model,
-            &[
-                (
-                    first,
-                    EngineFrame {
-                        text: "left".into(),
-                        cursor_byte: 0,
-                    },
-                ),
-                (
-                    second,
-                    EngineFrame {
-                        text: "right".into(),
-                        cursor_byte: 5,
-                    },
-                ),
-            ],
+            &[(first, EngineFrame::new("left", 0)), (second, EngineFrame::new("right", 5))],
             "status",
             None,
         );
-        let first_row: String = grid.rows[0]
-            .cells
-            .iter()
-            .map(|cell| cell.grapheme.as_ref())
-            .collect();
+        let first_row = grid.rows[0].text();
         assert!(first_row.contains("left"));
         assert!(first_row.contains('│'));
         assert!(first_row.contains("right"));
@@ -6107,35 +3964,14 @@ mod tests {
     fn terminal_sidebar_preserves_harness_cells_and_owns_focused_cursor() {
         let model = ClientViewModel::new(DocumentId::new(1), "terminal harness");
         let buffer_id = model.active_buffer();
-        let frame = EngineFrame {
-            text: "editor contents".into(),
-            cursor_byte: 0,
-        };
+        let frame = EngineFrame::new("editor contents", 0);
         let mut layout = ViewportLayout::new(80, 10);
         layout.set_terminal_sidebar_visible(true);
         let grid = layout.desired_workspace_grid(&model, &[(buffer_id, frame)], "NORMAL", None);
         let column = layout.terminal_sidebar_column().expect("sidebar geometry");
-        let harness_style = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(RgbColor::new(240, 10, 20))),
-            background: Some(CellColor::Rgb(RgbColor::new(10, 20, 120))),
-            ..CellStyle::default()
-        };
-        let harness_rows = vec![CellRow {
-            cells: vec![Cell {
-                grapheme: "界".into(),
-                width: 2,
-                style: harness_style,
-            }],
-        }];
-        let grid = layout.apply_terminal_sidebar(
-            grid,
-            TerminalSidebar {
-                rows: &harness_rows,
-                cursor: (2, 0),
-                focused: true,
-            },
-        );
+        let harness_style = CellStyle::rgb(RgbColor::new(240, 10, 20), RgbColor::new(10, 20, 120)).with_bold();
+        let harness_rows = vec![CellRow { cells: vec![Cell { grapheme: "界".into(), width: 2, style: harness_style }] }];
+        let grid = layout.apply_terminal_sidebar(grid, TerminalSidebar { rows: &harness_rows, cursor: (2, 0), focused: true });
         let mut display_column = 0;
         let harness_cell = grid.rows[0]
             .cells
@@ -6150,14 +3986,7 @@ mod tests {
         assert_eq!(harness_cell.width, 2);
         assert_eq!(harness_cell.style, harness_style);
         assert_eq!(grid.cursor, (column + 3, 0));
-        assert_eq!(
-            grid.rows[0]
-                .cells
-                .iter()
-                .map(|cell| usize::from(cell.width))
-                .sum::<usize>(),
-            80
-        );
+        assert_eq!(grid.rows[0].cells.iter().map(|cell| usize::from(cell.width)).sum::<usize>(), 80);
     }
 
     #[test]
@@ -6168,81 +3997,35 @@ mod tests {
         let second = model.add_buffer(DocumentId::new(11), "two");
         let second_window = model.split_active(SplitAxis::Vertical).expect("split");
         model.set_active_buffer(second).expect("second pane");
-        let frames = [
-            (
-                first,
-                EngineFrame {
-                    text: "ab界cdef\n\txy\nlast".into(),
-                    cursor_byte: 0,
-                },
-            ),
-            (
-                second,
-                EngineFrame {
-                    text: "right pane".into(),
-                    cursor_byte: 0,
-                },
-            ),
-        ];
+        let frames = [(first, EngineFrame::new("ab界cdef\n\txy\nlast", 0)), (second, EngineFrame::new("right pane", 0))];
         let mut layout = ViewportLayout::new(21, 7);
         layout.configure_dotfile_profile();
 
-        let wide = layout
-            .hit_test_workspace(&model, &frames, 6, 0, 1)
-            .expect("wide grapheme");
-        assert_eq!(
-            (wide.window_id, wide.buffer_id, wide.byte),
-            (first_window, first, 2)
-        );
-        let wrapped = layout
-            .hit_test_workspace(&model, &frames, 3, 1, 1)
-            .expect("wrapped continuation");
+        let wide = layout.hit_test_workspace(&model, &frames, 6, 0, 1).expect("wide grapheme");
+        assert_eq!((wide.window_id, wide.buffer_id, wide.byte), (first_window, first, 2));
+        let wrapped = layout.hit_test_workspace(&model, &frames, 3, 1, 1).expect("wrapped continuation");
         assert_eq!(wrapped.byte, 8);
-        let tab = layout
-            .hit_test_workspace(&model, &frames, 4, 2, 1)
-            .expect("tab expansion");
+        let tab = layout.hit_test_workspace(&model, &frames, 4, 2, 1).expect("tab expansion");
         assert_eq!(tab.byte, 10);
-        let trailing = layout
-            .hit_test_workspace(&model, &frames, 9, 2, 1)
-            .expect("trailing cell");
+        let trailing = layout.hit_test_workspace(&model, &frames, 9, 2, 1).expect("trailing cell");
         assert_eq!(trailing.byte, 12);
-        let other_pane = layout
-            .hit_test_workspace(&model, &frames, 14, 0, 1)
-            .expect("second pane");
-        assert_eq!(
-            (other_pane.window_id, other_pane.buffer_id),
-            (second_window, second)
-        );
-        assert!(
-            layout
-                .hit_test_workspace(&model, &frames, 10, 0, 1)
-                .is_none()
-        );
-        assert!(
-            layout
-                .hit_test_workspace(&model, &frames, 3, 6, 1)
-                .is_none()
-        );
-        let below_file = layout
-            .hit_test_workspace(&model, &frames, 3, 5, 1)
-            .expect("blank viewport row clamps to the last buffer line");
+        let other_pane = layout.hit_test_workspace(&model, &frames, 14, 0, 1).expect("second pane");
+        assert_eq!((other_pane.window_id, other_pane.buffer_id), (second_window, second));
+        assert!(layout.hit_test_workspace(&model, &frames, 10, 0, 1).is_none());
+        assert!(layout.hit_test_workspace(&model, &frames, 3, 6, 1).is_none());
+        let below_file = layout.hit_test_workspace(&model, &frames, 3, 5, 1).expect("blank viewport row clamps to the last buffer line");
         assert_eq!(below_file.byte, "ab界cdef\n\txy\nlast".len() - 1);
 
         let tiny = ViewportLayout::new(1, 1);
         assert!(tiny.hit_test_workspace(&model, &frames, 0, 0, 1).is_none());
 
-        model
-            .focus_window_id(first_window)
-            .expect("focus by click target");
+        model.focus_window_id(first_window).expect("focus by click target");
         assert_eq!(model.active_window().id, first_window);
     }
 
     #[test]
     fn telescope_overlay_renders_results_selection_preview_and_prompt() {
-        let frame = EngineFrame {
-            text: "underlying editor".into(),
-            cursor_byte: 0,
-        };
+        let frame = EngineFrame::new("underlying editor", 0);
         let mut layout = ViewportLayout::new(100, 30);
         let grid = layout.desired_editor_grid(&frame, "NORMAL", None);
         let grid = layout.apply_picker_overlay(
@@ -6251,43 +4034,23 @@ mod tests {
                 title: "Find Files".into(),
                 prompt: "main".into(),
                 rows: vec![
-                    PickerOverlayRow {
-                        label: "README.md".into(),
-                        detail: "".into(),
-                    },
-                    PickerOverlayRow {
-                        label: "src/main.rs".into(),
-                        detail: "Rust".into(),
-                    },
+                    PickerOverlayRow { label: "README.md".into(), detail: "".into() },
+                    PickerOverlayRow { label: "src/main.rs".into(), detail: "Rust".into() },
                 ],
                 selected: 1,
                 preview_title: "src/main.rs".into(),
                 preview: "fn main() {\n    println!(\"wren\");\n}".into(),
                 preview_scroll: 0,
                 preview_highlight_line: Some(1),
-                preview_decorations: vec![DecorationSpan {
-                    range: 0..2,
-                    priority: 100,
-                    style: CellStyle {
-                        bold: true,
-                        foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)),
-                        ..CellStyle::default()
-                    },
-                }],
+                preview_decorations: vec![DecorationSpan::new(
+                    0..2,
+                    CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)).with_bold(),
+                    100,
+                )],
                 footer: "↑/↓ select  ⏎ open".into(),
             },
         );
-        let rendered = grid
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| cell.grapheme.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = grid.text();
         assert!(rendered.contains("Find Files (2)"));
         assert!(rendered.contains("❯ src/main.rs  Rust"));
         assert!(rendered.contains("println!(\"wren\")"));
@@ -6304,14 +4067,7 @@ mod tests {
         theme.base = CatppuccinPalette::MOCHA.surface0;
         let mut layout = ViewportLayout::new(80, 24);
         layout.set_theme(theme);
-        let base = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "editor background".into(),
-                cursor_byte: 0,
-            },
-            "NORMAL",
-            None,
-        );
+        let base = layout.desired_editor_grid(&EngineFrame::new("editor background", 0), "NORMAL", None);
         let outside = base.rows[0].cells[0].style;
         let grid = layout.apply_picker_overlay(
             base,
@@ -6330,47 +4086,30 @@ mod tests {
         );
 
         assert_eq!(grid.rows[0].cells[0].style, outside);
-        assert_eq!(
-            grid.rows[0].cells[0].style.background,
-            Some(CellColor::Rgb(theme.base))
-        );
+        assert_eq!(grid.rows[0].cells[0].style.background, Some(CellColor::Rgb(theme.base)));
     }
 
     #[test]
     fn telescope_preview_wraps_long_decorated_lines_inside_its_border() {
         let mut layout = ViewportLayout::new(100, 30);
-        let grid = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "underlying editor".into(),
-                cursor_byte: 0,
-            },
-            "NORMAL",
-            None,
-        );
+        let grid = layout.desired_editor_grid(&EngineFrame::new("underlying editor", 0), "NORMAL", None);
         let preview = "x".repeat(140);
         let grid = layout.apply_picker_overlay(
             grid,
             &PickerOverlay {
                 title: "Find Files".into(),
                 prompt: "".into(),
-                rows: vec![PickerOverlayRow {
-                    label: "src/main.rs".into(),
-                    detail: "".into(),
-                }],
+                rows: vec![PickerOverlayRow { label: "src/main.rs".into(), detail: "".into() }],
                 selected: 0,
                 preview_title: "src/main.rs".into(),
                 preview: preview.clone().into(),
                 preview_scroll: 0,
                 preview_highlight_line: Some(0),
-                preview_decorations: vec![DecorationSpan {
-                    range: 0..preview.len(),
-                    priority: 100,
-                    style: CellStyle {
-                        bold: true,
-                        foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)),
-                        ..CellStyle::default()
-                    },
-                }],
+                preview_decorations: vec![DecorationSpan::new(
+                    0..preview.len(),
+                    CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).with_bold(),
+                    100,
+                )],
                 footer: "enter open".into(),
             },
         );
@@ -6380,64 +4119,31 @@ mod tests {
         for row in 5..25 {
             assert_eq!(grid.rows[row].cells[97].grapheme.as_ref(), "│");
         }
-        let rendered_x = grid
-            .rows
-            .iter()
-            .flat_map(|row| row.cells.iter())
-            .filter(|cell| cell.grapheme.as_ref() == "x")
-            .count();
+        let rendered_x = grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.grapheme.as_ref() == "x").count();
         assert_eq!(rendered_x, preview.len());
-        assert!(grid.rows.iter().all(|row| {
-            row.cells
-                .iter()
-                .map(|cell| usize::from(cell.width))
-                .sum::<usize>()
-                <= 100
-        }));
+        assert!(grid.rows.iter().all(|row| { row.cells.iter().map(|cell| usize::from(cell.width)).sum::<usize>() <= 100 }));
     }
 
     #[test]
     fn telescope_preview_uses_a_lighter_background_only_for_the_reference() {
         let mut layout = ViewportLayout::new(100, 30);
-        let base = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "underlying editor".into(),
-                cursor_byte: 0,
-            },
-            "NORMAL",
-            None,
-        );
+        let base = layout.desired_editor_grid(&EngineFrame::new("underlying editor", 0), "NORMAL", None);
         let picker = PickerOverlay {
             title: "Jumplist".into(),
             prompt: "".into(),
-            rows: vec![PickerOverlayRow {
-                label: "src/main.rs:1:7".into(),
-                detail: "language-server location".into(),
-            }],
+            rows: vec![PickerOverlayRow { label: "src/main.rs:1:7".into(), detail: "language-server location".into() }],
             selected: 0,
             preview_title: "src/main.rs".into(),
             preview: "alpha target omega".into(),
             preview_scroll: 0,
             preview_highlight_line: None,
             preview_decorations: vec![
-                DecorationSpan {
-                    range: 0..5,
-                    priority: 100,
-                    style: CellStyle {
-                        foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)),
-                        background: None,
-                        ..CellStyle::default()
-                    },
-                },
-                DecorationSpan {
-                    range: 6..12,
-                    priority: u32::MAX,
-                    style: CellStyle {
-                        foreground: None,
-                        background: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0)),
-                        ..CellStyle::default()
-                    },
-                },
+                DecorationSpan::new(0..5, CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).without_background(), 100),
+                DecorationSpan::new(
+                    6..12,
+                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0)),
+                    u32::MAX,
+                ),
             ],
             footer: "enter open".into(),
         };
@@ -6447,37 +4153,18 @@ mod tests {
         let grid = layout.apply_picker_overlay(base, &picker);
         let row = &grid.rows[geometry.content_start];
 
-        assert_eq!(
-            row.cells[preview_column].style.foreground,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green))
-        );
-        assert_eq!(
-            row.cells[preview_column].style.background,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
-        );
+        assert_eq!(row.cells[preview_column].style.foreground, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)));
+        assert_eq!(row.cells[preview_column].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
         for cell in &row.cells[preview_column + 6..preview_column + 12] {
-            assert_eq!(
-                cell.style.background,
-                Some(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0))
-            );
+            assert_eq!(cell.style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0)));
         }
-        assert_eq!(
-            row.cells[preview_column + 12].style.background,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
-        );
+        assert_eq!(row.cells[preview_column + 12].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
     }
 
     #[test]
     fn dap_ui_overlay_renders_default_panels_without_replacing_the_editor() {
         let mut layout = ViewportLayout::new(100, 30);
-        let grid = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "fn main() {}".into(),
-                cursor_byte: 0,
-            },
-            "NORMAL",
-            None,
-        );
+        let grid = layout.desired_editor_grid(&EngineFrame::new("fn main() {}", 0), "NORMAL", None);
         let grid = layout.apply_debug_overlay(
             grid,
             &DebugOverlay {
@@ -6489,25 +4176,8 @@ mod tests {
                 console: "stopped".into(),
             },
         );
-        let rendered = grid
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| cell.grapheme.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        for title in [
-            "Scopes",
-            "Breakpoints",
-            "Stacks",
-            "Watches",
-            "REPL",
-            "Console",
-        ] {
+        let rendered = grid.text();
+        for title in ["Scopes", "Breakpoints", "Stacks", "Watches", "REPL", "Console"] {
             assert!(rendered.contains(title), "missing {title}: {rendered}");
         }
         assert!(rendered.contains("fn main()"));
@@ -6515,18 +4185,9 @@ mod tests {
 
     #[test]
     fn catppuccin_flavors_are_exact_truecolor_and_overridable() {
-        assert_eq!(
-            CatppuccinPalette::MOCHA.base,
-            RgbColor::new(0x1e, 0x1e, 0x2e)
-        );
-        assert_eq!(
-            CatppuccinPalette::MOCHA.text,
-            RgbColor::new(0xcd, 0xd6, 0xf4)
-        );
-        assert_eq!(
-            CatppuccinPalette::LATTE.base,
-            RgbColor::new(0xef, 0xf1, 0xf5)
-        );
+        assert_eq!(CatppuccinPalette::MOCHA.base, RgbColor::new(0x1e, 0x1e, 0x2e));
+        assert_eq!(CatppuccinPalette::MOCHA.text, RgbColor::new(0xcd, 0xd6, 0xf4));
+        assert_eq!(CatppuccinPalette::LATTE.base, RgbColor::new(0xef, 0xf1, 0xf5));
         let mut palette = CatppuccinPalette::for_flavor(CatppuccinFlavor::Macchiato);
         assert!(palette.set("mauve", RgbColor::new(1, 2, 3)));
         assert_eq!(palette.mauve, RgbColor::new(1, 2, 3));
@@ -6534,36 +4195,15 @@ mod tests {
 
         let mut layout = ViewportLayout::new(20, 2);
         layout.set_theme(CatppuccinPalette::LATTE);
-        let grid = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "x".into(),
-                cursor_byte: 0,
-            },
-            "",
-            None,
-        );
-        assert_eq!(
-            grid.rows[0].cells[0].style,
-            CellStyle {
-                foreground: Some(CellColor::Rgb(CatppuccinPalette::LATTE.text)),
-                background: Some(CellColor::Rgb(CatppuccinPalette::LATTE.base)),
-                ..CellStyle::default()
-            }
-        );
+        let grid = layout.desired_editor_grid(&EngineFrame::new("x", 0), "", None);
+        assert_eq!(grid.rows[0].cells[0].style, CellStyle::rgb(CatppuccinPalette::LATTE.text, CatppuccinPalette::LATTE.base));
     }
 
     #[test]
     fn every_terminal_row_erases_with_the_active_theme_background() {
         let mut layout = ViewportLayout::new(120, 40);
         layout.set_theme(CatppuccinPalette::MACCHIATO);
-        let grid = layout.desired_editor_grid(
-            &EngineFrame {
-                text: "one short line".into(),
-                cursor_byte: 0,
-            },
-            "NORMAL",
-            None,
-        );
+        let grid = layout.desired_editor_grid(&EngineFrame::new("one short line", 0), "NORMAL", None);
         assert_eq!(grid.rows.len(), 40);
         assert!(grid.rows.iter().all(|row| !row.cells.is_empty()));
         let patches = diff(None, &grid);
@@ -6575,17 +4215,30 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(clears.len(), 40);
-        assert!(clears.iter().all(|style| {
-            style.background == Some(CellColor::Rgb(CatppuccinPalette::MACCHIATO.base))
+        assert!(clears.iter().all(|style| { style.background == Some(CellColor::Rgb(CatppuccinPalette::MACCHIATO.base)) }));
+    }
+
+    #[test]
+    fn raster_overlay_is_added_and_removed_by_the_grid_diff() {
+        let mut with_overlay = ViewportLayout::new(2, 2).desired_grid(&EngineFrame::new("", 0));
+        with_overlay.raster_overlay = Some(Arc::new(RasterOverlay {
+            frame_id: with_overlay.epoch,
+            width: 2,
+            height: 2,
+            columns: 2,
+            rows: 1,
+            source: RasterSource::Rgb(Arc::new(vec![0; 12])),
         }));
+        assert!(diff(None, &with_overlay).iter().any(|patch| matches!(patch, TerminalPatch::SetRasterOverlay(Some(_)))));
+
+        let mut without_overlay = with_overlay.clone();
+        without_overlay.raster_overlay = None;
+        assert!(diff(Some(&with_overlay), &without_overlay).iter().any(|patch| { matches!(patch, TerminalPatch::SetRasterOverlay(None)) }));
     }
 
     #[test]
     fn wraps_graphemes_without_splitting_them() {
-        let frame = EngineFrame {
-            text: "ab界c".into(),
-            cursor_byte: "ab界".len(),
-        };
+        let frame = EngineFrame::new("ab界c", "ab界".len());
         let grid = ViewportLayout::new(3, 3).desired_grid(&frame);
         assert_eq!(grid.rows[1].cells[0].grapheme.as_ref(), "界");
         assert_eq!(grid.cursor, (2, 1));
@@ -6593,40 +4246,22 @@ mod tests {
 
     #[test]
     fn dotfile_profile_renders_relative_numbers_two_column_tabs_and_scrolloff() {
-        let frame = EngineFrame {
-            text: "one\n\ttwo\nthree\nfour\nfive\nsix\nseven\n".into(),
-            cursor_byte: "one\n\tt".len(),
-        };
+        let frame = EngineFrame::new("one\n\ttwo\nthree\nfour\nfive\nsix\nseven\n", "one\n\tt".len());
         let mut layout = ViewportLayout::new(20, 5);
         layout.configure_dotfile_profile();
         layout.ensure_cursor_visible(&frame, 0);
         let grid = layout.desired_grid(&frame);
-        let rows = grid
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| cell.grapheme.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rows = grid.rows.iter().map(|row| row.text()).collect::<Vec<_>>();
         assert!(rows[0].starts_with(" 1 one"));
         assert!(rows[1].starts_with(" 2   two"));
         assert_eq!(grid.cursor.0, 6);
 
         let mut wide = ViewportLayout::new(90, 2);
         wide.configure_dotfile_profile();
-        let wide_grid = wide.desired_grid(&EngineFrame {
-            text: "short\n".into(),
-            cursor_byte: 0,
-        });
+        let wide_grid = wide.desired_grid(&EngineFrame::new("short\n", 0));
         let color_column = &wide_grid.rows[0].cells[82];
         assert_eq!(color_column.grapheme.as_ref(), " ");
-        assert_eq!(
-            color_column.style.background,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
-        );
+        assert_eq!(color_column.style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
         assert!(!color_column.style.reverse);
     }
 
@@ -6634,27 +4269,15 @@ mod tests {
     fn text_past_the_color_limit_keeps_the_same_edge_on_wrapped_rows() {
         let mut layout = ViewportLayout::new(90, 3);
         layout.configure_dotfile_profile();
-        let grid = layout.desired_grid(&EngineFrame {
-            text: "x".repeat(180).into(),
-            cursor_byte: 0,
-        });
+        let grid = layout.desired_grid(&EngineFrame::new("x".repeat(180), 0));
 
         for row in grid.rows.iter().take(2) {
             assert_eq!(row.cells[81].grapheme.as_ref(), "x");
-            assert_eq!(
-                row.cells[81].style.background,
-                Some(CellColor::Rgb(CatppuccinPalette::MOCHA.base))
-            );
+            assert_eq!(row.cells[81].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.base)));
             assert_eq!(row.cells[82].grapheme.as_ref(), "x");
-            assert_eq!(
-                row.cells[82].style.background,
-                Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
-            );
+            assert_eq!(row.cells[82].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
             assert_eq!(row.cells[83].grapheme.as_ref(), "x");
-            assert_eq!(
-                row.cells[83].style.background,
-                Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle))
-            );
+            assert_eq!(row.cells[83].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
         }
     }
 
@@ -6662,20 +4285,9 @@ mod tests {
     fn text_popup_crossing_color_limit_preserves_the_underlying_tail_background() {
         let mut layout = ViewportLayout::new(120, 8);
         layout.configure_dotfile_profile();
-        let source = (0..8)
-            .map(|_| format!("left{}right\n", " ".repeat(90)))
-            .collect::<String>();
-        let base = layout.desired_grid(&EngineFrame {
-            text: source.into(),
-            cursor_byte: 4,
-        });
-        let popup = TextPopup {
-            title: "hover".into(),
-            text: "a".repeat(80).into(),
-            scroll: 0,
-            cursor: None,
-            decorations: Vec::new(),
-        };
+        let source = (0..8).map(|_| format!("left{}right\n", " ".repeat(90))).collect::<String>();
+        let base = layout.desired_grid(&EngineFrame::new(source, 4));
+        let popup = TextPopup::new("hover", "a".repeat(80));
 
         let grid = layout.apply_text_popup(base, &popup);
         let interior = &grid.rows[2];
@@ -6695,25 +4307,13 @@ mod tests {
     #[test]
     fn text_popup_uses_empty_right_margin_instead_of_following_the_cursor() {
         let source = "fn one() {}\nfn two() {}\nfn three() {}\nfn four() {}\n";
-        let popup = TextPopup {
-            title: "hover".into(),
-            text: "documentation".into(),
-            scroll: 0,
-            cursor: None,
-            decorations: Vec::new(),
-        };
+        let popup = TextPopup::new("hover", "documentation");
         let mut layout = ViewportLayout::new(100, 12);
 
-        let first = layout.desired_grid(&EngineFrame {
-            text: source.into(),
-            cursor_byte: 0,
-        });
+        let first = layout.desired_grid(&EngineFrame::new(source, 0));
         let first_grid = layout.apply_text_popup(first.clone(), &popup);
         let first_placement = text_popup_placement(&first, 15, 3);
-        let second = layout.desired_grid(&EngineFrame {
-            text: source.into(),
-            cursor_byte: source.find("four").expect("four"),
-        });
+        let second = layout.desired_grid(&EngineFrame::new(source, source.find("four").expect("four")));
         let second_grid = layout.apply_text_popup(second.clone(), &popup);
         let second_placement = text_popup_placement(&second, 15, 3);
 
@@ -6728,17 +4328,8 @@ mod tests {
     #[test]
     fn text_popup_keeps_a_margin_after_its_right_border() {
         let mut layout = ViewportLayout::new(40, 8);
-        let base = layout.desired_grid(&EngineFrame {
-            text: "short\n".into(),
-            cursor_byte: 0,
-        });
-        let popup = TextPopup {
-            title: "hover".into(),
-            text: "x".repeat(80).into(),
-            scroll: 0,
-            cursor: None,
-            decorations: Vec::new(),
-        };
+        let base = layout.desired_grid(&EngineFrame::new("short\n", 0));
+        let popup = TextPopup::new("hover", "x".repeat(80));
         let placement = text_popup_placement(&base, 38, 5);
 
         let grid = layout.apply_text_popup(base, &popup);
@@ -6752,17 +4343,8 @@ mod tests {
     #[test]
     fn focused_text_popup_places_the_terminal_cursor_inside_its_content() {
         let mut layout = ViewportLayout::new(40, 8);
-        let base = layout.desired_grid(&EngineFrame {
-            text: "buffer\n".into(),
-            cursor_byte: 0,
-        });
-        let popup = TextPopup {
-            title: "hover".into(),
-            text: "one\ntwo\nthree".into(),
-            scroll: 0,
-            cursor: Some((1, 1)),
-            decorations: Vec::new(),
-        };
+        let base = layout.desired_grid(&EngineFrame::new("buffer\n", 0));
+        let popup = TextPopup::new("hover", "one\ntwo\nthree").with_cursor((1, 1));
         let placement = text_popup_placement(&base, 7, 5);
 
         let grid = layout.apply_text_popup(base, &popup);
@@ -6773,16 +4355,9 @@ mod tests {
     #[test]
     fn text_popup_finds_empty_right_edge_below_longer_lines() {
         let mut layout = ViewportLayout::new(40, 8);
-        let grid = layout.desired_grid(&EngineFrame {
-            text: "                              right\n                              edge\n"
-                .into(),
-            cursor_byte: 30,
-        });
+        let grid = layout.desired_grid(&EngineFrame::new("                              right\n                              edge\n", 30));
 
-        assert_eq!(
-            text_popup_placement(&grid, 12, 4),
-            PopupPlacement { column: 27, row: 2 }
-        );
+        assert_eq!(text_popup_placement(&grid, 12, 4), PopupPlacement { column: 27, row: 2 });
     }
 
     #[test]
@@ -6790,27 +4365,16 @@ mod tests {
         let mut layout = ViewportLayout::new(1, 1);
         layout.configure_dotfile_profile();
         let model = ClientViewModel::new(DocumentId::new(1), "tiny");
-        let frame = EngineFrame {
-            text: "x".into(),
-            cursor_byte: 0,
-        };
-        let grid =
-            layout.desired_workspace_grid(&model, &[(BufferId::new(1), frame)], "NORMAL", None);
+        let frame = EngineFrame::new("x", 0);
+        let grid = layout.desired_workspace_grid(&model, &[(BufferId::new(1), frame)], "NORMAL", None);
         assert_eq!(grid.rows.len(), 1);
     }
 
     #[test]
     fn controls_are_escaped_before_terminal_patches() {
-        let frame = EngineFrame {
-            text: "a\u{1b}\u{0}b".into(),
-            cursor_byte: 0,
-        };
+        let frame = EngineFrame::new("a\u{1b}\u{0}b", 0);
         let grid = ViewportLayout::new(20, 2).desired_grid(&frame);
-        let visible: String = grid.rows[0]
-            .cells
-            .iter()
-            .map(|cell| cell.grapheme.as_ref())
-            .collect();
+        let visible = grid.rows[0].text();
         assert_eq!(visible, "a^[^@b");
         assert!(!visible.contains('\u{1b}'));
     }
@@ -6822,97 +4386,34 @@ mod tests {
         model.split_active(SplitAxis::Vertical).expect("split");
         model.set_active_buffer(second).expect("second pane");
         let first = model.buffers[0].id;
-        let keyword = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Palette(12)),
-            ..CellStyle::default()
-        };
+        let keyword = CellStyle::default().with_foreground(CellColor::Palette(12)).with_bold();
         let grid = ViewportLayout::new(20, 3).desired_workspace_grid_with_decorations(
             &model,
-            &[
-                (
-                    first,
-                    EngineFrame {
-                        text: "界\tfn".into(),
-                        cursor_byte: 0,
-                    },
-                ),
-                (
-                    second,
-                    EngineFrame {
-                        text: "let value".into(),
-                        cursor_byte: 0,
-                    },
-                ),
-            ],
-            &[
-                (
-                    first,
-                    vec![DecorationSpan {
-                        range: "界\t".len().."界\tfn".len(),
-                        priority: 100,
-                        style: keyword,
-                    }],
-                ),
-                (
-                    second,
-                    vec![DecorationSpan {
-                        range: 0..3,
-                        priority: 100,
-                        style: keyword,
-                    }],
-                ),
-            ],
+            &[(first, EngineFrame::new("界\tfn", 0)), (second, EngineFrame::new("let value", 0))],
+            &[(first, vec![DecorationSpan::new("界\t".len().."界\tfn".len(), keyword, 100)]), (second, vec![DecorationSpan::new(0..3, keyword, 100)])],
             "",
             None,
         );
-        let styled: String = grid
-            .rows
-            .iter()
-            .flat_map(|row| row.cells.iter())
-            .filter(|cell| cell.style == keyword)
-            .map(|cell| cell.grapheme.as_ref())
-            .collect();
+        let styled: String =
+            grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.style == keyword).map(|cell| cell.grapheme.as_ref()).collect();
         assert_eq!(styled, "fnlet");
     }
 
     #[test]
     fn signcolumn_number_decorations_do_not_overwrite_syntax_tokens() {
-        let syntax = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)),
-            ..CellStyle::default()
-        };
-        let git_sign = CellStyle {
-            bold: true,
-            foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)),
-            ..CellStyle::default()
-        };
+        let syntax = CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)).with_bold();
+        let git_sign = CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).with_bold();
         let mut layout = ViewportLayout::new(20, 2);
         layout.configure_dotfile_profile();
         let grid = layout.desired_editor_grid_with_line_decorations(
-            &EngineFrame {
-                text: "fn main() {}\n".into(),
-                cursor_byte: 0,
-            },
+            &EngineFrame::new("fn main() {}\n", 0),
             "",
             None,
-            &[DecorationSpan {
-                range: 0..2,
-                priority: 100,
-                style: syntax,
-            }],
-            &[LineDecoration {
-                line: 0,
-                style: git_sign,
-            }],
+            &[DecorationSpan::new(0..2, syntax, 100)],
+            &[LineDecoration { line: 0, style: git_sign }],
         );
 
-        assert!(
-            grid.rows[0].cells[..3]
-                .iter()
-                .all(|cell| cell.style.foreground == git_sign.foreground)
-        );
+        assert!(grid.rows[0].cells[..3].iter().all(|cell| cell.style.foreground == git_sign.foreground));
         assert_eq!(grid.rows[0].cells[3].grapheme.as_ref(), "f");
         assert_eq!(grid.rows[0].cells[3].style.foreground, syntax.foreground);
         assert_eq!(grid.rows[0].cells[4].grapheme.as_ref(), "n");
@@ -6921,10 +4422,7 @@ mod tests {
 
     #[test]
     fn cursor_scrolls_into_view_and_prompt_owns_last_row() {
-        let frame = EngineFrame {
-            text: "0\n1\n2\n3\n4\n".into(),
-            cursor_byte: "0\n1\n2\n3\n".len(),
-        };
+        let frame = EngineFrame::new("0\n1\n2\n3\n4\n", "0\n1\n2\n3\n".len());
         let mut layout = ViewportLayout::new(10, 3);
         layout.ensure_cursor_visible(&frame, 1);
         assert_eq!(layout.top_line, 3);
@@ -6934,33 +4432,17 @@ mod tests {
 
     #[test]
     fn shrinking_rows_emits_clear_to_end() {
-        let old = ViewportLayout::new(20, 2).desired_grid(&EngineFrame {
-            text: "long line".into(),
-            cursor_byte: 0,
-        });
-        let new = ViewportLayout::new(20, 2).desired_grid(&EngineFrame {
-            text: "x".into(),
-            cursor_byte: 0,
-        });
-        assert!(
-            diff(Some(&old), &new)
-                .iter()
-                .any(|patch| matches!(patch, TerminalPatch::ClearToEndOfLine(_)))
-        );
+        let old = ViewportLayout::new(20, 2).desired_grid(&EngineFrame::new("long line", 0));
+        let new = ViewportLayout::new(20, 2).desired_grid(&EngineFrame::new("x", 0));
+        assert!(diff(Some(&old), &new).iter().any(|patch| matches!(patch, TerminalPatch::ClearToEndOfLine(_))));
     }
 
     #[test]
     fn unchanged_rows_are_arc_reused_while_frame_epochs_advance() {
-        let frame = EngineFrame {
-            text: "same\nrows".into(),
-            cursor_byte: 0,
-        };
+        let frame = EngineFrame::new("same\nrows", 0);
         let mut layout = ViewportLayout::new(20, 2);
         let first = layout.desired_grid(&frame);
-        let second = layout.desired_grid(&EngineFrame {
-            cursor_byte: 5,
-            ..frame
-        });
+        let second = layout.desired_grid(&EngineFrame::new(frame.text, 5));
         assert!(second.epoch > first.epoch);
         assert!(Arc::ptr_eq(&first.rows[0], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
@@ -6970,35 +4452,19 @@ mod tests {
     #[test]
     fn unicode_line_edits_only_rebuild_the_changed_visual_rows() {
         let mut layout = ViewportLayout::new(30, 3);
-        let first = layout.desired_grid(&EngineFrame {
-            text: "界 alpha\nβeta\ngamma".into(),
-            cursor_byte: 0,
-        });
-        let second = layout.desired_grid(&EngineFrame {
-            text: "界λ alpha\nβeta\ngamma".into(),
-            cursor_byte: "界λ".len(),
-        });
+        let first = layout.desired_grid(&EngineFrame::new("界 alpha\nβeta\ngamma", 0));
+        let second = layout.desired_grid(&EngineFrame::new("界λ alpha\nβeta\ngamma", "界λ".len()));
 
         assert!(!Arc::ptr_eq(&first.rows[0], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
         assert!(Arc::ptr_eq(&first.rows[2], &second.rows[2]));
         assert_eq!(second.cursor, (3, 0));
-        assert_eq!(
-            second.rows[0]
-                .cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>(),
-            "界λ alpha"
-        );
+        assert_eq!(second.rows[0].text(), "界λ alpha");
     }
 
     #[test]
     fn one_line_viewport_scroll_reuses_visible_unicode_rows() {
-        let frame = EngineFrame {
-            text: "αlpha\nβeta\nγamma\nδelta".into(),
-            cursor_byte: 0,
-        };
+        let frame = EngineFrame::new("αlpha\nβeta\nγamma\nδelta", 0);
         let mut layout = ViewportLayout::new(30, 3);
         let first = layout.desired_grid(&frame);
         layout.top_line = 1;
@@ -7006,25 +4472,13 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[2], &second.rows[1]));
-        assert_eq!(
-            second.rows[2]
-                .cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>(),
-            "δelta"
-        );
+        assert_eq!(second.rows[2].text(), "δelta");
     }
 
     #[test]
     fn half_page_viewport_scroll_reuses_the_overlapping_rows_in_both_directions() {
-        let text = (0..20)
-            .map(|line| format!("line {line:02}\n"))
-            .collect::<String>();
-        let frame = EngineFrame {
-            text: text.into(),
-            cursor_byte: 0,
-        };
+        let text = (0..20).map(|line| format!("line {line:02}\n")).collect::<String>();
+        let frame = EngineFrame::new(text, 0);
         let mut layout = ViewportLayout::new(30, 8);
         let first = layout.desired_grid(&frame);
         layout.top_line = 4;
@@ -7039,33 +4493,14 @@ mod tests {
         for offset in 0..6 {
             assert!(Arc::ptr_eq(&down.rows[offset], &up.rows[offset + 2]));
         }
-        assert_eq!(
-            up.rows[0]
-                .cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>(),
-            "line 02"
-        );
-        assert_eq!(
-            up.rows[1]
-                .cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>(),
-            "line 03"
-        );
+        assert_eq!(up.rows[0].text(), "line 02");
+        assert_eq!(up.rows[1].text(), "line 03");
     }
 
     #[test]
     fn distant_viewport_jump_reuses_a_recent_view_without_rerendering_rows() {
-        let text = (0..100)
-            .map(|line| format!("line {line:02}\n"))
-            .collect::<String>();
-        let frame = EngineFrame {
-            text: text.into(),
-            cursor_byte: 0,
-        };
+        let text = (0..100).map(|line| format!("line {line:02}\n")).collect::<String>();
+        let frame = EngineFrame::new(text, 0);
         let mut layout = ViewportLayout::new(30, 8);
         let first = layout.desired_grid(&frame);
 
@@ -7082,48 +4517,20 @@ mod tests {
 
     #[test]
     fn dotfile_relative_numbers_reuse_recent_rows_across_back_and_forth_scrolls() {
-        let text = (0..20)
-            .map(|line| format!("line {line:02}\n"))
-            .collect::<String>();
+        let text = (0..20).map(|line| format!("line {line:02}\n")).collect::<String>();
         let text = FrameText::from(text);
         let mut layout = ViewportLayout::new(30, 8);
         layout.configure_dotfile_profile();
-        let row_text = |row: &CellRow| {
-            row.cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>()
-        };
+        let row_text = CellRow::text;
 
-        let first = layout.desired_editor_grid(
-            &EngineFrame {
-                text: text.clone(),
-                cursor_byte: 0,
-            },
-            "",
-            None,
-        );
+        let first = layout.desired_editor_grid(&EngineFrame::new(text.clone(), 0), "", None);
         layout.top_line = 4;
-        let down = layout.desired_editor_grid(
-            &EngineFrame {
-                text: text.clone(),
-                cursor_byte: text.byte_of_line(4),
-            },
-            "",
-            None,
-        );
+        let down = layout.desired_editor_grid(&EngineFrame::new(text.clone(), text.byte_of_line(4)), "", None);
         assert!(layout.cached_logical_rows.keys().all(|line| *line < 4));
         assert!(row_text(&down.rows[0]).starts_with(" 5 line 04"));
 
         layout.top_line = 0;
-        let up = layout.desired_editor_grid(
-            &EngineFrame {
-                text,
-                cursor_byte: 0,
-            },
-            "",
-            None,
-        );
+        let up = layout.desired_editor_grid(&EngineFrame::new(text, 0), "", None);
         assert!(row_text(&up.rows[0]).starts_with(" 1 line 00"));
         assert_eq!(row_text(&up.rows[4]), row_text(&first.rows[4]));
         for (original, reused) in first.rows.iter().zip(&up.rows) {
@@ -7135,20 +4542,8 @@ mod tests {
     fn rich_status_overlay_builds_once_and_reuses_the_exact_row() {
         let mut layout = ViewportLayout::new(20, 3);
         let status = StatusOverlay {
-            left: vec![StatusSegment {
-                text: " LEFT ".into(),
-                style: CellStyle {
-                    bold: true,
-                    ..CellStyle::default()
-                },
-            }],
-            right: vec![StatusSegment {
-                text: " R ".into(),
-                style: CellStyle {
-                    reverse: true,
-                    ..CellStyle::default()
-                },
-            }],
+            left: vec![StatusSegment { text: " LEFT ".into(), style: CellStyle::default().with_bold() }],
+            right: vec![StatusSegment { text: " R ".into(), style: CellStyle::default().with_reverse() }],
         };
         let base = || DesiredGrid {
             epoch: 0,
@@ -7156,15 +4551,12 @@ mod tests {
             height: 3,
             rows: (0..3).map(|_| Arc::new(CellRow::default())).collect(),
             cursor: (0, 0),
+            raster_overlay: None,
         };
         let first = layout.apply_status_overlay(base(), &status);
         let second = layout.apply_status_overlay(base(), &status);
         assert!(Arc::ptr_eq(&first.rows[2], &second.rows[2]));
-        let rendered = first.rows[2]
-            .cells
-            .iter()
-            .map(|cell| cell.grapheme.as_ref())
-            .collect::<String>();
+        let rendered = first.rows[2].text();
         assert_eq!(rendered, " LEFT             R ");
     }
 
@@ -7174,36 +4566,11 @@ mod tests {
         let buffer_id = model.active_buffer();
         let window_id = model.active_window().id;
         let mut layout = ViewportLayout::new(30, 4);
-        let first = layout.desired_workspace_grid(
-            &model,
-            &[(
-                buffer_id,
-                EngineFrame {
-                    text: "界 alpha\nβeta\ngamma".into(),
-                    cursor_byte: 0,
-                },
-            )],
-            "NORMAL",
-            None,
-        );
+        let first = layout.desired_workspace_grid(&model, &[(buffer_id, EngineFrame::new("界 alpha\nβeta\ngamma", 0))], "NORMAL", None);
         let cached_second_row = Arc::clone(&layout.pane_layouts[&window_id].cached_rows[1]);
-        let second = layout.desired_workspace_grid(
-            &model,
-            &[(
-                buffer_id,
-                EngineFrame {
-                    text: "界λ alpha\nβeta\ngamma".into(),
-                    cursor_byte: "界λ".len(),
-                },
-            )],
-            "NORMAL",
-            None,
-        );
+        let second = layout.desired_workspace_grid(&model, &[(buffer_id, EngineFrame::new("界λ alpha\nβeta\ngamma", "界λ".len()))], "NORMAL", None);
 
-        assert!(Arc::ptr_eq(
-            &cached_second_row,
-            &layout.pane_layouts[&window_id].cached_rows[1]
-        ));
+        assert!(Arc::ptr_eq(&cached_second_row, &layout.pane_layouts[&window_id].cached_rows[1]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
         assert_eq!(second.cursor, (3, 0));
     }
@@ -7212,117 +4579,54 @@ mod tests {
     fn offscreen_line_edits_do_not_replace_visible_rows() {
         let mut layout = ViewportLayout::new(30, 2);
         layout.top_line = 1;
-        let first = layout.desired_grid(&EngineFrame {
-            text: "alpha\nbeta\ngamma".into(),
-            cursor_byte: "alpha\n".len(),
-        });
-        let second = layout.desired_grid(&EngineFrame {
-            text: "alphax\nbeta\ngamma".into(),
-            cursor_byte: "alphax\n".len(),
-        });
+        let first = layout.desired_grid(&EngineFrame::new("alpha\nbeta\ngamma", "alpha\n".len()));
+        let second = layout.desired_grid(&EngineFrame::new("alphax\nbeta\ngamma", "alphax\n".len()));
 
         assert!(Arc::ptr_eq(&first.rows[0], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
-        assert_eq!(
-            second.rows[0]
-                .cells
-                .iter()
-                .map(|cell| cell.grapheme.as_ref())
-                .collect::<String>(),
-            "beta"
-        );
+        assert_eq!(second.rows[0].text(), "beta");
     }
 
     #[test]
     fn ordered_decoration_sweep_matches_full_overlap_resolution() {
         let decorations = vec![
-            DecorationSpan {
-                range: 4..9,
-                priority: 20,
-                style: CellStyle {
-                    foreground: Some(CellColor::Palette(2)),
-                    ..CellStyle::default()
-                },
-            },
-            DecorationSpan {
-                range: 0..12,
-                priority: 10,
-                style: CellStyle {
-                    bold: true,
-                    foreground: Some(CellColor::Palette(1)),
-                    ..CellStyle::default()
-                },
-            },
-            DecorationSpan {
-                range: 7..11,
-                priority: 20,
-                style: CellStyle {
-                    underline: true,
-                    foreground: Some(CellColor::Palette(3)),
-                    ..CellStyle::default()
-                },
-            },
-            DecorationSpan {
-                range: 2..5,
-                priority: 30,
-                style: CellStyle {
-                    background: Some(CellColor::Palette(4)),
-                    ..CellStyle::default()
-                },
-            },
+            DecorationSpan::new(4..9, CellStyle::default().with_foreground(CellColor::Palette(2)), 20),
+            DecorationSpan::new(0..12, CellStyle::default().with_foreground(CellColor::Palette(1)).with_bold(), 10),
+            DecorationSpan::new(7..11, CellStyle::default().with_foreground(CellColor::Palette(3)).with_underline(), 20),
+            DecorationSpan::new(2..5, CellStyle::default().with_background(CellColor::Palette(4)), 30),
         ];
         let mut resolver = DecorationResolver::new(&decorations);
         for start in 0..14 {
             let range = start..start + 1;
-            assert_eq!(
-                resolver.style(range.clone()),
-                decoration_style(&decorations, range)
-            );
+            assert_eq!(resolver.style(range.clone()), decoration_style(&decorations, range));
         }
         let mut resolver = DecorationResolver::new_at(&decorations, 7);
         for start in 7..14 {
             let range = start..start + 1;
-            assert_eq!(
-                resolver.style(range.clone()),
-                decoration_style(&decorations, range)
-            );
+            assert_eq!(resolver.style(range.clone()), decoration_style(&decorations, range));
         }
     }
 
     #[test]
     fn shared_decoration_composition_reuses_equal_layers_by_value() {
-        let span = |range, priority| DecorationSpan {
-            range,
-            priority,
-            style: CellStyle::default(),
-        };
+        let span = |range, priority| DecorationSpan::new(range, CellStyle::default(), priority);
         let buffer_id = BufferId::new(1);
         let mut layout = ViewportLayout::new(80, 24);
-        let first_layers = vec![(
-            buffer_id,
-            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])],
-        )];
+        let first_layers = vec![(buffer_id, vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])])];
         let first = layout.compose_shared_decoration_layers(&first_layers);
         assert_eq!(first[0].1.len(), 2);
 
-        let equal_layers = vec![(
-            buffer_id,
-            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])],
-        )];
+        let equal_layers = vec![(buffer_id, vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(1..3, 2)])])];
         let equal = layout.compose_shared_decoration_layers(&equal_layers);
         assert!(Arc::ptr_eq(&first[0].1, &equal[0].1));
 
-        let changed_layers = vec![(
-            buffer_id,
-            vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(2..4, 2)])],
-        )];
+        let changed_layers = vec![(buffer_id, vec![Arc::new(vec![span(0..2, 1)]), Arc::new(vec![span(2..4, 2)])])];
         let changed = layout.compose_shared_decoration_layers(&changed_layers);
         assert!(!Arc::ptr_eq(&first[0].1, &changed[0].1));
         assert_eq!(changed[0].1[1].range, 2..4);
 
         let only = Arc::new(vec![span(4..5, 3)]);
-        let single =
-            layout.compose_shared_decoration_layers(&[(buffer_id, vec![Arc::clone(&only)])]);
+        let single = layout.compose_shared_decoration_layers(&[(buffer_id, vec![Arc::clone(&only)])]);
         assert!(Arc::ptr_eq(&only, &single[0].1));
     }
 }

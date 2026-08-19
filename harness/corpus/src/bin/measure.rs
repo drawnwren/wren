@@ -40,15 +40,8 @@ fn measure<T: TextStore>(backend: &'static str, path: &Path) -> Result<Measureme
     while midpoint > 0 && !whole.is_char_boundary(midpoint) {
         midpoint -= 1;
     }
-    let transaction = Transaction::new(
-        DocumentRevision::new(0),
-        vec![Edit::new(midpoint..midpoint, "x")],
-    )?;
-    let edit_iterations = if store.len_bytes() > 16 * 1024 * 1024 {
-        8
-    } else {
-        100
-    };
+    let transaction = Transaction::new(DocumentRevision::new(0), vec![Edit::new(midpoint..midpoint, "x")])?;
+    let edit_iterations = if store.len_bytes() > 16 * 1024 * 1024 { 8 } else { 100 };
     let started = Instant::now();
     for _ in 0..edit_iterations {
         let mut candidate = store.snapshot();
@@ -63,15 +56,7 @@ fn measure<T: TextStore>(backend: &'static str, path: &Path) -> Result<Measureme
         black_box(retained);
     }
     let retained = started.elapsed();
-    let conversion_iterations = if backend == "piece-stub" {
-        if store.len_bytes() > 16 * 1024 * 1024 {
-            10
-        } else {
-            1_000
-        }
-    } else {
-        100_000
-    };
+    let conversion_iterations = if backend == "piece-stub" { if store.len_bytes() > 16 * 1024 * 1024 { 10 } else { 1_000 } } else { 100_000 };
     let started = Instant::now();
     for _ in 0..conversion_iterations {
         let line = store.line_of_byte(black_box(midpoint));
@@ -80,11 +65,7 @@ fn measure<T: TextStore>(backend: &'static str, path: &Path) -> Result<Measureme
     let conversion = started.elapsed();
     Ok(Measurement {
         backend,
-        corpus: path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown")
-            .to_owned(),
+        corpus: path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown").to_owned(),
         bytes: store.len_bytes(),
         load_ms: load.as_secs_f64() * 1_000.0,
         snapshot_ns: elapsed_per(snapshot, snapshot_iterations, 1_000_000_000.0),
@@ -94,50 +75,35 @@ fn measure<T: TextStore>(backend: &'static str, path: &Path) -> Result<Measureme
     })
 }
 
-fn paths() -> Vec<PathBuf> {
+fn paths() -> Result<Vec<PathBuf>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    [
-        root.join("documents/normal.rs"),
+    Ok([
+        wren_benchmark_support::normal_rust_corpus()?,
         root.join("documents/unicode.txt"),
         root.join("generated/large-100mb.js"),
         root.join("generated/oneline-8mb.json"),
     ]
     .into_iter()
     .filter(|path| path.exists())
-    .collect()
+    .collect())
 }
 
 fn main() -> Result<()> {
     let mut measurements = Vec::new();
-    for path in paths() {
-        measurements.push(
-            measure::<RopeyText>("ropey", &path).with_context(|| path.display().to_string())?,
-        );
-        measurements
-            .push(measure::<CropText>("crop", &path).with_context(|| path.display().to_string())?);
-        measurements.push(
-            measure::<PieceTreeStub>("piece-stub", &path)
-                .with_context(|| path.display().to_string())?,
-        );
+    for path in paths()? {
+        measurements.push(measure::<RopeyText>("ropey", &path).with_context(|| path.display().to_string())?);
+        measurements.push(measure::<CropText>("crop", &path).with_context(|| path.display().to_string())?);
+        measurements.push(measure::<PieceTreeStub>("piece-stub", &path).with_context(|| path.display().to_string())?);
     }
     if env::args().any(|argument| argument == "--json") {
         println!("{}", serde_json::to_string_pretty(&measurements)?);
     } else {
-        println!(
-            "| backend | corpus | bytes | load ms | snapshot ns | edit µs | retained-32 µs | line↔byte ns |"
-        );
+        println!("| backend | corpus | bytes | load ms | snapshot ns | edit µs | retained-32 µs | line↔byte ns |");
         println!("|---|---|---:|---:|---:|---:|---:|---:|");
         for item in measurements {
             println!(
                 "| {} | {} | {} | {:.3} | {:.1} | {:.3} | {:.3} | {:.1} |",
-                item.backend,
-                item.corpus,
-                item.bytes,
-                item.load_ms,
-                item.snapshot_ns,
-                item.edit_us,
-                item.retained_32_us,
-                item.line_byte_ns,
+                item.backend, item.corpus, item.bytes, item.load_ms, item.snapshot_ns, item.edit_us, item.retained_32_us, item.line_byte_ns,
             );
         }
     }

@@ -6,8 +6,7 @@ use wren_provider::{AccelerationBackend, ProviderActor, ProviderRequest, Provide
 use wren_types::{DocumentId, DocumentRevision, LanguageBundle, Priority, ProviderDemand};
 
 const MIB: usize = 1024 * 1024;
-const WORKLOADS: [(&str, usize); 3] =
-    [("4-mib", 4 * MIB), ("8-mib", 8 * MIB), ("32-mib", 32 * MIB)];
+const WORKLOADS: [(&str, usize); 3] = [("4-mib", 4 * MIB), ("8-mib", 8 * MIB), ("32-mib", 32 * MIB)];
 
 fn bundle() -> LanguageBundle {
     LanguageBundle {
@@ -52,19 +51,12 @@ fn demand(document_id: DocumentId, bytes: usize) -> ProviderRequest {
 
 fn update(actor: &mut ProviderActor, document_id: DocumentId, source: Box<str>) {
     actor
-        .handle(ProviderRequest::UpdateDocument {
-            document_id,
-            revision: DocumentRevision::new(1),
-            text: source,
-            bundle: bundle(),
-        })
+        .handle(ProviderRequest::UpdateDocument { document_id, revision: DocumentRevision::new(1), text: source, bundle: bundle() })
         .expect("load provider benchmark document");
 }
 
 fn highlight(actor: &mut ProviderActor, document_id: DocumentId, bytes: usize) -> ProviderResponse {
-    actor
-        .handle(demand(document_id, bytes))
-        .expect("highlight provider benchmark document")
+    actor.handle(demand(document_id, bytes)).expect("highlight provider benchmark document")
 }
 
 fn provider_acceleration(criterion: &mut Criterion) {
@@ -84,9 +76,7 @@ fn provider_acceleration(criterion: &mut Criterion) {
     assert_eq!(actual, expected, "GPU and CPU provider output diverged");
     let gpu_available = gpu.acceleration_backend() == AccelerationBackend::Gpu;
     if !gpu_available {
-        eprintln!(
-            "hardware GPU unavailable; recording CPU baselines only (first workload: {first_name})"
-        );
+        eprintln!("hardware GPU unavailable; recording CPU baselines only (first workload: {first_name})");
     }
 
     let mut group = criterion.benchmark_group("provider-lexical-classification");

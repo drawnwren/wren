@@ -10,9 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wren_types::{
-    ClientId, ClientMutation, DocumentId, DocumentRevision, FileIdentity, LeaseEpoch,
-    MutationResult, RemoteOpenState, Resume, ResumeResult, SaveRequest, Saved, SessionEpoch,
-    WorkspaceGeneration,
+    ClientId, ClientMutation, DocumentId, DocumentRevision, FileIdentity, LeaseEpoch, MutationResult, RemoteOpenState, Resume, ResumeResult, SaveRequest,
+    Saved, SessionEpoch, WorkspaceGeneration,
 };
 
 pub const REMOTE_PROTOCOL_MAJOR: u16 = wren_proto::PROTOCOL_MAJOR as u16;
@@ -96,10 +95,7 @@ impl OpenSshSpec {
         for option in &self.extra_options {
             arguments.extend(["-o".to_owned(), option.to_string()]);
         }
-        let target = self.user.as_ref().map_or_else(
-            || self.host.to_string(),
-            |user| format!("{user}@{}", self.host),
-        );
+        let target = self.user.as_ref().map_or_else(|| self.host.to_string(), |user| format!("{user}@{}", self.host));
         arguments.push("--".to_owned());
         arguments.push(target);
         arguments.push(shell_quote(&self.remote_session_program));
@@ -110,27 +106,17 @@ impl OpenSshSpec {
             shell_quote(&format!("{REMOTE_PROTOCOL_MAJOR}.{REMOTE_PROTOCOL_MINOR}")),
         ]);
         if let Some(workspace) = &self.remote_workspace {
-            arguments.extend([
-                shell_quote("--workspace"),
-                shell_quote(&workspace.to_string_lossy()),
-            ]);
+            arguments.extend([shell_quote("--workspace"), shell_quote(&workspace.to_string_lossy())]);
         }
         if let Some(state_dir) = &self.remote_state_dir {
-            arguments.extend([
-                shell_quote("--state-dir"),
-                shell_quote(&state_dir.to_string_lossy()),
-            ]);
+            arguments.extend([shell_quote("--state-dir"), shell_quote(&state_dir.to_string_lossy())]);
         }
         arguments
     }
 }
 
 fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')
-        })
-    {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')) {
         return value.to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -144,25 +130,11 @@ pub struct OpenSshChannel {
 
 impl OpenSshChannel {
     pub fn connect(spec: &OpenSshSpec, lane: TransportLane) -> Result<Self, RemoteError> {
-        let mut child = Command::new(&spec.executable)
-            .args(spec.arguments(lane))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("ssh stdin unavailable"))?;
-        let output = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("ssh stdout unavailable"))?;
-        Ok(Self {
-            child,
-            input,
-            output,
-        })
+        let mut child =
+            Command::new(&spec.executable).args(spec.arguments(lane)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
+        let input = child.stdin.take().ok_or_else(|| io::Error::other("ssh stdin unavailable"))?;
+        let output = child.stdout.take().ok_or_else(|| io::Error::other("ssh stdout unavailable"))?;
+        Ok(Self { child, input, output })
     }
 
     pub fn send(&mut self, envelope: &wren_proto::Envelope) -> Result<(), RemoteError> {
@@ -171,75 +143,66 @@ impl OpenSshChannel {
     }
 
     pub fn receive(&mut self) -> Result<Option<wren_proto::Envelope>, RemoteError> {
-        Ok(wren_proto::read_envelope(
-            &mut self.output,
-            MAX_FRAME_BYTES,
-        )?)
+        Ok(wren_proto::read_envelope(&mut self.output, MAX_FRAME_BYTES)?)
     }
 
-    pub fn handshake(
+    fn request<T>(
         &mut self,
         request_id: u64,
-        capabilities: &RemoteCapabilities,
-    ) -> Result<RemoteCapabilities, RemoteError> {
-        self.send(&wren_proto::Envelope::new(
+        payload: wren_proto::envelope::Payload,
+        mut decode: impl FnMut(wren_proto::envelope::Payload) -> Result<Option<T>, RemoteError>,
+    ) -> Result<T, RemoteError> {
+        self.send(&wren_proto::Envelope::new(request_id, payload))?;
+        loop {
+            let envelope = self.receive()?.ok_or(RemoteError::UnexpectedResponse)?;
+            if envelope.request_id == 0 && matches!(envelope.payload, Some(wren_proto::envelope::Payload::SessionEvent(_))) {
+                continue;
+            }
+            if envelope.request_id != request_id {
+                return Err(RemoteError::UnexpectedResponse);
+            }
+            let payload = envelope.payload.ok_or(RemoteError::UnexpectedResponse)?;
+            if let Some(result) = decode(payload)? {
+                return Ok(result);
+            }
+        }
+    }
+
+    pub fn handshake(&mut self, request_id: u64, capabilities: &RemoteCapabilities) -> Result<RemoteCapabilities, RemoteError> {
+        let remote = self.request(
             request_id,
             wren_proto::envelope::Payload::Hello(wren_proto::Hello {
                 major: u32::from(capabilities.protocol_major),
                 minor: u32::from(capabilities.protocol_minor),
-                capabilities: capabilities
-                    .features
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
+                capabilities: capabilities.features.iter().map(ToString::to_string).collect(),
                 max_frame_bytes: MAX_FRAME_BYTES as u64,
             }),
-        ))?;
-        let reply = self.receive()?.ok_or(RemoteError::UnexpectedResponse)?;
-        let Some(wren_proto::envelope::Payload::HelloAck(ack)) = reply.payload else {
-            return Err(RemoteError::UnexpectedResponse);
-        };
-        let remote = RemoteCapabilities {
-            protocol_major: u16::try_from(ack.major).unwrap_or(u16::MAX),
-            protocol_minor: u16::try_from(ack.minor).unwrap_or(u16::MAX),
-            features: ack
-                .capabilities
-                .into_iter()
-                .map(String::into_boxed_str)
-                .collect(),
-        };
+            |payload| {
+                let wren_proto::envelope::Payload::HelloAck(ack) = payload else {
+                    return Err(RemoteError::UnexpectedResponse);
+                };
+                Ok(Some(RemoteCapabilities {
+                    protocol_major: u16::try_from(ack.major).unwrap_or(u16::MAX),
+                    protocol_minor: u16::try_from(ack.minor).unwrap_or(u16::MAX),
+                    features: ack.capabilities.into_iter().map(String::into_boxed_str).collect(),
+                }))
+            },
+        )?;
         capabilities.negotiate(&remote)
     }
 
     pub fn call(&mut self, request_id: u64, call: &RemoteCall) -> Result<RemoteReply, RemoteError> {
         let body = serde_json::to_vec(call)?;
-        self.send(&wren_proto::Envelope::new(
-            request_id,
-            wren_proto::envelope::Payload::RemoteCall(wren_proto::RemoteCall { body }),
-        ))?;
-        let reply = loop {
-            let reply = self.receive()?.ok_or(RemoteError::UnexpectedResponse)?;
-            if reply.request_id == 0
-                && matches!(
-                    reply.payload,
-                    Some(wren_proto::envelope::Payload::SessionEvent(_))
-                )
-            {
-                continue;
-            }
-            if reply.request_id != request_id {
-                return Err(RemoteError::UnexpectedResponse);
-            }
-            let Some(wren_proto::envelope::Payload::RemoteReply(reply)) = reply.payload else {
+        self.request(request_id, wren_proto::envelope::Payload::RemoteCall(wren_proto::RemoteCall { body }), |payload| {
+            let wren_proto::envelope::Payload::RemoteReply(reply) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            break reply;
-        };
-        let reply: RemoteReply = serde_json::from_slice(&reply.body)?;
-        if let RemoteReply::Failure { message } = &reply {
-            return Err(RemoteError::Peer(message.clone()));
-        }
-        Ok(reply)
+            let reply: RemoteReply = serde_json::from_slice(&reply.body)?;
+            match reply {
+                RemoteReply::Failure { message } => Err(RemoteError::Peer(message)),
+                reply => Ok(Some(reply)),
+            }
+        })
     }
 
     pub fn close(mut self) -> Result<(), RemoteError> {
@@ -270,25 +233,11 @@ impl DualOpenSshTransport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum RemoteCall {
-    Heartbeat {
-        nonce: u64,
-    },
-    Manifest {
-        generation: WorkspaceGeneration,
-    },
-    Open {
-        document_id: DocumentId,
-        client_id: ClientId,
-        path: Box<str>,
-        cached_hash: Option<[u8; 32]>,
-    },
-    Blob {
-        hash: [u8; 32],
-    },
-    Search {
-        needle: Box<str>,
-        maximum_results: usize,
-    },
+    Heartbeat { nonce: u64 },
+    Manifest { generation: WorkspaceGeneration },
+    Open { document_id: DocumentId, client_id: ClientId, path: Box<str>, cached_hash: Option<[u8; 32]> },
+    Blob { hash: [u8; 32] },
+    Search { needle: Box<str>, maximum_results: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,13 +264,7 @@ pub enum RemoteReply {
     Failure { message: Box<str> },
 }
 
-pub const REMOTE_CAPABILITIES: &[&str] = &[
-    "remote.manifest.v1",
-    "remote.open.v1",
-    "remote.blob.v1",
-    "remote.search.v1",
-    "remote.heartbeat.v1",
-];
+pub const REMOTE_CAPABILITIES: &[&str] = &["remote.manifest.v1", "remote.open.v1", "remote.blob.v1", "remote.search.v1", "remote.heartbeat.v1"];
 
 pub struct RemoteWorkspaceClient {
     spec: OpenSshSpec,
@@ -334,26 +277,15 @@ pub struct RemoteWorkspaceClient {
 impl RemoteWorkspaceClient {
     pub fn connect(spec: &OpenSshSpec) -> Result<Self, RemoteError> {
         let (transport, negotiated_control, negotiated_bulk) = Self::connect_transport(spec)?;
-        Ok(Self {
-            spec: spec.clone(),
-            transport,
-            next_request_id: 3,
-            negotiated_control,
-            negotiated_bulk,
-        })
+        Ok(Self { spec: spec.clone(), transport, next_request_id: 3, negotiated_control, negotiated_bulk })
     }
 
-    fn connect_transport(
-        spec: &OpenSshSpec,
-    ) -> Result<(DualOpenSshTransport, RemoteCapabilities, RemoteCapabilities), RemoteError> {
+    fn connect_transport(spec: &OpenSshSpec) -> Result<(DualOpenSshTransport, RemoteCapabilities, RemoteCapabilities), RemoteError> {
         let mut transport = DualOpenSshTransport::connect(spec)?;
         let offered = RemoteCapabilities {
             protocol_major: REMOTE_PROTOCOL_MAJOR,
             protocol_minor: REMOTE_PROTOCOL_MINOR,
-            features: REMOTE_CAPABILITIES
-                .iter()
-                .map(|feature| Box::<str>::from(*feature))
-                .collect(),
+            features: REMOTE_CAPABILITIES.iter().map(|feature| Box::<str>::from(*feature)).collect(),
         };
         let negotiated_control = transport.control.handshake(1, &offered)?;
         let negotiated_bulk = transport.bulk.handshake(2, &offered)?;
@@ -366,16 +298,16 @@ impl RemoteWorkspaceClient {
         request_id
     }
 
-    pub fn manifest(
-        &mut self,
-        generation: WorkspaceGeneration,
-    ) -> Result<MerkleManifest, RemoteError> {
+    fn call(&mut self, lane: TransportLane, call: RemoteCall) -> Result<RemoteReply, RemoteError> {
         let request_id = self.request_id();
-        match self
-            .transport
-            .control
-            .call(request_id, &RemoteCall::Manifest { generation })?
-        {
+        match lane {
+            TransportLane::Control => self.transport.control.call(request_id, &call),
+            TransportLane::Bulk => self.transport.bulk.call(request_id, &call),
+        }
+    }
+
+    pub fn manifest(&mut self, generation: WorkspaceGeneration) -> Result<MerkleManifest, RemoteError> {
+        match self.call(TransportLane::Control, RemoteCall::Manifest { generation })? {
             RemoteReply::Manifest { manifest } => Ok(manifest),
             _ => Err(RemoteError::UnexpectedResponse),
         }
@@ -385,15 +317,8 @@ impl RemoteWorkspaceClient {
     /// control lane. OpenSSH keepalives detect a dead transport; this message
     /// additionally proves that the remote session loop is responsive.
     pub fn heartbeat(&mut self, nonce: u64) -> Result<(), RemoteError> {
-        let request_id = self.request_id();
-        match self
-            .transport
-            .control
-            .call(request_id, &RemoteCall::Heartbeat { nonce })?
-        {
-            RemoteReply::Heartbeat {
-                nonce: returned_nonce,
-            } if returned_nonce == nonce => Ok(()),
+        match self.call(TransportLane::Control, RemoteCall::Heartbeat { nonce })? {
+            RemoteReply::Heartbeat { nonce: returned_nonce } if returned_nonce == nonce => Ok(()),
             _ => Err(RemoteError::UnexpectedResponse),
         }
     }
@@ -403,25 +328,14 @@ impl RemoteWorkspaceClient {
     /// The old lanes remain installed until both replacements have completed
     /// protocol negotiation and the control lane has accepted `Resume`.
     pub fn reconnect(&mut self, resume: &Resume) -> Result<ResumeResult, RemoteError> {
-        let (mut replacement, negotiated_control, negotiated_bulk) =
-            Self::connect_transport(&self.spec)?;
+        let (mut replacement, negotiated_control, negotiated_bulk) = Self::connect_transport(&self.spec)?;
         let request_id = self.request_id();
-        replacement.control.send(&wren_proto::Envelope::new(
-            request_id,
-            wren_proto::envelope::Payload::Resume(wren_proto::Resume::from(resume)),
-        ))?;
-        let envelope = replacement
-            .control
-            .receive()?
-            .ok_or(RemoteError::UnexpectedResponse)?;
-        if envelope.request_id != request_id {
-            return Err(RemoteError::UnexpectedResponse);
-        }
-        let Some(wren_proto::envelope::Payload::ResumeResult(result)) = envelope.payload else {
-            return Err(RemoteError::UnexpectedResponse);
-        };
-        let result = ResumeResult::try_from(result)
-            .map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))?;
+        let result = replacement.control.request(request_id, wren_proto::envelope::Payload::Resume(wren_proto::Resume::from(resume)), |payload| {
+            let wren_proto::envelope::Payload::ResumeResult(result) = payload else {
+                return Err(RemoteError::UnexpectedResponse);
+            };
+            ResumeResult::try_from(result).map(Some).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))
+        })?;
         let previous = std::mem::replace(&mut self.transport, replacement);
         self.negotiated_control = negotiated_control;
         self.negotiated_bulk = negotiated_bulk;
@@ -437,50 +351,22 @@ impl RemoteWorkspaceClient {
         path: impl Into<Box<str>>,
         cached_hash: Option<[u8; 32]>,
     ) -> Result<RemoteOpened, RemoteError> {
-        let request_id = self.request_id();
-        match self.transport.control.call(
-            request_id,
-            &RemoteCall::Open {
-                document_id,
-                client_id,
-                path: path.into(),
-                cached_hash,
-            },
-        )? {
+        match self.call(TransportLane::Control, RemoteCall::Open { document_id, client_id, path: path.into(), cached_hash })? {
             RemoteReply::Opened { opened } => Ok(opened),
             _ => Err(RemoteError::UnexpectedResponse),
         }
     }
 
     pub fn blob(&mut self, hash: [u8; 32]) -> Result<Vec<u8>, RemoteError> {
-        let request_id = self.request_id();
-        match self
-            .transport
-            .bulk
-            .call(request_id, &RemoteCall::Blob { hash })?
-        {
-            RemoteReply::Blob {
-                hash: returned_hash,
-                bytes,
-            } if returned_hash == hash && blake3::hash(&bytes).as_bytes() == &hash => Ok(bytes),
+        match self.call(TransportLane::Bulk, RemoteCall::Blob { hash })? {
+            RemoteReply::Blob { hash: returned_hash, bytes } if returned_hash == hash && blake3::hash(&bytes).as_bytes() == &hash => Ok(bytes),
             RemoteReply::Blob { .. } => Err(RemoteError::HashMismatch),
             _ => Err(RemoteError::UnexpectedResponse),
         }
     }
 
-    pub fn search(
-        &mut self,
-        needle: impl Into<Box<str>>,
-        maximum_results: usize,
-    ) -> Result<Vec<SearchHit>, RemoteError> {
-        let request_id = self.request_id();
-        match self.transport.bulk.call(
-            request_id,
-            &RemoteCall::Search {
-                needle: needle.into(),
-                maximum_results,
-            },
-        )? {
+    pub fn search(&mut self, needle: impl Into<Box<str>>, maximum_results: usize) -> Result<Vec<SearchHit>, RemoteError> {
+        match self.call(TransportLane::Bulk, RemoteCall::Search { needle: needle.into(), maximum_results })? {
             RemoteReply::Search { hits } => Ok(hits),
             _ => Err(RemoteError::UnexpectedResponse),
         }
@@ -488,60 +374,23 @@ impl RemoteWorkspaceClient {
 
     pub fn submit(&mut self, mutation: &ClientMutation) -> Result<MutationResult, RemoteError> {
         let request_id = self.request_id();
-        self.transport.control.send(&wren_proto::Envelope::new(
-            request_id,
-            wren_proto::envelope::Payload::ClientMutation(wren_proto::ClientMutation::from(
-                mutation,
-            )),
-        ))?;
-        loop {
-            let envelope = self
-                .transport
-                .control
-                .receive()?
-                .ok_or(RemoteError::UnexpectedResponse)?;
-            if envelope.request_id == 0 {
-                continue;
-            }
-            if envelope.request_id != request_id {
-                return Err(RemoteError::UnexpectedResponse);
-            }
-            let Some(wren_proto::envelope::Payload::MutationResult(result)) = envelope.payload
-            else {
+        self.transport.control.request(request_id, wren_proto::envelope::Payload::ClientMutation(wren_proto::ClientMutation::from(mutation)), |payload| {
+            let wren_proto::envelope::Payload::MutationResult(result) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            let result = MutationResult::try_from(result)
-                .map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))?;
-            if !matches!(result, MutationResult::Received { .. }) {
-                return Ok(result);
-            }
-        }
+            let result = MutationResult::try_from(result).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))?;
+            Ok((!matches!(result, MutationResult::Received { .. })).then_some(result))
+        })
     }
 
     pub fn save(&mut self, request: &SaveRequest) -> Result<Saved, RemoteError> {
         let request_id = self.request_id();
-        self.transport.control.send(&wren_proto::Envelope::new(
-            request_id,
-            wren_proto::envelope::Payload::SaveRequest(wren_proto::SaveRequest::from(request)),
-        ))?;
-        loop {
-            let envelope = self
-                .transport
-                .control
-                .receive()?
-                .ok_or(RemoteError::UnexpectedResponse)?;
-            if envelope.request_id == 0 {
-                continue;
-            }
-            if envelope.request_id != request_id {
-                return Err(RemoteError::UnexpectedResponse);
-            }
-            let Some(wren_proto::envelope::Payload::Saved(saved)) = envelope.payload else {
+        self.transport.control.request(request_id, wren_proto::envelope::Payload::SaveRequest(wren_proto::SaveRequest::from(request)), |payload| {
+            let wren_proto::envelope::Payload::Saved(saved) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            return Saved::try_from(saved)
-                .map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()));
-        }
+            Saved::try_from(saved).map(Some).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))
+        })
     }
 
     pub fn close(self) -> Result<(), RemoteError> {
@@ -562,19 +411,12 @@ pub struct RemoteCapabilities {
 impl RemoteCapabilities {
     pub fn negotiate(&self, remote: &Self) -> Result<Self, RemoteError> {
         if remote.protocol_major != self.protocol_major {
-            return Err(RemoteError::IncompatibleProtocol {
-                local: self.protocol_major,
-                remote: remote.protocol_major,
-            });
+            return Err(RemoteError::IncompatibleProtocol { local: self.protocol_major, remote: remote.protocol_major });
         }
         Ok(Self {
             protocol_major: self.protocol_major,
             protocol_minor: self.protocol_minor.min(remote.protocol_minor),
-            features: self
-                .features
-                .intersection(&remote.features)
-                .cloned()
-                .collect(),
+            features: self.features.intersection(&remote.features).cloned().collect(),
         })
     }
 }
@@ -618,11 +460,7 @@ impl MerkleManifest {
         let canonical_root = root.canonicalize()?;
         let mut entries = BTreeMap::new();
         let root_hash = scan_directory(&canonical_root, &canonical_root, generation, &mut entries)?;
-        Ok(Self {
-            generation,
-            root_hash,
-            entries,
-        })
+        Ok(Self { generation, root_hash, entries })
     }
 }
 
@@ -638,15 +476,10 @@ fn scan_directory(
     for child in children {
         let path = child.path();
         let metadata = fs::symlink_metadata(&path)?;
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| RemoteError::InvalidPath)?;
+        let relative = path.strip_prefix(root).map_err(|_| RemoteError::InvalidPath)?;
         let key = normalized_relative(relative)?;
         let (kind, symlink_target, content_hash, tree_hash) = if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&path)?
-                .to_string_lossy()
-                .into_owned()
-                .into_boxed_str();
+            let target = fs::read_link(&path)?.to_string_lossy().into_owned().into_boxed_str();
             let hash = *blake3::hash(target.as_bytes()).as_bytes();
             (ManifestEntryKind::Symlink, Some(target), Some(hash), None)
         } else if metadata.is_dir() {
@@ -658,12 +491,7 @@ fn scan_directory(
         };
         tree.update(key.as_bytes());
         tree.update(&[kind as u8]);
-        tree.update(
-            content_hash
-                .as_ref()
-                .or(tree_hash.as_ref())
-                .unwrap_or(&[0; 32]),
-        );
+        tree.update(content_hash.as_ref().or(tree_hash.as_ref()).unwrap_or(&[0; 32]));
         entries.insert(
             key.clone().into_boxed_str(),
             ManifestEntry {
@@ -714,32 +542,18 @@ fn metadata_mode(_metadata: &fs::Metadata) -> u32 {
 }
 
 fn modified_nanos(metadata: &fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-        })
+    metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
 }
 
 #[cfg(unix)]
 fn metadata_identity(metadata: &fs::Metadata) -> RemoteIdentity {
     use std::os::unix::fs::MetadataExt;
-    RemoteIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        modified_nanos: modified_nanos(metadata),
-    }
+    RemoteIdentity { device: metadata.dev(), inode: metadata.ino(), modified_nanos: modified_nanos(metadata) }
 }
 
 #[cfg(not(unix))]
 fn metadata_identity(metadata: &fs::Metadata) -> RemoteIdentity {
-    RemoteIdentity {
-        device: 0,
-        inode: 0,
-        modified_nanos: modified_nanos(metadata),
-    }
+    RemoteIdentity { device: 0, inode: 0, modified_nanos: modified_nanos(metadata) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -771,10 +585,7 @@ pub fn fastcdc_chunks(bytes: &[u8], min: usize, average: usize, max: usize) -> V
             }
         }
         let range = start..end;
-        chunks.push(ContentChunk {
-            hash: *blake3::hash(&bytes[range.clone()]).as_bytes(),
-            range,
-        });
+        chunks.push(ContentChunk { hash: *blake3::hash(&bytes[range.clone()]).as_bytes(), range });
         start = end;
     }
     chunks
@@ -782,9 +593,7 @@ pub fn fastcdc_chunks(bytes: &[u8], min: usize, average: usize, max: usize) -> V
 
 const fn gear(byte: u8) -> u64 {
     let value = byte as u64 + 1;
-    value
-        .wrapping_mul(0x9e37_79b1_85eb_ca87)
-        .rotate_left(byte as u32 & 31)
+    value.wrapping_mul(0x9e37_79b1_85eb_ca87).rotate_left(byte as u32 & 31)
 }
 
 #[derive(Debug, Clone)]
@@ -800,19 +609,12 @@ pub struct RemoteWorkspaceStorage {
 }
 
 impl RemoteWorkspaceStorage {
-    pub fn open(
-        root: impl AsRef<Path>,
-        cache_root: PathBuf,
-        maximum_cache_bytes: u64,
-    ) -> Result<Self, RemoteError> {
+    pub fn open(root: impl AsRef<Path>, cache_root: PathBuf, maximum_cache_bytes: u64) -> Result<Self, RemoteError> {
         let root = root.as_ref().canonicalize()?;
         if !root.is_dir() {
             return Err(RemoteError::InvalidPath);
         }
-        Ok(Self {
-            root,
-            cache: BlobCache::open(cache_root, maximum_cache_bytes)?,
-        })
+        Ok(Self { root, cache: BlobCache::open(cache_root, maximum_cache_bytes)? })
     }
 
     pub fn manifest(&self, generation: WorkspaceGeneration) -> Result<MerkleManifest, RemoteError> {
@@ -847,11 +649,7 @@ impl RemoteWorkspaceStorage {
         self.cache.get(hash)
     }
 
-    pub fn search(
-        &self,
-        needle: &str,
-        maximum_results: usize,
-    ) -> Result<Vec<SearchHit>, RemoteError> {
+    pub fn search(&self, needle: &str, maximum_results: usize) -> Result<Vec<SearchHit>, RemoteError> {
         if needle.is_empty() || maximum_results == 0 {
             return Ok(Vec::new());
         }
@@ -867,12 +665,7 @@ impl RemoteWorkspaceStorage {
             };
             for (line, line_text) in text.lines().enumerate() {
                 for (column, matched) in line_text.match_indices(needle) {
-                    hits.push(SearchHit {
-                        path: entry.path.clone(),
-                        line,
-                        byte_range: column..column + matched.len(),
-                        preview: line_text.into(),
-                    });
+                    hits.push(SearchHit { path: entry.path.clone(), line, byte_range: column..column + matched.len(), preview: line_text.into() });
                     if hits.len() >= maximum_results {
                         return Ok(hits);
                     }
@@ -887,22 +680,15 @@ impl BlobCache {
     pub fn open(root: PathBuf, maximum_bytes: u64) -> Result<Self, RemoteError> {
         fs::create_dir_all(&root)?;
         set_private_directory(&root)?;
-        Ok(Self {
-            root,
-            maximum_bytes,
-        })
+        Ok(Self { root, maximum_bytes })
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<[u8; 32], RemoteError> {
         let hash = *blake3::hash(bytes).as_bytes();
         let destination = self.path_for(hash);
         if !destination.exists() {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos());
-            let temporary = self
-                .root
-                .join(format!(".tmp-{}-{nonce}", std::process::id()));
+            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_nanos());
+            let temporary = self.root.join(format!(".tmp-{}-{nonce}", std::process::id()));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -951,20 +737,13 @@ impl BlobCache {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
-            if path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-            {
+            if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with('.')) {
                 continue;
             }
             let metadata = entry.metadata()?;
             if metadata.is_file() {
                 total = total.saturating_add(metadata.len());
-                entries.push((
-                    metadata.modified().unwrap_or(UNIX_EPOCH),
-                    metadata.len(),
-                    path,
-                ));
+                entries.push((metadata.modified().unwrap_or(UNIX_EPOCH), metadata.len(), path));
             }
         }
         entries.sort_by_key(|(modified, _, _)| *modified);
@@ -983,8 +762,7 @@ impl BlobCache {
 
     #[must_use]
     pub fn path_for(&self, hash: [u8; 32]) -> PathBuf {
-        self.root
-            .join(blake3::Hash::from_bytes(hash).to_hex().as_str())
+        self.root.join(blake3::Hash::from_bytes(hash).to_hex().as_str())
     }
 }
 
@@ -1003,17 +781,9 @@ fn touch(path: &Path) -> io::Result<()> {
     filetime::set_file_mtime(path, filetime::FileTime::now())
 }
 
-pub fn reuse_git_index_blob(
-    workspace: &Path,
-    relative_path: &Path,
-    expected_hash: [u8; 32],
-) -> Result<Option<Vec<u8>>, RemoteError> {
+pub fn reuse_git_index_blob(workspace: &Path, relative_path: &Path, expected_hash: [u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
     let path = normalized_relative(relative_path)?;
-    let output = Command::new("git")
-        .current_dir(workspace)
-        .args(["show", &format!(":./{path}")])
-        .stderr(Stdio::null())
-        .output()?;
+    let output = Command::new("git").current_dir(workspace).args(["show", &format!(":./{path}")]).stderr(Stdio::null()).output()?;
     if !output.status.success() || blake3::hash(&output.stdout).as_bytes() != &expected_hash {
         return Ok(None);
     }
@@ -1037,22 +807,6 @@ pub enum VerificationReason {
     ManualRefresh,
 }
 
-impl VerificationReason {
-    #[must_use]
-    pub const fn requires_hash(self) -> bool {
-        matches!(
-            self,
-            Self::WatchSuspicion
-                | Self::ExplicitReload
-                | Self::SaveIdentityChanged
-                | Self::Reconnect
-                | Self::WatchOverflow
-                | Self::WatchGap
-                | Self::ManualRefresh
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoherenceDecision {
     Unchanged,
@@ -1072,12 +826,7 @@ impl CoherenceTracker {
     }
 
     #[must_use]
-    pub fn observe_watch(
-        &mut self,
-        sequence: u64,
-        path: &str,
-        current: StatFingerprint,
-    ) -> CoherenceDecision {
+    pub fn observe_watch(&mut self, sequence: u64, path: &str, current: StatFingerprint) -> CoherenceDecision {
         if self.watch_sequence != 0 && sequence != self.watch_sequence.saturating_add(1) {
             self.watch_sequence = sequence;
             return CoherenceDecision::FullScanRequired;
@@ -1090,12 +839,8 @@ impl CoherenceTracker {
     }
 
     #[must_use]
-    pub const fn verification(reason: VerificationReason) -> CoherenceDecision {
-        if reason.requires_hash() {
-            CoherenceDecision::StatChangedHashRequired
-        } else {
-            CoherenceDecision::Unchanged
-        }
+    pub const fn verification(_reason: VerificationReason) -> CoherenceDecision {
+        CoherenceDecision::StatChangedHashRequired
     }
 }
 
@@ -1109,21 +854,14 @@ pub struct HashBudget {
 impl HashBudget {
     #[must_use]
     pub fn new(bytes_per_second: u64) -> Self {
-        Self {
-            bytes_per_second,
-            available: bytes_per_second,
-            last_refill: Instant::now(),
-        }
+        Self { bytes_per_second, available: bytes_per_second, last_refill: Instant::now() }
     }
 
     pub fn try_charge(&mut self, bytes: u64) -> bool {
         let elapsed = self.last_refill.elapsed();
         if elapsed >= Duration::from_secs(1) {
             let periods = elapsed.as_secs();
-            self.available = self
-                .available
-                .saturating_add(periods.saturating_mul(self.bytes_per_second))
-                .min(self.bytes_per_second);
+            self.available = self.available.saturating_add(periods.saturating_mul(self.bytes_per_second)).min(self.bytes_per_second);
             self.last_refill = Instant::now();
         }
         if bytes > self.available {
@@ -1165,57 +903,26 @@ impl DirtyOverlay {
 
     #[must_use]
     pub fn merge_search(&self, persisted: Vec<SearchHit>, needle: &str) -> Vec<SearchHit> {
-        let dirty_paths = self
-            .documents
-            .keys()
-            .map(AsRef::as_ref)
-            .collect::<BTreeSet<_>>();
-        let mut merged = persisted
-            .into_iter()
-            .filter(|hit| !dirty_paths.contains(hit.path.as_ref()))
-            .collect::<Vec<_>>();
+        let dirty_paths = self.documents.keys().map(AsRef::as_ref).collect::<BTreeSet<_>>();
+        let mut merged = persisted.into_iter().filter(|hit| !dirty_paths.contains(hit.path.as_ref())).collect::<Vec<_>>();
         for (path, document) in &self.documents {
             let text = String::from_utf8_lossy(&document.bytes);
             for (line, line_text) in text.lines().enumerate() {
                 for (column, matched) in line_text.match_indices(needle) {
-                    merged.push(SearchHit {
-                        path: path.clone(),
-                        line,
-                        byte_range: column..column + matched.len(),
-                        preview: line_text.into(),
-                    });
+                    merged.push(SearchHit { path: path.clone(), line, byte_range: column..column + matched.len(), preview: line_text.into() });
                 }
             }
         }
-        merged.sort_by(|left, right| {
-            (left.path.as_ref(), left.line, left.byte_range.start).cmp(&(
-                right.path.as_ref(),
-                right.line,
-                right.byte_range.start,
-            ))
-        });
+        merged.sort_by(|left, right| (left.path.as_ref(), left.line, left.byte_range.start).cmp(&(right.path.as_ref(), right.line, right.byte_range.start)));
         merged
     }
 
     #[must_use]
     pub fn merge_symbols(&self, persisted: Vec<(Box<str>, Box<str>)>) -> Vec<(Box<str>, Box<str>)> {
-        let dirty_paths = self
-            .documents
-            .keys()
-            .map(AsRef::as_ref)
-            .collect::<BTreeSet<_>>();
-        let mut merged = persisted
-            .into_iter()
-            .filter(|(path, _)| !dirty_paths.contains(path.as_ref()))
-            .collect::<Vec<_>>();
+        let dirty_paths = self.documents.keys().map(AsRef::as_ref).collect::<BTreeSet<_>>();
+        let mut merged = persisted.into_iter().filter(|(path, _)| !dirty_paths.contains(path.as_ref())).collect::<Vec<_>>();
         for (path, document) in &self.documents {
-            merged.extend(
-                document
-                    .symbols
-                    .iter()
-                    .cloned()
-                    .map(|symbol| (path.clone(), symbol)),
-            );
+            merged.extend(document.symbols.iter().cloned().map(|symbol| (path.clone(), symbol)));
         }
         merged.sort();
         merged
@@ -1243,10 +950,7 @@ pub enum WorkspaceTool {
 pub const fn tool_reads(tool: WorkspaceTool) -> &'static [ToolView] {
     match tool {
         WorkspaceTool::Lsp => &[ToolView::RemoteAcked],
-        WorkspaceTool::GitSigns => &[ToolView::LocalDirty, ToolView::PersistedDisk],
-        WorkspaceTool::Search | WorkspaceTool::Symbols => {
-            &[ToolView::LocalDirty, ToolView::PersistedDisk]
-        }
+        WorkspaceTool::GitSigns | WorkspaceTool::Search | WorkspaceTool::Symbols => &[ToolView::LocalDirty, ToolView::PersistedDisk],
         WorkspaceTool::Formatter => &[ToolView::LocalDirty],
         WorkspaceTool::BuildTask => &[ToolView::PersistedDisk],
     }
@@ -1263,12 +967,7 @@ pub struct RemoteMaterializer {
 impl RemoteMaterializer {
     #[must_use]
     pub fn new(revision: DocumentRevision, expected_size: u64, expected_hash: [u8; 32]) -> Self {
-        Self {
-            revision,
-            expected_size,
-            expected_hash,
-            bytes: Vec::new(),
-        }
+        Self { revision, expected_size, expected_hash, bytes: Vec::new() }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<RemoteOpenState, RemoteError> {
@@ -1290,29 +989,16 @@ impl RemoteMaterializer {
     }
 
     pub fn finish(self) -> Result<(RemoteOpenState, Vec<u8>), RemoteError> {
-        if u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) != self.expected_size
-            || blake3::hash(&self.bytes).as_bytes() != &self.expected_hash
-        {
+        if u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) != self.expected_size || blake3::hash(&self.bytes).as_bytes() != &self.expected_hash {
             return Err(RemoteError::HashMismatch);
         }
-        Ok((
-            RemoteOpenState::Materialized {
-                authoritative_revision: self.revision,
-                content_hash: self.expected_hash,
-            },
-            self.bytes,
-        ))
+        Ok((RemoteOpenState::Materialized { authoritative_revision: self.revision, content_hash: self.expected_hash }, self.bytes))
     }
 }
 
-pub fn validate_cached_open(
-    cached_revision: DocumentRevision,
-    authoritative_revision: Option<DocumentRevision>,
-) -> Result<RemoteOpenState, RemoteError> {
+pub fn validate_cached_open(cached_revision: DocumentRevision, authoritative_revision: Option<DocumentRevision>) -> Result<RemoteOpenState, RemoteError> {
     match authoritative_revision {
-        Some(revision) if revision == cached_revision => {
-            Ok(RemoteOpenState::CachedHeadValidated { revision })
-        }
+        Some(revision) if revision == cached_revision => Ok(RemoteOpenState::CachedHeadValidated { revision }),
         Some(_) => Err(RemoteError::StaleCache),
         None => Ok(RemoteOpenState::CachedAwaitingHead { cached_revision }),
     }
@@ -1329,10 +1015,7 @@ fn line_changes(base: &str, side: &str) -> Vec<LineChange> {
     let input = InternedInput::new(base, side);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
-    let side_lines = side
-        .split_inclusive('\n')
-        .map(Into::<Box<str>>::into)
-        .collect::<Vec<_>>();
+    let side_lines = side.split_inclusive('\n').map(Into::<Box<str>>::into).collect::<Vec<_>>();
     diff.hunks()
         .map(|hunk| LineChange {
             before: hunk.before.start as usize..hunk.before.end as usize,
@@ -1354,10 +1037,7 @@ pub fn reconcile_three_way(base: &str, local: &str, remote: &str) -> Result<Stri
     let mut local_changes = line_changes(base, local);
     let remote_changes = line_changes(base, remote);
     for remote_change in remote_changes {
-        let conflict = local_changes.iter().any(|local_change| {
-            ranges_conflict(&local_change.before, &remote_change.before)
-                && local_change != &remote_change
-        });
+        let conflict = local_changes.iter().any(|local_change| ranges_conflict(&local_change.before, &remote_change.before) && local_change != &remote_change);
         if conflict {
             return Err(RemoteError::ReconcileConflict);
         }
@@ -1420,39 +1100,20 @@ mod tests {
         let control = spec.arguments(TransportLane::Control);
         let bulk = spec.arguments(TransportLane::Bulk);
         assert_ne!(control, bulk);
-        assert!(
-            control
-                .windows(2)
-                .any(|pair| pair == ["--transport", "control"])
-        );
+        assert!(control.windows(2).any(|pair| pair == ["--transport", "control"]));
         assert!(bulk.windows(2).any(|pair| pair == ["--transport", "bulk"]));
-        assert!(
-            control
-                .windows(2)
-                .any(|pair| pair == ["-o", "ServerAliveInterval=5"])
-        );
+        assert!(control.windows(2).any(|pair| pair == ["-o", "ServerAliveInterval=5"]));
         assert_eq!(shell_quote("plain/path"), "plain/path");
         assert_eq!(shell_quote("work dir/it's"), "'work dir/it'\\''s'");
     }
 
     #[test]
     fn capability_negotiation_intersects_minor_features() {
-        let local = RemoteCapabilities {
-            protocol_major: 1,
-            protocol_minor: 2,
-            features: ["manifest".into(), "fastcdc".into()].into_iter().collect(),
-        };
-        let remote = RemoteCapabilities {
-            protocol_major: 1,
-            protocol_minor: 1,
-            features: ["manifest".into(), "other".into()].into_iter().collect(),
-        };
+        let local = RemoteCapabilities { protocol_major: 1, protocol_minor: 2, features: ["manifest".into(), "fastcdc".into()].into_iter().collect() };
+        let remote = RemoteCapabilities { protocol_major: 1, protocol_minor: 1, features: ["manifest".into(), "other".into()].into_iter().collect() };
         let negotiated = local.negotiate(&remote).expect("compatible");
         assert_eq!(negotiated.protocol_minor, 1);
-        assert_eq!(
-            negotiated.features,
-            ["manifest".into()].into_iter().collect()
-        );
+        assert_eq!(negotiated.features, ["manifest".into()].into_iter().collect());
     }
 
     #[test]
@@ -1462,14 +1123,12 @@ mod tests {
         fs::write(directory.path().join("src/main.rs"), "fn main() {}\n").expect("write");
         #[cfg(unix)]
         std::os::unix::fs::symlink("src/main.rs", directory.path().join("link")).expect("symlink");
-        let first =
-            MerkleManifest::scan(directory.path(), WorkspaceGeneration::new(1)).expect("manifest");
+        let first = MerkleManifest::scan(directory.path(), WorkspaceGeneration::new(1)).expect("manifest");
         assert!(first.entries.contains_key("src/main.rs"));
         #[cfg(unix)]
         assert_eq!(first.entries["link"].kind, ManifestEntryKind::Symlink);
         fs::write(directory.path().join("src/main.rs"), "fn changed() {}\n").expect("change");
-        let second =
-            MerkleManifest::scan(directory.path(), WorkspaceGeneration::new(2)).expect("manifest");
+        let second = MerkleManifest::scan(directory.path(), WorkspaceGeneration::new(2)).expect("manifest");
         assert_ne!(first.root_hash, second.root_hash);
     }
 
@@ -1479,10 +1138,7 @@ mod tests {
         let chunks = fastcdc_chunks(&bytes, 1_024, 4_096, 8_192);
         assert!(chunks.len() >= 8);
         assert_eq!(chunks.first().map(|chunk| chunk.range.start), Some(0));
-        assert_eq!(
-            chunks.last().map(|chunk| chunk.range.end),
-            Some(bytes.len())
-        );
+        assert_eq!(chunks.last().map(|chunk| chunk.range.end), Some(bytes.len()));
 
         let directory = tempfile::tempdir().expect("tempdir");
         let cache = BlobCache::open(directory.path().join("cache"), 80 * 1_024).expect("cache");
@@ -1491,61 +1147,27 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(cache.path_for(hash))
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = fs::metadata(cache.path_for(hash)).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
     }
 
     #[test]
     fn coherence_uses_watchers_as_hints_and_gaps_force_scans() {
-        let fingerprint = StatFingerprint {
-            identity: RemoteIdentity {
-                device: 1,
-                inode: 2,
-                modified_nanos: 3,
-            },
-            size: 4,
-        };
+        let fingerprint = StatFingerprint { identity: RemoteIdentity { device: 1, inode: 2, modified_nanos: 3 }, size: 4 };
         let mut tracker = CoherenceTracker::default();
         tracker.seed("a", fingerprint);
-        assert_eq!(
-            tracker.observe_watch(1, "a", fingerprint),
-            CoherenceDecision::Unchanged
-        );
-        assert_eq!(
-            tracker.observe_watch(3, "a", fingerprint),
-            CoherenceDecision::FullScanRequired
-        );
-        assert_eq!(
-            CoherenceTracker::verification(VerificationReason::Reconnect),
-            CoherenceDecision::StatChangedHashRequired
-        );
+        assert_eq!(tracker.observe_watch(1, "a", fingerprint), CoherenceDecision::Unchanged);
+        assert_eq!(tracker.observe_watch(3, "a", fingerprint), CoherenceDecision::FullScanRequired);
+        assert_eq!(CoherenceTracker::verification(VerificationReason::Reconnect), CoherenceDecision::StatChangedHashRequired);
     }
 
     #[test]
     fn dirty_search_replaces_persisted_hits_for_the_same_path() {
         let mut overlay = DirtyOverlay::default();
-        overlay.update(
-            "src/a.rs",
-            DirtyDocument {
-                revision: DocumentRevision::new(2),
-                bytes: b"fresh needle\n".to_vec(),
-                symbols: vec!["fresh_symbol".into()],
-            },
-        );
-        let hits = overlay.merge_search(
-            vec![SearchHit {
-                path: "src/a.rs".into(),
-                line: 9,
-                byte_range: 0..6,
-                preview: "stale needle".into(),
-            }],
-            "needle",
-        );
+        overlay
+            .update("src/a.rs", DirtyDocument { revision: DocumentRevision::new(2), bytes: b"fresh needle\n".to_vec(), symbols: vec!["fresh_symbol".into()] });
+        let hits = overlay.merge_search(vec![SearchHit { path: "src/a.rs".into(), line: 9, byte_range: 0..6, preview: "stale needle".into() }], "needle");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line, 0);
         assert_eq!(hits[0].preview.as_ref(), "fresh needle");
@@ -1554,11 +1176,7 @@ mod tests {
     #[test]
     fn progressive_open_blocks_editing_until_hash_verified() {
         let bytes = b"authoritative";
-        let mut materializer = RemoteMaterializer::new(
-            DocumentRevision::new(7),
-            bytes.len() as u64,
-            *blake3::hash(bytes).as_bytes(),
-        );
+        let mut materializer = RemoteMaterializer::new(DocumentRevision::new(7), bytes.len() as u64, *blake3::hash(bytes).as_bytes());
         let progressive = materializer.push(&bytes[..4]).expect("chunk");
         assert!(!progressive.editing_enabled());
         materializer.push(&bytes[4..]).expect("chunk");
@@ -1572,10 +1190,7 @@ mod tests {
         let base = "one\ntwo\nthree\n";
         let local = "ONE\ntwo\nthree\n";
         let remote = "one\ntwo\nTHREE\n";
-        assert_eq!(
-            reconcile_three_way(base, local, remote).expect("merge"),
-            "ONE\ntwo\nTHREE\n"
-        );
+        assert_eq!(reconcile_three_way(base, local, remote).expect("merge"), "ONE\ntwo\nTHREE\n");
         assert!(reconcile_three_way(base, "one\nLOCAL\nthree\n", "one\nREMOTE\nthree\n").is_err());
     }
 }

@@ -7,15 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use wren_presenter::{PresentationObserver, Presenter};
-use wren_term::{
-    TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode,
-};
-use wren_view::{CellColor, CellStyle, DesiredGrid, TerminalPatch, ViewportLayout, diff_into};
+use wren_term::{TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode};
+use wren_types::Modifiers;
+use wren_view::{CellColor, DesiredGrid, TerminalPatch, ViewportLayout, diff_into};
 
-use super::{
-    App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, StartupScreen,
-    desired_frame, poll_app_work,
-};
+use super::{App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, StartupScreen, desired_frame, poll_app_work};
 
 const WIDTH: usize = 120;
 const HEIGHT: usize = 40;
@@ -87,9 +83,7 @@ struct CountingWriter {
 impl Write for CountingWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         std::hint::black_box(buffer);
-        self.bytes = self
-            .bytes
-            .saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
+        self.bytes = self.bytes.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX));
         Ok(buffer.len())
     }
 
@@ -104,9 +98,7 @@ struct MeasuringBackend {
 
 impl MeasuringBackend {
     fn new() -> Result<Self> {
-        Ok(Self {
-            terminal: TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)?,
-        })
+        Ok(Self { terminal: TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)? })
     }
 }
 
@@ -126,10 +118,7 @@ struct SharedCountingWriter {
 impl Write for SharedCountingWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         std::hint::black_box(buffer);
-        self.bytes.fetch_add(
-            u64::try_from(buffer.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.bytes.fetch_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
         Ok(buffer.len())
     }
 
@@ -151,24 +140,20 @@ struct TilingProbe {
     samples: Vec<TilingPerformanceSample>,
 }
 
+const TILING_BENCHMARK_STARTUP_SEED: u64 = 0x7765_726e_2d74_696c;
+
 impl TilingProbe {
     fn new() -> Result<Self> {
         let mut app = App::open(None, None).context("open empty tiling performance app")?;
-        anyhow::ensure!(
-            app.shows_startup_screen(),
-            "tiling performance app did not open on the startup screen"
-        );
+        *app.startup_screen.borrow_mut() = StartupScreen::from_seed(TILING_BENCHMARK_STARTUP_SEED);
+        anyhow::ensure!(app.shows_startup_screen(), "tiling performance app did not open on the startup screen");
         let mut layout = ViewportLayout::new(WIDTH, HEIGHT);
         layout.configure_dotfile_profile();
         app.resize_terminal(HEIGHT, WIDTH);
         let diagnostic_terminal = TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)?;
         let presenter_writer = SharedCountingWriter::default();
         let presenter_bytes = Arc::clone(&presenter_writer.bytes);
-        let backend = Arc::new(Mutex::new(TerminaBackend::new(
-            presenter_writer,
-            WIDTH,
-            HEIGHT,
-        )?));
+        let backend = Arc::new(Mutex::new(TerminaBackend::new(presenter_writer, WIDTH, HEIGHT)?));
         let (presented_sender, presented) = mpsc::sync_channel(1);
         let observer: PresentationObserver = Arc::new(move |epoch| {
             let _ = presented_sender.send(epoch);
@@ -196,13 +181,11 @@ impl TilingProbe {
     }
 
     fn set_animation_time(&mut self, elapsed: Duration) {
-        self.app.started_at = Instant::now()
-            .checked_sub(elapsed)
-            .unwrap_or_else(Instant::now);
+        self.app.started_at = Instant::now().checked_sub(elapsed).unwrap_or_else(Instant::now);
     }
 
     fn reset_tiling_cache(&mut self) {
-        *self.app.startup_screen.borrow_mut() = StartupScreen::default();
+        *self.app.startup_screen.borrow_mut() = StartupScreen::from_seed(TILING_BENCHMARK_STARTUP_SEED);
     }
 
     fn present_setup(&mut self, elapsed: Duration) -> Result<()> {
@@ -210,19 +193,9 @@ impl TilingProbe {
         let frame = desired_frame(&mut self.layout, &self.app);
         let epoch = frame.epoch;
         self.presenter.publish(Arc::clone(&frame))?;
-        let presented = self
-            .presented
-            .recv_timeout(Duration::from_secs(5))
-            .context("tiling performance setup presentation timed out")?;
-        anyhow::ensure!(
-            presented == epoch,
-            "presenter completed an unexpected epoch"
-        );
-        diff_into(
-            self.previous.as_deref(),
-            &frame,
-            &mut self.diagnostic_patches,
-        );
+        let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("tiling performance setup presentation timed out")?;
+        anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
+        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_patches);
         self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
         self.previous = Some(frame);
         self.setup_presentations = self.setup_presentations.saturating_add(1);
@@ -239,19 +212,10 @@ impl TilingProbe {
         let desired_frame_nanos = elapsed_nanos(started);
         let epoch = frame.epoch;
         self.presenter.publish(Arc::clone(&frame))?;
-        let presented = self
-            .presented
-            .recv_timeout(Duration::from_secs(5))
-            .context("tiling performance presentation timed out")?;
-        anyhow::ensure!(
-            presented == epoch,
-            "presenter completed an unexpected epoch"
-        );
+        let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("tiling performance presentation timed out")?;
+        anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
         let full_render_nanos = elapsed_nanos(started);
-        let terminal_bytes = self
-            .presenter_bytes
-            .load(Ordering::Relaxed)
-            .saturating_sub(bytes_before);
+        let terminal_bytes = self.presenter_bytes.load(Ordering::Relaxed).saturating_sub(bytes_before);
 
         // These component clocks replay the same diff/write against a private
         // backend after the production presenter has completed. They expose
@@ -262,23 +226,12 @@ impl TilingProbe {
         // result was dropped after its measured interval.
         self.diagnostic_patches.clear();
         let diff_started = Instant::now();
-        diff_into(
-            self.previous.as_deref(),
-            &frame,
-            &mut self.diagnostic_patches,
-        );
+        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_patches);
         let diff_nanos = elapsed_nanos(diff_started);
         let terminal_started = Instant::now();
         self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
         let terminal_write_nanos = elapsed_nanos(terminal_started);
-        anyhow::ensure!(
-            frame
-                .rows
-                .first()
-                .and_then(|row| row.cells.first())
-                .is_some_and(|cell| cell.grapheme.as_ref() == "▀"),
-            "tiling performance sample did not render the startup tiling"
-        );
+        anyhow::ensure!(frame.raster_overlay.is_some(), "tiling performance sample did not render the startup tiling");
         self.samples.push(TilingPerformanceSample {
             scenario: scenario.into(),
             width,
@@ -316,9 +269,7 @@ pub fn run_tiling_performance_probe(iterations: u64) -> Result<TilingPerformance
     probe.previous = None;
     probe.present_setup(Duration::from_millis(scenario_span_millis))?;
     for sample in 0..iterations {
-        let elapsed = Duration::from_millis(
-            scenario_span_millis.saturating_add(sample.saturating_add(1).saturating_mul(83)),
-        );
+        let elapsed = Duration::from_millis(scenario_span_millis.saturating_add(sample.saturating_add(1).saturating_mul(83)));
         probe.measure("animated_240x80", elapsed)?;
     }
 
@@ -326,26 +277,14 @@ pub fn run_tiling_performance_probe(iterations: u64) -> Result<TilingPerformance
     for sample in 0..iterations {
         probe.reset_tiling_cache();
         probe.previous = None;
-        let elapsed = Duration::from_millis(
-            scenario_span_millis
-                .saturating_mul(2)
-                .saturating_add(sample.saturating_add(1).saturating_mul(83)),
-        );
+        let elapsed = Duration::from_millis(scenario_span_millis.saturating_mul(2).saturating_add(sample.saturating_add(1).saturating_mul(83)));
         probe.measure("cold_120x40", elapsed)?;
     }
 
     for sample in 0..iterations {
-        let (width, height) = if sample % 2 == 0 {
-            (160, 50)
-        } else {
-            (120, 40)
-        };
+        let (width, height) = if sample % 2 == 0 { (160, 50) } else { (120, 40) };
         probe.configure_size(width, height);
-        let elapsed = Duration::from_millis(
-            scenario_span_millis
-                .saturating_mul(3)
-                .saturating_add(sample.saturating_add(1).saturating_mul(83)),
-        );
+        let elapsed = Duration::from_millis(scenario_span_millis.saturating_mul(3).saturating_add(sample.saturating_add(1).saturating_mul(83)));
         probe.measure("resize_120x40_160x50", elapsed)?;
     }
 
@@ -365,19 +304,12 @@ pub fn run_tiling_performance_probe(iterations: u64) -> Result<TilingPerformance
 }
 
 fn elapsed_nanos(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos())
-        .unwrap_or(u64::MAX)
-        .max(1)
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1)
 }
 
 fn terminal_key(code: TerminalKeyCode, control: bool) -> TerminalInput {
-    TerminalInput::Key(TerminalKey {
-        code,
-        shift: false,
-        control,
-        alt: false,
-        super_key: false,
-    })
+    let modifiers = if control { Modifiers::CONTROL } else { Modifiers::empty() };
+    TerminalInput::Key(TerminalKey::modified(code, modifiers))
 }
 
 fn character(character: char) -> TerminalInput {
@@ -409,14 +341,8 @@ impl Probe {
         let frame = desired_frame(&mut self.layout, &self.app);
         let epoch = frame.epoch;
         self.presenter.publish(frame)?;
-        let presented = self
-            .presented
-            .recv_timeout(Duration::from_secs(5))
-            .context("production latency setup presentation timed out")?;
-        anyhow::ensure!(
-            presented == epoch,
-            "presenter completed an unexpected setup epoch"
-        );
+        let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("production latency setup presentation timed out")?;
+        anyhow::ensure!(presented == epoch, "presenter completed an unexpected setup epoch");
         Ok(())
     }
 
@@ -440,14 +366,8 @@ impl Probe {
         let input_to_desired_frame_nanos = elapsed_nanos(started);
         let epoch = frame.epoch;
         self.presenter.publish(frame)?;
-        let presented = self
-            .presented
-            .recv_timeout(Duration::from_secs(5))
-            .context("production latency presenter timed out")?;
-        anyhow::ensure!(
-            presented == epoch,
-            "presenter completed an unexpected epoch"
-        );
+        let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("production latency presenter timed out")?;
+        anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
         let input_to_terminal_write_nanos = elapsed_nanos(started);
         self.samples.push(ProductionLatencySample {
             scenario: scenario.into(),
@@ -473,19 +393,13 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
     let app = App::open(Some(source_path), None).context("open production latency fixture")?;
     let open_nanos = elapsed_nanos(open_started);
     let prepared = prepare_app(app, source_path, source)?;
-    let StartedProbe {
-        mut probe,
-        first_desired_frame_nanos,
-        open_to_first_terminal_write_nanos,
-    } = start_probe(prepared.app, open_started)?;
+    let StartedProbe { mut probe, first_desired_frame_nanos, open_to_first_terminal_write_nanos } = start_probe(prepared.app, open_started)?;
     let samples_per_case = run_probe_workload(&mut probe, iterations)?;
     let samples = std::mem::take(&mut probe.samples);
     let stats = probe.presenter.finish()?;
     Ok(ProductionLatencyReport {
         schema: 2,
-        workload:
-            "full_tui_app_large_rust_14000_lines_active_syntax_semantic_search_git_diagnostics"
-                .into(),
+        workload: "full_tui_app_large_rust_14000_lines_active_syntax_semantic_search_git_diagnostics".into(),
         width: WIDTH,
         height: HEIGHT,
         requested_iterations: iterations,
@@ -507,37 +421,19 @@ pub fn run_production_latency_probe(iterations: u64) -> Result<ProductionLatency
 
 fn production_fixture() -> Result<(tempfile::NamedTempFile, String)> {
     let source = (0..LARGE_RUST_LINES)
-        .map(|line| {
-            format!(
-                "pub fn item_{line:05}() -> usize {{ let value_{line:05}: usize = {line}; value_{line:05} }}\n"
-            )
-        })
+        .map(|line| format!("pub fn item_{line:05}() -> usize {{ let value_{line:05}: usize = {line}; value_{line:05} }}\n"))
         .collect::<String>();
-    let mut source_file = tempfile::Builder::new()
-        .prefix("wren-production-latency-")
-        .suffix(".rs")
-        .tempfile()
-        .context("create production latency fixture")?;
-    source_file
-        .write_all(source.as_bytes())
-        .context("write production latency fixture")?;
-    source_file
-        .flush()
-        .context("flush production latency fixture")?;
+    let mut source_file = tempfile::Builder::new().prefix("wren-production-latency-").suffix(".rs").tempfile().context("create production latency fixture")?;
+    source_file.write_all(source.as_bytes()).context("write production latency fixture")?;
+    source_file.flush().context("flush production latency fixture")?;
     Ok((source_file, source))
 }
 
 fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<PreparedApp> {
     app.active.git_index_text = Some(Arc::from(source));
     app.active.refresh_git_hunks();
-    let syntax_spans = app
-        .decorations
-        .get(&app.active.buffer_id)
-        .map_or(0, |decorations| decorations.spans.len());
-    anyhow::ensure!(
-        syntax_spans >= 42_000,
-        "production probe did not retain full syntax highlighting"
-    );
+    let syntax_spans = app.decorations.get(&app.active.buffer_id).map_or(0, |decorations| decorations.spans.len());
+    anyhow::ensure!(syntax_spans >= 42_000, "production probe did not retain full syntax highlighting");
     let revision = app.active.editor.revision();
     let semantic_spans = app
         .decorations
@@ -550,24 +446,15 @@ fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<Prepa
                 .cloned()
                 .map(|mut span| {
                     span.priority = 2_000_000;
-                    span.style = CellStyle {
-                        foreground: Some(CellColor::Rgb(app.theme.lavender)),
-                        ..span.style
-                    };
+                    span.style = span.style.with_foreground(CellColor::Rgb(app.theme.lavender));
                     span
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let semantic_spans_count = semantic_spans.len();
-    app.semantic_decorations.insert(
-        app.active.buffer_id,
-        BufferDecorations::new(revision, semantic_spans),
-    );
-    app.active
-        .editor
-        .search("value_", SearchDirection::Forward)
-        .context("prepare production search highlight")?;
+    app.semantic_decorations.insert(app.active.buffer_id, BufferDecorations::new(revision, semantic_spans));
+    app.active.editor.search("value_", SearchDirection::Forward).context("prepare production search highlight")?;
     app.search_highlight = true;
     app.diagnostics.extend([
         DiagnosticEntry {
@@ -585,11 +472,7 @@ fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<Prepa
             message: "deterministic benchmark error".to_owned(),
         },
     ]);
-    Ok(PreparedApp {
-        app,
-        syntax_spans,
-        semantic_spans: semantic_spans_count,
-    })
+    Ok(PreparedApp { app, syntax_spans, semantic_spans: semantic_spans_count })
 }
 
 fn start_probe(mut app: App, open_started: Instant) -> Result<StartedProbe> {
@@ -609,25 +492,10 @@ fn start_probe(mut app: App, open_started: Instant) -> Result<StartedProbe> {
     let first_desired_frame_nanos = elapsed_nanos(first_started);
     let first_epoch = first.epoch;
     presenter.publish(first)?;
-    let presented_epoch = presented
-        .recv_timeout(Duration::from_secs(5))
-        .context("first production frame was not presented")?;
-    anyhow::ensure!(
-        presented_epoch == first_epoch,
-        "presenter completed an unexpected first epoch"
-    );
+    let presented_epoch = presented.recv_timeout(Duration::from_secs(5)).context("first production frame was not presented")?;
+    anyhow::ensure!(presented_epoch == first_epoch, "presenter completed an unexpected first epoch");
     let open_to_first_terminal_write_nanos = elapsed_nanos(open_started);
-    Ok(StartedProbe {
-        probe: Probe {
-            app,
-            layout,
-            presenter,
-            presented,
-            samples: Vec::new(),
-        },
-        first_desired_frame_nanos,
-        open_to_first_terminal_write_nanos,
-    })
+    Ok(StartedProbe { probe: Probe { app, layout, presenter, presented, samples: Vec::new() }, first_desired_frame_nanos, open_to_first_terminal_write_nanos })
 }
 
 fn run_probe_workload(probe: &mut Probe, iterations: u64) -> Result<u64> {
@@ -642,49 +510,26 @@ fn run_probe_workload(probe: &mut Probe, iterations: u64) -> Result<u64> {
         probe.measure("bottom_navigation", character('G'))?;
     }
     for sample in 0..samples_per_case {
-        probe.measure(
-            "local_motion",
-            character(if sample % 2 == 0 { 'h' } else { 'l' }),
-        )?;
+        probe.measure("local_motion", character(if sample % 2 == 0 { 'h' } else { 'l' }))?;
     }
     for sample in 0..samples_per_case {
-        probe.measure(
-            "viewport_navigation",
-            terminal_key(
-                TerminalKeyCode::Char(if sample % 2 == 0 { 'u' } else { 'd' }),
-                true,
-            ),
-        )?;
+        probe.measure("viewport_navigation", terminal_key(TerminalKeyCode::Char(if sample % 2 == 0 { 'u' } else { 'd' }), true))?;
     }
 
     probe.measure("enter_insert", character('i'))?;
     for sample in 0..samples_per_case {
         probe.measure(
-            if sample % 2 == 0 {
-                "insert_character"
-            } else {
-                "delete_character"
-            },
-            if sample % 2 == 0 {
-                character('x')
-            } else {
-                terminal_key(TerminalKeyCode::Backspace, false)
-            },
+            if sample % 2 == 0 { "insert_character" } else { "delete_character" },
+            if sample % 2 == 0 { character('x') } else { terminal_key(TerminalKeyCode::Backspace, false) },
         )?;
     }
     if samples_per_case % 2 == 1 {
-        probe.measure(
-            "delete_character",
-            terminal_key(TerminalKeyCode::Backspace, false),
-        )?;
+        probe.measure("delete_character", terminal_key(TerminalKeyCode::Backspace, false))?;
     }
     probe.measure("leave_insert", terminal_key(TerminalKeyCode::Escape, false))?;
     probe.measure("enter_visual", character('v'))?;
     for sample in 0..samples_per_case {
-        probe.measure(
-            "selection_change",
-            character(if sample % 2 == 0 { 'h' } else { 'l' }),
-        )?;
+        probe.measure("selection_change", character(if sample % 2 == 0 { 'h' } else { 'l' }))?;
     }
     Ok(samples_per_case)
 }

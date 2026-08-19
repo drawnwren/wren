@@ -1,8 +1,10 @@
 # wren-tiling-performance
 
 Measures Wren's complete empty-startup Penrose render path: production `App`
-composition, exact tiling/raster work, half-block cell construction, desired
-grid publication, Presenter diffing, and completed Termina byte serialization.
+composition, exact tiling/vector work, desired-grid publication, Presenter
+diffing, high-resolution quad rasterization, zlib/Kitty graphics encoding, and
+completed Termina byte serialization. Wren targets Ghostty directly, so this
+probe always measures the same smooth raster path as the editor.
 
 The fixed scenarios cover warm animation at 120×40 and 240×80, cold tiling
 construction at 120×40, and alternating 120×40/160×50 resize frames. Reports

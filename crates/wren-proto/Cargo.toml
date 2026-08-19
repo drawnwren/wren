@@ -9,5 +9,9 @@ prost.workspace = true
 thiserror.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
+[build-dependencies]
+prost-build = "0.14.4"
+protox = "0.9.1"
+
 [lints]
 workspace = true

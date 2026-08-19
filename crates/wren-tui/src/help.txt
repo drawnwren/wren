@@ -1,0 +1,55 @@
+wren — a small, reliable modal code editor
+
+USAGE:
+    wren [FILE] [+LINE]
+
+NORMAL MODE:
+    h j k l / arrows     move          w b e       words
+    0 ^ $ gg G           line/file     f{char}     find on line
+    i a I A o O          insert/open   Esc         normal mode
+    d c y + motion       operator      dd cc yy    whole line
+    x X D C J r{char}    edit          p P         paste
+    u / Ctrl-R           undo/redo     .           repeat change
+    / ? then Enter       search        n N         next/previous
+    m{letter} / `{mark}  marks         q{reg}...q  record macro
+    @{reg} / @@           replay macro
+    "=EXPR then p          evaluate closed expression register
+
+DOTFILE KEYS:
+    Space q / Space w     quit/write    Space Space  select line
+    Space ff              fuzzy files   Space fb     file browser
+    Space fr / Space fw   grep repo     Space b      buffers
+    Space fo/fj/fd        oldfiles/jumps/diagnostics
+    Space a               embedded Oh My Pi terminal pane
+    Space jj              Ace jump to a visible character
+    Space e               diagnostic    [d / ]d      diagnostic nav
+    [c / ]c               Git hunk nav  Space g…     Git hunk actions
+    gd/gD/gi/gr/K         LSP navigation, refs, hover
+    K on open float       focus float   hjkl/Ctrl-d/u navigate; q/Esc close
+    Space rn/ca/D         rename/action/type definition
+    Space f               format        :FormatToggle[!] on-save toggle
+    Space d…              debug/REPL     Space h…/r…  Haskell/Hoogle/REPL
+    Ctrl-h/j/k/l          focus split window
+
+INSERT COMPLETION:
+    Ctrl-Space            complete       Ctrl-N/P     select candidate
+    Enter                 accept selected Ctrl-E      abort completion
+    Ctrl-B/F              scroll completion documentation
+
+EX COMMANDS:
+    :w [FILE]   :q[!]   :wq   :x       save and quit
+    :e[!] FILE                         edit another file
+    :s/old/new/[gciIp]  :%s/old/new/g  Vim-regex substitution
+    :s   :&   :~                         repeat previous replacement
+    :undo   :redo   :normal KEYS       editing commands
+    :registers   :marks                inspect durable state
+    :messages / :debuglog               open message history buffer
+    :find [QUERY]                       fuzzy file picker
+    :terminal [PROGRAM]                 interactive terminal buffer
+    :make PROGRAM [ARGS]                cancellable build task
+    :format PROGRAM [ARGS]              revision-safe formatter
+    :Git                                 lazygit diff/status interface
+    :Git ARGS    :Gwrite  :Gdiffsplit   direct and native Git commands
+    :Codex / :AvanteChat / :AvanteAsk   open/send to embedded Oh My Pi
+
+Unsaved edits use a checksummed recovery WAL; undo history and oldfiles persist.

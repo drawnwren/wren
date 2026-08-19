@@ -12,8 +12,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use wren_shmem::{SharedDocumentHeadReader, SharedHeadError};
 use wren_types::{
-    Anchor, ClientId, DocumentId, DurableJumpEntry, HeadValidation, PublishedViewportKey,
-    ResumeViewState, SemanticGroupId, SessionEpoch, StateDelta,
+    Anchor, ClientId, DocumentId, DurableJumpEntry, HeadValidation, PublishedViewportKey, ResumeViewState, SemanticGroupId, SessionEpoch, StateDelta,
 };
 use wren_view::DesiredGrid;
 
@@ -93,18 +92,8 @@ impl DurableClientState {
 
     pub fn apply(&mut self, delta: &StateDelta) {
         match delta {
-            StateDelta::Register {
-                name,
-                text,
-                linewise,
-            } => {
-                self.registers.insert(
-                    *name,
-                    DurableRegister {
-                        text: text.clone(),
-                        linewise: *linewise,
-                    },
-                );
+            StateDelta::Register { name, text, linewise } => {
+                self.registers.insert(*name, DurableRegister { text: text.clone(), linewise: *linewise });
             }
             StateDelta::SearchPattern(pattern) => {
                 push_history(&mut self.search_history, pattern.clone());
@@ -113,39 +102,15 @@ impl DurableClientState {
             StateDelta::CommandHistory(command) => {
                 push_history(&mut self.command_history, command.clone());
             }
-            StateDelta::GlobalMark {
-                name,
-                document_id,
-                anchor,
-            } => {
-                self.global_marks.insert(
-                    *name,
-                    DurableGlobalMark {
-                        document_id: *document_id,
-                        anchor: *anchor,
-                    },
-                );
+            StateDelta::GlobalMark { name, document_id, anchor } => {
+                self.global_marks.insert(*name, DurableGlobalMark { document_id: *document_id, anchor: *anchor });
             }
-            StateDelta::UndoBranchHead {
-                document_id,
-                semantic_group_id,
-            } => {
-                self.undo_branch_heads
-                    .insert(*document_id, *semantic_group_id);
+            StateDelta::UndoBranchHead { document_id, semantic_group_id } => {
+                self.undo_branch_heads.insert(*document_id, *semantic_group_id);
             }
             StateDelta::RepeatData(data) => self.repeat_data = Some(data.clone()),
-            StateDelta::MacroRecording {
-                name,
-                raw_keys,
-                lowered_ir,
-            } => {
-                self.macro_recordings.insert(
-                    *name,
-                    DurableMacroRecording {
-                        raw_keys: raw_keys.clone(),
-                        lowered_ir: lowered_ir.clone(),
-                    },
-                );
+            StateDelta::MacroRecording { name, raw_keys, lowered_ir } => {
+                self.macro_recordings.insert(*name, DurableMacroRecording { raw_keys: raw_keys.clone(), lowered_ir: lowered_ir.clone() });
             }
             StateDelta::JumpList { entries, current } => {
                 self.jump_list.clone_from(entries);
@@ -202,9 +167,7 @@ pub struct ClientViewStateStore {
 impl ClientViewStateStore {
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
-        Self {
-            directory: directory.into(),
-        }
+        Self { directory: directory.into() }
     }
 
     pub fn save_resume(&self, state: &ResumeViewState) -> Result<(), ClientStateError> {
@@ -215,29 +178,16 @@ impl ClientViewStateStore {
         self.save(&self.durable_path(state.client_id.get()), state)
     }
 
-    pub fn load_durable(
-        &self,
-        client_id: ClientId,
-    ) -> Result<Option<DurableClientState>, ClientStateError> {
+    pub fn load_durable(&self, client_id: ClientId) -> Result<Option<DurableClientState>, ClientStateError> {
         self.load(&self.durable_path(client_id.get()))
     }
 
-    pub fn load_resume(
-        &self,
-        client_id: wren_types::ClientId,
-    ) -> Result<Option<ResumeViewState>, ClientStateError> {
+    pub fn load_resume(&self, client_id: wren_types::ClientId) -> Result<Option<ResumeViewState>, ClientStateError> {
         self.load(&self.resume_path(client_id.get()))
     }
 
     pub fn save_viewport(&self, viewport: &PublishedViewport) -> Result<(), ClientStateError> {
-        self.save(
-            &self.viewport_path(
-                viewport.key.client_id.get(),
-                viewport.key.view_id.get(),
-                viewport.document_id.get(),
-            ),
-            viewport,
-        )
+        self.save(&self.viewport_path(viewport.key.client_id.get(), viewport.key.view_id.get(), viewport.document_id.get()), viewport)
     }
 
     pub fn load_viewport(
@@ -256,12 +206,7 @@ impl ClientViewStateStore {
         session_epoch: SessionEpoch,
         heads: &SharedDocumentHeadReader,
     ) -> Result<ViewportRestore, ClientStateError> {
-        let Some(viewport) = self.load_viewport(
-            expected_key.client_id,
-            expected_key.view_id,
-            resume.document_id,
-        )?
-        else {
+        let Some(viewport) = self.load_viewport(expected_key.client_id, expected_key.view_id, resume.document_id)? else {
             return Ok(ViewportRestore::Missing);
         };
         if viewport.key != *expected_key
@@ -274,34 +219,18 @@ impl ClientViewStateStore {
             return Ok(ViewportRestore::Stale(HeadValidation::Unknown));
         }
         let validation = heads.validate(session_epoch, resume)?;
-        if validation == HeadValidation::Correct {
-            Ok(ViewportRestore::Correct(Arc::new(viewport.grid)))
-        } else {
-            Ok(ViewportRestore::Stale(validation))
-        }
+        if validation == HeadValidation::Correct { Ok(ViewportRestore::Correct(Arc::new(viewport.grid))) } else { Ok(ViewportRestore::Stale(validation)) }
     }
 
     fn save<T: Serialize>(&self, path: &Path, value: &T) -> Result<(), ClientStateError> {
         fs::create_dir_all(&self.directory).map_err(|source| io_error(&self.directory, source))?;
         let value_bytes = serde_json::to_vec(value)?;
-        let stored = Stored {
-            checksum: *blake3::hash(&value_bytes).as_bytes(),
-            value,
-        };
+        let stored = Stored { checksum: *blake3::hash(&value_bytes).as_bytes(), value };
         let bytes = serde_json::to_vec(&stored)?;
-        let mut temporary =
-            NamedTempFile::new_in(&self.directory).map_err(|source| io_error(path, source))?;
-        temporary
-            .write_all(&bytes)
-            .and_then(|()| temporary.flush())
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|source| io_error(path, source))?;
-        temporary
-            .persist(path)
-            .map_err(|error| io_error(path, error.error))?;
-        File::open(&self.directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| io_error(&self.directory, source))
+        let mut temporary = NamedTempFile::new_in(&self.directory).map_err(|source| io_error(path, source))?;
+        temporary.write_all(&bytes).and_then(|()| temporary.flush()).and_then(|()| temporary.as_file().sync_all()).map_err(|source| io_error(path, source))?;
+        temporary.persist(path).map_err(|error| io_error(path, error.error))?;
+        File::open(&self.directory).and_then(|directory| directory.sync_all()).map_err(|source| io_error(&self.directory, source))
     }
 
     fn load<T>(&self, path: &Path) -> Result<Option<T>, ClientStateError>
@@ -310,17 +239,13 @@ impl ClientViewStateStore {
     {
         let mut bytes = Vec::new();
         match File::open(path) {
-            Ok(mut file) => file
-                .read_to_end(&mut bytes)
-                .map_err(|source| io_error(path, source))?,
+            Ok(mut file) => file.read_to_end(&mut bytes).map_err(|source| io_error(path, source))?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(path, error)),
         };
         let stored: RawStored<'_> = serde_json::from_slice(&bytes)?;
         if blake3::hash(stored.value.get().as_bytes()).as_bytes() != &stored.checksum {
-            return Err(ClientStateError::Checksum {
-                path: path.to_path_buf(),
-            });
+            return Err(ClientStateError::Checksum { path: path.to_path_buf() });
         }
         Ok(Some(serde_json::from_str(stored.value.get())?))
     }
@@ -334,16 +259,12 @@ impl ClientViewStateStore {
     }
 
     fn viewport_path(&self, client: u64, view: u64, document: u64) -> PathBuf {
-        self.directory
-            .join(format!("viewport-{client}-{view}-{document}.json"))
+        self.directory.join(format!("viewport-{client}-{view}-{document}.json"))
     }
 }
 
 fn io_error(path: &Path, source: io::Error) -> ClientStateError {
-    ClientStateError::Io {
-        path: path.to_path_buf(),
-        source,
-    }
+    ClientStateError::Io { path: path.to_path_buf(), source }
 }
 
 #[cfg(test)]
@@ -352,9 +273,7 @@ mod tests {
 
     use tempfile::tempdir;
     use wren_shmem::SharedDocumentHeadWriter;
-    use wren_types::{
-        ClientId, ConfigGeneration, DocumentHead, DocumentRevision, SelRange, SelectionSet, ViewId,
-    };
+    use wren_types::{ClientId, ConfigGeneration, DocumentHead, DocumentRevision, SelRange, SelectionSet, ViewId};
     use wren_view::CellRow;
 
     use super::*;
@@ -365,10 +284,7 @@ mod tests {
             view_id: ViewId::new(2),
             document_id: DocumentId::new(3),
             document_revision: DocumentRevision::new(revision),
-            selections: SelectionSet {
-                primary: 0,
-                ranges: vec![SelRange { anchor: 0, head: 0 }],
-            },
+            selections: SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 0, head: 0 }] },
             top_line: 0,
             rows: 4,
             columns: 20,
@@ -396,11 +312,7 @@ mod tests {
         let head_path = directory.path().join("heads.link");
         let writer = SharedDocumentHeadWriter::create(&head_path, 4).expect("writer");
         writer
-            .publish(&[DocumentHead {
-                session_epoch: SessionEpoch::new(1),
-                document_id: DocumentId::new(3),
-                authoritative_revision: DocumentRevision::new(9),
-            }])
+            .publish(&[DocumentHead { session_epoch: SessionEpoch::new(1), document_id: DocumentId::new(3), authoritative_revision: DocumentRevision::new(9) }])
             .expect("head");
         let heads = SharedDocumentHeadReader::open(&head_path).expect("reader");
         let viewport = PublishedViewport {
@@ -413,22 +325,16 @@ mod tests {
                 height: 4,
                 rows: (0..4).map(|_| Arc::new(CellRow::default())).collect(),
                 cursor: (0, 0),
+                raster_overlay: None,
             },
         };
         store.save_resume(&resume(9)).expect("save resume");
         store.save_viewport(&viewport).expect("save viewport");
-        assert!(matches!(
-            store
-                .restore_correct_viewport(&key(9), &resume(9), SessionEpoch::new(1), &heads)
-                .expect("restore"),
-            ViewportRestore::Correct(_)
-        ));
+        assert!(matches!(store.restore_correct_viewport(&key(9), &resume(9), SessionEpoch::new(1), &heads).expect("restore"), ViewportRestore::Correct(_)));
         let mut changed_theme = key(9);
         changed_theme.theme_hash = [8; 32];
         assert!(matches!(
-            store
-                .restore_correct_viewport(&changed_theme, &resume(9), SessionEpoch::new(1), &heads)
-                .expect("stale key"),
+            store.restore_correct_viewport(&changed_theme, &resume(9), SessionEpoch::new(1), &heads).expect("stale key"),
             ViewportRestore::Stale(_)
         ));
     }
@@ -452,39 +358,18 @@ mod tests {
         let store = ClientViewStateStore::new(directory.path());
         let mut state = DurableClientState::new(ClientId::new(7));
         for delta in [
-            StateDelta::Register {
-                name: 'a',
-                text: "value".into(),
-                linewise: true,
-            },
+            StateDelta::Register { name: 'a', text: "value".into(), linewise: true },
             StateDelta::SearchPattern("needle".into()),
             StateDelta::SearchDirection { backward: true },
             StateDelta::CommandHistory("write".into()),
-            StateDelta::GlobalMark {
-                name: 'A',
-                document_id: DocumentId::new(3),
-                anchor: wren_types::Anchor {
-                    byte: 9,
-                    bias: wren_types::Bias::Right,
-                },
-            },
-            StateDelta::UndoBranchHead {
-                document_id: DocumentId::new(3),
-                semantic_group_id: Some(SemanticGroupId::new(11)),
-            },
+            StateDelta::GlobalMark { name: 'A', document_id: DocumentId::new(3), anchor: wren_types::Anchor { byte: 9, bias: wren_types::Bias::Right } },
+            StateDelta::UndoBranchHead { document_id: DocumentId::new(3), semantic_group_id: Some(SemanticGroupId::new(11)) },
             StateDelta::RepeatData(vec![1, 2, 3]),
-            StateDelta::MacroRecording {
-                name: 'q',
-                raw_keys: vec![4, 5],
-                lowered_ir: vec![6, 7],
-            },
+            StateDelta::MacroRecording { name: 'q', raw_keys: vec![4, 5], lowered_ir: vec![6, 7] },
             StateDelta::JumpList {
                 entries: vec![wren_types::DurableJumpEntry {
                     document_id: DocumentId::new(3),
-                    anchor: wren_types::Anchor {
-                        byte: 12,
-                        bias: wren_types::Bias::Right,
-                    },
+                    anchor: wren_types::Anchor { byte: 12, bias: wren_types::Bias::Right },
                     path_hint: Some("/workspace/main.rs".into()),
                 }],
                 current: Some(0),
@@ -493,10 +378,7 @@ mod tests {
             state.apply(&delta);
         }
         store.save_durable(&state).expect("save durable");
-        assert_eq!(
-            store.load_durable(ClientId::new(7)).expect("load durable"),
-            Some(state)
-        );
+        assert_eq!(store.load_durable(ClientId::new(7)).expect("load durable"), Some(state));
     }
 
     #[test]
@@ -523,14 +405,9 @@ mod tests {
             undo_branch_heads: BTreeMap::new(),
             repeat_data: None,
         };
-        store
-            .save(&directory.path().join("durable-7.json"), &legacy)
-            .expect("save legacy durable state");
+        store.save(&directory.path().join("durable-7.json"), &legacy).expect("save legacy durable state");
 
-        let loaded = store
-            .load_durable(ClientId::new(7))
-            .expect("load legacy durable state")
-            .expect("durable state");
+        let loaded = store.load_durable(ClientId::new(7)).expect("load legacy durable state").expect("durable state");
         assert_eq!(loaded.search_history, vec![Box::<str>::from("needle")]);
         assert!(!loaded.search_backward);
         assert!(loaded.macro_recordings.is_empty());

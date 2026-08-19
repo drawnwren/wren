@@ -18,6 +18,7 @@ wren-types = { version = "0.1.0", path = "../wren-types" }
 anyhow.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+wren-benchmark-support = { version = "0.1.0", path = "../../harness/benchmark-support" }
 
 [[bench]]
 name = "textstore"

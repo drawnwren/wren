@@ -1,16 +1,8 @@
 use super::*;
 
 pub(super) fn git_root_for(path: &Path) -> Result<PathBuf> {
-    let directory = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
-    let output = Command::new("git")
-        .current_dir(directory)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("locate Git root")?;
+    let directory = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    let output = Command::new("git").current_dir(directory).args(["rev-parse", "--show-toplevel"]).output().context("locate Git root")?;
     if !output.status.success() {
         bail!("not inside a Git repository");
     }
@@ -19,11 +11,7 @@ pub(super) fn git_root_for(path: &Path) -> Result<PathBuf> {
 }
 
 pub(super) fn git_ex_program(arguments: &[Box<str>]) -> &'static str {
-    if arguments.is_empty() {
-        "lazygit"
-    } else {
-        "git"
-    }
+    if arguments.is_empty() { "lazygit" } else { "git" }
 }
 
 pub(super) fn terminal_cell_color(color: TerminalColor, default: RgbColor) -> CellColor {
@@ -36,11 +24,7 @@ pub(super) fn terminal_cell_color(color: TerminalColor, default: RgbColor) -> Ce
 
 pub(super) fn git_branch_for(path: &Path) -> Option<String> {
     let root = git_root_for(path).ok()?;
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .output()
-        .ok()?;
+    let output = Command::new("git").current_dir(root).args(["symbolic-ref", "--quiet", "--short", "HEAD"]).output().ok()?;
     if !output.status.success() {
         return Some("HEAD".to_owned());
     }
@@ -49,20 +33,13 @@ pub(super) fn git_branch_for(path: &Path) -> Option<String> {
 }
 
 pub(super) fn git_index_contents(root: &Path, relative: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(root)
-        .arg("show")
-        .arg(format!(":{}", relative.to_string_lossy()))
-        .output()
-        .context("read file from Git index")?;
+    let output =
+        Command::new("git").current_dir(root).arg("show").arg(format!(":{}", relative.to_string_lossy())).output().context("read file from Git index")?;
     if output.status.success() {
         return String::from_utf8(output.stdout).context("Git index contents are not UTF-8");
     }
     if git_path_tracked(root, relative)? {
-        bail!(
-            "read Git index: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("read Git index: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::new())
 }
@@ -78,12 +55,7 @@ pub(super) fn git_path_tracked(root: &Path, relative: &Path) -> Result<bool> {
         .success())
 }
 
-pub(super) fn make_git_patch(
-    root: &Path,
-    relative: &Path,
-    before: &str,
-    after: &str,
-) -> Result<Vec<u8>> {
+pub(super) fn make_git_patch(root: &Path, relative: &Path, before: &str, after: &str) -> Result<Vec<u8>> {
     if before == after {
         return Ok(Vec::new());
     }
@@ -99,10 +71,7 @@ pub(super) fn make_git_patch(
         .output()
         .context("compute Git-compatible buffer patch")?;
     if !output.status.success() && output.status.code() != Some(1) {
-        bail!(
-            "git diff: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("git diff: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     let relative = relative.to_string_lossy();
     let diff = String::from_utf8(output.stdout).context("git diff returned non-UTF-8")?;
@@ -122,27 +91,17 @@ pub(super) fn make_git_patch(
     Ok(rewritten.into_bytes())
 }
 
-pub(super) fn select_git_hunk(
-    patch: &[u8],
-    cursor_line: usize,
-    selected_lines: Option<&Range<usize>>,
-) -> Result<Vec<u8>> {
+pub(super) fn select_git_hunk(patch: &[u8], cursor_line: usize, selected_lines: Option<&Range<usize>>) -> Result<Vec<u8>> {
     let patch = std::str::from_utf8(patch).context("Git patch is not UTF-8")?;
     if patch.is_empty() {
         bail!("buffer has no Git changes");
     }
     let lines = patch.lines().collect::<Vec<_>>();
-    let header_end = lines
-        .iter()
-        .position(|line| line.starts_with("@@"))
-        .ok_or_else(|| anyhow!("Git patch contains no hunks"))?;
+    let header_end = lines.iter().position(|line| line.starts_with("@@")).ok_or_else(|| anyhow!("Git patch contains no hunks"))?;
     let mut selected = None;
     let mut index = header_end;
     while index < lines.len() {
-        let end = lines[index + 1..]
-            .iter()
-            .position(|line| line.starts_with("@@"))
-            .map_or(lines.len(), |offset| index + 1 + offset);
+        let end = lines[index + 1..].iter().position(|line| line.starts_with("@@")).map_or(lines.len(), |offset| index + 1 + offset);
         let range = parse_git_after_range(lines[index])?;
         let matches = selected_lines.map_or_else(
             || {
@@ -170,20 +129,11 @@ pub(super) fn select_git_hunk(
 }
 
 pub(super) fn parse_git_after_range(header: &str) -> Result<Range<usize>> {
-    let after = header
-        .split_whitespace()
-        .find(|field| field.starts_with('+'))
-        .ok_or_else(|| anyhow!("invalid Git hunk header {header:?}"))?
-        .trim_start_matches('+');
+    let after =
+        header.split_whitespace().find(|field| field.starts_with('+')).ok_or_else(|| anyhow!("invalid Git hunk header {header:?}"))?.trim_start_matches('+');
     let mut values = after.split(',');
-    let start = values
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| anyhow!("invalid Git hunk range {after:?}"))?;
-    let count = values
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
+    let start = values.next().and_then(|value| value.parse::<usize>().ok()).ok_or_else(|| anyhow!("invalid Git hunk range {after:?}"))?;
+    let count = values.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
     Ok(start..start.saturating_add(count))
 }
 
@@ -192,49 +142,28 @@ pub(super) fn byte_range_of_lines(text: &str, lines: Range<usize>) -> Range<usiz
         if line == 0 {
             return 0;
         }
-        text.match_indices('\n')
-            .nth(line - 1)
-            .map_or(text.len(), |(byte, _)| byte + 1)
+        text.match_indices('\n').nth(line - 1).map_or(text.len(), |(byte, _)| byte + 1)
     }
     line_byte(text, lines.start)..line_byte(text, lines.end)
 }
 
-pub(super) fn git_apply_patch(
-    root: &Path,
-    patch: &[u8],
-    cached: bool,
-    reverse: bool,
-) -> Result<()> {
+pub(super) fn git_apply_patch(root: &Path, patch: &[u8], cached: bool, reverse: bool) -> Result<()> {
     if patch.is_empty() {
         bail!("Git patch is empty");
     }
     let mut command = Command::new("git");
-    command
-        .current_dir(root)
-        .args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
+    command.current_dir(root).args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
     if cached {
         command.arg("--cached");
     }
     if reverse {
         command.arg("--reverse");
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start git apply")?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("git apply stdin unavailable"))?
-        .write_all(patch)?;
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("start git apply")?;
+    child.stdin.take().ok_or_else(|| anyhow!("git apply stdin unavailable"))?.write_all(patch)?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        bail!(
-            "git apply: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("git apply: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
 }

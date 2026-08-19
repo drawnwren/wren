@@ -5,10 +5,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
-use wren_types::{
-    DocumentId, DocumentRevision, ExpectedTarget, FileIdentity, PersistBatchId, ResourceOp,
-    TransactionError, WorkspaceTransaction,
-};
+use wren_types::{DocumentId, DocumentRevision, ExpectedTarget, FileIdentity, PersistBatchId, ResourceOp, TransactionError, WorkspaceTransaction};
 
 use crate::{LocalDocument, SaveError};
 
@@ -25,10 +22,7 @@ pub struct WorkspaceDocument {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistBatchState {
     Pending,
-    Failed {
-        completed_actions: usize,
-        message: Box<str>,
-    },
+    Failed { completed_actions: usize, message: Box<str> },
     Persisted,
 }
 
@@ -50,19 +44,10 @@ pub enum WorkspaceError {
     UnknownDocument(DocumentId),
     #[error("document {document_id:?} occurs more than once in one workspace transaction")]
     DuplicateDocumentEdit { document_id: DocumentId },
-    #[error(
-        "document {document_id:?} expected revision {expected:?}, authoritative revision is {actual:?}"
-    )]
-    RevisionMismatch {
-        document_id: DocumentId,
-        expected: DocumentRevision,
-        actual: DocumentRevision,
-    },
+    #[error("document {document_id:?} expected revision {expected:?}, authoritative revision is {actual:?}")]
+    RevisionMismatch { document_id: DocumentId, expected: DocumentRevision, actual: DocumentRevision },
     #[error("document {document_id:?} mutation is invalid: {reason}")]
-    InvalidDocumentMutation {
-        document_id: DocumentId,
-        reason: Box<str>,
-    },
+    InvalidDocumentMutation { document_id: DocumentId, reason: Box<str> },
     #[error("document {document_id:?} transaction failed validation: {source}")]
     Transaction {
         document_id: DocumentId,
@@ -89,10 +74,7 @@ pub enum WorkspaceError {
 
 #[derive(Debug, Clone)]
 enum PersistAction {
-    Document {
-        document_id: DocumentId,
-        frontier: DocumentRevision,
-    },
+    Document { document_id: DocumentId, frontier: DocumentRevision },
     Resource(ResourceOp),
 }
 
@@ -129,20 +111,10 @@ impl WorkspaceExecutor {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|source| io_error(&root, source))?;
         let root = fs::canonicalize(&root).map_err(|source| io_error(&root, source))?;
-        Ok(Self {
-            root,
-            documents: BTreeMap::new(),
-            batches: BTreeMap::new(),
-            busy_paths: BTreeSet::new(),
-            next_batch: 1,
-        })
+        Ok(Self { root, documents: BTreeMap::new(), batches: BTreeMap::new(), busy_paths: BTreeSet::new(), next_batch: 1 })
     }
 
-    pub fn track_document(
-        &mut self,
-        document_id: DocumentId,
-        relative_path: impl AsRef<Path>,
-    ) -> Result<&WorkspaceDocument, WorkspaceError> {
+    pub fn track_document(&mut self, document_id: DocumentId, relative_path: impl AsRef<Path>) -> Result<&WorkspaceDocument, WorkspaceError> {
         if self.documents.contains_key(&document_id) {
             return Err(WorkspaceError::DuplicateDocument(document_id));
         }
@@ -160,9 +132,7 @@ impl WorkspaceExecutor {
                 local,
             },
         );
-        self.documents
-            .get(&document_id)
-            .ok_or(WorkspaceError::UnknownDocument(document_id))
+        self.documents.get(&document_id).ok_or(WorkspaceError::UnknownDocument(document_id))
     }
 
     #[must_use]
@@ -170,43 +140,22 @@ impl WorkspaceExecutor {
         self.documents.get(&document_id)
     }
 
-    pub fn apply(
-        &mut self,
-        transaction: &WorkspaceTransaction,
-    ) -> Result<PersistBatchReport, WorkspaceError> {
+    pub fn apply(&mut self, transaction: &WorkspaceTransaction) -> Result<PersistBatchReport, WorkspaceError> {
         let mut staged_documents = Vec::with_capacity(transaction.document_edits.len());
         let mut document_ids = BTreeSet::new();
         for edit in &transaction.document_edits {
             if !document_ids.insert(edit.document_id) {
-                return Err(WorkspaceError::DuplicateDocumentEdit {
-                    document_id: edit.document_id,
-                });
+                return Err(WorkspaceError::DuplicateDocumentEdit { document_id: edit.document_id });
             }
-            let document = self
-                .documents
-                .get(&edit.document_id)
-                .ok_or(WorkspaceError::UnknownDocument(edit.document_id))?;
+            let document = self.documents.get(&edit.document_id).ok_or(WorkspaceError::UnknownDocument(edit.document_id))?;
             if edit.base_revision != document.revision {
-                return Err(WorkspaceError::RevisionMismatch {
-                    document_id: edit.document_id,
-                    expected: edit.base_revision,
-                    actual: document.revision,
-                });
+                return Err(WorkspaceError::RevisionMismatch { document_id: edit.document_id, expected: edit.base_revision, actual: document.revision });
             }
-            edit.validate()
-                .map_err(|error| WorkspaceError::InvalidDocumentMutation {
-                    document_id: edit.document_id,
-                    reason: error.to_string().into(),
-                })?;
+            edit.validate().map_err(|error| WorkspaceError::InvalidDocumentMutation { document_id: edit.document_id, reason: error.to_string().into() })?;
             let mut text = document.text.clone();
             let mut revision = document.revision;
             for semantic in &edit.transactions {
-                text = semantic.apply_to_string(&text).map_err(|source| {
-                    WorkspaceError::Transaction {
-                        document_id: edit.document_id,
-                        source,
-                    }
-                })?;
+                text = semantic.apply_to_string(&text).map_err(|source| WorkspaceError::Transaction { document_id: edit.document_id, source })?;
                 revision = revision.next().ok_or(WorkspaceError::CounterOverflow)?;
             }
             staged_documents.push((edit.document_id, text, revision));
@@ -222,60 +171,29 @@ impl WorkspaceExecutor {
         // No authoritative memory changes occur before every document and
         // resource precondition has passed.
         for (document_id, text, revision) in &staged_documents {
-            let document = self
-                .documents
-                .get_mut(document_id)
-                .ok_or(WorkspaceError::UnknownDocument(*document_id))?;
+            let document = self.documents.get_mut(document_id).ok_or(WorkspaceError::UnknownDocument(*document_id))?;
             document.text.clone_from(text);
             document.revision = *revision;
         }
 
         let id = PersistBatchId::new(self.next_batch);
-        self.next_batch = self
-            .next_batch
-            .checked_add(1)
-            .ok_or(WorkspaceError::CounterOverflow)?;
-        let document_frontiers = staged_documents
-            .iter()
-            .map(|(document_id, _, revision)| (*document_id, *revision))
-            .collect::<Vec<_>>();
+        self.next_batch = self.next_batch.checked_add(1).ok_or(WorkspaceError::CounterOverflow)?;
+        let document_frontiers = staged_documents.iter().map(|(document_id, _, revision)| (*document_id, *revision)).collect::<Vec<_>>();
         let mut actions = document_frontiers
             .iter()
-            .map(|(document_id, frontier)| PersistAction::Document {
-                document_id: *document_id,
-                frontier: *frontier,
-            })
+            .map(|(document_id, frontier)| PersistAction::Document { document_id: *document_id, frontier: *frontier })
             .collect::<Vec<_>>();
-        actions.extend(
-            transaction
-                .resource_ops
-                .iter()
-                .cloned()
-                .map(PersistAction::Resource),
-        );
+        actions.extend(transaction.resource_ops.iter().cloned().map(PersistAction::Resource));
         self.busy_paths.extend(resource_paths.iter().cloned());
-        let batch = PersistBatch {
-            id,
-            actions,
-            completed: 0,
-            state: PersistBatchState::Pending,
-            touched_paths: resource_paths,
-            document_frontiers,
-        };
+        let batch = PersistBatch { id, actions, completed: 0, state: PersistBatchState::Pending, touched_paths: resource_paths, document_frontiers };
         let report = batch.report();
         self.batches.insert(id, batch);
         Ok(report)
     }
 
-    pub fn persist(
-        &mut self,
-        batch_id: PersistBatchId,
-    ) -> Result<PersistBatchReport, WorkspaceError> {
+    pub fn persist(&mut self, batch_id: PersistBatchId) -> Result<PersistBatchReport, WorkspaceError> {
         let (start, actions) = {
-            let batch = self
-                .batches
-                .get(&batch_id)
-                .ok_or(WorkspaceError::UnknownBatch(batch_id))?;
+            let batch = self.batches.get(&batch_id).ok_or(WorkspaceError::UnknownBatch(batch_id))?;
             if batch.state == PersistBatchState::Persisted {
                 return Ok(batch.report());
             }
@@ -285,40 +203,25 @@ impl WorkspaceExecutor {
         for (index, action) in actions.into_iter().enumerate().skip(start) {
             if let Err(error) = self.persist_action(&action) {
                 let message: Box<str> = error.to_string().into();
-                let batch = self
-                    .batches
-                    .get_mut(&batch_id)
-                    .ok_or(WorkspaceError::UnknownBatch(batch_id))?;
-                batch.state = PersistBatchState::Failed {
-                    completed_actions: index,
-                    message,
-                };
+                let batch = self.batches.get_mut(&batch_id).ok_or(WorkspaceError::UnknownBatch(batch_id))?;
+                batch.state = PersistBatchState::Failed { completed_actions: index, message };
                 batch.completed = index;
                 return Ok(batch.report());
             }
-            let batch = self
-                .batches
-                .get_mut(&batch_id)
-                .ok_or(WorkspaceError::UnknownBatch(batch_id))?;
+            let batch = self.batches.get_mut(&batch_id).ok_or(WorkspaceError::UnknownBatch(batch_id))?;
             batch.completed = index.saturating_add(1);
             batch.state = PersistBatchState::Pending;
         }
 
         let touched = {
-            let batch = self
-                .batches
-                .get_mut(&batch_id)
-                .ok_or(WorkspaceError::UnknownBatch(batch_id))?;
+            let batch = self.batches.get_mut(&batch_id).ok_or(WorkspaceError::UnknownBatch(batch_id))?;
             batch.state = PersistBatchState::Persisted;
             batch.touched_paths.clone()
         };
         for path in touched {
             self.busy_paths.remove(&path);
         }
-        self.batches
-            .get(&batch_id)
-            .map(PersistBatch::report)
-            .ok_or(WorkspaceError::UnknownBatch(batch_id))
+        self.batches.get(&batch_id).map(PersistBatch::report).ok_or(WorkspaceError::UnknownBatch(batch_id))
     }
 
     #[must_use]
@@ -328,14 +231,8 @@ impl WorkspaceExecutor {
 
     fn persist_action(&mut self, action: &PersistAction) -> Result<(), WorkspaceError> {
         match action {
-            PersistAction::Document {
-                document_id,
-                frontier,
-            } => {
-                let document = self
-                    .documents
-                    .get_mut(document_id)
-                    .ok_or(WorkspaceError::UnknownDocument(*document_id))?;
+            PersistAction::Document { document_id, frontier } => {
+                let document = self.documents.get_mut(document_id).ok_or(WorkspaceError::UnknownDocument(*document_id))?;
                 document.local.save(&document.text)?;
                 document.persisted_revision = *frontier;
                 Ok(())
@@ -344,10 +241,7 @@ impl WorkspaceExecutor {
         }
     }
 
-    fn validate_resource_ops(
-        &self,
-        operations: &[ResourceOp],
-    ) -> Result<(BTreeSet<PathBuf>, BTreeMap<PathBuf, VirtualResource>), WorkspaceError> {
+    fn validate_resource_ops(&self, operations: &[ResourceOp]) -> Result<(BTreeSet<PathBuf>, BTreeMap<PathBuf, VirtualResource>), WorkspaceError> {
         let mut touched = BTreeSet::new();
         let mut resources = BTreeMap::new();
         for operation in operations {
@@ -364,22 +258,14 @@ impl WorkspaceExecutor {
         }
         for operation in operations {
             match operation {
-                ResourceOp::Create {
-                    path,
-                    expected_absent,
-                } => {
+                ResourceOp::Create { path, expected_absent } => {
                     let path = normalize_relative(Path::new(path.as_ref()))?;
                     if *expected_absent && resources.contains_key(&path) {
                         return Err(precondition(&path, "create target exists"));
                     }
                     resources.insert(path, VirtualResource::PendingCreate);
                 }
-                ResourceOp::Rename {
-                    from,
-                    to,
-                    expected_source_identity,
-                    expected_target,
-                } => {
+                ResourceOp::Rename { from, to, expected_source_identity, expected_target } => {
                     let from = normalize_relative(Path::new(from.as_ref()))?;
                     let to = normalize_relative(Path::new(to.as_ref()))?;
                     expect_identity(&resources, &from, expected_source_identity)?;
@@ -392,15 +278,10 @@ impl WorkspaceExecutor {
                         }
                         ExpectedTarget::Absent => {}
                     }
-                    let source = resources
-                        .remove(&from)
-                        .ok_or_else(|| precondition(&from, "rename source is absent"))?;
+                    let source = resources.remove(&from).ok_or_else(|| precondition(&from, "rename source is absent"))?;
                     resources.insert(to, source);
                 }
-                ResourceOp::Delete {
-                    path,
-                    expected_identity,
-                } => {
+                ResourceOp::Delete { path, expected_identity } => {
                     let path = normalize_relative(Path::new(path.as_ref()))?;
                     expect_identity(&resources, &path, expected_identity)?;
                     resources.remove(&path);
@@ -412,43 +293,24 @@ impl WorkspaceExecutor {
 
     fn persist_resource(&self, operation: &ResourceOp) -> Result<(), WorkspaceError> {
         match operation {
-            ResourceOp::Create {
-                path,
-                expected_absent,
-            } => {
+            ResourceOp::Create { path, expected_absent } => {
                 let path = self.absolute(path)?;
                 if *expected_absent && identity_if_exists(&path)?.is_some() {
-                    return Err(precondition(
-                        &path,
-                        "create target appeared before persistence",
-                    ));
+                    return Err(precondition(&path, "create target appeared before persistence"));
                 }
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
                 }
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|source| io_error(&path, source))?;
+                OpenOptions::new().create_new(true).write(true).open(&path).and_then(|file| file.sync_all()).map_err(|source| io_error(&path, source))?;
                 sync_parent(&path)
             }
-            ResourceOp::Rename {
-                from,
-                to,
-                expected_source_identity,
-                expected_target,
-            } => {
+            ResourceOp::Rename { from, to, expected_source_identity, expected_target } => {
                 let from = self.absolute(from)?;
                 let to = self.absolute(to)?;
                 expect_path_identity(&from, expected_source_identity)?;
                 match expected_target {
                     ExpectedTarget::Absent if identity_if_exists(&to)?.is_some() => {
-                        return Err(precondition(
-                            &to,
-                            "rename target appeared before persistence",
-                        ));
+                        return Err(precondition(&to, "rename target appeared before persistence"));
                     }
                     ExpectedTarget::Identity(identity) => expect_path_identity(&to, identity)?,
                     ExpectedTarget::Absent => {}
@@ -460,14 +322,10 @@ impl WorkspaceExecutor {
                 sync_parent(&from)?;
                 sync_parent(&to)
             }
-            ResourceOp::Delete {
-                path,
-                expected_identity,
-            } => {
+            ResourceOp::Delete { path, expected_identity } => {
                 let path = self.absolute(path)?;
                 expect_path_identity(&path, expected_identity)?;
-                let metadata =
-                    fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+                let metadata = fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
                 if metadata.file_type().is_dir() {
                     fs::remove_dir(&path).map_err(|source| io_error(&path, source))?;
                 } else {
@@ -505,9 +363,7 @@ fn operation_paths(operation: &ResourceOp) -> Vec<&str> {
 
 fn normalize_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
     if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(WorkspaceError::UnsafePath {
-            path: path.to_path_buf(),
-        });
+        return Err(WorkspaceError::UnsafePath { path: path.to_path_buf() });
     }
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -515,32 +371,21 @@ fn normalize_relative(path: &Path) -> Result<PathBuf, WorkspaceError> {
             Component::Normal(value) => normalized.push(value),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(WorkspaceError::UnsafePath {
-                    path: path.to_path_buf(),
-                });
+                return Err(WorkspaceError::UnsafePath { path: path.to_path_buf() });
             }
         }
     }
     if normalized.as_os_str().is_empty() {
-        return Err(WorkspaceError::UnsafePath {
-            path: path.to_path_buf(),
-        });
+        return Err(WorkspaceError::UnsafePath { path: path.to_path_buf() });
     }
     Ok(normalized)
 }
 
-fn expect_identity(
-    resources: &BTreeMap<PathBuf, VirtualResource>,
-    path: &Path,
-    expected: &FileIdentity,
-) -> Result<(), WorkspaceError> {
+fn expect_identity(resources: &BTreeMap<PathBuf, VirtualResource>, path: &Path, expected: &FileIdentity) -> Result<(), WorkspaceError> {
     match resources.get(path) {
         Some(VirtualResource::Existing(actual)) if actual == expected => Ok(()),
         Some(VirtualResource::Existing(_)) => Err(precondition(path, "file identity changed")),
-        Some(VirtualResource::PendingCreate) => Err(precondition(
-            path,
-            "newly-created resource has no established identity",
-        )),
+        Some(VirtualResource::PendingCreate) => Err(precondition(path, "newly-created resource has no established identity")),
         None => Err(precondition(path, "resource is absent")),
     }
 }
@@ -564,47 +409,27 @@ fn identity_if_exists(path: &Path) -> Result<Option<FileIdentity>, WorkspaceErro
 #[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
-    FileIdentity {
-        device: metadata.dev(),
-        file: metadata.ino(),
-        generation: 0,
-    }
+    FileIdentity { device: metadata.dev(), file: metadata.ino(), generation: 0 }
 }
 
 #[cfg(not(unix))]
 fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     use std::time::UNIX_EPOCH;
-    let generation = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    FileIdentity {
-        device: 0,
-        file: metadata.len(),
-        generation,
-    }
+    let generation = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |duration| duration.as_nanos() as u64);
+    FileIdentity { device: 0, file: metadata.len(), generation }
 }
 
 fn sync_parent(path: &Path) -> Result<(), WorkspaceError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(parent, source))
+    File::open(parent).and_then(|directory| directory.sync_all()).map_err(|source| io_error(parent, source))
 }
 
 fn precondition(path: &Path, reason: impl Into<Box<str>>) -> WorkspaceError {
-    WorkspaceError::ResourcePrecondition {
-        path: path.to_path_buf(),
-        reason: reason.into(),
-    }
+    WorkspaceError::ResourcePrecondition { path: path.to_path_buf(), reason: reason.into() }
 }
 
 fn io_error(path: &Path, source: io::Error) -> WorkspaceError {
-    WorkspaceError::Io {
-        path: path.to_path_buf(),
-        source,
-    }
+    WorkspaceError::Io { path: path.to_path_buf(), source }
 }
 
 #[cfg(test)]
@@ -612,9 +437,7 @@ mod tests {
     use std::fs;
 
     use tempfile::tempdir;
-    use wren_types::{
-        DocumentMutation, Edit, LeaseEpoch, SemanticGroupId, SemanticGroupKind, Transaction,
-    };
+    use wren_types::{DocumentMutation, Edit, LeaseEpoch, SemanticGroupId, SemanticGroupKind, Transaction};
 
     use super::*;
 
@@ -626,10 +449,7 @@ mod tests {
             semantic_group_id: SemanticGroupId::new(1),
             semantic_group_kind: SemanticGroupKind::WorkspaceRefactor,
             undo_parent: None,
-            transactions: vec![
-                Transaction::new(DocumentRevision::new(base), vec![Edit::new(0..0, insert)])
-                    .expect("transaction"),
-            ],
+            transactions: vec![Transaction::new(DocumentRevision::new(base), vec![Edit::new(0..0, insert)]).expect("transaction")],
         }
     }
 
@@ -643,24 +463,12 @@ mod tests {
         fs::write(directory.path().join("a"), "a").expect("fixture");
         fs::write(directory.path().join("source"), "s").expect("fixture");
         let mut workspace = WorkspaceExecutor::new(directory.path()).expect("workspace");
-        workspace
-            .track_document(DocumentId::new(1), "a")
-            .expect("track");
+        workspace.track_document(DocumentId::new(1), "a").expect("track");
         let transaction = WorkspaceTransaction {
             document_edits: vec![document_edit(DocumentId::new(1), 0, "x")],
-            resource_ops: vec![ResourceOp::Delete {
-                path: "source".into(),
-                expected_identity: FileIdentity {
-                    device: 99,
-                    file: 99,
-                    generation: 99,
-                },
-            }],
+            resource_ops: vec![ResourceOp::Delete { path: "source".into(), expected_identity: FileIdentity { device: 99, file: 99, generation: 99 } }],
         };
-        assert!(matches!(
-            workspace.apply(&transaction),
-            Err(WorkspaceError::ResourcePrecondition { .. })
-        ));
+        assert!(matches!(workspace.apply(&transaction), Err(WorkspaceError::ResourcePrecondition { .. })));
         let document = workspace.document(DocumentId::new(1)).expect("document");
         assert_eq!(document.text, "a");
         assert_eq!(document.revision, DocumentRevision::new(0));
@@ -675,9 +483,7 @@ mod tests {
         fs::write(&source, "s").expect("fixture");
         let source_identity = identity(&source);
         let mut workspace = WorkspaceExecutor::new(directory.path()).expect("workspace");
-        workspace
-            .track_document(DocumentId::new(1), "a")
-            .expect("track");
+        workspace.track_document(DocumentId::new(1), "a").expect("track");
         let report = workspace
             .apply(&WorkspaceTransaction {
                 document_edits: vec![document_edit(DocumentId::new(1), 0, "x")],
@@ -689,21 +495,12 @@ mod tests {
                 }],
             })
             .expect("apply");
-        assert_eq!(
-            fs::read_to_string(&document_path).expect("disk before"),
-            "a"
-        );
-        assert_eq!(
-            workspace.document(DocumentId::new(1)).expect("memory").text,
-            "xa"
-        );
+        assert_eq!(fs::read_to_string(&document_path).expect("disk before"), "a");
+        assert_eq!(workspace.document(DocumentId::new(1)).expect("memory").text, "xa");
         let persisted = workspace.persist(report.batch_id).expect("persist");
         assert_eq!(persisted.state, PersistBatchState::Persisted);
         assert_eq!(fs::read_to_string(document_path).expect("disk after"), "xa");
-        assert_eq!(
-            fs::read_to_string(directory.path().join("renamed")).expect("renamed"),
-            "s"
-        );
+        assert_eq!(fs::read_to_string(directory.path().join("renamed")).expect("renamed"), "s");
     }
 
     #[test]
@@ -714,33 +511,17 @@ mod tests {
         fs::write(&doomed, "d").expect("fixture");
         let doomed_identity = identity(&doomed);
         let mut workspace = WorkspaceExecutor::new(directory.path()).expect("workspace");
-        workspace
-            .track_document(DocumentId::new(1), "a")
-            .expect("track");
+        workspace.track_document(DocumentId::new(1), "a").expect("track");
         let report = workspace
             .apply(&WorkspaceTransaction {
                 document_edits: vec![document_edit(DocumentId::new(1), 0, "x")],
-                resource_ops: vec![ResourceOp::Delete {
-                    path: "doomed".into(),
-                    expected_identity: doomed_identity,
-                }],
+                resource_ops: vec![ResourceOp::Delete { path: "doomed".into(), expected_identity: doomed_identity }],
             })
             .expect("apply");
         fs::remove_file(&doomed).expect("external race");
-        let failed = workspace
-            .persist(report.batch_id)
-            .expect("reported failure");
-        assert!(matches!(
-            failed.state,
-            PersistBatchState::Failed {
-                completed_actions: 1,
-                ..
-            }
-        ));
-        assert_eq!(
-            workspace.document(DocumentId::new(1)).expect("memory").text,
-            "xa"
-        );
+        let failed = workspace.persist(report.batch_id).expect("reported failure");
+        assert!(matches!(failed.state, PersistBatchState::Failed { completed_actions: 1, .. }));
+        assert_eq!(workspace.document(DocumentId::new(1)).expect("memory").text, "xa");
         fs::write(&doomed, "d").expect("restore path");
         // Restoring the content creates a different identity. The retry must
         // stay failed instead of deleting an unrelated replacement.
@@ -756,10 +537,7 @@ mod tests {
         assert!(matches!(
             workspace.apply(&WorkspaceTransaction {
                 document_edits: Vec::new(),
-                resource_ops: vec![ResourceOp::Create {
-                    path: "../escape".into(),
-                    expected_absent: true,
-                }],
+                resource_ops: vec![ResourceOp::Create { path: "../escape".into(), expected_absent: true }],
             }),
             Err(WorkspaceError::UnsafePath { .. })
         ));

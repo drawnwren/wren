@@ -23,65 +23,38 @@ fn language_bundle(language_id: &str) -> LanguageBundle {
 fn provider_is_a_restartable_process_failure_boundary() {
     let executable = env!("CARGO_BIN_EXE_wren-client-providers");
     let mut supervisor = ProviderSupervisor::spawn(executable).expect("spawn provider");
-    assert_eq!(
-        supervisor
-            .request(&ProviderRequest::Hello { protocol: 1 })
-            .expect("hello"),
-        ProviderResponse::Hello { protocol: 1 }
-    );
+    assert_eq!(supervisor.request(&ProviderRequest::Hello { protocol: 1 }).expect("hello"), ProviderResponse::Hello { protocol: 1 });
     assert!(supervisor.request(&ProviderRequest::CrashForTest).is_err());
     assert_eq!(supervisor.restart_count(), 1);
-    assert_eq!(
-        supervisor
-            .request(&ProviderRequest::Hello { protocol: 1 })
-            .expect("hello after restart"),
-        ProviderResponse::Hello { protocol: 1 }
-    );
+    assert_eq!(supervisor.request(&ProviderRequest::Hello { protocol: 1 }).expect("hello after restart"), ProviderResponse::Hello { protocol: 1 });
 }
 
 #[test]
 fn provider_process_loads_nix_tree_sitter_without_runtime_installation() {
     let executable = env!("CARGO_BIN_EXE_wren-client-providers");
     let mut supervisor = ProviderSupervisor::spawn(executable).expect("spawn provider");
-    let source =
-        "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n";
+    let source = "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n";
     let document_id = DocumentId::new(7);
     let revision = DocumentRevision::new(0);
     assert!(matches!(
         supervisor
-            .request(&ProviderRequest::UpdateDocument {
-                document_id,
-                revision,
-                text: source.into(),
-                bundle: language_bundle("nix"),
-            })
+            .request(&ProviderRequest::UpdateDocument { document_id, revision, text: source.into(), bundle: language_bundle("nix") })
             .expect("load Nix document"),
         ProviderResponse::Updated { .. }
     ));
     let ProviderResponse::Highlight(highlight) = supervisor
         .request(&ProviderRequest::Demand {
             document_id,
-            demand: ProviderDemand {
-                revision,
-                visible: std::iter::once(0..source.len()).collect(),
-                near_viewport: Vec::new(),
-                priority: Priority::Visible,
-            },
+            demand: ProviderDemand { revision, visible: std::iter::once(0..source.len()).collect(), near_viewport: Vec::new(), priority: Priority::Visible },
         })
         .expect("highlight Nix document")
     else {
         panic!("unexpected provider response");
     };
-    for (needle, kind) in [
-        ("lib", "variable.parameter"),
-        ("enabled", "variable.member"),
-        ("mkDefault", "function.call"),
-    ] {
+    for (needle, kind) in [("lib", "variable.parameter"), ("enabled", "variable.member"), ("mkDefault", "function.call")] {
         let start = source.find(needle).expect("Nix token");
         assert!(
-            highlight.spans.iter().any(|span| {
-                span.range == (start..start + needle.len()) && span.kind.as_ref() == kind
-            }),
+            highlight.spans.iter().any(|span| { span.range == (start..start + needle.len()) && span.kind.as_ref() == kind }),
             "provider process did not classify {needle:?} as {kind}: {:?}",
             highlight.spans
         );

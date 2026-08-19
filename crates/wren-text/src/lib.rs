@@ -9,9 +9,7 @@ use wren_types::Transaction;
 
 mod snapshot;
 
-pub use snapshot::{
-    HeldSnapshot, SnapshotError, SnapshotHandle, SnapshotManager, SnapshotMetrics, SnapshotQuota,
-};
+pub use snapshot::{HeldSnapshot, SnapshotError, SnapshotHandle, SnapshotManager, SnapshotMetrics, SnapshotQuota};
 
 /// Cloneable storage for UTF-8 editor text.
 pub trait TextStore: Clone {
@@ -24,12 +22,12 @@ pub trait TextStore: Clone {
     fn byte_of_line(&self, line: usize) -> usize;
     fn line_starts(&self) -> Vec<usize> {
         let last_line = self.line_of_byte(self.len_bytes());
-        (0..=last_line)
-            .map(|line| self.byte_of_line(line))
-            .collect()
+        (0..=last_line).map(|line| self.byte_of_line(line)).collect()
     }
     fn apply(&mut self, transaction: &Transaction);
-    fn snapshot(&self) -> Self;
+    fn snapshot(&self) -> Self {
+        self.clone()
+    }
 }
 
 /// Ropey-backed candidate.
@@ -64,11 +62,7 @@ impl TextStore for RopeyText {
     }
 
     fn byte_of_line(&self, line: usize) -> usize {
-        if line >= self.rope.len_lines() {
-            self.rope.len_bytes()
-        } else {
-            self.rope.line_to_byte(line)
-        }
+        if line >= self.rope.len_lines() { self.rope.len_bytes() } else { self.rope.line_to_byte(line) }
     }
 
     fn apply(&mut self, transaction: &Transaction) {
@@ -83,10 +77,6 @@ impl TextStore for RopeyText {
             }
         }
     }
-
-    fn snapshot(&self) -> Self {
-        self.clone()
-    }
 }
 
 /// Crop-backed candidate.
@@ -98,9 +88,7 @@ pub struct CropText {
 impl CropText {
     #[must_use]
     pub fn from_string(text: String) -> Self {
-        Self {
-            rope: crop::Rope::from(text),
-        }
+        Self { rope: crop::Rope::from(text) }
     }
 }
 
@@ -143,10 +131,6 @@ impl TextStore for CropText {
             self.rope.replace(edit.range.clone(), &edit.insert);
         }
     }
-
-    fn snapshot(&self) -> Self {
-        self.clone()
-    }
 }
 
 /// Experimental copy-on-write placeholder for the mmap-base piece-tree track.
@@ -163,9 +147,7 @@ impl TextStore for PieceTreeStub {
     fn from_reader(mut reader: impl Read) -> io::Result<Self> {
         let mut text = String::new();
         reader.read_to_string(&mut text)?;
-        Ok(Self {
-            text: Arc::from(text),
-        })
+        Ok(Self { text: Arc::from(text) })
     }
 
     fn len_bytes(&self) -> usize {
@@ -173,20 +155,9 @@ impl TextStore for PieceTreeStub {
     }
 
     fn line_starts(&self) -> Vec<usize> {
-        let mut starts = Vec::with_capacity(
-            self.text
-                .bytes()
-                .filter(|value| *value == b'\n')
-                .count()
-                .saturating_add(1),
-        );
+        let mut starts = Vec::with_capacity(self.text.bytes().filter(|value| *value == b'\n').count().saturating_add(1));
         starts.push(0);
-        starts.extend(
-            self.text
-                .bytes()
-                .enumerate()
-                .filter_map(|(byte, value)| (value == b'\n').then_some(byte + 1)),
-        );
+        starts.extend(self.text.bytes().enumerate().filter_map(|(byte, value)| (value == b'\n').then_some(byte + 1)));
         starts
     }
 
@@ -204,9 +175,7 @@ impl TextStore for PieceTreeStub {
 
     fn line_of_byte(&self, byte: usize) -> usize {
         let end = byte.min(self.text.len());
-        self.text.get(..end).map_or(0, |prefix| {
-            prefix.bytes().filter(|value| *value == b'\n').count()
-        })
+        self.text.get(..end).map_or(0, |prefix| prefix.bytes().filter(|value| *value == b'\n').count())
     }
 
     fn byte_of_line(&self, line: usize) -> usize {
@@ -230,10 +199,6 @@ impl TextStore for PieceTreeStub {
             self.text = Arc::from(changed);
         }
     }
-
-    fn snapshot(&self) -> Self {
-        self.clone()
-    }
 }
 
 #[cfg(test)]
@@ -250,8 +215,7 @@ mod tests {
         let mut store = T::from_reader(Cursor::new(source)).expect("source is valid UTF-8");
         let snapshot = store.snapshot();
         assert!(store.content_eq(&snapshot));
-        let transaction = Transaction::new(DocumentRevision::new(0), vec![Edit::new(6..8, "B")])
-            .expect("valid edit");
+        let transaction = Transaction::new(DocumentRevision::new(0), vec![Edit::new(6..8, "B")]).expect("valid edit");
         store.apply(&transaction);
         assert!(!store.content_eq(&snapshot));
         assert_eq!(store.slice(0..store.len_bytes()), "alpha\nBeta\n👩🏽‍💻 end\n");
@@ -270,12 +234,7 @@ mod tests {
         let line_starts = store.line_starts();
         assert_eq!(line_starts.first(), Some(&0));
         assert_eq!(line_starts.len(), 4);
-        assert!(
-            line_starts
-                .iter()
-                .enumerate()
-                .all(|(line, byte)| store.byte_of_line(line) == *byte)
-        );
+        assert!(line_starts.iter().enumerate().all(|(line, byte)| store.byte_of_line(line) == *byte));
     }
 
     #[test]

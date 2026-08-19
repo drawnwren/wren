@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use logos::{Lexer, Logos};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,11 +32,7 @@ impl Value {
             Self::Number(value) => value.to_string(),
             Self::String(value) => value.clone(),
             Self::Bool(value) => value.to_string(),
-            Self::List(values) => values
-                .iter()
-                .map(Self::to_editor_text)
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Self::List(values) => values.iter().map(Self::to_editor_text).collect::<Vec<_>>().join("\n"),
             Self::Null => String::new(),
         }
     }
@@ -84,7 +81,7 @@ impl ExpressionContext {
     }
 }
 
-#[derive(Debug, Error, Clone, PartialEq)]
+#[derive(Debug, Error, Clone, PartialEq, Default)]
 pub enum ExpressionError {
     #[error("unexpected character {character:?} at byte {byte}")]
     UnexpectedCharacter { character: char, byte: usize },
@@ -94,6 +91,7 @@ pub enum ExpressionError {
     InvalidNumber { text: String, byte: usize },
     #[error("unexpected token {token} at token {index}")]
     UnexpectedToken { token: String, index: usize },
+    #[default]
     #[error("expression ended unexpectedly")]
     UnexpectedEnd,
     #[error("unknown context key {0}")]
@@ -101,57 +99,68 @@ pub enum ExpressionError {
     #[error("unknown function {0}")]
     UnknownFunction(String),
     #[error("{operator} does not accept {left} and {right}")]
-    InvalidBinaryTypes {
-        operator: &'static str,
-        left: &'static str,
-        right: &'static str,
-    },
+    InvalidBinaryTypes { operator: &'static str, left: &'static str, right: &'static str },
     #[error("{operator} does not accept {operand}")]
-    InvalidUnaryType {
-        operator: &'static str,
-        operand: &'static str,
-    },
+    InvalidUnaryType { operator: &'static str, operand: &'static str },
     #[error("function {function} expected {expected}, received {actual} arguments")]
-    ArgumentCount {
-        function: String,
-        expected: usize,
-        actual: usize,
-    },
+    ArgumentCount { function: String, expected: usize, actual: usize },
     #[error("function {function} argument {index} must be {expected}, not {actual}")]
-    ArgumentType {
-        function: String,
-        index: usize,
-        expected: &'static str,
-        actual: &'static str,
-    },
+    ArgumentType { function: String, index: usize, expected: &'static str, actual: &'static str },
     #[error("division by zero")]
     DivisionByZero,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Logos, Debug, Clone, PartialEq)]
+#[logos(error = ExpressionError)]
+#[logos(skip r"[ \t\r\n\f]+")]
 enum Token {
+    #[regex(r"(?:[0-9][0-9.]*|\.[0-9][0-9.]*)", lex_number)]
     Number(f64),
+    #[token("\"", lex_string)]
+    #[token("'", lex_string)]
     String(String),
+    #[regex(r"[\p{Alphabetic}_][\p{Alphabetic}\p{Number}_.]*", |lexer| lexer.slice().to_owned())]
     Identifier(String),
+    #[token("+")]
     Plus,
+    #[token("-")]
     Minus,
+    #[token("*")]
     Star,
+    #[token("/")]
     Slash,
+    #[token("%")]
     Percent,
+    #[token("!")]
     Bang,
+    #[token("==")]
     EqualEqual,
+    #[token("!=")]
     BangEqual,
+    #[token("<")]
     Less,
+    #[token("<=")]
     LessEqual,
+    #[token(">")]
     Greater,
+    #[token(">=")]
     GreaterEqual,
+    #[token("&&")]
     AndAnd,
+    #[token("||")]
     OrOr,
+    #[token("(")]
     LeftParen,
+    #[token(")")]
     RightParen,
+    #[token("[")]
     LeftBracket,
+    #[token("]")]
     RightBracket,
+    #[token(",")]
     Comma,
+    #[regex(r".", lex_unexpected, priority = 1)]
+    Invalid,
 }
 
 impl Token {
@@ -179,103 +188,43 @@ impl Token {
             Self::LeftBracket => "[".to_owned(),
             Self::RightBracket => "]".to_owned(),
             Self::Comma => ",".to_owned(),
+            Self::Invalid => "invalid token".to_owned(),
         }
     }
 }
 
-pub fn evaluate_expression(
-    source: &str,
-    context: &ExpressionContext,
-) -> Result<Value, ExpressionError> {
+pub fn evaluate_expression(source: &str, context: &ExpressionContext) -> Result<Value, ExpressionError> {
     let tokens = lex(source)?;
-    let mut parser = Parser {
-        tokens: &tokens,
-        cursor: 0,
-        context,
-    };
+    let mut parser = Parser { tokens: &tokens, cursor: 0, context };
     let value = parser.expression(0)?;
     if let Some(token) = parser.tokens.get(parser.cursor) {
-        return Err(ExpressionError::UnexpectedToken {
-            token: token.label(),
-            index: parser.cursor,
-        });
+        return Err(ExpressionError::UnexpectedToken { token: token.label(), index: parser.cursor });
     }
     Ok(value)
 }
 
 fn lex(source: &str) -> Result<Vec<Token>, ExpressionError> {
-    let mut tokens = Vec::new();
-    let mut cursor = 0;
-    while cursor < source.len() {
-        let character = source[cursor..]
-            .chars()
-            .next()
-            .ok_or(ExpressionError::UnexpectedEnd)?;
-        if character.is_whitespace() {
-            cursor += character.len_utf8();
-            continue;
-        }
-        tokens.push(lex_token(source, &mut cursor, character)?);
-    }
-    Ok(tokens)
+    Token::lexer(source).collect()
 }
 
-fn lex_token(source: &str, cursor: &mut usize, character: char) -> Result<Token, ExpressionError> {
-    if is_number_start(source, *cursor, character) {
-        return lex_number(source, cursor, character);
-    }
-    if matches!(character, '\'' | '"') {
-        return lex_string(source, cursor, character);
-    }
-    if character.is_alphabetic() || character == '_' {
-        return Ok(lex_identifier(source, cursor, character));
-    }
-    lex_symbol(&source[*cursor..], cursor, character)
+fn lex_number(lexer: &mut Lexer<'_, Token>) -> Result<f64, ExpressionError> {
+    lexer.slice().parse().map_err(|_| ExpressionError::InvalidNumber { text: lexer.slice().to_owned(), byte: lexer.span().start })
 }
 
-fn is_number_start(source: &str, cursor: usize, character: char) -> bool {
-    character.is_ascii_digit()
-        || (character == '.'
-            && source[cursor + 1..]
-                .chars()
-                .next()
-                .is_some_and(|next| next.is_ascii_digit()))
-}
-
-fn lex_number(source: &str, cursor: &mut usize, first: char) -> Result<Token, ExpressionError> {
-    let start = *cursor;
-    *cursor += first.len_utf8();
-    while *cursor < source.len() {
-        let next = source[*cursor..].chars().next().unwrap_or(' ');
-        if !next.is_ascii_digit() && next != '.' {
-            break;
-        }
-        *cursor += next.len_utf8();
-    }
-    let text = &source[start..*cursor];
-    text.parse()
-        .map(Token::Number)
-        .map_err(|_| ExpressionError::InvalidNumber {
-            text: text.to_owned(),
-            byte: start,
-        })
-}
-
-fn lex_string(source: &str, cursor: &mut usize, quote: char) -> Result<Token, ExpressionError> {
-    let start = *cursor;
-    *cursor += quote.len_utf8();
+fn lex_string(lexer: &mut Lexer<'_, Token>) -> Result<String, ExpressionError> {
+    let start = lexer.span().start;
+    let quote = lexer.slice().chars().next().unwrap_or('"');
     let mut value = String::new();
     let mut escaped = false;
-    while *cursor < source.len() {
-        let next = source[*cursor..].chars().next().unwrap_or(' ');
-        *cursor += next.len_utf8();
+    for (offset, next) in lexer.remainder().char_indices() {
         if escaped {
             value.push(unescape(next));
             escaped = false;
         } else if next == '\\' {
             escaped = true;
         } else if next == quote {
-            return Ok(Token::String(value));
+            lexer.bump(offset + next.len_utf8());
+            return Ok(value);
         } else {
             value.push(next);
         }
@@ -292,50 +241,8 @@ fn unescape(character: char) -> char {
     }
 }
 
-fn lex_identifier(source: &str, cursor: &mut usize, first: char) -> Token {
-    let start = *cursor;
-    *cursor += first.len_utf8();
-    while *cursor < source.len() {
-        let next = source[*cursor..].chars().next().unwrap_or(' ');
-        if !next.is_alphanumeric() && !matches!(next, '_' | '.') {
-            break;
-        }
-        *cursor += next.len_utf8();
-    }
-    Token::Identifier(source[start..*cursor].to_owned())
-}
-
-fn lex_symbol(rest: &str, cursor: &mut usize, character: char) -> Result<Token, ExpressionError> {
-    let (token, width) = match rest {
-        rest if rest.starts_with("==") => (Token::EqualEqual, 2),
-        rest if rest.starts_with("!=") => (Token::BangEqual, 2),
-        rest if rest.starts_with("<=") => (Token::LessEqual, 2),
-        rest if rest.starts_with(">=") => (Token::GreaterEqual, 2),
-        rest if rest.starts_with("&&") => (Token::AndAnd, 2),
-        rest if rest.starts_with("||") => (Token::OrOr, 2),
-        _ => (single_symbol(character, *cursor)?, character.len_utf8()),
-    };
-    *cursor += width;
-    Ok(token)
-}
-
-fn single_symbol(character: char, byte: usize) -> Result<Token, ExpressionError> {
-    match character {
-        '+' => Ok(Token::Plus),
-        '-' => Ok(Token::Minus),
-        '*' => Ok(Token::Star),
-        '/' => Ok(Token::Slash),
-        '%' => Ok(Token::Percent),
-        '!' => Ok(Token::Bang),
-        '<' => Ok(Token::Less),
-        '>' => Ok(Token::Greater),
-        '(' => Ok(Token::LeftParen),
-        ')' => Ok(Token::RightParen),
-        '[' => Ok(Token::LeftBracket),
-        ']' => Ok(Token::RightBracket),
-        ',' => Ok(Token::Comma),
-        _ => Err(ExpressionError::UnexpectedCharacter { character, byte }),
-    }
+fn lex_unexpected(lexer: &mut Lexer<'_, Token>) -> Result<(), ExpressionError> {
+    Err(ExpressionError::UnexpectedCharacter { character: lexer.slice().chars().next().unwrap_or('\0'), byte: lexer.span().start })
 }
 
 struct Parser<'a> {
@@ -363,11 +270,7 @@ impl Parser<'_> {
     }
 
     fn prefix(&mut self) -> Result<Value, ExpressionError> {
-        let token = self
-            .tokens
-            .get(self.cursor)
-            .cloned()
-            .ok_or(ExpressionError::UnexpectedEnd)?;
+        let token = self.tokens.get(self.cursor).cloned().ok_or(ExpressionError::UnexpectedEnd)?;
         self.cursor += 1;
         match token {
             Token::Number(value) => Ok(Value::Number(value)),
@@ -375,10 +278,7 @@ impl Parser<'_> {
             Token::Identifier(identifier) => self.identifier(identifier),
             Token::Minus => match self.expression(11)? {
                 Value::Number(value) => Ok(Value::Number(-value)),
-                value => Err(ExpressionError::InvalidUnaryType {
-                    operator: "-",
-                    operand: value.type_name(),
-                }),
+                value => Err(ExpressionError::InvalidUnaryType { operator: "-", operand: value.type_name() }),
             },
             Token::Bang => Ok(Value::Bool(!self.expression(11)?.as_bool())),
             Token::LeftParen => {
@@ -387,10 +287,7 @@ impl Parser<'_> {
                 Ok(value)
             }
             Token::LeftBracket => self.list(),
-            unexpected => Err(ExpressionError::UnexpectedToken {
-                token: unexpected.label(),
-                index: self.cursor - 1,
-            }),
+            unexpected => Err(ExpressionError::UnexpectedToken { token: unexpected.label(), index: self.cursor - 1 }),
         }
     }
 
@@ -416,10 +313,7 @@ impl Parser<'_> {
             self.expect(Token::RightParen)?;
             call_function(&identifier, arguments)
         } else {
-            self.context
-                .get(&identifier)
-                .cloned()
-                .ok_or(ExpressionError::UnknownContextKey(identifier))
+            self.context.get(&identifier).cloned().ok_or(ExpressionError::UnknownContextKey(identifier))
         }
     }
 
@@ -444,10 +338,7 @@ impl Parser<'_> {
                 self.cursor += 1;
                 Ok(())
             }
-            Some(actual) => Err(ExpressionError::UnexpectedToken {
-                token: actual.label(),
-                index: self.cursor,
-            }),
+            Some(actual) => Err(ExpressionError::UnexpectedToken { token: actual.label(), index: self.cursor }),
             None => Err(ExpressionError::UnexpectedEnd),
         }
     }
@@ -503,31 +394,18 @@ fn apply_binary(operator: Token, left: Value, right: Value) -> Result<Value, Exp
         Token::GreaterEqual => comparison(">=", left, right, |order| order.is_ge()),
         Token::AndAnd => Ok(Value::Bool(left.as_bool() && right.as_bool())),
         Token::OrOr => Ok(Value::Bool(left.as_bool() || right.as_bool())),
-        unexpected => Err(ExpressionError::UnexpectedToken {
-            token: unexpected.label(),
-            index: 0,
-        }),
+        unexpected => Err(ExpressionError::UnexpectedToken { token: unexpected.label(), index: 0 }),
     }
 }
 
-fn numbers(
-    operator: &'static str,
-    left: Value,
-    right: Value,
-    operation: impl FnOnce(f64, f64) -> f64,
-) -> Result<Value, ExpressionError> {
+fn numbers(operator: &'static str, left: Value, right: Value, operation: impl FnOnce(f64, f64) -> f64) -> Result<Value, ExpressionError> {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => Ok(Value::Number(operation(left, right))),
         (left, right) => invalid_binary(operator, &left, &right),
     }
 }
 
-fn comparison(
-    operator: &'static str,
-    left: Value,
-    right: Value,
-    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
-) -> Result<Value, ExpressionError> {
+fn comparison(operator: &'static str, left: Value, right: Value, predicate: impl FnOnce(std::cmp::Ordering) -> bool) -> Result<Value, ExpressionError> {
     let ordering = match (&left, &right) {
         (Value::Number(left), Value::Number(right)) => left.partial_cmp(right),
         (Value::String(left), Value::String(right)) => Some(left.cmp(right)),
@@ -536,16 +414,8 @@ fn comparison(
     Ok(Value::Bool(ordering.is_some_and(predicate)))
 }
 
-fn invalid_binary(
-    operator: &'static str,
-    left: &Value,
-    right: &Value,
-) -> Result<Value, ExpressionError> {
-    Err(ExpressionError::InvalidBinaryTypes {
-        operator,
-        left: left.type_name(),
-        right: right.type_name(),
-    })
+fn invalid_binary(operator: &'static str, left: &Value, right: &Value) -> Result<Value, ExpressionError> {
+    Err(ExpressionError::InvalidBinaryTypes { operator, left: left.type_name(), right: right.type_name() })
 }
 
 fn call_function(name: &str, arguments: Vec<Value>) -> Result<Value, ExpressionError> {
@@ -564,11 +434,7 @@ fn call_function(name: &str, arguments: Vec<Value>) -> Result<Value, ExpressionE
             let Value::String(value) = &arguments[0] else {
                 return argument_type(name, 0, "string", &arguments[0]);
             };
-            Ok(Value::String(if name == "upper" {
-                value.to_uppercase()
-            } else {
-                value.to_lowercase()
-            }))
+            Ok(Value::String(if name == "upper" { value.to_uppercase() } else { value.to_lowercase() }))
         }
         "contains" => {
             require_count(name, &arguments, 2)?;
@@ -588,42 +454,18 @@ fn call_function(name: &str, arguments: Vec<Value>) -> Result<Value, ExpressionE
             let Value::String(separator) = &arguments[1] else {
                 return argument_type(name, 1, "string", &arguments[1]);
             };
-            Ok(Value::String(
-                values
-                    .iter()
-                    .map(Value::to_editor_text)
-                    .collect::<Vec<_>>()
-                    .join(separator),
-            ))
+            Ok(Value::String(values.iter().map(Value::to_editor_text).collect::<Vec<_>>().join(separator)))
         }
         _ => Err(ExpressionError::UnknownFunction(name.to_owned())),
     }
 }
 
 fn require_count(name: &str, arguments: &[Value], expected: usize) -> Result<(), ExpressionError> {
-    if arguments.len() == expected {
-        Ok(())
-    } else {
-        Err(ExpressionError::ArgumentCount {
-            function: name.to_owned(),
-            expected,
-            actual: arguments.len(),
-        })
-    }
+    if arguments.len() == expected { Ok(()) } else { Err(ExpressionError::ArgumentCount { function: name.to_owned(), expected, actual: arguments.len() }) }
 }
 
-fn argument_type(
-    name: &str,
-    index: usize,
-    expected: &'static str,
-    actual: &Value,
-) -> Result<Value, ExpressionError> {
-    Err(ExpressionError::ArgumentType {
-        function: name.to_owned(),
-        index,
-        expected,
-        actual: actual.type_name(),
-    })
+fn argument_type(name: &str, index: usize, expected: &'static str, actual: &Value) -> Result<Value, ExpressionError> {
+    Err(ExpressionError::ArgumentType { function: name.to_owned(), index, expected, actual: actual.type_name() })
 }
 
 #[cfg(test)]
@@ -632,52 +474,26 @@ mod tests {
 
     #[test]
     fn evaluates_precedence_strings_lists_and_context() {
-        let context = ExpressionContext::new()
-            .with("cursor.line", Value::Number(4.0))
-            .with("workspace.trusted", Value::Bool(true));
-        assert_eq!(
-            evaluate_expression("1 + 2 * 3", &context),
-            Ok(Value::Number(7.0))
-        );
-        assert_eq!(
-            evaluate_expression("upper('wr' + 'en')", &context),
-            Ok(Value::String("WREN".to_owned()))
-        );
-        assert_eq!(
-            evaluate_expression("join(['a', cursor.line], ':')", &context),
-            Ok(Value::String("a:4".to_owned()))
-        );
-        assert_eq!(
-            evaluate_expression("workspace.trusted && cursor.line >= 4", &context),
-            Ok(Value::Bool(true))
-        );
+        let context =
+            ExpressionContext::new().with("cursor.line", Value::Number(4.0)).with("café", Value::Bool(true)).with("workspace.trusted", Value::Bool(true));
+        assert_eq!(evaluate_expression("1 + 2 * 3", &context), Ok(Value::Number(7.0)));
+        assert_eq!(evaluate_expression("upper('wr' + 'en')", &context), Ok(Value::String("WREN".to_owned())));
+        assert_eq!(evaluate_expression("join(['a', cursor.line], ':')", &context), Ok(Value::String("a:4".to_owned())));
+        assert_eq!(evaluate_expression("workspace.trusted && cursor.line >= 4", &context), Ok(Value::Bool(true)));
+        assert_eq!(evaluate_expression("café", &context), Ok(Value::Bool(true)));
     }
 
     #[test]
     fn rejects_io_and_unknown_context_instead_of_becoming_a_script_language() {
         let context = ExpressionContext::new();
-        assert!(matches!(
-            evaluate_expression("read_file('/etc/passwd')", &context),
-            Err(ExpressionError::UnknownFunction(_))
-        ));
-        assert_eq!(
-            evaluate_expression("lsp.available", &context),
-            Err(ExpressionError::UnknownContextKey(
-                "lsp.available".to_owned()
-            ))
-        );
+        assert!(matches!(evaluate_expression("read_file('/etc/passwd')", &context), Err(ExpressionError::UnknownFunction(_))));
+        assert_eq!(evaluate_expression("lsp.available", &context), Err(ExpressionError::UnknownContextKey("lsp.available".to_owned())));
     }
 
     #[test]
     fn reports_type_and_arithmetic_errors() {
         let context = ExpressionContext::new();
-        assert!(matches!(
-            evaluate_expression("'x' - 1", &context),
-            Err(ExpressionError::InvalidBinaryTypes { .. })
-        ));
-        assert_eq!(
-            evaluate_expression("1 / 0", &context),
-            Err(ExpressionError::DivisionByZero)
-        );
+        assert!(matches!(evaluate_expression("'x' - 1", &context), Err(ExpressionError::InvalidBinaryTypes { .. })));
+        assert_eq!(evaluate_expression("1 / 0", &context), Err(ExpressionError::DivisionByZero));
     }
 }

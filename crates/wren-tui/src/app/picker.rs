@@ -18,13 +18,7 @@ fn launch_grep_picker_task(request: GrepPickerRequest) -> Result<GrepPickerTask>
             let _ = sender.send(result);
         })
         .context("start repository search worker")?;
-    Ok(GrepPickerTask {
-        generation,
-        query,
-        child,
-        cancelled,
-        receiver,
-    })
+    Ok(GrepPickerTask { generation, query, child, cancelled, receiver })
 }
 
 fn run_grep_picker_search(
@@ -45,14 +39,9 @@ fn run_grep_picker_search(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("start rg: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "rg stdout was not captured".to_owned())?;
+    let stdout = child.stdout.take().ok_or_else(|| "rg stdout was not captured".to_owned())?;
     {
-        let mut slot = child_slot
-            .lock()
-            .map_err(|_| "repository search child lock is poisoned".to_owned())?;
+        let mut slot = child_slot.lock().map_err(|_| "repository search child lock is poisoned".to_owned())?;
         if cancelled.load(Ordering::Acquire) {
             let _ = child.kill();
             return Err("cancelled".to_owned());
@@ -90,9 +79,7 @@ fn run_grep_picker_search(
     if limited || cancelled.load(Ordering::Acquire) {
         let _ = child.kill();
     }
-    let status = child
-        .wait()
-        .map_err(|error| format!("wait for rg: {error}"))?;
+    let status = child.wait().map_err(|error| format!("wait for rg: {error}"))?;
     if cancelled.load(Ordering::Acquire) {
         return Err("cancelled".to_owned());
     }
@@ -108,15 +95,9 @@ fn run_grep_picker_search(
 impl App {
     pub(super) fn start_file_picker(&mut self, query: &str) -> Result<()> {
         self.picker_directory = None;
-        let output = Command::new("rg")
-            .args(["--files", "--null"])
-            .output()
-            .context("enumerate workspace files with rg")?;
+        let output = Command::new("rg").args(["--files", "--null"]).output().context("enumerate workspace files with rg")?;
         if !output.status.success() {
-            bail!(
-                "file enumeration failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            bail!("file enumeration failed: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
         self.picker_files = output
             .stdout
@@ -126,84 +107,67 @@ impl App {
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect();
         self.last_picker_source = Some(PickerSource::Files);
-        self.begin_path_picker(query);
+        self.begin_path_picker(PickerSource::Files, query);
         Ok(())
     }
 
     pub(super) fn picker_overlay(&self) -> Option<PickerOverlay> {
-        let prompt = self
-            .prompt
-            .as_ref()
-            .filter(|prompt| prompt.kind.is_picker())?;
-        let source = self.last_picker_source.unwrap_or(PickerSource::Files);
+        let prompt = self.prompt.as_ref().filter(|prompt| prompt.kind.is_picker())?;
+        let source = prompt.kind.picker_source()?;
         let title = match source {
             PickerSource::Files => "Find Files".to_owned(),
-            PickerSource::Browser => self.picker_directory.as_ref().map_or_else(
-                || "File Browser".to_owned(),
-                |path| format!("File Browser · {}", path.display()),
-            ),
+            PickerSource::Browser => {
+                self.picker_directory.as_ref().map_or_else(|| "File Browser".to_owned(), |path| format!("File Browser · {}", path.display()))
+            }
             PickerSource::Grep => "Live Grep".to_owned(),
             PickerSource::Buffers => "Buffers".to_owned(),
             PickerSource::Recent => "Oldfiles".to_owned(),
             PickerSource::Jumps => "Jumplist".to_owned(),
             PickerSource::Diagnostics => "Diagnostics".to_owned(),
         };
-        let rows = match prompt.kind {
-            PromptKind::FilePicker | PromptKind::FileBrowser => {
+        let rows = match source.family() {
+            PickerFamily::Path => {
                 let workspace_root = self.workspace_root();
                 self.picker_matches
                     .iter()
                     .map(|path| {
                         let is_directory = path.is_dir();
-                        let label = if prompt.kind == PromptKind::FileBrowser {
-                            path.file_name().map_or_else(
-                                || path.display().to_string(),
-                                |name| name.to_string_lossy().into_owned(),
-                            )
+                        let label = if source == PickerSource::Browser {
+                            path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
                         } else if let Ok(relative) = path.strip_prefix(&workspace_root) {
                             relative.display().to_string()
                         } else if path.is_absolute() {
-                            path.file_name().map_or_else(
-                                || path.display().to_string(),
-                                |name| name.to_string_lossy().into_owned(),
-                            )
+                            path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
                         } else {
                             path.display().to_string()
                         };
                         let detail = if is_directory {
                             "directory".to_owned()
                         } else if path.is_absolute() && !path.starts_with(&workspace_root) {
-                            path.parent()
-                                .map_or_else(String::new, |parent| parent.display().to_string())
+                            path.parent().map_or_else(String::new, |parent| parent.display().to_string())
                         } else {
                             String::new()
                         };
-                        PickerOverlayRow {
-                            label: format!("{label}{}", if is_directory { "/" } else { "" }).into(),
-                            detail: detail.into(),
-                        }
+                        PickerOverlayRow { label: format!("{label}{}", if is_directory { "/" } else { "" }).into(), detail: detail.into() }
                     })
                     .collect()
             }
-            PromptKind::Grep => self
+            PickerFamily::Grep => self
                 .quickfix
                 .iter()
                 .map(|entry| PickerOverlayRow {
-                    label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column)
-                        .into(),
+                    label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column).into(),
                     detail: compact(&entry.text, 80).into(),
                 })
                 .collect(),
-            PromptKind::Location => self
+            PickerFamily::Location => self
                 .filtered_locations(&prompt.buffer)
                 .into_iter()
                 .map(|entry| PickerOverlayRow {
-                    label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column)
-                        .into(),
+                    label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column).into(),
                     detail: compact(&entry.text, 80).into(),
                 })
                 .collect(),
-            _ => return None,
         };
         Some(PickerOverlay {
             title: title.into(),
@@ -221,28 +185,18 @@ impl App {
 
     fn selected_picker_target(&self) -> Option<(PathBuf, Option<QuickfixEntry>)> {
         let prompt = self.prompt.as_ref()?;
-        match prompt.kind {
-            PromptKind::FilePicker | PromptKind::FileBrowser => self
-                .picker_matches
-                .get(self.picker_index)
-                .cloned()
-                .map(|path| (path, None)),
-            PromptKind::Grep | PromptKind::Location => self
-                .selected_picker_entry()
-                .map(|entry| (entry.path.clone(), Some(entry))),
-            _ => None,
+        match prompt.kind.picker_source()?.family() {
+            PickerFamily::Path => self.picker_matches.get(self.picker_index).cloned().map(|path| (path, None)),
+            PickerFamily::Grep | PickerFamily::Location => self.selected_picker_entry().map(|entry| (entry.path.clone(), Some(entry))),
         }
     }
 
     fn selected_picker_entry(&self) -> Option<QuickfixEntry> {
         let prompt = self.prompt.as_ref()?;
-        match prompt.kind {
-            PromptKind::Grep => self.quickfix.get(self.picker_index).cloned(),
-            PromptKind::Location => self
-                .filtered_locations(&prompt.buffer)
-                .get(self.picker_index)
-                .cloned(),
-            _ => None,
+        match prompt.kind.picker_source()?.family() {
+            PickerFamily::Grep => self.quickfix.get(self.picker_index).cloned(),
+            PickerFamily::Location => self.filtered_locations(&prompt.buffer).get(self.picker_index).cloned(),
+            PickerFamily::Path => None,
         }
     }
 
@@ -260,23 +214,15 @@ impl App {
             self.picker_preview = std::fs::read_dir(&path).map_or_else(
                 |error| format!("Unable to preview directory: {error}"),
                 |entries| {
-                    let mut entries = entries
-                        .filter_map(Result::ok)
-                        .map(|entry| entry.path())
-                        .collect::<Vec<_>>();
-                    entries.sort_by_key(|entry| {
-                        (!entry.is_dir(), entry.file_name().map(ToOwned::to_owned))
-                    });
+                    let mut entries = entries.filter_map(Result::ok).map(|entry| entry.path()).collect::<Vec<_>>();
+                    entries.sort_by_key(|entry| (!entry.is_dir(), entry.file_name().map(ToOwned::to_owned)));
                     entries
                         .into_iter()
                         .take(2_000)
                         .map(|entry| {
                             format!(
                                 "{}{}",
-                                entry.file_name().map_or_else(
-                                    || entry.display().to_string(),
-                                    |name| { name.to_string_lossy().into_owned() }
-                                ),
+                                entry.file_name().map_or_else(|| entry.display().to_string(), |name| { name.to_string_lossy().into_owned() }),
                                 if entry.is_dir() { "/" } else { "" }
                             )
                         })
@@ -288,12 +234,7 @@ impl App {
         }
         let in_memory = std::iter::once(&self.active)
             .chain(self.inactive.iter())
-            .find(|buffer| {
-                buffer
-                    .document
-                    .presentation_path()
-                    .is_some_and(|buffer_path| same_path(buffer_path, &path))
-            })
+            .find(|buffer| buffer.document.presentation_path().is_some_and(|buffer_path| same_path(buffer_path, &path)))
             .map(|buffer| buffer.editor.contents());
         self.picker_preview = in_memory.unwrap_or_else(|| match std::fs::read(&path) {
             Ok(bytes) if bytes.iter().take(8_192).any(|byte| *byte == 0) => {
@@ -314,30 +255,18 @@ impl App {
         let revision = DocumentRevision::new(0);
         let spans = self
             .provider
-            .highlight_now(
-                stable_document_id(Some(&path)),
-                revision,
-                Arc::from(self.picker_preview.as_str()),
-                bundle,
-            )
+            .highlight_now(stable_document_id(Some(&path)), revision, Arc::from(self.picker_preview.as_str()), bundle)
             .unwrap_or_else(|_| lexical_highlight_text(&self.picker_preview));
-        self.picker_preview_decorations = spans
-            .into_iter()
-            .map(|span| provider_decoration(span, self.theme))
-            .collect();
+        self.picker_preview_decorations = spans.into_iter().map(|span| provider_decoration(span, self.theme)).collect();
         if let Some(entry) = selected_entry {
             let line = entry.line.saturating_sub(1);
             self.picker_preview_scroll = line.saturating_sub(5);
             if let Some(range) = entry.selection_byte_range(&self.picker_preview) {
-                self.picker_preview_decorations.push(DecorationSpan {
+                self.picker_preview_decorations.push(DecorationSpan::new(
                     range,
-                    style: CellStyle {
-                        foreground: None,
-                        background: Some(CellColor::Rgb(self.theme.surface0)),
-                        ..CellStyle::default()
-                    },
-                    priority: u32::MAX,
-                });
+                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(self.theme.surface0)),
+                    u32::MAX,
+                ));
             } else {
                 self.picker_preview_highlight_line = Some(line);
             }
@@ -350,31 +279,23 @@ impl App {
     }
 
     pub(super) fn start_file_browser_at(&mut self, directory: &Path) -> Result<()> {
-        let directory = std::fs::canonicalize(directory)
-            .with_context(|| format!("open browser directory {}", directory.display()))?;
+        let directory = std::fs::canonicalize(directory).with_context(|| format!("open browser directory {}", directory.display()))?;
         let mut entries = std::fs::read_dir(&directory)
             .with_context(|| format!("read browser directory {}", directory.display()))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
         entries.sort_by_key(|path| (!path.is_dir(), path.file_name().map(ToOwned::to_owned)));
-        self.picker_files = entries
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+        self.picker_files = entries.iter().map(|path| path.to_string_lossy().into_owned()).collect();
         self.picker_directory = Some(directory);
         self.last_picker_source = Some(PickerSource::Browser);
-        self.prompt = Some(Prompt::new(PromptKind::FileBrowser));
+        self.prompt = Some(Prompt::new(PromptKind::Picker(PickerSource::Browser)));
         self.update_file_picker();
         Ok(())
     }
 
     pub(super) fn browse_parent(&mut self) -> Result<()> {
-        let parent = self
-            .picker_directory
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
+        let parent = self.picker_directory.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         if let Some(parent) = parent {
             self.start_file_browser_at(&parent)?;
         }
@@ -393,34 +314,24 @@ impl App {
             return Ok(());
         }
         self.last_picker_source = Some(PickerSource::Buffers);
-        self.begin_path_picker("");
+        self.begin_path_picker(PickerSource::Buffers, "");
         Ok(())
     }
 
     pub(super) fn start_recent_picker(&mut self) -> Result<()> {
-        self.picker_files = self
-            .recent_files
-            .iter()
-            .filter(|path| path.exists())
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
+        self.picker_files = self.recent_files.iter().filter(|path| path.exists()).map(|path| path.to_string_lossy().into_owned()).collect();
         if self.picker_files.is_empty() {
             self.message = "oldfiles is empty".to_owned();
             return Ok(());
         }
         self.last_picker_source = Some(PickerSource::Recent);
-        self.begin_path_picker("");
+        self.begin_path_picker(PickerSource::Recent, "");
         Ok(())
     }
 
     pub(super) fn start_jumplist_picker(&mut self) -> Result<()> {
         self.quickfix = if self.jump_history.is_empty() {
-            let Some(path) = self
-                .active
-                .document
-                .presentation_path()
-                .map(Path::to_path_buf)
-            else {
+            let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
                 self.message = "jumplist has no named locations".to_owned();
                 return Ok(());
             };
@@ -431,14 +342,7 @@ impl App {
                 .map(|(index, byte)| {
                     let line = self.active.editor.text().line_of_byte(byte);
                     let line_start = self.active.editor.text().byte_of_line(line);
-                    QuickfixEntry {
-                        path: path.clone(),
-                        line: line + 1,
-                        column: byte.saturating_sub(line_start) + 1,
-                        selection_end: None,
-                        column_utf16: false,
-                        text: format!("jump {}", index + 1),
-                    }
+                    QuickfixEntry::new(path.clone(), line + 1, byte.saturating_sub(line_start) + 1, format!("jump {}", index + 1))
                 })
                 .collect()
         } else {
@@ -446,31 +350,14 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, jump)| {
-                    let buffer = if self
-                        .active
-                        .document
-                        .presentation_path()
-                        .is_some_and(|path| same_path(path, &jump.path))
-                    {
+                    let buffer = if self.active.document.presentation_path().is_some_and(|path| same_path(path, &jump.path)) {
                         Some(&self.active)
                     } else {
-                        self.inactive.iter().find(|buffer| {
-                            buffer
-                                .document
-                                .presentation_path()
-                                .is_some_and(|path| same_path(path, &jump.path))
-                        })
+                        self.inactive.iter().find(|buffer| buffer.document.presentation_path().is_some_and(|path| same_path(path, &jump.path)))
                     }?;
                     let line = buffer.editor.text().line_of_byte(jump.byte);
                     let line_start = buffer.editor.text().byte_of_line(line);
-                    Some(QuickfixEntry {
-                        path: jump.path.clone(),
-                        line: line + 1,
-                        column: jump.byte.saturating_sub(line_start) + 1,
-                        selection_end: None,
-                        column_utf16: false,
-                        text: format!("jump {}", index + 1),
-                    })
+                    Some(QuickfixEntry::new(jump.path.clone(), line + 1, jump.byte.saturating_sub(line_start) + 1, format!("jump {}", index + 1)))
                 })
                 .collect()
         };
@@ -479,19 +366,11 @@ impl App {
 
     pub(super) fn start_diagnostic_picker(&mut self) -> Result<()> {
         self.refresh_diagnostics()?;
-        self.quickfix = self
-            .diagnostics
-            .iter()
-            .map(DiagnosticEntry::quickfix)
-            .collect();
+        self.quickfix = self.diagnostics.iter().map(DiagnosticEntry::quickfix).collect();
         self.start_location_picker(PickerSource::Diagnostics, "")
     }
 
-    pub(super) fn start_location_picker(
-        &mut self,
-        source: PickerSource,
-        query: &str,
-    ) -> Result<()> {
+    pub(super) fn start_location_picker(&mut self, source: PickerSource, query: &str) -> Result<()> {
         if self.quickfix.is_empty() {
             self.message = match source {
                 PickerSource::Jumps => "jumplist is empty".to_owned(),
@@ -503,32 +382,20 @@ impl App {
         self.last_picker_source = Some(source);
         self.last_picker_query = query.to_owned();
         self.picker_index = 0;
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Location,
-            buffer: query.to_owned(),
-            history_index: None,
-        });
+        self.prompt = Some(Prompt { kind: PromptKind::Picker(source), buffer: query.to_owned(), history_index: None });
         self.update_location_picker();
         Ok(())
     }
 
-    pub(super) fn begin_path_picker(&mut self, query: &str) {
+    pub(super) fn begin_path_picker(&mut self, source: PickerSource, query: &str) {
         self.picker_directory = None;
-        self.prompt = Some(Prompt {
-            kind: PromptKind::FilePicker,
-            buffer: query.to_owned(),
-            history_index: None,
-        });
+        self.prompt = Some(Prompt { kind: PromptKind::Picker(source), buffer: query.to_owned(), history_index: None });
         self.update_file_picker();
     }
 
     pub(super) fn start_grep_picker(&mut self, query: &str) -> Result<()> {
         self.last_picker_source = Some(PickerSource::Grep);
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Grep,
-            buffer: query.to_owned(),
-            history_index: None,
-        });
+        self.prompt = Some(Prompt { kind: PromptKind::Picker(PickerSource::Grep), buffer: query.to_owned(), history_index: None });
         self.picker_index = 0;
         self.update_grep_picker();
         Ok(())
@@ -536,15 +403,15 @@ impl App {
 
     pub(super) fn update_prompt_picker(&mut self) -> Result<()> {
         match self.prompt.as_ref().map(|prompt| prompt.kind) {
-            Some(PromptKind::FilePicker | PromptKind::FileBrowser) => {
+            Some(PromptKind::Picker(PickerSource::Files | PickerSource::Browser | PickerSource::Buffers | PickerSource::Recent)) => {
                 self.update_file_picker();
                 Ok(())
             }
-            Some(PromptKind::Grep) => {
+            Some(PromptKind::Picker(PickerSource::Grep)) => {
                 self.update_grep_picker();
                 Ok(())
             }
-            Some(PromptKind::Location) => {
+            Some(PromptKind::Picker(PickerSource::Jumps | PickerSource::Diagnostics)) => {
                 self.update_location_picker();
                 Ok(())
             }
@@ -552,20 +419,13 @@ impl App {
                 self.update_inccommand_preview();
                 Ok(())
             }
-            Some(PromptKind::SearchForward | PromptKind::SearchBackward) => {
-                self.update_incremental_search()
-            }
+            Some(PromptKind::Search(_)) => self.update_incremental_search(),
             _ => Ok(()),
         }
     }
 
     pub(super) fn update_inccommand_preview(&mut self) {
-        let Some(command) = self
-            .prompt
-            .as_ref()
-            .filter(|prompt| prompt.kind == PromptKind::Command)
-            .map(|prompt| prompt.buffer.clone())
-        else {
+        let Some(command) = self.prompt.as_ref().filter(|prompt| prompt.kind == PromptKind::Command).map(|prompt| prompt.buffer.clone()) else {
             return;
         };
         let Some(parsed) = parse_inccommand_substitute(&command) else {
@@ -573,21 +433,12 @@ impl App {
             return;
         };
         let substitute = match parsed {
-            ExCommand::Substitute {
-                range,
-                pattern,
-                replacement,
-                flags,
-            } => self.resolve_byte_range(range.as_ref()).and_then(|range| {
-                self.resolve_substitute(&pattern, &replacement, flags, vec![range])
-            }),
-            ExCommand::SubstituteRepeat {
-                range,
-                use_search_pattern,
-                flags,
-            } => self.resolve_byte_range(range.as_ref()).and_then(|range| {
-                self.resolve_repeated_substitute(use_search_pattern, flags, vec![range])
-            }),
+            ExCommand::Substitute { range, pattern, replacement, flags } => {
+                self.resolve_byte_range(range.as_ref()).and_then(|range| self.resolve_substitute(&pattern, &replacement, flags, vec![range]))
+            }
+            ExCommand::SubstituteRepeat { range, use_search_pattern, flags } => {
+                self.resolve_byte_range(range.as_ref()).and_then(|range| self.resolve_repeated_substitute(use_search_pattern, flags, vec![range]))
+            }
             _ => return,
         };
         let Ok(substitute) = substitute else {
@@ -595,23 +446,12 @@ impl App {
             return;
         };
         let text = self.active.editor.contents();
-        let Ok(pattern) = self
-            .active
-            .editor
-            .compile_search_pattern(&substitute.needle, substitute.case_override)
-        else {
+        let Ok(pattern) = self.active.editor.compile_search_pattern(&substitute.needle, substitute.case_override) else {
             self.message = "inccommand: invalid pattern".to_owned();
             return;
         };
         let replacement = VimReplacement::new(substitute.replacement);
-        let Ok(edits) = plan_substitution_edits(
-            &text,
-            &pattern,
-            &replacement,
-            &substitute.ranges,
-            substitute.global,
-            || Ok(()),
-        ) else {
+        let Ok(edits) = plan_substitution_edits(&text, &pattern, &replacement, &substitute.ranges, substitute.global, || Ok(())) else {
             self.message.clear();
             return;
         };
@@ -623,39 +463,23 @@ impl App {
             self.message.clear();
             return;
         };
-        self.message = format!(
-            "inccommand: {}",
-            substitution_message(transaction.edit_count(), true, &text, &transaction)
-        );
+        self.message = format!("inccommand: {}", substitution_message(transaction.edit_count(), true, &text, &transaction));
     }
 
     pub(super) fn update_file_picker(&mut self) {
-        let Some(prompt) = self.prompt.as_ref().filter(|prompt| {
-            matches!(
-                prompt.kind,
-                PromptKind::FilePicker | PromptKind::FileBrowser
-            )
-        }) else {
+        let Some(prompt) = self.prompt.as_ref().filter(|prompt| prompt.kind.picker_source().map(PickerSource::family) == Some(PickerFamily::Path)) else {
             return;
         };
         let query = prompt.buffer.clone();
         self.last_picker_query.clone_from(&query);
-        self.picker_matches = fuzzy_rank(&query, self.picker_files.iter().map(String::as_str))
-            .into_iter()
-            .take(128)
-            .map(PathBuf::from)
-            .collect();
+        self.picker_matches = fuzzy_rank(&query, self.picker_files.iter().map(String::as_str)).into_iter().take(128).map(PathBuf::from).collect();
         self.picker_index = 0;
         self.update_file_picker_message();
         self.refresh_picker_preview();
     }
 
     pub(super) fn update_grep_picker(&mut self) {
-        let Some(query) = self
-            .prompt
-            .as_ref()
-            .filter(|prompt| prompt.kind == PromptKind::Grep)
-            .map(|prompt| prompt.buffer.clone())
+        let Some(query) = self.prompt.as_ref().filter(|prompt| prompt.kind == PromptKind::Picker(PickerSource::Grep)).map(|prompt| prompt.buffer.clone())
         else {
             return;
         };
@@ -681,13 +505,7 @@ impl App {
         self.grep_pending = Some(GrepPickerRequest {
             generation: self.grep_generation,
             query,
-            root: self
-                .active
-                .document
-                .presentation_path()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.root_workspace.clone()),
+            root: self.active.document.presentation_path().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_else(|| self.root_workspace.clone()),
         });
         self.grep_due = Some(Instant::now() + Duration::from_millis(50));
     }
@@ -700,22 +518,17 @@ impl App {
         }
     }
 
-    pub(super) fn poll_grep_picker(&mut self) -> bool {
+    pub(super) fn poll_grep_picker(&mut self) -> Result<bool> {
         let mut changed = false;
         if let Some(task) = &self.grep_task {
-            let result = match task.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("repository search worker disconnected".to_owned()))
-                }
+            let result = match poll_channel(&task.receiver) {
+                Ok(result) => result,
+                Err(ChannelDisconnected) => Some(Err("repository search worker disconnected".to_owned())),
             };
             if let Some(result) = result {
                 let task = self.grep_task.take().expect("grep task exists");
                 let current = task.generation == self.grep_generation
-                    && self.prompt.as_ref().is_some_and(|prompt| {
-                        prompt.kind == PromptKind::Grep && prompt.buffer == task.query
-                    });
+                    && self.prompt.as_ref().is_some_and(|prompt| prompt.kind == PromptKind::Picker(PickerSource::Grep) && prompt.buffer == task.query);
                 if current {
                     match result {
                         Ok(entries) => {
@@ -742,26 +555,18 @@ impl App {
                 }
             }
         }
-        changed
+        Ok(changed)
     }
 
     pub(super) fn open_selected_grep_result(&mut self, query: &str) -> Result<()> {
-        let entry = self
-            .quickfix
-            .get(self.picker_index)
-            .cloned()
-            .ok_or_else(|| anyhow!("no grep matches for {query:?}"))?;
+        let entry = self.quickfix.get(self.picker_index).cloned().ok_or_else(|| anyhow!("no grep matches for {query:?}"))?;
         self.navigate_to_entry(&entry)?;
         self.message = format!("{}:{}: {}", entry.line, entry.column, entry.text);
         Ok(())
     }
 
     pub(super) fn open_selected_location(&mut self, query: &str) -> Result<()> {
-        let entry = self
-            .filtered_locations(query)
-            .get(self.picker_index)
-            .cloned()
-            .ok_or_else(|| anyhow!("no matching location"))?;
+        let entry = self.filtered_locations(query).get(self.picker_index).cloned().ok_or_else(|| anyhow!("no matching location"))?;
         self.navigate_to_entry(&entry)?;
         self.message = format!("{}:{}: {}", entry.line, entry.column, entry.text);
         Ok(())
@@ -771,42 +576,22 @@ impl App {
         if query.is_empty() {
             return self.quickfix.clone();
         }
-        let candidates = self
-            .quickfix
-            .iter()
-            .map(QuickfixEntry::display)
-            .collect::<Vec<_>>();
+        let candidates = self.quickfix.iter().map(QuickfixEntry::display).collect::<Vec<_>>();
         let ranked = fuzzy_rank(query, candidates.iter().map(String::as_str));
         ranked
             .into_iter()
-            .filter_map(|label| {
-                candidates
-                    .iter()
-                    .position(|candidate| candidate == label)
-                    .and_then(|index| self.quickfix.get(index).cloned())
-            })
+            .filter_map(|label| candidates.iter().position(|candidate| candidate == label).and_then(|index| self.quickfix.get(index).cloned()))
             .collect()
     }
 
     pub(super) fn update_location_picker(&mut self) {
-        let query = self
-            .prompt
-            .as_ref()
-            .map_or_else(String::new, |prompt| prompt.buffer.clone());
+        let query = self.prompt.as_ref().map_or_else(String::new, |prompt| prompt.buffer.clone());
         self.last_picker_query.clone_from(&query);
         let locations = self.filtered_locations(&query);
         self.picker_index = self.picker_index.min(locations.len().saturating_sub(1));
-        self.message = locations.get(self.picker_index).map_or_else(
-            || "no matching locations".to_owned(),
-            |entry| {
-                format!(
-                    "[{}/{}] {}",
-                    self.picker_index + 1,
-                    locations.len(),
-                    entry.display()
-                )
-            },
-        );
+        self.message = locations
+            .get(self.picker_index)
+            .map_or_else(|| "no matching locations".to_owned(), |entry| format!("[{}/{}] {}", self.picker_index + 1, locations.len(), entry.display()));
         self.refresh_picker_preview();
     }
 
@@ -847,19 +632,16 @@ impl App {
     }
 
     pub(super) fn move_picker(&mut self, direction: isize) {
-        let location_query = self.prompt.as_ref().and_then(|prompt| {
-            (prompt.kind == PromptKind::Location).then_some(prompt.buffer.as_str())
-        });
-        let length = if let Some(query) = location_query {
-            self.filtered_locations(query).len()
-        } else if self
-            .prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.kind == PromptKind::Grep)
-        {
-            self.quickfix.len()
-        } else {
-            self.picker_matches.len()
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let Some(source) = prompt.kind.picker_source() else {
+            return;
+        };
+        let length = match source.family() {
+            PickerFamily::Grep => self.quickfix.len(),
+            PickerFamily::Location => self.filtered_locations(&prompt.buffer).len(),
+            PickerFamily::Path => self.picker_matches.len(),
         };
         if length == 0 {
             self.picker_index = 0;
@@ -868,20 +650,10 @@ impl App {
         } else {
             self.picker_index = self.picker_index.saturating_add(1).min(length - 1);
         }
-        if self
-            .prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.kind == PromptKind::Grep)
-        {
-            self.update_grep_picker_message();
-        } else if self
-            .prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.kind == PromptKind::Location)
-        {
-            self.update_location_picker();
-        } else {
-            self.update_file_picker_message();
+        match source.family() {
+            PickerFamily::Grep => self.update_grep_picker_message(),
+            PickerFamily::Location => self.update_location_picker(),
+            PickerFamily::Path => self.update_file_picker_message(),
         }
         self.refresh_picker_preview();
     }
@@ -920,23 +692,13 @@ impl App {
                 "[{}/{}] {selected}{}",
                 self.picker_index + 1,
                 self.picker_matches.len(),
-                if nearby.is_empty() {
-                    String::new()
-                } else {
-                    format!("  ·  {nearby}")
-                }
+                if nearby.is_empty() { String::new() } else { format!("  ·  {nearby}") }
             )
         };
     }
 
     pub(super) fn buffer(&self, buffer_id: BufferId) -> Option<&BufferState> {
-        if self.active.buffer_id == buffer_id {
-            Some(&self.active)
-        } else {
-            self.inactive
-                .iter()
-                .find(|buffer| buffer.buffer_id == buffer_id)
-        }
+        if self.active.buffer_id == buffer_id { Some(&self.active) } else { self.inactive.iter().find(|buffer| buffer.buffer_id == buffer_id) }
     }
 
     pub(super) fn move_prompt_history(&mut self, direction: isize) {
@@ -945,31 +707,19 @@ impl App {
         };
         let history = match prompt.kind {
             PromptKind::Command => &self.client_state.command_history,
-            PromptKind::SearchForward | PromptKind::SearchBackward => {
-                &self.client_state.search_history
+            PromptKind::Search(_) => &self.client_state.search_history,
+            PromptKind::Expression | PromptKind::Picker(_) | PromptKind::Rename | PromptKind::ConditionalBreakpoint => {
+                return;
             }
-            PromptKind::Expression
-            | PromptKind::FilePicker
-            | PromptKind::FileBrowser
-            | PromptKind::Grep
-            | PromptKind::Location
-            | PromptKind::Rename
-            | PromptKind::ConditionalBreakpoint => return,
         };
         if history.is_empty() {
             return;
         }
         let current = prompt.history_index.unwrap_or(history.len());
-        let next = if direction < 0 {
-            current.saturating_sub(1)
-        } else {
-            current.saturating_add(1).min(history.len())
-        };
+        let next = if direction < 0 { current.saturating_sub(1) } else { current.saturating_add(1).min(history.len()) };
         if let Some(prompt) = &mut self.prompt {
             prompt.history_index = (next < history.len()).then_some(next);
-            prompt.buffer = history
-                .get(next)
-                .map_or_else(String::new, ToString::to_string);
+            prompt.buffer = history.get(next).map_or_else(String::new, ToString::to_string);
         }
     }
 }

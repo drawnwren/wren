@@ -48,104 +48,34 @@ pub enum TabAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExCommand {
-    Goto {
-        address: ExAddress,
-    },
-    Substitute {
-        range: Option<ExRange>,
-        pattern: Box<str>,
-        replacement: Box<str>,
-        flags: SubstituteFlags,
-    },
-    SubstituteRepeat {
-        range: Option<ExRange>,
-        use_search_pattern: bool,
-        flags: Option<SubstituteFlags>,
-    },
-    Global {
-        range: Option<ExRange>,
-        invert: bool,
-        pattern: Box<str>,
-        command: Box<ExCommand>,
-    },
-    Normal {
-        range: Option<ExRange>,
-        bang: bool,
-        keys: Box<str>,
-    },
-    Write {
-        range: Option<ExRange>,
-        all: bool,
-        bang: bool,
-        path: Option<Box<str>>,
-    },
-    WriteQuit {
-        bang: bool,
-        path: Option<Box<str>>,
-    },
-    Quit {
-        all: bool,
-        bang: bool,
-    },
-    Edit {
-        bang: bool,
-        path: Option<Box<str>>,
-    },
-    Buffer {
-        action: BufferAction,
-        bang: bool,
-        target: Option<Box<str>>,
-    },
-    Split {
-        vertical: bool,
-        path: Option<Box<str>>,
-    },
-    Close {
-        bang: bool,
-    },
-    Tab {
-        action: TabAction,
-        path: Option<Box<str>>,
-    },
-    Marks {
-        names: Box<str>,
-    },
-    Registers {
-        names: Box<str>,
-    },
-    Grep {
-        pattern: Box<str>,
-        paths: Vec<Box<str>>,
-    },
-    Cdo {
-        command: Box<ExCommand>,
-    },
+    Goto { address: ExAddress },
+    Substitute { range: Option<ExRange>, pattern: Box<str>, replacement: Box<str>, flags: SubstituteFlags },
+    SubstituteRepeat { range: Option<ExRange>, use_search_pattern: bool, flags: Option<SubstituteFlags> },
+    Global { range: Option<ExRange>, invert: bool, pattern: Box<str>, command: Box<ExCommand> },
+    Normal { range: Option<ExRange>, bang: bool, keys: Box<str> },
+    Write { range: Option<ExRange>, all: bool, bang: bool, path: Option<Box<str>> },
+    WriteQuit { bang: bool, path: Option<Box<str>> },
+    Quit { all: bool, bang: bool },
+    Edit { bang: bool, path: Option<Box<str>> },
+    Buffer { action: BufferAction, bang: bool, target: Option<Box<str>> },
+    Split { vertical: bool, path: Option<Box<str>> },
+    Close { bang: bool },
+    Tab { action: TabAction, path: Option<Box<str>> },
+    Marks { names: Box<str> },
+    Registers { names: Box<str> },
+    Grep { pattern: Box<str>, paths: Vec<Box<str>> },
+    Cdo { command: Box<ExCommand> },
     Undo,
     Redo,
-    Echo {
-        expression: Box<str>,
-    },
+    Echo { expression: Box<str> },
     NoHighlight,
-    Help {
-        topic: Option<Box<str>>,
-    },
+    Help { topic: Option<Box<str>> },
     Messages,
     ConvertUtf8,
-    Terminal {
-        program: Option<Box<str>>,
-        arguments: Vec<Box<str>>,
-    },
-    Make {
-        program: Box<str>,
-        arguments: Vec<Box<str>>,
-    },
-    Format {
-        program: Box<str>,
-        arguments: Vec<Box<str>>,
-    },
-    Find {
-        query: Box<str>,
-    },
+    Terminal { program: Option<Box<str>>, arguments: Vec<Box<str>> },
+    Make { program: Box<str>, arguments: Vec<Box<str>> },
+    Format { program: Box<str>, arguments: Vec<Box<str>> },
+    Find { query: Box<str> },
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -178,11 +108,7 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     let (range, rest) = parse_range(input)?;
     let rest = rest.trim_start();
     if rest.is_empty() {
-        return range
-            .map(|range| ExCommand::Goto {
-                address: range.end.unwrap_or(range.start),
-            })
-            .ok_or(ExError::Empty);
+        return range.map(|range| ExCommand::Goto { address: range.end.unwrap_or(range.start) }).ok_or(ExError::Empty);
     }
     if let Some(argument) = rest.strip_prefix('&') {
         return parse_substitute_repeat(range, false, argument);
@@ -190,10 +116,7 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     if let Some(argument) = rest.strip_prefix('~') {
         return parse_substitute_repeat(range, true, argument);
     }
-    let name_end = rest
-        .char_indices()
-        .find(|(_, character)| !character.is_ascii_alphabetic())
-        .map_or(rest.len(), |(index, _)| index);
+    let name_end = rest.char_indices().find(|(_, character)| !character.is_ascii_alphabetic()).map_or(rest.len(), |(index, _)| index);
     if name_end == 0 {
         return Err(ExError::UnknownCommand(rest.into()));
     }
@@ -208,133 +131,132 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     parse_named_ex(range, name, bang, argument)
 }
 
-fn parse_named_ex(
-    range: Option<ExRange>,
-    name: &str,
-    bang: bool,
-    argument: &str,
-) -> Result<ExCommand, ExError> {
-    if let Some(action) = buffer_action(name) {
-        return buffer(action, bang, argument);
-    }
-    if let Some(action) = tab_action(name) {
-        return tab(action, argument);
-    }
-    match name {
-        "s" | "substitute" => parse_substitute(range, argument),
-        "g" | "global" => parse_global(range, false, argument, name),
-        "v" | "vglobal" => parse_global(range, true, argument, name),
-        "norm" | "normal" => Ok(ExCommand::Normal {
+macro_rules! ex_commands {
+    (|$range:ident, $name:ident, $bang:ident, $argument:ident| $($canonical:literal: $pattern:pat => $body:expr,)*) => {
+        pub const EX_COMMAND_NAMES: &[&str] = &[
+            $($canonical),*
+        ];
+
+        fn parse_named_ex(
+            $range: Option<ExRange>, $name: &str, $bang: bool, $argument: &str,
+        ) -> Result<ExCommand, ExError> {
+            match $name {
+                $($pattern => $body,)*
+                _ => Err(ExError::UnknownCommand($name.into())),
+            }
+        }
+    };
+}
+
+pub const EX_COMMAND_COMPLETIONS: &[&str] = &[
+    "bdelete",
+    "buffer",
+    "cdo",
+    "close",
+    "debuglog",
+    "edit",
+    "find",
+    "format",
+    "grep",
+    "help",
+    "make",
+    "marks",
+    "messages",
+    "nohlsearch",
+    "normal",
+    "quit",
+    "registers",
+    "redo",
+    "split",
+    "tabnew",
+    "terminal",
+    "undo",
+    "vsplit",
+    "write",
+    "wq",
+];
+
+ex_commands! { |range, name, bang, argument|
+        "bnext": "bn" | "bnext" => buffer(BufferAction::Next, bang, argument),
+        "bprevious": "bp" | "bprevious" => buffer(BufferAction::Previous, bang, argument),
+        "bfirst": "bf" | "bfirst" => buffer(BufferAction::First, bang, argument),
+        "blast": "bl" | "blast" => buffer(BufferAction::Last, bang, argument),
+        "bdelete": "bd" | "bdelete" => buffer(BufferAction::Delete, bang, argument),
+        "buffer": "b" | "buffer" => buffer(BufferAction::Select, bang, argument),
+        "tabnew": "tabnew" | "tabe" | "tabedit" => tab(TabAction::New, argument),
+        "tabnext": "tabn" | "tabnext" => tab(TabAction::Next, argument),
+        "tabprevious": "tabp" | "tabprevious" => tab(TabAction::Previous, argument),
+        "tabfirst": "tabfirst" => tab(TabAction::First, argument),
+        "tablast": "tablast" => tab(TabAction::Last, argument),
+        "tabclose": "tabclose" => tab(TabAction::Close, argument),
+        "substitute": "s" | "substitute" => parse_substitute(range, argument),
+        "global": "g" | "global" => parse_global(range, false, argument, name),
+        "vglobal": "v" | "vglobal" => parse_global(range, true, argument, name),
+        "normal": "norm" | "normal" => Ok(ExCommand::Normal {
             range,
             bang,
             keys: argument.into(),
         }),
-        "w" | "write" => Ok(ExCommand::Write {
+        "write": "w" | "write" => Ok(ExCommand::Write {
             range,
             all: false,
             bang,
             path: optional_argument(argument),
         }),
-        "wa" | "wall" => Ok(ExCommand::Write {
+        "wall": "wa" | "wall" => Ok(ExCommand::Write {
             range,
             all: true,
             bang,
             path: optional_argument(argument),
         }),
-        "wq" | "x" | "xit" => Ok(ExCommand::WriteQuit {
+        "wq": "wq" | "x" | "xit" => Ok(ExCommand::WriteQuit {
             bang,
             path: optional_argument(argument),
         }),
-        "q" | "quit" => Ok(ExCommand::Quit { all: false, bang }),
-        "qa" | "qall" => Ok(ExCommand::Quit { all: true, bang }),
-        "e" | "edit" => Ok(ExCommand::Edit {
+        "quit": "q" | "quit" => Ok(ExCommand::Quit { all: false, bang }),
+        "qall": "qa" | "qall" => Ok(ExCommand::Quit { all: true, bang }),
+        "edit": "e" | "edit" => Ok(ExCommand::Edit {
             bang,
             path: optional_argument(argument),
         }),
-        "sp" | "split" => Ok(ExCommand::Split {
+        "split": "sp" | "split" => Ok(ExCommand::Split {
             vertical: false,
             path: optional_argument(argument),
         }),
-        "vs" | "vsplit" => Ok(ExCommand::Split {
+        "vsplit": "vs" | "vsplit" => Ok(ExCommand::Split {
             vertical: true,
             path: optional_argument(argument),
         }),
-        "clo" | "close" => Ok(ExCommand::Close { bang }),
-        "marks" => Ok(ExCommand::Marks {
-            names: argument.into(),
-        }),
-        "reg" | "registers" => Ok(ExCommand::Registers {
-            names: argument.into(),
-        }),
-        "grep" | "vimgrep" => parse_grep(argument, name),
-        "cdo" => parse_cdo(argument, name),
-        "u" | "undo" => Ok(ExCommand::Undo),
-        "redo" => Ok(ExCommand::Redo),
-        "echo" => Ok(ExCommand::Echo {
-            expression: argument.into(),
-        }),
-        "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
-        "h" | "help" => Ok(ExCommand::Help {
-            topic: optional_argument(argument),
-        }),
-        "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
-        "convertutf8" => Ok(ExCommand::ConvertUtf8),
-        "term" | "terminal" => Ok(parse_terminal(argument)),
-        "make" => parse_required_process(argument, name, ProcessCommand::Make),
-        "format" => parse_required_process(argument, name, ProcessCommand::Format),
-        "find" => Ok(ExCommand::Find {
-            query: argument.into(),
-        }),
-        _ => Err(ExError::UnknownCommand(name.into())),
-    }
-}
-
-fn buffer_action(name: &str) -> Option<BufferAction> {
-    match name {
-        "bn" | "bnext" => Some(BufferAction::Next),
-        "bp" | "bprevious" => Some(BufferAction::Previous),
-        "bf" | "bfirst" => Some(BufferAction::First),
-        "bl" | "blast" => Some(BufferAction::Last),
-        "bd" | "bdelete" => Some(BufferAction::Delete),
-        "b" | "buffer" => Some(BufferAction::Select),
-        _ => None,
-    }
-}
-
-fn tab_action(name: &str) -> Option<TabAction> {
-    match name {
-        "tabnew" | "tabe" | "tabedit" => Some(TabAction::New),
-        "tabn" | "tabnext" => Some(TabAction::Next),
-        "tabp" | "tabprevious" => Some(TabAction::Previous),
-        "tabfirst" => Some(TabAction::First),
-        "tablast" => Some(TabAction::Last),
-        "tabclose" => Some(TabAction::Close),
-        _ => None,
-    }
+        "close": "clo" | "close" => Ok(ExCommand::Close { bang }),
+        "marks": "marks" => Ok(ExCommand::Marks { names: argument.into() }),
+        "registers": "reg" | "registers" => Ok(ExCommand::Registers { names: argument.into() }),
+        "grep": "grep" | "vimgrep" => parse_grep(argument, name),
+        "cdo": "cdo" => parse_cdo(argument, name),
+        "undo": "u" | "undo" => Ok(ExCommand::Undo),
+        "redo": "redo" => Ok(ExCommand::Redo),
+        "echo": "echo" => Ok(ExCommand::Echo { expression: argument.into() }),
+        "nohlsearch": "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
+        "help": "h" | "help" => Ok(ExCommand::Help { topic: optional_argument(argument) }),
+        "messages": "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
+        "convertutf8": "convertutf8" => Ok(ExCommand::ConvertUtf8),
+        "terminal": "term" | "terminal" => Ok(parse_terminal(argument)),
+        "make": "make" => parse_required_process(argument, name, ProcessCommand::Make),
+        "format": "format" => parse_required_process(argument, name, ProcessCommand::Format),
+        "find": "find" => Ok(ExCommand::Find { query: argument.into() }),
 }
 
 fn parse_cdo(argument: &str, name: &str) -> Result<ExCommand, ExError> {
     if argument.is_empty() {
-        return Err(ExError::MissingArgument {
-            command: name.into(),
-        });
+        return Err(ExError::MissingArgument { command: name.into() });
     }
     parse_ex(argument)
-        .map(|command| ExCommand::Cdo {
-            command: Box::new(command),
-        })
-        .map_err(|source| ExError::Nested {
-            command: name.into(),
-            source: Box::new(source),
-        })
+        .map(|command| ExCommand::Cdo { command: Box::new(command) })
+        .map_err(|source| ExError::Nested { command: name.into(), source: Box::new(source) })
 }
 
 fn parse_terminal(argument: &str) -> ExCommand {
     let mut words = argument.split_whitespace();
-    ExCommand::Terminal {
-        program: words.next().map(Into::into),
-        arguments: words.map(Into::into).collect(),
-    }
+    ExCommand::Terminal { program: words.next().map(Into::into), arguments: words.map(Into::into).collect() }
 }
 
 enum ProcessCommand {
@@ -342,38 +264,19 @@ enum ProcessCommand {
     Format,
 }
 
-fn parse_required_process(
-    argument: &str,
-    name: &str,
-    command: ProcessCommand,
-) -> Result<ExCommand, ExError> {
+fn parse_required_process(argument: &str, name: &str, command: ProcessCommand) -> Result<ExCommand, ExError> {
     let mut words = argument.split_whitespace();
-    let program = words.next().ok_or_else(|| ExError::MissingArgument {
-        command: name.into(),
-    })?;
+    let program = words.next().ok_or_else(|| ExError::MissingArgument { command: name.into() })?;
     let arguments = words.map(Into::into).collect();
     Ok(match command {
-        ProcessCommand::Make => ExCommand::Make {
-            program: program.into(),
-            arguments,
-        },
-        ProcessCommand::Format => ExCommand::Format {
-            program: program.into(),
-            arguments,
-        },
+        ProcessCommand::Make => ExCommand::Make { program: program.into(), arguments },
+        ProcessCommand::Format => ExCommand::Format { program: program.into(), arguments },
     })
 }
 
 fn parse_range(input: &str) -> Result<(Option<ExRange>, &str), ExError> {
     if let Some(rest) = input.strip_prefix('%') {
-        return Ok((
-            Some(ExRange {
-                start: ExAddress::Line(1),
-                end: Some(ExAddress::Last),
-                semicolon: false,
-            }),
-            rest,
-        ));
+        return Ok((Some(ExRange { start: ExAddress::Line(1), end: Some(ExAddress::Last), semicolon: false }), rest));
     }
     let Some((start, consumed)) = parse_address(input, 0)? else {
         return Ok((None, input));
@@ -386,19 +289,11 @@ fn parse_range(input: &str) -> Result<(Option<ExRange>, &str), ExError> {
     {
         semicolon = separator == ';';
         rest = &rest[separator.len_utf8()..];
-        let (parsed, consumed) =
-            parse_address(rest, input.len() - rest.len())?.unwrap_or((ExAddress::Last, 0));
+        let (parsed, consumed) = parse_address(rest, input.len() - rest.len())?.unwrap_or((ExAddress::Last, 0));
         end = Some(parsed);
         rest = &rest[consumed..];
     }
-    Ok((
-        Some(ExRange {
-            start,
-            end,
-            semicolon,
-        }),
-        rest,
-    ))
+    Ok((Some(ExRange { start, end, semicolon }), rest))
 }
 
 fn parse_address(input: &str, offset: usize) -> Result<Option<(ExAddress, usize)>, ExError> {
@@ -416,11 +311,7 @@ fn parse_address(input: &str, offset: usize) -> Result<Option<(ExAddress, usize)
         }
         '/' | '?' => {
             let (pattern, length) = delimited(input, first)?;
-            let address = if first == '/' {
-                ExAddress::SearchForward(pattern.into())
-            } else {
-                ExAddress::SearchBackward(pattern.into())
-            };
+            let address = if first == '/' { ExAddress::SearchForward(pattern.into()) } else { ExAddress::SearchBackward(pattern.into()) };
             (address, length)
         }
         character if character.is_ascii_digit() => {
@@ -430,9 +321,7 @@ fn parse_address(input: &str, offset: usize) -> Result<Option<(ExAddress, usize)
                 .map(|(index, character)| index + character.len_utf8())
                 .last()
                 .unwrap_or(0);
-            let line = input[..digits]
-                .parse::<usize>()
-                .map_err(|_| ExError::InvalidAddress { offset })?;
+            let line = input[..digits].parse::<usize>().map_err(|_| ExError::InvalidAddress { offset })?;
             (ExAddress::Line(line), digits)
         }
         '+' | '-' => (ExAddress::Current, 0),
@@ -456,61 +345,30 @@ fn parse_address(input: &str, offset: usize) -> Result<Option<(ExAddress, usize)
         let amount = if digit_length == 0 {
             1
         } else {
-            input[consumed..consumed + digit_length]
-                .parse::<i64>()
-                .map_err(|_| ExError::InvalidAddress {
-                    offset: offset + consumed,
-                })?
+            input[consumed..consumed + digit_length].parse::<i64>().map_err(|_| ExError::InvalidAddress { offset: offset + consumed })?
         };
         consumed += digit_length;
-        address = ExAddress::Offset {
-            base: Box::new(address),
-            delta: if sign == '-' { -amount } else { amount },
-        };
+        address = ExAddress::Offset { base: Box::new(address), delta: if sign == '-' { -amount } else { amount } };
     }
     Ok(Some((address, consumed)))
 }
 
 fn parse_substitute(range: Option<ExRange>, argument: &str) -> Result<ExCommand, ExError> {
     if argument.is_empty() {
-        return Ok(ExCommand::SubstituteRepeat {
-            range,
-            use_search_pattern: false,
-            flags: None,
-        });
+        return Ok(ExCommand::SubstituteRepeat { range, use_search_pattern: false, flags: None });
     }
-    let delimiter = argument
-        .chars()
-        .next()
-        .ok_or_else(|| ExError::MissingArgument {
-            command: "substitute".into(),
-        })?;
+    let delimiter = argument.chars().next().ok_or_else(|| ExError::MissingArgument { command: "substitute".into() })?;
     let (pattern, pattern_bytes) = delimited(argument, delimiter)?;
     let replacement_input = &argument[pattern_bytes..];
     let (replacement, replacement_bytes) = delimited_tail(replacement_input, delimiter)?;
     let flags_input = replacement_input[replacement_bytes..].trim();
     let flags = parse_substitute_flags(flags_input)?;
-    Ok(ExCommand::Substitute {
-        range,
-        pattern: pattern.into(),
-        replacement: replacement.into(),
-        flags,
-    })
+    Ok(ExCommand::Substitute { range, pattern: pattern.into(), replacement: replacement.into(), flags })
 }
 
-fn parse_substitute_repeat(
-    range: Option<ExRange>,
-    use_search_pattern: bool,
-    argument: &str,
-) -> Result<ExCommand, ExError> {
+fn parse_substitute_repeat(range: Option<ExRange>, use_search_pattern: bool, argument: &str) -> Result<ExCommand, ExError> {
     let argument = argument.trim();
-    Ok(ExCommand::SubstituteRepeat {
-        range,
-        use_search_pattern,
-        flags: (!argument.is_empty())
-            .then(|| parse_substitute_flags(argument))
-            .transpose()?,
-    })
+    Ok(ExCommand::SubstituteRepeat { range, use_search_pattern, flags: (!argument.is_empty()).then(|| parse_substitute_flags(argument)).transpose()? })
 }
 
 fn parse_substitute_flags(input: &str) -> Result<SubstituteFlags, ExError> {
@@ -529,58 +387,29 @@ fn parse_substitute_flags(input: &str) -> Result<SubstituteFlags, ExError> {
     Ok(flags)
 }
 
-fn parse_global(
-    range: Option<ExRange>,
-    invert: bool,
-    argument: &str,
-    name: &str,
-) -> Result<ExCommand, ExError> {
-    let delimiter = argument
-        .chars()
-        .next()
-        .ok_or_else(|| ExError::MissingArgument {
-            command: name.into(),
-        })?;
+fn parse_global(range: Option<ExRange>, invert: bool, argument: &str, name: &str) -> Result<ExCommand, ExError> {
+    let delimiter = argument.chars().next().ok_or_else(|| ExError::MissingArgument { command: name.into() })?;
     let (pattern, consumed) = delimited(argument, delimiter)?;
     let nested = argument[consumed..].trim_start();
     if nested.is_empty() {
-        return Err(ExError::MissingArgument {
-            command: name.into(),
-        });
+        return Err(ExError::MissingArgument { command: name.into() });
     }
     parse_ex(nested)
-        .map(|command| ExCommand::Global {
-            range,
-            invert,
-            pattern: pattern.into(),
-            command: Box::new(command),
-        })
-        .map_err(|source| ExError::Nested {
-            command: name.into(),
-            source: Box::new(source),
-        })
+        .map(|command| ExCommand::Global { range, invert, pattern: pattern.into(), command: Box::new(command) })
+        .map_err(|source| ExError::Nested { command: name.into(), source: Box::new(source) })
 }
 
 fn parse_grep(argument: &str, name: &str) -> Result<ExCommand, ExError> {
     if argument.is_empty() {
-        return Err(ExError::MissingArgument {
-            command: name.into(),
-        });
+        return Err(ExError::MissingArgument { command: name.into() });
     }
-    let (pattern, rest) =
-        if let Some(delimiter) = argument.chars().next().filter(|c| !c.is_alphanumeric()) {
-            let (pattern, consumed) = delimited(argument, delimiter)?;
-            (pattern, argument[consumed..].trim())
-        } else {
-            argument.split_once(char::is_whitespace).map_or_else(
-                || (argument.to_owned(), ""),
-                |(pattern, rest)| (pattern.to_owned(), rest.trim()),
-            )
-        };
-    Ok(ExCommand::Grep {
-        pattern: pattern.into(),
-        paths: rest.split_whitespace().map(Into::into).collect(),
-    })
+    let (pattern, rest) = if let Some(delimiter) = argument.chars().next().filter(|c| !c.is_alphanumeric()) {
+        let (pattern, consumed) = delimited(argument, delimiter)?;
+        (pattern, argument[consumed..].trim())
+    } else {
+        argument.split_once(char::is_whitespace).map_or_else(|| (argument.to_owned(), ""), |(pattern, rest)| (pattern.to_owned(), rest.trim()))
+    };
+    Ok(ExCommand::Grep { pattern: pattern.into(), paths: rest.split_whitespace().map(Into::into).collect() })
 }
 
 fn delimited(input: &str, delimiter: char) -> Result<(String, usize), ExError> {
@@ -617,18 +446,11 @@ fn optional_argument(argument: &str) -> Option<Box<str>> {
 }
 
 fn buffer(action: BufferAction, bang: bool, argument: &str) -> Result<ExCommand, ExError> {
-    Ok(ExCommand::Buffer {
-        action,
-        bang,
-        target: optional_argument(argument),
-    })
+    Ok(ExCommand::Buffer { action, bang, target: optional_argument(argument) })
 }
 
 fn tab(action: TabAction, argument: &str) -> Result<ExCommand, ExError> {
-    Ok(ExCommand::Tab {
-        action,
-        path: optional_argument(argument),
-    })
+    Ok(ExCommand::Tab { action, path: optional_argument(argument) })
 }
 
 #[cfg(test)]
@@ -641,26 +463,15 @@ mod tests {
             parse_ex("'a+2,$-1normal! dd").expect("parse"),
             ExCommand::Normal {
                 range: Some(ExRange {
-                    start: ExAddress::Offset {
-                        base: Box::new(ExAddress::Mark('a')),
-                        delta: 2,
-                    },
-                    end: Some(ExAddress::Offset {
-                        base: Box::new(ExAddress::Last),
-                        delta: -1,
-                    }),
+                    start: ExAddress::Offset { base: Box::new(ExAddress::Mark('a')), delta: 2 },
+                    end: Some(ExAddress::Offset { base: Box::new(ExAddress::Last), delta: -1 }),
                     semicolon: false,
                 }),
                 bang: true,
                 keys: "dd".into(),
             }
         );
-        assert_eq!(
-            parse_ex("42").expect("goto"),
-            ExCommand::Goto {
-                address: ExAddress::Line(42)
-            }
-        );
+        assert_eq!(parse_ex("42").expect("goto"), ExCommand::Goto { address: ExAddress::Line(42) });
     }
 
     #[test]
@@ -668,59 +479,23 @@ mod tests {
         assert_eq!(
             parse_ex(r"%s/one\/two/ONE\/TWO/gip").expect("substitute"),
             ExCommand::Substitute {
-                range: Some(ExRange {
-                    start: ExAddress::Line(1),
-                    end: Some(ExAddress::Last),
-                    semicolon: false,
-                }),
+                range: Some(ExRange { start: ExAddress::Line(1), end: Some(ExAddress::Last), semicolon: false }),
                 pattern: "one/two".into(),
                 replacement: "ONE/TWO".into(),
-                flags: SubstituteFlags {
-                    global: true,
-                    confirm: false,
-                    case_sensitive: Some(false),
-                    print: true,
-                },
+                flags: SubstituteFlags { global: true, confirm: false, case_sensitive: Some(false), print: true },
             }
         );
-        assert_eq!(
-            parse_ex("s").expect("repeat substitute"),
-            ExCommand::SubstituteRepeat {
-                range: None,
-                use_search_pattern: false,
-                flags: None,
-            }
-        );
+        assert_eq!(parse_ex("s").expect("repeat substitute"), ExCommand::SubstituteRepeat { range: None, use_search_pattern: false, flags: None });
         assert_eq!(
             parse_ex("%&gI").expect("ampersand repeat"),
             ExCommand::SubstituteRepeat {
-                range: Some(ExRange {
-                    start: ExAddress::Line(1),
-                    end: Some(ExAddress::Last),
-                    semicolon: false,
-                }),
+                range: Some(ExRange { start: ExAddress::Line(1), end: Some(ExAddress::Last), semicolon: false }),
                 use_search_pattern: false,
-                flags: Some(SubstituteFlags {
-                    global: true,
-                    confirm: false,
-                    case_sensitive: Some(true),
-                    print: false,
-                }),
+                flags: Some(SubstituteFlags { global: true, confirm: false, case_sensitive: Some(true), print: false }),
             }
         );
-        assert!(matches!(
-            parse_ex("~"),
-            Ok(ExCommand::SubstituteRepeat {
-                use_search_pattern: true,
-                ..
-            })
-        ));
-        let ExCommand::Substitute {
-            pattern,
-            replacement,
-            ..
-        } = parse_ex(r"s/\\/\\/").expect("literal backslashes")
-        else {
+        assert!(matches!(parse_ex("~"), Ok(ExCommand::SubstituteRepeat { use_search_pattern: true, .. })));
+        let ExCommand::Substitute { pattern, replacement, .. } = parse_ex(r"s/\\/\\/").expect("literal backslashes") else {
             panic!("expected substitute");
         };
         assert_eq!(pattern.as_ref(), r"\\");
@@ -768,58 +543,26 @@ mod tests {
 
     #[test]
     fn parses_explicit_terminal_and_task_commands_without_implicit_shell_expansion() {
-        assert_eq!(
-            parse_ex("terminal /bin/sh -l").expect("terminal"),
-            ExCommand::Terminal {
-                program: Some("/bin/sh".into()),
-                arguments: vec!["-l".into()],
-            }
-        );
-        assert_eq!(
-            parse_ex("make cargo check").expect("make"),
-            ExCommand::Make {
-                program: "cargo".into(),
-                arguments: vec!["check".into()],
-            }
-        );
-        assert!(matches!(
-            parse_ex("make"),
-            Err(ExError::MissingArgument { .. })
-        ));
+        assert_eq!(parse_ex("terminal /bin/sh -l").expect("terminal"), ExCommand::Terminal { program: Some("/bin/sh".into()), arguments: vec!["-l".into()] });
+        assert_eq!(parse_ex("make cargo check").expect("make"), ExCommand::Make { program: "cargo".into(), arguments: vec!["check".into()] });
+        assert!(matches!(parse_ex("make"), Err(ExError::MissingArgument { .. })));
         assert_eq!(
             parse_ex("format /usr/bin/tr a-z A-Z").expect("format"),
-            ExCommand::Format {
-                program: "/usr/bin/tr".into(),
-                arguments: vec!["a-z".into(), "A-Z".into()],
-            }
+            ExCommand::Format { program: "/usr/bin/tr".into(), arguments: vec!["a-z".into(), "A-Z".into()] }
         );
-        assert_eq!(
-            parse_ex("find src main").expect("find"),
-            ExCommand::Find {
-                query: "src main".into(),
-            }
-        );
+        assert_eq!(parse_ex("find src main").expect("find"), ExCommand::Find { query: "src main".into() });
     }
 
     #[test]
     fn parses_message_and_debug_log_commands() {
         assert_eq!(parse_ex("messages").expect("messages"), ExCommand::Messages);
-        assert_eq!(
-            parse_ex("debuglog").expect("debug log"),
-            ExCommand::Messages
-        );
+        assert_eq!(parse_ex("debuglog").expect("debug log"), ExCommand::Messages);
     }
 
     #[test]
     fn rejects_incomplete_or_unknown_commands() {
         assert!(matches!(parse_ex("wat"), Err(ExError::UnknownCommand(_))));
-        assert!(matches!(
-            parse_ex("s/foo/bar/x"),
-            Err(ExError::InvalidSubstituteFlag { flag: 'x' })
-        ));
-        assert!(matches!(
-            parse_ex("g/foo/"),
-            Err(ExError::MissingArgument { .. })
-        ));
+        assert!(matches!(parse_ex("s/foo/bar/x"), Err(ExError::InvalidSubstituteFlag { flag: 'x' })));
+        assert!(matches!(parse_ex("g/foo/"), Err(ExError::MissingArgument { .. })));
     }
 }

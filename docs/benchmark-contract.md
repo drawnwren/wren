@@ -37,10 +37,12 @@ The latency and startup harnesses emit HDR histogram JSON and accept CPU
 affinity. Macro-replayed keys are excluded by construction.
 
 `wren-tiling-performance` measures the complete empty-startup animation through
-the production `App`: exact Penrose construction/rasterization, half-block cell
-construction, Presenter publication/diffing, and completed Termina byte
-serialization. Its fixed workloads are warm animation at 120×40 and 240×80,
-cold construction at 120×40, and alternating 120×40/160×50 resizes.
+the production `App`: exact Penrose construction/vector composition, Presenter
+publication/diffing, high-resolution quad rasterization, zlib/Kitty graphics
+encoding, and completed Termina byte serialization. The isolated child
+identifies as Ghostty so the full graphics path is measured. Its fixed
+workloads are warm animation at 120×40 and 240×80, cold construction at
+120×40, and alternating 120×40/160×50 resizes.
 Desired-frame, diff, terminal-write, and complete-path p99 values each have hard
 gates at the floor of 90% of their pre-optimization baselines. The complete path
 also gates its worst observed sample. Its full-path limits are respectively

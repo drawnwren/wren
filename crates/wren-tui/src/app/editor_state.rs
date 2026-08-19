@@ -13,14 +13,10 @@ impl App {
             self.show_error(format!("format-on-save: {error}"));
         }
         if let Some(wal) = &self.active.wal {
-            wal.barrier()
-                .context("make recovery WAL durable before save")?;
+            wal.barrier().context("make recovery WAL durable before save")?;
         }
         let report = match path {
-            Some(path) => self
-                .active
-                .document
-                .save_as(path, &self.active.editor.contents()),
+            Some(path) => self.active.document.save_as(path, &self.active.editor.contents()),
             None => self.active.document.save(&self.active.editor.contents()),
         }?;
         self.active.editor.mark_clean();
@@ -28,25 +24,17 @@ impl App {
         save_undo_state(&mut self.active)?;
         if path.is_some() {
             if let Some(wal) = &self.active.wal {
-                wal.clear()
-                    .context("compact old recovery WAL after save-as")?;
+                wal.clear().context("compact old recovery WAL after save-as")?;
             }
-            self.active.wal = self
-                .active
-                .document
-                .presentation_path()
-                .map(LocalWal::for_document)
-                .transpose()?
-                .map(WalWorker::start);
+            self.active.wal = self.active.document.presentation_path().map(LocalWal::for_document).transpose()?.map(WalWorker::start);
         }
         if let Some(wal) = &self.active.wal {
             wal.clear().context("compact recovery WAL after save")?;
         }
         self.message = match report.warning {
-            Some(SaveWarning::HardLinkReplaced { links }) => format!(
-                "{} bytes written; warning: replaced one of {links} hard links",
-                report.bytes_written
-            ),
+            Some(SaveWarning::HardLinkReplaced { links }) => {
+                format!("{} bytes written; warning: replaced one of {links} hard links", report.bytes_written)
+            }
             None => format!("{} bytes written", report.bytes_written),
         };
         Ok(())
@@ -62,38 +50,13 @@ impl App {
             Mode::VisualLine => "V-LINE",
         };
         let path = self.active.name();
-        let changed = if self.active.editor.is_dirty() {
-            " [+]"
-        } else {
-            ""
-        };
-        let readonly = if self.active.editor.is_read_only() {
-            " [RO]"
-        } else {
-            ""
-        };
-        let eol = if self.active.mixed_line_endings {
-            " [mixed EOL]"
-        } else {
-            ""
-        };
+        let changed = if self.active.editor.is_dirty() { " [+]" } else { "" };
+        let readonly = if self.active.editor.is_read_only() { " [RO]" } else { "" };
+        let eol = if self.active.mixed_line_endings { " [mixed EOL]" } else { "" };
         let (line, column) = self.active.editor.cursor_line_column();
-        let class = match self.active.class {
-            DocumentClass::Normal => "",
-            DocumentClass::Large => " [large]",
-            DocumentClass::Pathological => " [pathological]",
-        };
-        let detail = if self.message.is_empty() {
-            String::new()
-        } else {
-            format!(" | {}", self.message)
-        };
-        let tab = self
-            .views
-            .tabs
-            .iter()
-            .position(|tab| tab.id == self.views.active_tab)
-            .map_or(1, |index| index + 1);
+        let class = self.active.class.status_suffix();
+        let detail = if self.message.is_empty() { String::new() } else { format!(" | {}", self.message) };
+        let tab = self.views.tabs.iter().position(|tab| tab.id == self.views.active_tab).map_or(1, |index| index + 1);
         format!(
             " {mode} | {path}{changed}{readonly}{eol}{class} | {}:{} | b{} t{}/{}{detail}",
             line + 1,
@@ -106,10 +69,7 @@ impl App {
 
     pub(super) fn status_overlay(&self) -> StatusOverlay {
         let (mode, styles) = self.status_mode_and_styles();
-        StatusOverlay {
-            left: self.left_status_segments(mode, styles),
-            right: self.right_status_segments(styles),
-        }
+        StatusOverlay { left: self.left_status_segments(mode, styles), right: self.right_status_segments(styles) }
     }
 
     fn status_mode_and_styles(&self) -> ((&'static str, RgbColor), [CellStyle; 3]) {
@@ -121,99 +81,41 @@ impl App {
             Mode::VisualLine => ("V-LINE", self.theme.mauve),
         };
         let styles = [
-            CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.base)),
-                background: Some(CellColor::Rgb(mode.1)),
-                ..CellStyle::default()
-            },
-            CellStyle {
-                bold: true,
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.surface1)),
-                ..CellStyle::default()
-            },
-            CellStyle {
-                foreground: Some(CellColor::Rgb(self.theme.text)),
-                background: Some(CellColor::Rgb(self.theme.mantle)),
-                ..CellStyle::default()
-            },
+            CellStyle::rgb(self.theme.base, mode.1).with_bold(),
+            CellStyle::rgb(self.theme.text, self.theme.surface1).with_bold(),
+            CellStyle::rgb(self.theme.text, self.theme.mantle),
         ];
         (mode, styles)
     }
 
-    fn left_status_segments(
-        &self,
-        mode: (&str, RgbColor),
-        [section_a, section_b, section_c]: [CellStyle; 3],
-    ) -> Vec<StatusSegment> {
+    fn left_status_segments(&self, mode: (&str, RgbColor), [section_a, section_b, section_c]: [CellStyle; 3]) -> Vec<StatusSegment> {
         let path = self.active.name();
-        let mut left = vec![StatusSegment {
-            text: format!(" {} ", mode.0).into(),
-            style: section_a,
-        }];
+        let mut left = vec![StatusSegment { text: format!(" {} ", mode.0).into(), style: section_a }];
         if let Some(branch) = &self.active.git_branch {
-            left.push(StatusSegment {
-                text: format!("  {branch} ").into(),
-                style: section_b,
-            });
+            left.push(StatusSegment { text: format!("  {branch} ").into(), style: section_b });
         }
-        let diagnostic_count = self.active.document.presentation_path().map_or(0, |path| {
-            self.diagnostics
-                .iter()
-                .filter(|diagnostic| same_path(&diagnostic.path, path))
-                .count()
-        });
+        let diagnostic_count =
+            self.active.document.presentation_path().map_or(0, |path| self.diagnostics.iter().filter(|diagnostic| same_path(&diagnostic.path, path)).count());
         if diagnostic_count > 0 {
-            left.push(StatusSegment {
-                text: format!("  {diagnostic_count} ").into(),
-                style: CellStyle {
-                    foreground: Some(CellColor::Rgb(self.theme.yellow)),
-                    ..section_b
-                },
-            });
+            left.push(StatusSegment { text: format!("  {diagnostic_count} ").into(), style: section_b.with_foreground(CellColor::Rgb(self.theme.yellow)) });
         }
-        left.push(StatusSegment {
-            text: format!(" {path}{} ", self.active_status_flags()).into(),
-            style: section_c,
-        });
+        left.push(StatusSegment { text: format!(" {path}{} ", self.active_status_flags()).into(), style: section_c });
         if !self.message.is_empty() {
-            left.push(StatusSegment {
-                text: format!(" {} ", self.message).into(),
-                style: CellStyle {
-                    foreground: Some(CellColor::Rgb(self.theme.subtext0)),
-                    ..section_c
-                },
-            });
+            left.push(StatusSegment { text: format!(" {} ", self.message).into(), style: section_c.with_foreground(CellColor::Rgb(self.theme.subtext0)) });
         }
         left
     }
 
-    fn right_status_segments(
-        &self,
-        [section_a, section_b, section_c]: [CellStyle; 3],
-    ) -> Vec<StatusSegment> {
+    fn right_status_segments(&self, [section_a, section_b, section_c]: [CellStyle; 3]) -> Vec<StatusSegment> {
         let (line, column) = self.active.editor.cursor_line_column();
         let text = self.active.editor.text();
         let line_count = text.line_of_byte(text.len_bytes()).saturating_add(1);
-        let progress = (line + 1)
-            .saturating_mul(100)
-            .checked_div(line_count)
-            .unwrap_or(100);
+        let progress = (line + 1).saturating_mul(100).checked_div(line_count).unwrap_or(100);
         let language = language_bundle(self.active.document.presentation_path()).language_id;
         vec![
-            StatusSegment {
-                text: format!(" utf-8  unix  {language} ").into(),
-                style: section_c,
-            },
-            StatusSegment {
-                text: format!(" {progress}% ").into(),
-                style: section_b,
-            },
-            StatusSegment {
-                text: format!(" {}:{} ", line + 1, column + 1).into(),
-                style: section_a,
-            },
+            StatusSegment { text: format!(" utf-8  unix  {language} ").into(), style: section_c },
+            StatusSegment { text: format!(" {progress}% ").into(), style: section_b },
+            StatusSegment { text: format!(" {}:{} ", line + 1, column + 1).into(), style: section_a },
         ]
     }
 
@@ -230,11 +132,7 @@ impl App {
 
     pub(super) fn expression_context(&self) -> ExpressionContext {
         let (line, column) = self.active.editor.cursor_line_column();
-        let class = match self.active.class {
-            DocumentClass::Normal => "normal",
-            DocumentClass::Large => "large",
-            DocumentClass::Pathological => "pathological",
-        };
+        let class = self.active.class.name();
         ExpressionContext::new()
             .with("cursor.line", Value::Number((line + 1) as f64))
             .with("cursor.column", Value::Number((column + 1) as f64))
@@ -242,7 +140,7 @@ impl App {
             .with("document.class", Value::String(class.to_owned()))
             .with("remote", Value::Bool(false))
             .with("workspace.trusted", Value::Bool(false))
-            .with("os", Value::String(env::consts::OS.to_owned()))
+            .with("os", Value::String("macos".to_owned()))
     }
 
     pub(super) fn flush_wal(&self) -> Result<()> {
@@ -255,30 +153,18 @@ impl App {
             }
         }
         self.mutations.barrier()?;
-        self.client_state_worker
-            .barrier(self.client_state.clone())?;
+        self.client_state_worker.barrier(self.client_state.clone())?;
         save_recent_files(&self.recent_files)?;
         Ok(())
     }
 
-    pub(super) fn resolve_substitute(
-        &self,
-        pattern: &str,
-        replacement: &str,
-        flags: SubstituteFlags,
-        ranges: Vec<Range<usize>>,
-    ) -> Result<Substitute> {
+    pub(super) fn resolve_substitute(&self, pattern: &str, replacement: &str, flags: SubstituteFlags, ranges: Vec<Range<usize>>) -> Result<Substitute> {
         let persist_pattern = !pattern.is_empty();
         let needle = self.effective_search_pattern(pattern)?;
         if self.last_substitute.is_none() && has_unescaped_tilde(replacement) {
             bail!("no previous substitute replacement for ~");
         }
-        let replacement = resolve_previous_replacement(
-            replacement,
-            self.last_substitute
-                .as_ref()
-                .map(|substitute| substitute.replacement.as_str()),
-        );
+        let replacement = resolve_previous_replacement(replacement, self.last_substitute.as_ref().map(|substitute| substitute.replacement.as_str()));
         Ok(Substitute {
             needle,
             replacement,
@@ -297,16 +183,9 @@ impl App {
         flags: Option<SubstituteFlags>,
         ranges: Vec<Range<usize>>,
     ) -> Result<Substitute> {
-        let previous = self
-            .last_substitute
-            .as_ref()
-            .ok_or_else(|| anyhow!("no previous substitute command"))?;
+        let previous = self.last_substitute.as_ref().ok_or_else(|| anyhow!("no previous substitute command"))?;
         let flags = flags.unwrap_or(previous.flags);
-        let needle = if use_search_pattern {
-            self.effective_search_pattern("")?
-        } else {
-            previous.needle.clone()
-        };
+        let needle = if use_search_pattern { self.effective_search_pattern("")? } else { previous.needle.clone() };
         Ok(Substitute {
             needle,
             replacement: previous.replacement.clone(),
@@ -328,11 +207,7 @@ impl App {
             .editor
             .compile_search_pattern(&substitute.needle, substitute.case_override)
             .with_context(|| format!("invalid substitution pattern {:?}", substitute.needle))?;
-        self.synchronize_search(
-            &substitute.needle,
-            self.last_search_direction,
-            substitute.persist_pattern,
-        )?;
+        self.synchronize_search(&substitute.needle, self.last_search_direction, substitute.persist_pattern)?;
         self.last_substitute = Some(LastSubstitute {
             needle: substitute.needle.clone(),
             replacement: substitute.replacement.clone(),
@@ -353,22 +228,11 @@ impl App {
         self.start_substitution_task(substitute, pattern)
     }
 
-    pub(super) fn begin_substitution_confirmation(
-        &mut self,
-        substitute: Substitute,
-        pattern: VimPattern,
-    ) -> Result<()> {
+    pub(super) fn begin_substitution_confirmation(&mut self, substitute: Substitute, pattern: VimPattern) -> Result<()> {
         let text = self.active.editor.contents();
         let replacement = VimReplacement::new(substitute.replacement);
-        let candidates = plan_substitution_edits(
-            &text,
-            &pattern,
-            &replacement,
-            &substitute.ranges,
-            substitute.global,
-            || Ok(()),
-        )
-        .map_err(|error| anyhow!(error.to_string()))?;
+        let candidates = plan_substitution_edits(&text, &pattern, &replacement, &substitute.ranges, substitute.global, || Ok(()))
+            .map_err(|error| anyhow!(error.to_string()))?;
         self.substitute_confirmation = Some(SubstituteConfirmation {
             base_revision: self.active.editor.revision(),
             original_text: text,
@@ -389,12 +253,7 @@ impl App {
         }
         let candidate = &confirmation.candidates[confirmation.index];
         self.active.editor.set_cursor(candidate.range.start);
-        self.message = format!(
-            "replace with {:?}? (y/n/a/q/l) [{}/{}]",
-            compact(&candidate.insert, 40),
-            confirmation.index + 1,
-            confirmation.candidates.len()
-        );
+        self.message = format!("replace with {:?}? (y/n/a/q/l) [{}/{}]", compact(&candidate.insert, 40), confirmation.index + 1, confirmation.candidates.len());
         Ok(())
     }
 
@@ -404,9 +263,7 @@ impl App {
         };
         let finish = match key.code {
             TerminalKeyCode::Char('y' | 'Y') => {
-                confirmation
-                    .accepted
-                    .push(confirmation.candidates[confirmation.index].clone());
+                confirmation.accepted.push(confirmation.candidates[confirmation.index].clone());
                 confirmation.index += 1;
                 false
             }
@@ -415,16 +272,12 @@ impl App {
                 false
             }
             TerminalKeyCode::Char('a' | 'A') => {
-                confirmation
-                    .accepted
-                    .extend_from_slice(&confirmation.candidates[confirmation.index..]);
+                confirmation.accepted.extend_from_slice(&confirmation.candidates[confirmation.index..]);
                 confirmation.index = confirmation.candidates.len();
                 true
             }
             TerminalKeyCode::Char('l' | 'L') => {
-                confirmation
-                    .accepted
-                    .push(confirmation.candidates[confirmation.index].clone());
+                confirmation.accepted.push(confirmation.candidates[confirmation.index].clone());
                 confirmation.index = confirmation.candidates.len();
                 true
             }
@@ -436,11 +289,7 @@ impl App {
             }
         };
         self.substitute_confirmation = Some(confirmation);
-        if finish {
-            self.finish_substitution_confirmation()
-        } else {
-            self.advance_substitution_confirmation()
-        }
+        if finish { self.finish_substitution_confirmation() } else { self.advance_substitution_confirmation() }
     }
 
     pub(super) fn finish_substitution_confirmation(&mut self) -> Result<()> {
@@ -453,28 +302,16 @@ impl App {
             return Ok(());
         }
         let transaction = Transaction::new(confirmation.base_revision, confirmation.accepted)?;
-        let message = substitution_message(
-            count,
-            confirmation.print,
-            &confirmation.original_text,
-            &transaction,
-        );
+        let message = substitution_message(count, confirmation.print, &confirmation.original_text, &transaction);
         self.active.editor.apply_transaction(transaction.clone())?;
         self.after_transaction(Some(transaction));
         self.message = message;
         Ok(())
     }
 
-    pub(super) fn start_substitution_task(
-        &mut self,
-        substitute: Substitute,
-        pattern: VimPattern,
-    ) -> Result<()> {
+    pub(super) fn start_substitution_task(&mut self, substitute: Substitute, pattern: VimPattern) -> Result<()> {
         let task_id = CommandTaskId::new(self.next_task_id);
-        self.next_task_id = self
-            .next_task_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("task ID overflow"))?;
+        self.next_task_id = self.next_task_id.checked_add(1).ok_or_else(|| anyhow!("task ID overflow"))?;
         let text = self.active.editor.contents();
         let base_revision = self.active.editor.revision();
         let replacement = VimReplacement::new(substitute.replacement);
@@ -482,33 +319,15 @@ impl App {
         let global = substitute.global;
         let print = substitute.print;
         let document_id = self.active.document_id;
-        let cancellation = self.tasks.submit(
-            CommandTask {
-                task_id,
-                affected_documents: vec![document_id],
-                label: "range substitution".into(),
-            },
-            move |context| {
-                let edits = plan_substitution_edits(
-                    &text,
-                    &pattern,
-                    &replacement,
-                    &ranges,
-                    global,
-                    || context.checkpoint(),
-                )?;
+        let cancellation =
+            self.tasks.submit(CommandTask { task_id, affected_documents: vec![document_id], label: "range substitution".into() }, move |context| {
+                let edits = plan_substitution_edits(&text, &pattern, &replacement, &ranges, global, || context.checkpoint())?;
                 context.checkpoint()?;
                 let count = edits.len();
-                let mut effects = Effects {
-                    messages: Vec::new(),
-                    ..Effects::default()
-                };
+                let mut effects = Effects { messages: Vec::new(), ..Effects::default() };
                 if count > 0 {
-                    let transaction = Transaction::new(base_revision, edits)
-                        .map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
-                    effects.messages.push(
-                        substitution_message(count, print, &text, &transaction).into_boxed_str(),
-                    );
+                    let transaction = Transaction::new(base_revision, edits).map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
+                    effects.messages.push(substitution_message(count, print, &text, &transaction).into_boxed_str());
                     effects.edit_proposals.push(EditProposal {
                         document_id,
                         base_revision,
@@ -519,8 +338,7 @@ impl App {
                     effects.messages.push("0 substitutions".into());
                 }
                 Ok(effects)
-            },
-        )?;
+            })?;
         self.active_task = Some(cancellation);
         self.message = format!("task {} running", task_id.get());
         Ok(())
@@ -540,11 +358,7 @@ impl App {
         self.apply_editor_task_result(result.task.task_id, result.outcome)
     }
 
-    fn apply_editor_task_result(
-        &mut self,
-        task_id: CommandTaskId,
-        outcome: Result<Effects, TaskFailure>,
-    ) -> Result<()> {
+    fn apply_editor_task_result(&mut self, task_id: CommandTaskId, outcome: Result<Effects, TaskFailure>) -> Result<()> {
         match outcome {
             Ok(effects) => self.apply_editor_task_effects(task_id, effects),
             Err(TaskFailure::Cancelled) => {
@@ -558,23 +372,11 @@ impl App {
         }
     }
 
-    fn apply_editor_task_effects(
-        &mut self,
-        task_id: CommandTaskId,
-        effects: Effects,
-    ) -> Result<()> {
+    fn apply_editor_task_effects(&mut self, task_id: CommandTaskId, effects: Effects) -> Result<()> {
         let active_document = self.active.document_id;
-        for proposal in effects
-            .edit_proposals
-            .into_iter()
-            .filter(|proposal| proposal.document_id == active_document)
-        {
+        for proposal in effects.edit_proposals.into_iter().filter(|proposal| proposal.document_id == active_document) {
             if proposal.base_revision != self.active.editor.revision() {
-                self.message = format!(
-                    "task {} is stale at revision {}",
-                    task_id.get(),
-                    self.active.editor.revision().get()
-                );
+                self.message = format!("task {} is stale at revision {}", task_id.get(), self.active.editor.revision().get());
                 continue;
             }
             for transaction in proposal.transactions {

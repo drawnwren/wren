@@ -15,29 +15,16 @@ pub struct VimPattern {
 }
 
 impl VimPattern {
-    pub fn compile(
-        pattern: &str,
-        ignore_case: bool,
-        smart_case: bool,
-        case_override: CaseOverride,
-    ) -> Result<Self, Box<str>> {
+    pub fn compile(pattern: &str, ignore_case: bool, smart_case: bool, case_override: CaseOverride) -> Result<Self, Box<str>> {
         let translated = translate_vim_pattern(pattern)?;
         let insensitive = match translated.case_override.unwrap_or(case_override) {
-            CaseOverride::Default => {
-                ignore_case && (!smart_case || !pattern.chars().any(char::is_uppercase))
-            }
+            CaseOverride::Default => ignore_case && (!smart_case || !pattern.chars().any(char::is_uppercase)),
             CaseOverride::Ignore => true,
             CaseOverride::Sensitive => false,
         };
-        let regex = RegexBuilder::new(&translated.regex)
-            .multi_line(true)
-            .case_insensitive(insensitive)
-            .build()
-            .map_err(|error| error.to_string().into_boxed_str())?;
-        Ok(Self {
-            source: pattern.into(),
-            regex,
-        })
+        let regex =
+            RegexBuilder::new(&translated.regex).multi_line(true).case_insensitive(insensitive).build().map_err(|error| error.to_string().into_boxed_str())?;
+        Ok(Self { source: pattern.into(), regex })
     }
 
     #[must_use]
@@ -67,12 +54,7 @@ impl VimPattern {
     /// patterns deliberately return `None`; only fixed-width literals can be
     /// repaired locally after an edit without changing search semantics.
     pub(crate) fn literal_width(&self) -> Option<usize> {
-        (!self.source.is_empty()
-            && self
-                .source
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b' ')))
-        .then_some(self.source.len())
+        (!self.source.is_empty() && self.source.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b' '))).then_some(self.source.len())
     }
 }
 
@@ -84,9 +66,7 @@ pub struct VimReplacement {
 impl VimReplacement {
     #[must_use]
     pub fn new(source: impl Into<Box<str>>) -> Self {
-        Self {
-            source: source.into(),
-        }
+        Self { source: source.into() }
     }
 
     #[must_use]
@@ -107,13 +87,8 @@ impl VimReplacement {
                     Some('0') => append_capture(&mut output, captures.get(0), case, &mut next_case),
                     Some(first @ '1'..='9') => {
                         let mut group = first.to_digit(10).unwrap_or_default() as usize;
-                        while let Some(next) =
-                            characters.peek().and_then(|value| value.to_digit(10))
-                        {
-                            let Some(candidate) = group
-                                .checked_mul(10)
-                                .and_then(|value| value.checked_add(next as usize))
-                            else {
+                        while let Some(next) = characters.peek().and_then(|value| value.to_digit(10)) {
+                            let Some(candidate) = group.checked_mul(10).and_then(|value| value.checked_add(next as usize)) else {
                                 break;
                             };
                             group = candidate;
@@ -133,23 +108,13 @@ impl VimReplacement {
                     }
                     Some(next) => {
                         let mut encoded = [0_u8; 4];
-                        append_text(
-                            &mut output,
-                            next.encode_utf8(&mut encoded),
-                            case,
-                            &mut next_case,
-                        );
+                        append_text(&mut output, next.encode_utf8(&mut encoded), case, &mut next_case);
                     }
                     None => append_text(&mut output, "\\", case, &mut next_case),
                 },
                 _ => {
                     let mut encoded = [0_u8; 4];
-                    append_text(
-                        &mut output,
-                        character.encode_utf8(&mut encoded),
-                        case,
-                        &mut next_case,
-                    );
+                    append_text(&mut output, character.encode_utf8(&mut encoded), case, &mut next_case);
                 }
             }
         }
@@ -182,23 +147,13 @@ enum CaseTransform {
     Lower,
 }
 
-fn append_capture(
-    output: &mut String,
-    capture: Option<regex::Match<'_>>,
-    case: CaseTransform,
-    next_case: &mut CaseTransform,
-) {
+fn append_capture(output: &mut String, capture: Option<regex::Match<'_>>, case: CaseTransform, next_case: &mut CaseTransform) {
     if let Some(capture) = capture {
         append_text(output, capture.as_str(), case, next_case);
     }
 }
 
-fn append_text(
-    output: &mut String,
-    text: &str,
-    case: CaseTransform,
-    next_case: &mut CaseTransform,
-) {
+fn append_text(output: &mut String, text: &str, case: CaseTransform, next_case: &mut CaseTransform) {
     for character in text.chars() {
         let transform = if *next_case == CaseTransform::None {
             case
@@ -249,11 +204,7 @@ struct PatternTranslator {
 
 impl Default for PatternTranslator {
     fn default() -> Self {
-        Self {
-            output: String::new(),
-            magic: PatternMode::Default,
-            case_override: None,
-        }
+        Self { output: String::new(), magic: PatternMode::Default, case_override: None }
     }
 }
 
@@ -266,13 +217,8 @@ impl PatternTranslator {
         }
     }
 
-    fn push_escape(
-        &mut self,
-        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    ) -> Result<(), Box<str>> {
-        let escaped = characters
-            .next()
-            .ok_or_else(|| Box::<str>::from("pattern ends with an incomplete escape"))?;
+    fn push_escape(&mut self, characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<(), Box<str>> {
+        let escaped = characters.next().ok_or_else(|| Box::<str>::from("pattern ends with an incomplete escape"))?;
         match escaped {
             'v' => self.magic = PatternMode::Very,
             'm' => self.magic = PatternMode::Default,
@@ -283,20 +229,12 @@ impl PatternTranslator {
             '<' | '>' => self.output.push_str(r"\b"),
             'z' if matches!(characters.peek(), Some('s' | 'e')) => {
                 let suffix = characters.next().unwrap_or_default();
-                return Err(format!(
-                    "Vim atom \\z{suffix} is not supported by the bounded search engine"
-                )
-                .into_boxed_str());
+                return Err(format!("Vim atom \\z{suffix} is not supported by the bounded search engine").into_boxed_str());
             }
             '1'..='9' => {
-                return Err(
-                    "Vim pattern backreferences are not supported by the bounded search engine"
-                        .into(),
-                );
+                return Err("Vim pattern backreferences are not supported by the bounded search engine".into());
             }
-            '(' | ')' | '|' | '+' | '?' | '{' | '}' | '='
-                if matches!(self.magic, PatternMode::Default | PatternMode::Nomagic) =>
-            {
+            '(' | ')' | '|' | '+' | '?' | '{' | '}' | '=' if matches!(self.magic, PatternMode::Default | PatternMode::Nomagic) => {
                 self.output.push(if escaped == '=' { '?' } else { escaped });
             }
             '.' | '*' | '[' | ']' | '^' | '$' if self.magic == PatternMode::Default => {
@@ -312,9 +250,7 @@ impl PatternTranslator {
                 self.output.push('\\');
                 self.output.push(escaped);
             }
-            _ if self.magic == PatternMode::Literal
-                || (!escaped.is_alphanumeric() && escaped != '_') =>
-            {
+            _ if self.magic == PatternMode::Literal || (!escaped.is_alphanumeric() && escaped != '_') => {
                 push_escaped_literal(&mut self.output, escaped);
             }
             _ => return Err(format!("unsupported Vim atom \\{escaped}").into_boxed_str()),
@@ -323,10 +259,7 @@ impl PatternTranslator {
     }
 
     fn finish(self) -> TranslatedPattern {
-        TranslatedPattern {
-            regex: self.output,
-            case_override: self.case_override,
-        }
+        TranslatedPattern { regex: self.output, case_override: self.case_override }
     }
 }
 
@@ -342,10 +275,7 @@ impl PatternMode {
 }
 
 fn push_escaped_literal(output: &mut String, character: char) {
-    if matches!(
-        character,
-        '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
-    ) {
+    if matches!(character, '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\') {
         output.push('\\');
     }
     output.push(character);
@@ -375,26 +305,10 @@ mod tests {
 
     #[test]
     fn honors_smart_case_and_inline_case_atoms() {
-        assert!(
-            VimPattern::compile("alpha", true, true, CaseOverride::Default)
-                .expect("smart case")
-                .is_match("ALPHA")
-        );
-        assert!(
-            !VimPattern::compile("Alpha", true, true, CaseOverride::Default)
-                .expect("smart case")
-                .is_match("ALPHA")
-        );
-        assert!(
-            VimPattern::compile(r"Alpha\c", false, false, CaseOverride::Default)
-                .expect("inline ignore case")
-                .is_match("ALPHA")
-        );
-        assert!(
-            !VimPattern::compile(r"alpha\C", true, false, CaseOverride::Default)
-                .expect("inline sensitive")
-                .is_match("ALPHA")
-        );
+        assert!(VimPattern::compile("alpha", true, true, CaseOverride::Default).expect("smart case").is_match("ALPHA"));
+        assert!(!VimPattern::compile("Alpha", true, true, CaseOverride::Default).expect("smart case").is_match("ALPHA"));
+        assert!(VimPattern::compile(r"Alpha\c", false, false, CaseOverride::Default).expect("inline ignore case").is_match("ALPHA"));
+        assert!(!VimPattern::compile(r"alpha\C", true, false, CaseOverride::Default).expect("inline sensitive").is_match("ALPHA"));
     }
 
     #[test]
@@ -407,9 +321,6 @@ mod tests {
 
     #[test]
     fn resolves_unescaped_previous_replacement_atoms() {
-        assert_eq!(
-            resolve_previous_replacement(r"pre~:\~", Some("OLD")),
-            r"preOLD:\~"
-        );
+        assert_eq!(resolve_previous_replacement(r"pre~:\~", Some("OLD")), r"preOLD:\~");
     }
 }

@@ -15,11 +15,7 @@ pub struct SnapshotQuota {
 
 impl Default for SnapshotQuota {
     fn default() -> Self {
-        Self {
-            max_bytes: 64 * 1_048_576,
-            max_revisions: 8,
-            held_too_long: Duration::from_secs(5),
-        }
+        Self { max_bytes: 64 * 1_048_576, max_revisions: 8, held_too_long: Duration::from_secs(5) }
     }
 }
 
@@ -42,26 +38,12 @@ pub struct SnapshotMetrics {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SnapshotError {
-    #[error(
-        "provider {provider} snapshot quota would exceed {max_bytes} bytes (currently {current_bytes}, requested {requested_bytes})"
-    )]
-    ByteQuota {
-        provider: Box<str>,
-        current_bytes: usize,
-        requested_bytes: usize,
-        max_bytes: usize,
-    },
+    #[error("provider {provider} snapshot quota would exceed {max_bytes} bytes (currently {current_bytes}, requested {requested_bytes})")]
+    ByteQuota { provider: Box<str>, current_bytes: usize, requested_bytes: usize, max_bytes: usize },
     #[error("provider {provider} snapshot quota would exceed {max_revisions} live revisions")]
-    RevisionQuota {
-        provider: Box<str>,
-        max_revisions: usize,
-    },
+    RevisionQuota { provider: Box<str>, max_revisions: usize },
     #[error("snapshot range {start}..{end} is outside {len} bytes or not UTF-8 aligned")]
-    InvalidRange {
-        start: usize,
-        end: usize,
-        len: usize,
-    },
+    InvalidRange { start: usize, end: usize, len: usize },
     #[error("snapshot manager lock was poisoned")]
     Poisoned,
 }
@@ -110,15 +92,11 @@ impl SnapshotHandle {
     }
 
     pub fn slice(&self, range: Range<usize>) -> Result<String, SnapshotError> {
-        self.record
-            .text
-            .get(range.clone())
-            .map(ToOwned::to_owned)
-            .ok_or(SnapshotError::InvalidRange {
-                start: range.start,
-                end: range.end,
-                len: self.record.bytes,
-            })
+        self.record.text.get(range.clone()).map(ToOwned::to_owned).ok_or(SnapshotError::InvalidRange {
+            start: range.start,
+            end: range.end,
+            len: self.record.bytes,
+        })
     }
 }
 
@@ -135,10 +113,7 @@ impl ManagerState {
     }
 
     fn quota_for(&self, provider: &str) -> SnapshotQuota {
-        self.provider_quotas
-            .get(provider)
-            .copied()
-            .unwrap_or(self.default_quota)
+        self.provider_quotas.get(provider).copied().unwrap_or(self.default_quota)
     }
 }
 
@@ -151,25 +126,11 @@ pub struct SnapshotManager {
 impl SnapshotManager {
     #[must_use]
     pub fn new(default_quota: SnapshotQuota) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ManagerState {
-                default_quota,
-                provider_quotas: BTreeMap::new(),
-                records: Vec::new(),
-            })),
-        }
+        Self { state: Arc::new(Mutex::new(ManagerState { default_quota, provider_quotas: BTreeMap::new(), records: Vec::new() })) }
     }
 
-    pub fn set_provider_quota(
-        &self,
-        provider: impl Into<Box<str>>,
-        quota: SnapshotQuota,
-    ) -> Result<(), SnapshotError> {
-        self.state
-            .lock()
-            .map_err(|_| SnapshotError::Poisoned)?
-            .provider_quotas
-            .insert(provider.into(), quota);
+    pub fn set_provider_quota(&self, provider: impl Into<Box<str>>, quota: SnapshotQuota) -> Result<(), SnapshotError> {
+        self.state.lock().map_err(|_| SnapshotError::Poisoned)?.provider_quotas.insert(provider.into(), quota);
         Ok(())
     }
 
@@ -186,38 +147,16 @@ impl SnapshotManager {
         let mut state = self.state.lock().map_err(|_| SnapshotError::Poisoned)?;
         state.prune();
         let quota = state.quota_for(&provider);
-        let live = state
-            .records
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|record| record.provider == provider)
-            .collect::<Vec<_>>();
-        let current_bytes = live
-            .iter()
-            .try_fold(0_usize, |total, record| total.checked_add(record.bytes));
+        let live = state.records.iter().filter_map(Weak::upgrade).filter(|record| record.provider == provider).collect::<Vec<_>>();
+        let current_bytes = live.iter().try_fold(0_usize, |total, record| total.checked_add(record.bytes));
         let current_bytes = current_bytes.unwrap_or(usize::MAX);
         if current_bytes.saturating_add(requested_bytes) > quota.max_bytes {
-            return Err(SnapshotError::ByteQuota {
-                provider,
-                current_bytes,
-                requested_bytes,
-                max_bytes: quota.max_bytes,
-            });
+            return Err(SnapshotError::ByteQuota { provider, current_bytes, requested_bytes, max_bytes: quota.max_bytes });
         }
         if live.len() >= quota.max_revisions {
-            return Err(SnapshotError::RevisionQuota {
-                provider,
-                max_revisions: quota.max_revisions,
-            });
+            return Err(SnapshotError::RevisionQuota { provider, max_revisions: quota.max_revisions });
         }
-        let record = Arc::new(SnapshotRecord {
-            provider,
-            document_id,
-            revision,
-            bytes: requested_bytes,
-            issued_at: Instant::now(),
-            text,
-        });
+        let record = Arc::new(SnapshotRecord { provider, document_id, revision, bytes: requested_bytes, issued_at: Instant::now(), text });
         state.records.push(Arc::downgrade(&record));
         Ok(SnapshotHandle { record })
     }
@@ -226,14 +165,8 @@ impl SnapshotManager {
         let mut state = self.state.lock().map_err(|_| SnapshotError::Poisoned)?;
         state.prune();
         let now = Instant::now();
-        let live = state
-            .records
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        let retained_snapshot_bytes = live
-            .iter()
-            .fold(0_usize, |total, record| total.saturating_add(record.bytes));
+        let live = state.records.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+        let retained_snapshot_bytes = live.iter().fold(0_usize, |total, record| total.saturating_add(record.bytes));
         let oldest_live_revision = live.iter().map(|record| record.revision).min();
         let held_too_long = live
             .iter()
@@ -248,12 +181,7 @@ impl SnapshotManager {
                 })
             })
             .collect();
-        Ok(SnapshotMetrics {
-            live_revisions: live.len(),
-            retained_snapshot_bytes,
-            oldest_live_revision,
-            held_too_long,
-        })
+        Ok(SnapshotMetrics { live_revisions: live.len(), retained_snapshot_bytes, oldest_live_revision, held_too_long })
     }
 }
 
@@ -262,40 +190,17 @@ mod tests {
     use super::*;
 
     fn quota() -> SnapshotQuota {
-        SnapshotQuota {
-            max_bytes: 10,
-            max_revisions: 2,
-            held_too_long: Duration::ZERO,
-        }
+        SnapshotQuota { max_bytes: 10, max_revisions: 2, held_too_long: Duration::ZERO }
     }
 
     #[test]
     fn quotas_are_provider_scoped_and_drop_releases_retention() {
         let manager = SnapshotManager::new(quota());
-        let first = manager
-            .issue(
-                "syntax",
-                DocumentId::new(1),
-                DocumentRevision::new(2),
-                "12345",
-            )
-            .expect("first snapshot");
+        let first = manager.issue("syntax", DocumentId::new(1), DocumentRevision::new(2), "12345").expect("first snapshot");
         let clone = first.clone();
-        let second = manager
-            .issue(
-                "syntax",
-                DocumentId::new(1),
-                DocumentRevision::new(3),
-                "67890",
-            )
-            .expect("second snapshot");
-        assert!(matches!(
-            manager.issue("syntax", DocumentId::new(1), DocumentRevision::new(4), "x"),
-            Err(SnapshotError::ByteQuota { .. })
-        ));
-        let other = manager
-            .issue("git", DocumentId::new(1), DocumentRevision::new(4), "x")
-            .expect("other provider has its own quota");
+        let second = manager.issue("syntax", DocumentId::new(1), DocumentRevision::new(3), "67890").expect("second snapshot");
+        assert!(matches!(manager.issue("syntax", DocumentId::new(1), DocumentRevision::new(4), "x"), Err(SnapshotError::ByteQuota { .. })));
+        let other = manager.issue("git", DocumentId::new(1), DocumentRevision::new(4), "x").expect("other provider has its own quota");
         assert_eq!(manager.metrics().expect("metrics").live_revisions, 3);
         drop(first);
         assert_eq!(manager.metrics().expect("clone retains").live_revisions, 3);
@@ -308,15 +213,10 @@ mod tests {
     #[test]
     fn handle_exposes_borrowed_access_and_owned_validated_slices() {
         let manager = SnapshotManager::new(quota());
-        let handle = manager
-            .issue("syntax", DocumentId::new(1), DocumentRevision::new(9), "aβ")
-            .expect("snapshot");
+        let handle = manager.issue("syntax", DocumentId::new(1), DocumentRevision::new(9), "aβ").expect("snapshot");
         assert_eq!(handle.with_text(str::len), 3);
         assert_eq!(handle.slice(1..3).expect("UTF-8 slice"), "β");
-        assert!(matches!(
-            handle.slice(1..2),
-            Err(SnapshotError::InvalidRange { .. })
-        ));
+        assert!(matches!(handle.slice(1..2), Err(SnapshotError::InvalidRange { .. })));
         let metrics = manager.metrics().expect("metrics");
         assert_eq!(metrics.oldest_live_revision, Some(DocumentRevision::new(9)));
         assert_eq!(metrics.retained_snapshot_bytes, 3);

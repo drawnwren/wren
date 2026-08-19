@@ -11,7 +11,7 @@ const MAP_TIMEOUT: Duration = Duration::from_secs(5);
 struct Buffers {
     input: wgpu::Buffer,
     output: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    readback: Option<wgpu::Buffer>,
     bind_group: wgpu::BindGroup,
     input_capacity: u64,
     output_capacity: u64,
@@ -26,6 +26,19 @@ struct DispatchSize {
     invocations_per_row: u32,
 }
 
+impl DispatchSize {
+    fn new(text_len: usize, max_workgroups: u32) -> Option<Self> {
+        let input = input_size(text_len)?;
+        let output = output_size(text_len)?;
+        let (workgroups_x, workgroups_y) = dispatch_dimensions(text_len, max_workgroups)?;
+        Some(Self { input, output, workgroups_x, workgroups_y, invocations_per_row: workgroups_x.checked_mul(WORKGROUP_SIZE)? })
+    }
+
+    fn fits(self, max_buffer_size: u64) -> bool {
+        [self.input, self.output].into_iter().all(|size| u64::try_from(size).is_ok_and(|size| size <= max_buffer_size))
+    }
+}
+
 pub(super) struct GpuLexical {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -34,13 +47,16 @@ pub(super) struct GpuLexical {
     buffers: Option<Buffers>,
     max_buffer_size: u64,
     max_workgroups: u32,
+    direct_readback: bool,
     failed: Arc<AtomicBool>,
     upload: Vec<u8>,
 }
 
 impl GpuLexical {
     pub(super) fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
+        let mut instance_options = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_options.backends = wgpu::Backends::METAL;
+        let instance = wgpu::Instance::new(instance_options);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -49,17 +65,14 @@ impl GpuLexical {
         }))
         .map_err(|error| format!("request GPU adapter: {error}"))?;
         let adapter_info = adapter.get_info();
-        if matches!(
-            adapter_info.device_type,
-            wgpu::DeviceType::Cpu | wgpu::DeviceType::Other
-        ) {
-            return Err(format!(
-                "adapter {} is not a hardware GPU",
-                adapter_info.name
-            ));
+        if matches!(adapter_info.device_type, wgpu::DeviceType::Cpu | wgpu::DeviceType::Other) {
+            return Err(format!("adapter {} is not a hardware GPU", adapter_info.name));
         }
+        let direct_readback =
+            adapter_info.device_type == wgpu::DeviceType::IntegratedGpu && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wren-provider-compute"),
+            required_features: if direct_readback { wgpu::Features::MAPPABLE_PRIMARY_BUFFERS } else { wgpu::Features::empty() },
             ..Default::default()
         }))
         .map_err(|error| format!("request GPU device: {error}"))?;
@@ -81,9 +94,7 @@ impl GpuLexical {
             compilation_options: Default::default(),
             cache: None,
         });
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| format!("poll GPU after pipeline creation: {error}"))?;
+        device.poll(wgpu::PollType::Poll).map_err(|error| format!("poll GPU after pipeline creation: {error}"))?;
         if failed.load(Ordering::Acquire) {
             return Err("GPU rejected the lexical compute pipeline".to_owned());
         }
@@ -102,47 +113,24 @@ impl GpuLexical {
             buffers: None,
             max_buffer_size: limits.max_storage_buffer_binding_size,
             max_workgroups: limits.max_compute_workgroups_per_dimension,
+            direct_readback,
             failed,
             upload: Vec::new(),
         })
     }
 
     pub(super) fn supports(&self, text_len: usize) -> bool {
-        let Some(input_size) = input_size(text_len) else {
-            return false;
-        };
-        let Some(output_size) = output_size(text_len) else {
-            return false;
-        };
-        let Some((workgroups_x, workgroups_y)) = dispatch_dimensions(text_len, self.max_workgroups)
-        else {
-            return false;
-        };
-        text_len > 0
-            && u32::try_from(text_len).is_ok()
-            && u64::try_from(input_size).is_ok_and(|size| size <= self.max_buffer_size)
-            && u64::try_from(output_size).is_ok_and(|size| size <= self.max_buffer_size)
-            && workgroups_x <= self.max_workgroups
-            && workgroups_y <= self.max_workgroups
+        text_len > 0 && u32::try_from(text_len).is_ok() && DispatchSize::new(text_len, self.max_workgroups).is_some_and(|size| size.fits(self.max_buffer_size))
     }
 
-    pub(super) fn classify(
-        &mut self,
-        text: &str,
-        upload_required: bool,
-    ) -> Result<Vec<Range<usize>>, String> {
+    pub(super) fn classify(&mut self, text: &str, upload_required: bool) -> Result<Vec<Range<usize>>, String> {
         let size = self.validate_dispatch(text)?;
-        let buffers_replaced = self.ensure_capacity(
-            u64::try_from(size.input).map_err(|error| error.to_string())?,
-            u64::try_from(size.output).map_err(|error| error.to_string())?,
-        );
+        let buffers_replaced =
+            self.ensure_capacity(u64::try_from(size.input).map_err(|error| error.to_string())?, u64::try_from(size.output).map_err(|error| error.to_string())?);
         if upload_required || buffers_replaced {
             self.upload_text(text, size)?;
         }
-        let buffers = self
-            .buffers
-            .as_ref()
-            .ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
+        let buffers = self.buffers.as_ref().ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
         let submission = self.submit(buffers, size)?;
         self.read_ranges(buffers, submission, size.output, text)
     }
@@ -157,29 +145,11 @@ impl GpuLexical {
         if self.failed.load(Ordering::Acquire) {
             return Err("GPU lexical classifier device is unavailable".to_owned());
         }
-        let input =
-            input_size(text.len()).ok_or_else(|| "GPU input buffer size overflow".to_owned())?;
-        let output =
-            output_size(text.len()).ok_or_else(|| "GPU output buffer size overflow".to_owned())?;
-        let (workgroups_x, workgroups_y) = dispatch_dimensions(text.len(), self.max_workgroups)
-            .ok_or_else(|| "document exceeds GPU dispatch limits".to_owned())?;
-        let invocations_per_row = workgroups_x
-            .checked_mul(WORKGROUP_SIZE)
-            .ok_or_else(|| "GPU dispatch width overflow".to_owned())?;
-        Ok(DispatchSize {
-            input,
-            output,
-            workgroups_x,
-            workgroups_y,
-            invocations_per_row,
-        })
+        DispatchSize::new(text.len(), self.max_workgroups).ok_or_else(|| "document exceeds GPU dispatch limits".to_owned())
     }
 
     fn upload_text(&mut self, text: &str, size: DispatchSize) -> Result<(), String> {
-        let buffers = self
-            .buffers
-            .as_ref()
-            .ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
+        let buffers = self.buffers.as_ref().ok_or_else(|| "GPU buffers were not initialized".to_owned())?;
         let input = if size.input == text.len() {
             text.as_bytes()
         } else {
@@ -189,95 +159,56 @@ impl GpuLexical {
         };
         self.queue.write_buffer(&buffers.input, 0, input);
         let mut params = [0_u8; 16];
-        params[..4].copy_from_slice(
-            &u32::try_from(text.len())
-                .map_err(|error| error.to_string())?
-                .to_le_bytes(),
-        );
+        params[..4].copy_from_slice(&u32::try_from(text.len()).map_err(|error| error.to_string())?.to_le_bytes());
         params[4..8].copy_from_slice(&size.invocations_per_row.to_le_bytes());
         self.queue.write_buffer(&self.params, 0, &params);
         Ok(())
     }
 
-    fn submit(
-        &self,
-        buffers: &Buffers,
-        size: DispatchSize,
-    ) -> Result<wgpu::SubmissionIndex, String> {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wren lexical classifier"),
-            });
+    fn submit(&self, buffers: &Buffers, size: DispatchSize) -> Result<wgpu::SubmissionIndex, String> {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wren lexical classifier") });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wren lexical classifier"),
-                timestamp_writes: None,
-            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("wren lexical classifier"), timestamp_writes: None });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &buffers.bind_group, &[]);
             pass.dispatch_workgroups(size.workgroups_x, size.workgroups_y, 1);
         }
-        encoder.copy_buffer_to_buffer(
-            &buffers.output,
-            0,
-            &buffers.readback,
-            0,
-            u64::try_from(size.output).map_err(|error| error.to_string())?,
-        );
+        if let Some(readback) = &buffers.readback {
+            encoder.copy_buffer_to_buffer(&buffers.output, 0, readback, 0, u64::try_from(size.output).map_err(|error| error.to_string())?);
+        }
         Ok(self.queue.submit([encoder.finish()]))
     }
 
-    fn read_ranges(
-        &self,
-        buffers: &Buffers,
-        submission: wgpu::SubmissionIndex,
-        output_size: usize,
-        text: &str,
-    ) -> Result<Vec<Range<usize>>, String> {
-        let slice = buffers
-            .readback
-            .slice(..u64::try_from(output_size).map_err(|error| error.to_string())?);
+    fn read_ranges(&self, buffers: &Buffers, submission: wgpu::SubmissionIndex, output_size: usize, text: &str) -> Result<Vec<Range<usize>>, String> {
+        let readback = buffers.readback.as_ref().unwrap_or(&buffers.output);
+        let slice = readback.slice(..u64::try_from(output_size).map_err(|error| error.to_string())?);
         let (sender, receiver) = mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
         self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(MAP_TIMEOUT),
-            })
+            .poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: Some(MAP_TIMEOUT) })
             .map_err(|error| format!("wait for GPU lexical classifier: {error}"))?;
         receiver
             .recv_timeout(MAP_TIMEOUT)
             .map_err(|error| format!("receive GPU lexical classifier result: {error}"))?
             .map_err(|error| format!("map GPU lexical classifier result: {error}"))?;
         if self.failed.load(Ordering::Acquire) {
-            buffers.readback.unmap();
+            readback.unmap();
             return Err("GPU lexical classifier reported a device error".to_owned());
         }
-        let result = slice
-            .get_mapped_range()
-            .map_err(|error| format!("read GPU lexical classifier result: {error}"))
-            .map(|mapped| decode_ranges(&mapped, text));
-        buffers.readback.unmap();
+        let result =
+            slice.get_mapped_range().map_err(|error| format!("read GPU lexical classifier result: {error}")).map(|mapped| decode_ranges(&mapped, text));
+        readback.unmap();
         result
     }
 
     fn ensure_capacity(&mut self, input_required: u64, output_required: u64) -> bool {
-        if self.buffers.as_ref().is_some_and(|buffers| {
-            buffers.input_capacity >= input_required && buffers.output_capacity >= output_required
-        }) {
+        if self.buffers.as_ref().is_some_and(|buffers| buffers.input_capacity >= input_required && buffers.output_capacity >= output_required) {
             return false;
         }
-        let input_capacity = input_required
-            .checked_next_power_of_two()
-            .filter(|capacity| *capacity <= self.max_buffer_size)
-            .unwrap_or(input_required);
-        let output_capacity = output_required
-            .checked_next_power_of_two()
-            .filter(|capacity| *capacity <= self.max_buffer_size)
-            .unwrap_or(output_required);
+        let input_capacity = input_required.checked_next_power_of_two().filter(|capacity| *capacity <= self.max_buffer_size).unwrap_or(input_required);
+        let output_capacity = output_required.checked_next_power_of_two().filter(|capacity| *capacity <= self.max_buffer_size).unwrap_or(output_required);
         let input = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wren lexical input"),
             size: input_capacity,
@@ -287,41 +218,27 @@ impl GpuLexical {
         let output = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wren lexical output"),
             size: output_capacity,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | if self.direct_readback { wgpu::BufferUsages::MAP_READ } else { wgpu::BufferUsages::COPY_SRC },
             mapped_at_creation: false,
         });
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wren lexical readback"),
-            size: output_capacity,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        let readback = (!self.direct_readback).then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wren lexical readback"),
+                size: output_capacity,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
         });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wren lexical classifier"),
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.params.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.params.as_entire_binding() },
             ],
         });
-        self.buffers = Some(Buffers {
-            input,
-            output,
-            readback,
-            bind_group,
-            input_capacity,
-            output_capacity,
-        });
+        self.buffers = Some(Buffers { input, output, readback, bind_group, input_capacity, output_capacity });
         true
     }
 }
@@ -349,9 +266,7 @@ fn input_size(length: usize) -> Option<usize> {
 }
 
 fn output_size(length: usize) -> Option<usize> {
-    length
-        .checked_add(31)
-        .map(|length| (length / 32).saturating_mul(4))
+    length.checked_add(31).and_then(|length| (length / 32).checked_mul(4))
 }
 
 fn workgroup_size() -> usize {
@@ -373,26 +288,10 @@ fn dispatch_dimensions(text_len: usize, max_workgroups: u32) -> Option<(u32, u32
 }
 
 fn keyword_length_at(text: &[u8], start: usize) -> Option<usize> {
-    [
-        b"fn".as_slice(),
-        b"let",
-        b"mut",
-        b"struct",
-        b"enum",
-        b"impl",
-        b"trait",
-        b"pub",
-        b"use",
-        b"match",
-        b"if",
-        b"else",
-        b"for",
-        b"while",
-        b"return",
-    ]
-    .into_iter()
-    .find(|keyword| text.get(start..start + keyword.len()) == Some(*keyword))
-    .map(<[u8]>::len)
+    [b"fn".as_slice(), b"let", b"mut", b"struct", b"enum", b"impl", b"trait", b"pub", b"use", b"match", b"if", b"else", b"for", b"while", b"return"]
+        .into_iter()
+        .find(|keyword| text.get(start..start + keyword.len()) == Some(*keyword))
+        .map(<[u8]>::len)
 }
 
 #[cfg(test)]
@@ -403,9 +302,7 @@ mod tests {
     fn two_dimensional_dispatch_has_at_most_one_partial_row() {
         let maximum = 65_535;
         let total_workgroups = maximum * 2 + 2;
-        let text_len = usize::try_from(total_workgroups)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(usize::try_from(WORKGROUP_SIZE).unwrap_or(256));
+        let text_len = usize::try_from(total_workgroups).unwrap_or(usize::MAX).saturating_mul(usize::try_from(WORKGROUP_SIZE).unwrap_or(256));
 
         let (x, y) = dispatch_dimensions(text_len, maximum).expect("valid dispatch");
         let dispatched = u64::from(x) * u64::from(y);

@@ -13,7 +13,7 @@ fn corpus_root() -> PathBuf {
 fn corpus_files() -> Vec<(&'static str, PathBuf)> {
     let root = corpus_root();
     [
-        ("normal", root.join("documents/normal.rs")),
+        ("normal", wren_benchmark_support::normal_rust_corpus().expect("generate normal Rust corpus")),
         ("unicode", root.join("documents/unicode.txt")),
         ("large-100mb", root.join("generated/large-100mb.js")),
         ("oneline-8mb", root.join("generated/oneline-8mb.json")),
@@ -29,11 +29,7 @@ fn load<T: TextStore>(path: &Path) -> T {
 }
 
 fn deterministic_edits(text: &str, count: usize) -> Transaction {
-    let boundaries: Vec<usize> = text
-        .char_indices()
-        .map(|(byte, _)| byte)
-        .chain(std::iter::once(text.len()))
-        .collect();
+    let boundaries: Vec<usize> = text.char_indices().map(|(byte, _)| byte).chain(std::iter::once(text.len())).collect();
     let mut state = 0x9e37_79b9_usize;
     let mut points = Vec::with_capacity(count);
     for _ in 0..count {
@@ -42,14 +38,8 @@ fn deterministic_edits(text: &str, count: usize) -> Transaction {
     }
     points.sort_unstable();
     points.dedup();
-    Transaction::new(
-        DocumentRevision::new(0),
-        points
-            .into_iter()
-            .map(|point| Edit::new(point..point, "x"))
-            .collect(),
-    )
-    .expect("deterministic edit points are valid")
+    Transaction::new(DocumentRevision::new(0), points.into_iter().map(|point| Edit::new(point..point, "x")).collect())
+        .expect("deterministic edit points are valid")
 }
 
 fn bench_loads(criterion: &mut Criterion) {
@@ -61,68 +51,47 @@ fn bench_loads(criterion: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("crop", name), &path, |bencher, path| {
             bencher.iter(|| black_box(load::<CropText>(path)));
         });
-        group.bench_with_input(
-            BenchmarkId::new("piece-stub", name),
-            &path,
-            |bencher, path| {
-                bencher.iter(|| black_box(load::<PieceTreeStub>(path)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("piece-stub", name), &path, |bencher, path| {
+            bencher.iter(|| black_box(load::<PieceTreeStub>(path)));
+        });
     }
     group.finish();
 }
 
-fn bench_operations_for<T: TextStore>(
-    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    backend: &str,
-    corpus: &str,
-    store: &T,
-) {
-    group.bench_function(
-        BenchmarkId::new(format!("snapshot/{backend}"), corpus),
-        |bencher| {
-            bencher.iter(|| black_box(store.snapshot()));
-        },
-    );
+fn bench_operations_for<T: TextStore>(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>, backend: &str, corpus: &str, store: &T) {
+    group.bench_function(BenchmarkId::new(format!("snapshot/{backend}"), corpus), |bencher| {
+        bencher.iter(|| black_box(store.snapshot()));
+    });
     let whole = store.slice(0..store.len_bytes());
     let mut midpoint = store.len_bytes() / 2;
     while midpoint > 0 && !whole.is_char_boundary(midpoint) {
         midpoint -= 1;
     }
     let transaction = deterministic_edits(&whole, 16);
-    group.bench_function(
-        BenchmarkId::new(format!("edit/{backend}"), corpus),
-        |bencher| {
-            bencher.iter_batched(
-                || store.snapshot(),
-                |mut candidate| {
-                    candidate.apply(black_box(&transaction));
-                    black_box(candidate)
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        },
-    );
-    group.bench_function(
-        BenchmarkId::new(format!("edit-retained-32/{backend}"), corpus),
-        |bencher| {
-            bencher.iter(|| {
-                let retained: Vec<T> = (0..32).map(|_| store.snapshot()).collect();
-                let mut candidate = store.snapshot();
-                candidate.apply(&transaction);
-                black_box((candidate, retained))
-            });
-        },
-    );
-    group.bench_function(
-        BenchmarkId::new(format!("line-byte/{backend}"), corpus),
-        |bencher| {
-            bencher.iter(|| {
-                let line = store.line_of_byte(black_box(midpoint));
-                black_box(store.byte_of_line(line))
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new(format!("edit/{backend}"), corpus), |bencher| {
+        bencher.iter_batched(
+            || store.snapshot(),
+            |mut candidate| {
+                candidate.apply(black_box(&transaction));
+                black_box(candidate)
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+    group.bench_function(BenchmarkId::new(format!("edit-retained-32/{backend}"), corpus), |bencher| {
+        bencher.iter(|| {
+            let retained: Vec<T> = (0..32).map(|_| store.snapshot()).collect();
+            let mut candidate = store.snapshot();
+            candidate.apply(&transaction);
+            black_box((candidate, retained))
+        });
+    });
+    group.bench_function(BenchmarkId::new(format!("line-byte/{backend}"), corpus), |bencher| {
+        bencher.iter(|| {
+            let line = store.line_of_byte(black_box(midpoint));
+            black_box(store.byte_of_line(line))
+        });
+    });
 }
 
 fn bench_operations(criterion: &mut Criterion) {

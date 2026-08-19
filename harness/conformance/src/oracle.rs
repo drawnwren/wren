@@ -35,16 +35,7 @@ pub struct Oracle {
 impl Oracle {
     pub fn spawn() -> Result<Self> {
         let mut child = Command::new("nvim")
-            .args([
-                "--embed",
-                "--headless",
-                "--clean",
-                "-n",
-                "-u",
-                "NONE",
-                "-i",
-                "NONE",
-            ])
+            .args(["--embed", "--headless", "--clean", "-n", "-u", "NONE", "-i", "NONE"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -52,21 +43,10 @@ impl Oracle {
             .context("spawn pinned nvim --embed --headless")?;
         let input = child.stdin.take().context("capture nvim stdin")?;
         let output = child.stdout.take().context("capture nvim stdout")?;
-        let mut oracle = Self {
-            child,
-            input,
-            output: BufReader::new(output),
-            next_message_id: 1,
-            version: String::new(),
-        };
+        let mut oracle = Self { child, input, output: BufReader::new(output), next_message_id: 1, version: String::new() };
         let api_info = oracle.request("nvim_get_api_info", Vec::new())?;
         oracle.version = parse_version(&api_info)?;
-        oracle.request(
-            "nvim_command",
-            vec![Value::from(
-                "set shortmess+=I noswapfile undolevels=1000 nohlsearch",
-            )],
-        )?;
+        oracle.request("nvim_command", vec![Value::from("set shortmess+=I noswapfile undolevels=1000 nohlsearch")])?;
         Ok(oracle)
     }
 
@@ -78,44 +58,18 @@ impl Oracle {
     pub fn reset(&mut self, lines: &[&str]) -> Result<()> {
         self.request(
             "nvim_command",
-            vec![Value::from(
-                "silent! delmarks! | silent! delmarks A-Z0-9 | clearjumps | let @/ = '' | messages clear | setlocal undolevels=-1",
-            )],
+            vec![Value::from("silent! delmarks! | silent! delmarks A-Z0-9 | clearjumps | let @/ = '' | messages clear | setlocal undolevels=-1")],
         )?;
         for mark in ["<", ">"] {
             self.request("nvim_buf_del_mark", vec![Value::from(0), Value::from(mark)])?;
         }
         for register in ["\"", "0", "1", "a"] {
-            self.request(
-                "nvim_call_function",
-                vec![
-                    Value::from("setreg"),
-                    Value::Array(vec![Value::from(register), Value::Array(Vec::new())]),
-                ],
-            )?;
+            self.request("nvim_call_function", vec![Value::from("setreg"), Value::Array(vec![Value::from(register), Value::Array(Vec::new())])])?;
         }
         let lines = lines.iter().map(|line| Value::from(*line)).collect();
-        self.request(
-            "nvim_buf_set_lines",
-            vec![
-                Value::from(0),
-                Value::from(0),
-                Value::from(-1),
-                Value::from(false),
-                Value::Array(lines),
-            ],
-        )?;
-        self.request(
-            "nvim_win_set_cursor",
-            vec![
-                Value::from(0),
-                Value::Array(vec![Value::from(1), Value::from(0)]),
-            ],
-        )?;
-        self.request(
-            "nvim_command",
-            vec![Value::from("setlocal undolevels=1000")],
-        )?;
+        self.request("nvim_buf_set_lines", vec![Value::from(0), Value::from(0), Value::from(-1), Value::from(false), Value::Array(lines)])?;
+        self.request("nvim_win_set_cursor", vec![Value::from(0), Value::Array(vec![Value::from(1), Value::from(0)])])?;
+        self.request("nvim_command", vec![Value::from("setlocal undolevels=1000")])?;
         self.request("nvim_command", vec![Value::from("set nomodified")])?;
         self.request("nvim_input", vec![Value::from("<Esc>")])?;
         Ok(())
@@ -146,13 +100,7 @@ impl Oracle {
               \ 'options': {'tabstop': &l:tabstop, 'shiftwidth': &l:shiftwidth, 'expandtab': &l:expandtab, 'selection': &selection, 'virtualedit': &virtualedit, 'whichwrap': &whichwrap}
               \ }
             echo json_encode(wren_state)"#;
-        let response = self.request(
-            "nvim_exec2",
-            vec![
-                Value::from(command),
-                Value::Map(vec![(Value::from("output"), Value::from(true))]),
-            ],
-        )?;
+        let response = self.request("nvim_exec2", vec![Value::from(command), Value::Map(vec![(Value::from("output"), Value::from(true))])])?;
         let map = response.as_map().context("nvim_exec2 returned a non-map")?;
         let output = map
             .iter()
@@ -167,12 +115,7 @@ impl Oracle {
     fn request(&mut self, method: &str, parameters: Vec<Value>) -> Result<Value> {
         let message_id = self.next_message_id;
         self.next_message_id = self.next_message_id.saturating_add(1);
-        let request = Value::Array(vec![
-            Value::from(0),
-            Value::from(message_id),
-            Value::from(method),
-            Value::Array(parameters),
-        ]);
+        let request = Value::Array(vec![Value::from(0), Value::from(message_id), Value::from(method), Value::Array(parameters)]);
         write_value(&mut self.input, &request).context("encode msgpack-rpc request")?;
         self.input.flush().context("flush msgpack-rpc request")?;
 
@@ -204,11 +147,7 @@ impl Drop for Oracle {
 }
 
 fn parse_version(api_info: &Value) -> Result<String> {
-    let metadata = api_info
-        .as_array()
-        .and_then(|values| values.get(1))
-        .and_then(Value::as_map)
-        .context("nvim API metadata missing")?;
+    let metadata = api_info.as_array().and_then(|values| values.get(1)).and_then(Value::as_map).context("nvim API metadata missing")?;
     let version = metadata
         .iter()
         .find_map(|(key, value)| (key.as_str() == Some("version")).then_some(value))
@@ -221,12 +160,7 @@ fn parse_version(api_info: &Value) -> Result<String> {
             .and_then(Value::as_u64)
             .with_context(|| format!("nvim version field {name} missing"))
     };
-    Ok(format!(
-        "{}.{}.{}",
-        number("major")?,
-        number("minor")?,
-        number("patch")?
-    ))
+    Ok(format!("{}.{}.{}", number("major")?, number("minor")?, number("patch")?))
 }
 
 fn strip_volatile_undo_fields(value: &mut serde_json::Value) {

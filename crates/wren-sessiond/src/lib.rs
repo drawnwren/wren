@@ -9,15 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
 use wren_proto::{
-    DEFAULT_MAX_FRAME_BYTES, Envelope, HelloAck, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError,
-    TransportError, envelope, read_envelope, write_envelope,
+    DEFAULT_MAX_FRAME_BYTES, Envelope, HelloAck, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, TransportError, envelope, read_envelope, write_envelope,
 };
-use wren_remote::{
-    RemoteCall, RemoteError, RemoteOpened, RemoteReply, RemoteWorkspaceStorage, TransportLane,
-};
-use wren_session::{
-    AuthorityError, LocalDocument, MutationSubmission, SaveError, SessionAuthority,
-};
+use wren_remote::{RemoteCall, RemoteError, RemoteOpened, RemoteReply, RemoteWorkspaceStorage, TransportLane};
+use wren_session::{AuthorityError, LocalDocument, MutationSubmission, SaveError, SessionAuthority};
 use wren_shmem::{SharedDocumentHeadWriter, SharedHeadError};
 
 const CAPABILITIES: &[&str] = &[
@@ -64,18 +59,11 @@ pub enum ServerError {
     #[error("remote document {0:?} has not been bound to a workspace path")]
     UnboundDocument(wren_types::DocumentId),
     #[error("save frontier {requested:?} does not match authoritative revision {actual:?}")]
-    SaveFrontier {
-        requested: wren_types::DocumentRevision,
-        actual: wren_types::DocumentRevision,
-    },
+    SaveFrontier { requested: wren_types::DocumentRevision, actual: wren_types::DocumentRevision },
     #[error("save precondition does not match the opened file")]
     SavePrecondition,
     #[error("remote document {document_id:?} is already bound to {existing}, not {requested}")]
-    PathBindingConflict {
-        document_id: wren_types::DocumentId,
-        existing: Box<str>,
-        requested: Box<str>,
-    },
+    PathBindingConflict { document_id: wren_types::DocumentId, existing: Box<str>, requested: Box<str> },
     #[error("remote workspace state I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -116,10 +104,7 @@ impl SessionServer {
         self
     }
 
-    pub fn with_head_writer(
-        mut self,
-        writer: Arc<SharedDocumentHeadWriter>,
-    ) -> Result<Self, ServerError> {
+    pub fn with_head_writer(mut self, writer: Arc<SharedDocumentHeadWriter>) -> Result<Self, ServerError> {
         writer.publish(&self.authority()?.document_heads())?;
         self.head_writer = Some(writer);
         Ok(self)
@@ -132,10 +117,7 @@ impl SessionServer {
         maximum_cache_bytes: u64,
         lane: TransportLane,
     ) -> Result<Self, ServerError> {
-        let bindings_path = cache_root
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("document-bindings.json");
+        let bindings_path = cache_root.parent().unwrap_or_else(|| Path::new(".")).join("document-bindings.json");
         let paths = match fs::read(&bindings_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
@@ -177,63 +159,34 @@ impl SessionServer {
     where
         S: Read + Write,
     {
-        let hello_envelope =
-            read_envelope(stream, self.max_frame_bytes)?.ok_or(ServerError::ExpectedHello)?;
-        let envelope::Payload::Hello(hello) = hello_envelope
-            .payload
-            .ok_or(ProtocolError::MissingField("Envelope.payload"))?
-        else {
+        let hello_envelope = read_envelope(stream, self.max_frame_bytes)?.ok_or(ServerError::ExpectedHello)?;
+        let envelope::Payload::Hello(hello) = hello_envelope.payload.ok_or(ProtocolError::MissingField("Envelope.payload"))? else {
             return Err(ServerError::ExpectedHello);
         };
         if hello.major != PROTOCOL_MAJOR {
-            return Err(ServerError::IncompatibleMajor {
-                actual: hello.major,
-                expected: PROTOCOL_MAJOR,
-            });
+            return Err(ServerError::IncompatibleMajor { actual: hello.major, expected: PROTOCOL_MAJOR });
         }
         let client_limit = usize::try_from(hello.max_frame_bytes).unwrap_or(usize::MAX);
         let negotiated_limit = self.max_frame_bytes.min(client_limit.max(1));
-        let capabilities = CAPABILITIES
-            .iter()
-            .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
-            .map(|value| (*value).to_owned())
-            .collect();
+        let capabilities =
+            CAPABILITIES.iter().filter(|capability| hello.capabilities.iter().any(|value| value == **capability)).map(|value| (*value).to_owned()).collect();
         write_envelope(
             stream,
             &Envelope::new(
                 hello_envelope.request_id,
-                envelope::Payload::HelloAck(HelloAck {
-                    major: PROTOCOL_MAJOR,
-                    minor: PROTOCOL_MINOR,
-                    capabilities,
-                    max_frame_bytes: negotiated_limit as u64,
-                }),
+                envelope::Payload::HelloAck(HelloAck { major: PROTOCOL_MAJOR, minor: PROTOCOL_MINOR, capabilities, max_frame_bytes: negotiated_limit as u64 }),
             ),
             negotiated_limit,
         )?;
         Ok(negotiated_limit)
     }
 
-    fn serve_request(
-        &self,
-        stream: &mut (impl Read + Write),
-        request: Envelope,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn serve_request(&self, stream: &mut (impl Read + Write), request: Envelope, limit: usize) -> Result<(), ServerError> {
         let request_id = request.request_id;
-        match request
-            .payload
-            .ok_or(ProtocolError::MissingField("Envelope.payload"))?
-        {
-            envelope::Payload::ClientMutation(mutation) => {
-                self.handle_mutation(stream, request_id, mutation.try_into()?, limit)
-            }
-            envelope::Payload::Resume(resume) => {
-                self.handle_resume(stream, request_id, resume, limit)
-            }
-            envelope::Payload::OpenDocument(open) => {
-                self.handle_open_document(stream, request_id, open, limit)
-            }
+        match request.payload.ok_or(ProtocolError::MissingField("Envelope.payload"))? {
+            envelope::Payload::ClientMutation(mutation) => self.handle_mutation(stream, request_id, mutation.try_into()?, limit),
+            envelope::Payload::Resume(resume) => self.handle_resume(stream, request_id, resume, limit),
+            envelope::Payload::OpenDocument(open) => self.handle_open_document(stream, request_id, open, limit),
             envelope::Payload::RemoteCall(call) => {
                 let call: RemoteCall = serde_json::from_slice(&call.body)?;
                 let reply = self.handle_remote_call(call);
@@ -241,54 +194,22 @@ impl SessionServer {
             }
             envelope::Payload::SaveRequest(request) => {
                 let saved = self.save_remote_document(&request.try_into()?)?;
-                self.write_payload(
-                    stream,
-                    request_id,
-                    envelope::Payload::Saved(wren_proto::Saved::from(&saved)),
-                    limit,
-                )
+                self.write_payload(stream, request_id, envelope::Payload::Saved(wren_proto::Saved::from(&saved)), limit)
             }
-            envelope::Payload::Hello(_) => {
-                Err(ServerError::UnexpectedPayload("Hello after handshake"))
-            }
-            envelope::Payload::HelloAck(_) => {
-                Err(ServerError::UnexpectedPayload("HelloAck from client"))
-            }
-            envelope::Payload::MutationResult(_) => {
-                Err(ServerError::UnexpectedPayload("MutationResult from client"))
-            }
-            envelope::Payload::SessionEvent(_) => {
-                Err(ServerError::UnexpectedPayload("SessionEvent from client"))
-            }
-            envelope::Payload::ResumeResult(_) => {
-                Err(ServerError::UnexpectedPayload("ResumeResult from client"))
-            }
+            envelope::Payload::Hello(_) => Err(ServerError::UnexpectedPayload("Hello after handshake")),
+            envelope::Payload::HelloAck(_) => Err(ServerError::UnexpectedPayload("HelloAck from client")),
+            envelope::Payload::MutationResult(_) => Err(ServerError::UnexpectedPayload("MutationResult from client")),
+            envelope::Payload::SessionEvent(_) => Err(ServerError::UnexpectedPayload("SessionEvent from client")),
+            envelope::Payload::ResumeResult(_) => Err(ServerError::UnexpectedPayload("ResumeResult from client")),
             envelope::Payload::Saved(_) => Err(ServerError::UnexpectedPayload("Saved from client")),
-            envelope::Payload::DocumentOpened(_) => {
-                Err(ServerError::UnexpectedPayload("DocumentOpened from client"))
-            }
-            envelope::Payload::RemoteReply(_) => {
-                Err(ServerError::UnexpectedPayload("RemoteReply from client"))
-            }
+            envelope::Payload::DocumentOpened(_) => Err(ServerError::UnexpectedPayload("DocumentOpened from client")),
+            envelope::Payload::RemoteReply(_) => Err(ServerError::UnexpectedPayload("RemoteReply from client")),
         }
     }
 
-    fn handle_mutation(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        mutation: wren_types::ClientMutation,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn handle_mutation(&self, stream: &mut impl Write, request_id: u64, mutation: wren_types::ClientMutation, limit: usize) -> Result<(), ServerError> {
         let previous_sequence = self.authority()?.session_sequence();
-        self.send_result(
-            stream,
-            request_id,
-            &wren_types::MutationResult::Received {
-                mutation_id: mutation.mutation_id,
-            },
-            limit,
-        )?;
+        self.send_result(stream, request_id, &wren_types::MutationResult::Received { mutation_id: mutation.mutation_id }, limit)?;
         if self.crash_after_received.swap(false, Ordering::AcqRel) {
             return Err(ServerError::InjectedCrashAfterReceived);
         }
@@ -300,44 +221,20 @@ impl SessionServer {
             MutationSubmission::Accepted { durable, .. } => {
                 self.send_result(stream, request_id, &durable, limit)?;
                 for event in self.authority()?.events_after(previous_sequence) {
-                    self.write_payload(
-                        stream,
-                        0,
-                        envelope::Payload::SessionEvent(wren_proto::SessionEvent::from(&event)),
-                        limit,
-                    )?;
+                    self.write_payload(stream, 0, envelope::Payload::SessionEvent(wren_proto::SessionEvent::from(&event)), limit)?;
                 }
                 Ok(())
             }
-            MutationSubmission::Rejected(result) => {
-                self.send_result(stream, request_id, &result, limit)
-            }
+            MutationSubmission::Rejected(result) => self.send_result(stream, request_id, &result, limit),
         }
     }
 
-    fn handle_resume(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        resume: wren_proto::Resume,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn handle_resume(&self, stream: &mut impl Write, request_id: u64, resume: wren_proto::Resume, limit: usize) -> Result<(), ServerError> {
         let result = self.authority()?.resume(&resume.into());
-        self.write_payload(
-            stream,
-            request_id,
-            envelope::Payload::ResumeResult(wren_proto::ResumeResult::from(&result)),
-            limit,
-        )
+        self.write_payload(stream, request_id, envelope::Payload::ResumeResult(wren_proto::ResumeResult::from(&result)), limit)
     }
 
-    fn handle_open_document(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        open: wren_proto::OpenDocument,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn handle_open_document(&self, stream: &mut impl Write, request_id: u64, open: wren_proto::OpenDocument, limit: usize) -> Result<(), ServerError> {
         let document_id = wren_types::DocumentId::new(open.document_id);
         let client_id = wren_types::ClientId::new(open.client_id);
         {
@@ -348,9 +245,7 @@ impl SessionServer {
         }
         self.publish_heads()?;
         let authority = self.authority()?;
-        let document = authority
-            .document(document_id)
-            .ok_or(AuthorityError::UnknownDocument(document_id))?;
+        let document = authority.document(document_id).ok_or(AuthorityError::UnknownDocument(document_id))?;
         self.write_payload(
             stream,
             request_id,
@@ -364,123 +259,61 @@ impl SessionServer {
         )
     }
 
-    fn write_payload(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        payload: envelope::Payload,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn write_payload(&self, stream: &mut impl Write, request_id: u64, payload: envelope::Payload, limit: usize) -> Result<(), ServerError> {
         write_envelope(stream, &Envelope::new(request_id, payload), limit)?;
         Ok(())
     }
 
-    fn send_result(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        result: &wren_types::MutationResult,
-        limit: usize,
-    ) -> Result<(), ServerError> {
-        write_envelope(
-            stream,
-            &Envelope::new(
-                request_id,
-                envelope::Payload::MutationResult(wren_proto::MutationResult::from(result)),
-            ),
-            limit,
-        )?;
+    fn send_result(&self, stream: &mut impl Write, request_id: u64, result: &wren_types::MutationResult, limit: usize) -> Result<(), ServerError> {
+        write_envelope(stream, &Envelope::new(request_id, envelope::Payload::MutationResult(wren_proto::MutationResult::from(result))), limit)?;
         Ok(())
     }
 
-    fn send_remote_reply(
-        &self,
-        stream: &mut impl Write,
-        request_id: u64,
-        reply: Result<RemoteReply, ServerError>,
-        limit: usize,
-    ) -> Result<(), ServerError> {
+    fn send_remote_reply(&self, stream: &mut impl Write, request_id: u64, reply: Result<RemoteReply, ServerError>, limit: usize) -> Result<(), ServerError> {
         let reply = match reply {
             Ok(reply) => reply,
-            Err(error) => RemoteReply::Failure {
-                message: error.to_string().into_boxed_str(),
-            },
+            Err(error) => RemoteReply::Failure { message: error.to_string().into_boxed_str() },
         };
         write_envelope(
             stream,
-            &Envelope::new(
-                request_id,
-                envelope::Payload::RemoteReply(wren_proto::RemoteReply {
-                    body: serde_json::to_vec(&reply)?,
-                }),
-            ),
+            &Envelope::new(request_id, envelope::Payload::RemoteReply(wren_proto::RemoteReply { body: serde_json::to_vec(&reply)? })),
             limit,
         )?;
         Ok(())
     }
 
     fn handle_remote_call(&self, call: RemoteCall) -> Result<RemoteReply, ServerError> {
-        let workspace = self
-            .remote_workspace
-            .as_ref()
-            .ok_or(ServerError::UnexpectedPayload(
-                "RemoteCall on a local-only session",
-            ))?;
+        let workspace = self.remote_workspace.as_ref().ok_or(ServerError::UnexpectedPayload("RemoteCall on a local-only session"))?;
         match call {
             RemoteCall::Heartbeat { nonce } => {
                 let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
                 if workspace.lane != TransportLane::Control {
-                    return Err(ServerError::UnexpectedPayload(
-                        "heartbeat request on the bulk lane",
-                    ));
+                    return Err(ServerError::UnexpectedPayload("heartbeat request on the bulk lane"));
                 }
                 Ok(RemoteReply::Heartbeat { nonce })
             }
             RemoteCall::Manifest { generation } => {
                 let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
                 if workspace.lane != TransportLane::Control {
-                    return Err(ServerError::UnexpectedPayload(
-                        "manifest request on the bulk lane",
-                    ));
+                    return Err(ServerError::UnexpectedPayload("manifest request on the bulk lane"));
                 }
-                Ok(RemoteReply::Manifest {
-                    manifest: workspace.storage.manifest(generation)?,
-                })
+                Ok(RemoteReply::Manifest { manifest: workspace.storage.manifest(generation)? })
             }
-            RemoteCall::Open {
-                document_id,
-                client_id,
-                path,
-                cached_hash,
-            } => self.handle_remote_open(workspace, document_id, client_id, path, cached_hash),
+            RemoteCall::Open { document_id, client_id, path, cached_hash } => self.handle_remote_open(workspace, document_id, client_id, path, cached_hash),
             RemoteCall::Blob { hash } => {
                 let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
                 if workspace.lane != TransportLane::Bulk {
-                    return Err(ServerError::UnexpectedPayload(
-                        "blob request on the control lane",
-                    ));
+                    return Err(ServerError::UnexpectedPayload("blob request on the control lane"));
                 }
-                let bytes = workspace
-                    .storage
-                    .blob(hash)?
-                    .ok_or(RemoteError::HashMismatch)?;
+                let bytes = workspace.storage.blob(hash)?.ok_or(RemoteError::HashMismatch)?;
                 Ok(RemoteReply::Blob { hash, bytes })
             }
-            RemoteCall::Search {
-                needle,
-                maximum_results,
-            } => {
+            RemoteCall::Search { needle, maximum_results } => {
                 let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
                 if workspace.lane != TransportLane::Bulk {
-                    return Err(ServerError::UnexpectedPayload(
-                        "search request on the control lane",
-                    ));
+                    return Err(ServerError::UnexpectedPayload("search request on the control lane"));
                 }
-                Ok(RemoteReply::Search {
-                    hits: workspace
-                        .storage
-                        .search(&needle, maximum_results.min(100_000))?,
-                })
+                Ok(RemoteReply::Search { hits: workspace.storage.search(&needle, maximum_results.min(100_000))? })
             }
         }
     }
@@ -496,18 +329,12 @@ impl SessionServer {
         let (document, opened) = {
             let workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
             if workspace.lane != TransportLane::Control {
-                return Err(ServerError::UnexpectedPayload(
-                    "open request on the bulk lane",
-                ));
+                return Err(ServerError::UnexpectedPayload("open request on the bulk lane"));
             }
             if let Some(existing) = workspace.paths.get(&document_id.get())
                 && existing.as_ref() != path.as_ref()
             {
-                return Err(ServerError::PathBindingConflict {
-                    document_id,
-                    existing: existing.clone(),
-                    requested: path,
-                });
+                return Err(ServerError::PathBindingConflict { document_id, existing: existing.clone(), requested: path });
             }
             LocalDocument::open_or_new(workspace.storage.workspace_path(&path)?)?
         };
@@ -517,25 +344,10 @@ impl SessionServer {
                 authority.register_document(document_id, opened.text.clone(), client_id)?;
             }
             let session_epoch = authority.session_epoch();
-            let authoritative = authority
-                .document(document_id)
-                .ok_or(AuthorityError::UnknownDocument(document_id))?;
-            (
-                authoritative.text(),
-                authoritative.revision,
-                authoritative.lease.lease_epoch,
-                session_epoch,
-            )
+            let authoritative = authority.document(document_id).ok_or(AuthorityError::UnknownDocument(document_id))?;
+            (authoritative.text(), authoritative.revision, authoritative.lease.lease_epoch, session_epoch)
         };
-        let file_identity =
-            document
-                .stamp()
-                .map(remote_file_identity)
-                .unwrap_or(wren_types::FileIdentity {
-                    device: 0,
-                    file: 0,
-                    generation: 0,
-                });
+        let file_identity = document.stamp().map(remote_file_identity).unwrap_or(wren_types::FileIdentity { device: 0, file: 0, generation: 0 });
         let content_hash = {
             let mut workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
             let content_hash = workspace.storage.cache_bytes(text.as_bytes())?;
@@ -561,51 +373,23 @@ impl SessionServer {
         })
     }
 
-    fn save_remote_document(
-        &self,
-        request: &wren_types::SaveRequest,
-    ) -> Result<wren_types::Saved, ServerError> {
-        let workspace = self
-            .remote_workspace
-            .as_ref()
-            .ok_or(ServerError::UnexpectedPayload(
-                "SaveRequest before workspace document binding",
-            ))?;
+    fn save_remote_document(&self, request: &wren_types::SaveRequest) -> Result<wren_types::Saved, ServerError> {
+        let workspace = self.remote_workspace.as_ref().ok_or(ServerError::UnexpectedPayload("SaveRequest before workspace document binding"))?;
         let (text, revision) = {
             let authority = self.authority()?;
-            let document = authority
-                .document(request.document_id)
-                .ok_or(AuthorityError::UnknownDocument(request.document_id))?;
+            let document = authority.document(request.document_id).ok_or(AuthorityError::UnknownDocument(request.document_id))?;
             (document.text(), document.revision)
         };
         if revision != request.required_frontier {
-            return Err(ServerError::SaveFrontier {
-                requested: request.required_frontier,
-                actual: revision,
-            });
+            return Err(ServerError::SaveFrontier { requested: request.required_frontier, actual: revision });
         }
         let mut workspace = workspace.lock().map_err(|_| ServerError::Poisoned)?;
         if workspace.lane != TransportLane::Control {
-            return Err(ServerError::UnexpectedPayload(
-                "SaveRequest on the bulk lane",
-            ));
+            return Err(ServerError::UnexpectedPayload("SaveRequest on the bulk lane"));
         }
-        let document = workspace
-            .documents
-            .get_mut(&request.document_id)
-            .ok_or(ServerError::UnboundDocument(request.document_id))?;
-        let expected_identity =
-            document
-                .stamp()
-                .map(remote_file_identity)
-                .unwrap_or(wren_types::FileIdentity {
-                    device: 0,
-                    file: 0,
-                    generation: 0,
-                });
-        if request.expected_content_hash != document.base_hash()
-            || request.expected_file_identity != expected_identity
-        {
+        let document = workspace.documents.get_mut(&request.document_id).ok_or(ServerError::UnboundDocument(request.document_id))?;
+        let expected_identity = document.stamp().map(remote_file_identity).unwrap_or(wren_types::FileIdentity { device: 0, file: 0, generation: 0 });
+        if request.expected_content_hash != document.base_hash() || request.expected_file_identity != expected_identity {
             return Err(ServerError::SavePrecondition);
         }
         let report = document.save(&text)?;
@@ -627,21 +411,13 @@ impl SessionServer {
 }
 
 fn remote_file_identity(stamp: &wren_session::FileStamp) -> wren_types::FileIdentity {
-    wren_types::FileIdentity {
-        device: stamp.identity.first,
-        file: stamp.identity.second,
-        generation: stamp.len,
-    }
+    stamp.identity
 }
 
 fn persist_bindings(workspace: &RemoteWorkspace) -> Result<(), ServerError> {
     let bytes = serde_json::to_vec(&workspace.paths)?;
     let temporary = workspace.bindings_path.with_extension("json.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)?;
+    let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&temporary)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, &workspace.bindings_path)?;
@@ -657,15 +433,12 @@ mod tests {
     use std::thread;
 
     use tempfile::tempdir;
-    use wren_proto::{
-        ClientMutation as WireMutation, Hello, MutationResult as WireResult, OpenDocument,
-    };
+    use wren_proto::{ClientMutation as WireMutation, Hello, MutationResult as WireResult, OpenDocument};
     use wren_session::SessionJournal;
     use wren_shmem::{SharedDocumentHeadReader, SharedDocumentHeadWriter};
     use wren_types::{
-        ClientId, ClientMutation, ClientSequence, DocumentId, DocumentMutation, DocumentRevision,
-        Edit, LeaseEpoch, MutationId, MutationResult, SemanticGroupId, SemanticGroupKind,
-        SessionId, Transaction,
+        ClientId, ClientMutation, ClientSequence, DocumentId, DocumentMutation, DocumentRevision, Edit, LeaseEpoch, MutationId, MutationResult,
+        SemanticGroupId, SemanticGroupKind, SessionId, Transaction,
     };
 
     use super::*;
@@ -683,10 +456,7 @@ mod tests {
                 semantic_group_id: SemanticGroupId::new(1),
                 semantic_group_kind: SemanticGroupKind::InsertRun,
                 undo_parent: None,
-                transactions: vec![
-                    Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "socket ")])
-                        .expect("transaction"),
-                ],
+                transactions: vec![Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "socket ")]).expect("transaction")],
             }],
         }
     }
@@ -699,42 +469,24 @@ mod tests {
                 envelope::Payload::Hello(Hello {
                     major: PROTOCOL_MAJOR,
                     minor: PROTOCOL_MINOR,
-                    capabilities: CAPABILITIES
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
+                    capabilities: CAPABILITIES.iter().map(|value| (*value).to_owned()).collect(),
                     max_frame_bytes: DEFAULT_MAX_FRAME_BYTES as u64,
                 }),
             ),
             DEFAULT_MAX_FRAME_BYTES,
         )
         .expect("hello");
-        assert!(matches!(
-            read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
-                .expect("ack")
-                .expect("ack frame")
-                .payload,
-            Some(envelope::Payload::HelloAck(_))
-        ));
+        assert!(matches!(read_envelope(client, DEFAULT_MAX_FRAME_BYTES).expect("ack").expect("ack frame").payload, Some(envelope::Payload::HelloAck(_))));
     }
 
     fn open_test_document(client: &mut UnixStream) {
         write_envelope(
             client,
-            &Envelope::new(
-                10,
-                envelope::Payload::OpenDocument(OpenDocument {
-                    document_id: 9,
-                    client_id: 7,
-                    text: "document".to_owned(),
-                }),
-            ),
+            &Envelope::new(10, envelope::Payload::OpenDocument(OpenDocument { document_id: 9, client_id: 7, text: "document".to_owned() })),
             DEFAULT_MAX_FRAME_BYTES,
         )
         .expect("open document");
-        let opened = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("opened")
-            .expect("opened frame");
+        let opened = read_envelope(client, DEFAULT_MAX_FRAME_BYTES).expect("opened").expect("opened frame");
         assert!(matches!(
             opened.payload,
             Some(envelope::Payload::DocumentOpened(ref opened))
@@ -743,57 +495,31 @@ mod tests {
     }
 
     fn assert_received_then_durable(client: &mut UnixStream) {
-        write_envelope(
-            client,
-            &Envelope::new(
-                11,
-                envelope::Payload::ClientMutation(WireMutation::from(&mutation())),
-            ),
-            DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("mutation");
-        let first = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("received")
-            .expect("received frame");
-        let second = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("durable")
-            .expect("durable frame");
+        write_envelope(client, &Envelope::new(11, envelope::Payload::ClientMutation(WireMutation::from(&mutation()))), DEFAULT_MAX_FRAME_BYTES)
+            .expect("mutation");
+        let first = read_envelope(client, DEFAULT_MAX_FRAME_BYTES).expect("received").expect("received frame");
+        let second = read_envelope(client, DEFAULT_MAX_FRAME_BYTES).expect("durable").expect("durable frame");
         let Some(envelope::Payload::MutationResult(first)) = first.payload else {
             panic!("expected received result");
         };
         let Some(envelope::Payload::MutationResult(second)) = second.payload else {
             panic!("expected durable result");
         };
-        assert!(matches!(
-            MutationResult::try_from(first).expect("received conversion"),
-            MutationResult::Received { .. }
-        ));
-        assert!(matches!(
-            MutationResult::try_from(second).expect("durable conversion"),
-            MutationResult::Durable { .. }
-        ));
-        let event = read_envelope(client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("session event")
-            .expect("session event frame");
+        assert!(matches!(MutationResult::try_from(first).expect("received conversion"), MutationResult::Received { .. }));
+        assert!(matches!(MutationResult::try_from(second).expect("durable conversion"), MutationResult::Durable { .. }));
+        let event = read_envelope(client, DEFAULT_MAX_FRAME_BYTES).expect("session event").expect("session event frame");
         assert_eq!(event.request_id, 0);
-        assert!(matches!(
-            event.payload,
-            Some(envelope::Payload::SessionEvent(_))
-        ));
+        assert!(matches!(event.payload, Some(envelope::Payload::SessionEvent(_))));
     }
 
     #[test]
     fn socket_round_trip_negotiates_then_emits_received_before_durable() {
         let directory = tempdir().expect("temporary directory");
         let journal = SessionJournal::in_directory(directory.path());
-        let authority =
-            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
+        let authority = SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
         let head_path = directory.path().join("heads.link");
-        let head_writer =
-            Arc::new(SharedDocumentHeadWriter::create(&head_path, 8).expect("shared head writer"));
-        let server = SessionServer::new(authority)
-            .with_head_writer(head_writer)
-            .expect("publish heads");
+        let head_writer = Arc::new(SharedDocumentHeadWriter::create(&head_path, 8).expect("shared head writer"));
+        let server = SessionServer::new(authority).with_head_writer(head_writer).expect("publish heads");
         let (mut client, mut daemon) = UnixStream::pair().expect("socket pair");
         let task_server = server.clone();
         let task = thread::spawn(move || task_server.serve_connection(&mut daemon));
@@ -802,22 +528,11 @@ mod tests {
         open_test_document(&mut client);
         assert_received_then_durable(&mut client);
         drop(client);
-        task.join()
-            .expect("server thread")
-            .expect("serve connection");
+        task.join().expect("server thread").expect("serve connection");
 
         let recovered = SessionAuthority::open(journal, SessionId::new(1)).expect("reopen");
-        assert_eq!(
-            recovered
-                .document(DocumentId::new(9))
-                .expect("document")
-                .text(),
-            "socket document"
-        );
-        let (_, heads) = SharedDocumentHeadReader::open(&head_path)
-            .expect("head reader")
-            .snapshot()
-            .expect("head snapshot");
+        assert_eq!(recovered.document(DocumentId::new(9)).expect("document").text(), "socket document");
+        let (_, heads) = SharedDocumentHeadReader::open(&head_path).expect("head reader").snapshot().expect("head snapshot");
         assert_eq!(heads[0].authoritative_revision, DocumentRevision::new(1));
         let _ = std::mem::size_of::<WireResult>();
     }
@@ -826,11 +541,8 @@ mod tests {
     fn crash_after_received_leaves_no_commit_and_retry_is_durable() {
         let directory = tempdir().expect("temporary directory");
         let journal = SessionJournal::in_directory(directory.path());
-        let mut authority =
-            SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
-        authority
-            .register_document(DocumentId::new(9), "document", ClientId::new(7))
-            .expect("document");
+        let mut authority = SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("authority");
+        authority.register_document(DocumentId::new(9), "document", ClientId::new(7)).expect("document");
         let server = SessionServer::new(authority);
         server.inject_crash_after_next_received();
         let task_server = server.clone();
@@ -843,67 +555,28 @@ mod tests {
                 envelope::Payload::Hello(Hello {
                     major: PROTOCOL_MAJOR,
                     minor: PROTOCOL_MINOR,
-                    capabilities: CAPABILITIES
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
+                    capabilities: CAPABILITIES.iter().map(|value| (*value).to_owned()).collect(),
                     max_frame_bytes: DEFAULT_MAX_FRAME_BYTES as u64,
                 }),
             ),
             DEFAULT_MAX_FRAME_BYTES,
         )
         .expect("hello");
-        read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("hello ack")
-            .expect("ack frame");
-        write_envelope(
-            &mut client,
-            &Envelope::new(
-                2,
-                envelope::Payload::ClientMutation(WireMutation::from(&mutation())),
-            ),
-            DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("mutation");
-        let received = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES)
-            .expect("received")
-            .expect("received frame");
+        read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES).expect("hello ack").expect("ack frame");
+        write_envelope(&mut client, &Envelope::new(2, envelope::Payload::ClientMutation(WireMutation::from(&mutation()))), DEFAULT_MAX_FRAME_BYTES)
+            .expect("mutation");
+        let received = read_envelope(&mut client, DEFAULT_MAX_FRAME_BYTES).expect("received").expect("received frame");
         let Some(envelope::Payload::MutationResult(received)) = received.payload else {
             panic!("expected Received result");
         };
-        assert!(matches!(
-            MutationResult::try_from(received).expect("result"),
-            MutationResult::Received { .. }
-        ));
+        assert!(matches!(MutationResult::try_from(received).expect("result"), MutationResult::Received { .. }));
         drop(client);
-        assert!(matches!(
-            task.join().expect("server thread"),
-            Err(ServerError::InjectedCrashAfterReceived)
-        ));
+        assert!(matches!(task.join().expect("server thread"), Err(ServerError::InjectedCrashAfterReceived)));
         drop(server);
 
-        let mut recovered =
-            SessionAuthority::open(journal, SessionId::new(1)).expect("reopen authority");
-        assert_eq!(
-            recovered
-                .document(DocumentId::new(9))
-                .expect("document")
-                .text(),
-            "document"
-        );
-        assert!(matches!(
-            recovered.submit(mutation()).expect("retry"),
-            MutationSubmission::Accepted {
-                durable: MutationResult::Durable { .. },
-                ..
-            }
-        ));
-        assert_eq!(
-            recovered
-                .document(DocumentId::new(9))
-                .expect("retried document")
-                .text(),
-            "socket document"
-        );
+        let mut recovered = SessionAuthority::open(journal, SessionId::new(1)).expect("reopen authority");
+        assert_eq!(recovered.document(DocumentId::new(9)).expect("document").text(), "document");
+        assert!(matches!(recovered.submit(mutation()).expect("retry"), MutationSubmission::Accepted { durable: MutationResult::Durable { .. }, .. }));
+        assert_eq!(recovered.document(DocumentId::new(9)).expect("retried document").text(), "socket document");
     }
 }

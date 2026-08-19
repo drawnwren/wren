@@ -48,6 +48,7 @@ message StateDelta {
     bytes repeat_data = 6;
     MacroRecordingDelta macro_recording = 7;
     JumpListDelta jump_list = 8;
+    bool search_backward = 9;
   }
 }
 enum SemanticGroupKind { INSERT_RUN = 0; OPERATOR = 1; MACRO_INVOCATION = 2; FORMATTER = 3; WORKSPACE_REFACTOR = 4; UNDO_OF = 5; REDO_OF = 6; }

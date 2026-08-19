@@ -7,16 +7,11 @@ use wren_penrose::{Canvas, Palette, Rasterizer, Rgb8, Shading, Tiling};
 
 fn main() -> io::Result<()> {
     let mut arguments = env::args().skip(1);
-    let path = arguments
-        .next()
-        .unwrap_or_else(|| "penrose-preview.ppm".to_owned());
+    let path = arguments.next().unwrap_or_else(|| "penrose-preview.ppm".to_owned());
     let width = parse_dimension(arguments.next(), 960);
     let height = parse_dimension(arguments.next(), 540);
     let shortest_side = width.min(height) as f64;
-    let tiling = Tiling::cover(
-        Canvas::new(width as f64, height as f64),
-        shortest_side / 24.0,
-    );
+    let tiling = Tiling::cover(Canvas::new(width as f64, height as f64), shortest_side / 24.0);
     let rasterizer = Rasterizer::new(&tiling, width, height);
     let shading = Shading {
         palette: Palette {
@@ -39,8 +34,5 @@ fn main() -> io::Result<()> {
 }
 
 fn parse_dimension(value: Option<String>, fallback: usize) -> usize {
-    value
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback)
+    value.and_then(|value| value.parse().ok()).filter(|value| *value > 0).unwrap_or(fallback)
 }

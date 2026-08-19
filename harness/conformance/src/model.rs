@@ -16,10 +16,7 @@ pub struct GeneratorState {
 
 impl Default for GeneratorState {
     fn default() -> Self {
-        Self {
-            mode: ModelMode::Normal,
-            pending_operator: None,
-        }
+        Self { mode: ModelMode::Normal, pending_operator: None }
     }
 }
 
@@ -29,17 +26,14 @@ pub fn validish_sequence(state: &GeneratorState) -> BoxedStrategy<Vec<KeyEvent>>
         vec!["w", "e", "b", "$", "0", "j", "k", "iw", "aw", "gg"]
     } else {
         match state.mode {
-            ModelMode::Normal => vec![
-                "h", "j", "k", "l", "w", "b", "0", "$", "dw", "dd", "cw", "ciw", "yy", "2w", "3dd",
-                "\"ayy", "\"ap", "u", ".",
-            ],
+            ModelMode::Normal => {
+                vec!["h", "j", "k", "l", "w", "b", "0", "$", "dw", "dd", "cw", "ciw", "yy", "2w", "3dd", "\"ayy", "\"ap", "u", "."]
+            }
             ModelMode::Insert => vec!["a", "Z", " ", "<Esc>"],
             ModelMode::Visual => vec!["h", "j", "k", "l", "w", "d", "y", "<Esc>"],
         }
     };
-    proptest::sample::select(choices)
-        .prop_map(|sequence| sequence.chars().map(KeyEvent::character).collect())
-        .boxed()
+    proptest::sample::select(choices).prop_map(|sequence| sequence.chars().map(KeyEvent::character).collect()).boxed()
 }
 
 #[cfg(test)]

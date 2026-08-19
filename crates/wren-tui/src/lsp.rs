@@ -1,4 +1,14 @@
 use super::*;
+use ls_types::{Location, LocationLink, Range as LspRange, SemanticTokens, Uri};
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum LspLocations {
+    Location(Location),
+    Locations(Vec<Location>),
+    Link(LocationLink),
+    Links(Vec<LocationLink>),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LanguageServerInvocation {
@@ -17,19 +27,12 @@ pub(super) fn spawn_lsp_client(
     text: &str,
     environment: BTreeMap<Box<str>, Box<str>>,
 ) -> Result<(LspClient, String, LspCapabilities)> {
-    let spec = WorkflowTaskSpec {
-        program: server.program.clone().into(),
-        arguments: server
-            .arguments
-            .iter()
-            .cloned()
-            .map(String::into_boxed_str)
-            .collect(),
+    let spec = WorkflowTaskSpec::persisted(
+        server.program.clone(),
+        server.arguments.iter().cloned().map(String::into_boxed_str).collect(),
         environment,
-        visibility: DocumentVisibility::Persisted,
-        save: SavePolicy::Never,
-        max_output_bytes: 16 * 1024 * 1024,
-    };
+        16 * 1024 * 1024,
+    );
     let mut client = LspClient::spawn(&spec, true, 16 * 1024 * 1024)?;
     let initialize = client.initialize_with_options(
         &file_uri(root),
@@ -64,18 +67,10 @@ pub(super) fn spawn_lsp_client(
         server.initialization_options.clone(),
     )?;
     if !server.settings.is_null() {
-        client.notify(
-            "workspace/didChangeConfiguration",
-            serde_json::json!({"settings": server.settings}),
-        )?;
+        client.notify("workspace/didChangeConfiguration", serde_json::json!({"settings": server.settings}))?;
     }
     let uri = file_uri(path);
-    client.did_open(
-        &uri,
-        &server.language_id,
-        i64::try_from(revision.get()).unwrap_or(i64::MAX),
-        text,
-    )?;
+    client.did_open(&uri, &server.language_id, i64::try_from(revision.get()).unwrap_or(i64::MAX), text)?;
     Ok((client, uri, lsp_capabilities(&initialize)))
 }
 
@@ -120,84 +115,32 @@ pub(super) fn lsp_capabilities(initialize: &serde_json::Value) -> LspCapabilitie
 pub(super) fn semantic_token_legend(initialize: &serde_json::Value) -> Option<SemanticTokenLegend> {
     let legend = initialize.pointer("/capabilities/semanticTokensProvider/legend")?;
     Some(SemanticTokenLegend {
-        token_types: legend
-            .get("tokenTypes")?
-            .as_array()?
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .collect(),
-        token_modifiers: legend
-            .get("tokenModifiers")?
-            .as_array()?
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .collect(),
+        token_types: legend.get("tokenTypes")?.as_array()?.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect(),
+        token_modifiers: legend.get("tokenModifiers")?.as_array()?.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect(),
     })
 }
 
-pub(super) fn parse_semantic_tokens(
-    text: &str,
-    response: &serde_json::Value,
-    legend: &SemanticTokenLegend,
-) -> Vec<HighlightSpan> {
-    let Some(data) = response.get("data").and_then(serde_json::Value::as_array) else {
+pub(super) fn parse_semantic_tokens(text: &str, response: &serde_json::Value, legend: &SemanticTokenLegend) -> Vec<HighlightSpan> {
+    let Ok(Some(tokens)) = serde_json::from_value::<Option<SemanticTokens>>(response.clone()) else {
         return Vec::new();
     };
-    let line_starts = std::iter::once(0)
-        .chain(
-            text.match_indices('\n')
-                .map(|(byte, _)| byte.saturating_add(1)),
-        )
-        .collect::<Vec<_>>();
-    let mut spans = Vec::with_capacity(data.len() / 5);
+    let line_starts = std::iter::once(0).chain(text.match_indices('\n').map(|(byte, _)| byte.saturating_add(1))).collect::<Vec<_>>();
+    let mut spans = Vec::with_capacity(tokens.data.len());
     let mut line = 0_u32;
     let mut character = 0_u32;
-    for token in data.chunks_exact(5) {
-        let Some(delta_line) = token[0]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-        else {
-            continue;
-        };
-        let Some(delta_start) = token[1]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-        else {
-            continue;
-        };
-        let Some(length) = token[2]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-        else {
-            continue;
-        };
-        let Some(token_type) = token[3]
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-        else {
-            continue;
-        };
-        let modifiers = token[4].as_u64().unwrap_or(0);
-        line = line.saturating_add(delta_line);
-        character = if delta_line == 0 {
-            character.saturating_add(delta_start)
-        } else {
-            delta_start
-        };
+    for token in tokens.data {
+        line = line.saturating_add(token.delta_line);
+        character = if token.delta_line == 0 { character.saturating_add(token.delta_start) } else { token.delta_start };
         let Some(start) = lsp_position_byte_indexed(text, &line_starts, line, character) else {
             continue;
         };
-        let Some(end) =
-            lsp_position_byte_indexed(text, &line_starts, line, character.saturating_add(length))
-        else {
+        let Some(end) = lsp_position_byte_indexed(text, &line_starts, line, character.saturating_add(token.length)) else {
             continue;
         };
         if start >= end {
             continue;
         }
-        let Some(token_type) = legend.token_types.get(token_type).map(String::as_str) else {
+        let Some(token_type) = usize::try_from(token.token_type).ok().and_then(|index| legend.token_types.get(index)).map(String::as_str) else {
             continue;
         };
         let has_modifier = |name: &str| {
@@ -206,7 +149,7 @@ pub(super) fn parse_semantic_tokens(
                 .iter()
                 .position(|modifier| modifier == name)
                 .and_then(|index| u32::try_from(index).ok())
-                .is_some_and(|index| modifiers & 1_u64.checked_shl(index).unwrap_or(0) != 0)
+                .is_some_and(|index| token.token_modifiers_bitset & 1_u32.checked_shl(index).unwrap_or(0) != 0)
         };
         let kind = match token_type {
             "namespace" => "semantic.namespace",
@@ -234,101 +177,103 @@ pub(super) fn parse_semantic_tokens(
             // preserves the more specific Tree-sitter capture underneath.
             _ => continue,
         };
-        spans.push(HighlightSpan {
-            range: start..end,
-            kind: kind.into(),
-            priority: u32::MAX,
-        });
+        spans.push(HighlightSpan::new(start..end, kind, u32::MAX));
     }
     spans
 }
 
-fn lsp_position_byte_indexed(
-    text: &str,
-    line_starts: &[usize],
-    line: u32,
-    character: u32,
-) -> Option<usize> {
+fn lsp_position_byte_indexed(text: &str, line_starts: &[usize], line: u32, character: u32) -> Option<usize> {
     let line = usize::try_from(line).ok()?;
-    let start = *line_starts.get(line)?;
-    let end = line_starts
-        .get(line.saturating_add(1))
-        .map_or(text.len(), |next| next.saturating_sub(1));
-    let wanted = usize::try_from(character).ok()?;
-    let mut utf16 = 0;
-    for (offset, current) in text[start..end].char_indices() {
-        if utf16 == wanted {
-            return Some(start + offset);
-        }
-        utf16 = utf16.saturating_add(current.len_utf16());
-        if utf16 > wanted {
-            return None;
-        }
-    }
-    (utf16 == wanted).then_some(end)
+    let column = usize::try_from(character).ok()?;
+    utf16_position_to_byte(text, line_starts, line, column).ok()
 }
-
-type LanguageServerFactory = fn(&Path, &str) -> LanguageServerInvocation;
-
-struct LanguageServerRule {
-    extensions: &'static [&'static str],
-    build: LanguageServerFactory,
-}
-
-const LANGUAGE_SERVER_RULES: &[LanguageServerRule] = &[
-    LanguageServerRule {
-        extensions: &["rs"],
-        build: rust_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"],
-        build: typescript_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["py", "pyi"],
-        build: python_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["go"],
-        build: go_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["tf", "tfvars"],
-        build: terraform_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["nix"],
-        build: nix_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["hs", "lhs"],
-        build: haskell_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["lua"],
-        build: lua_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["sh", "bash", "zsh"],
-        build: bash_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["c", "h"],
-        build: c_language_server,
-    },
-    LanguageServerRule {
-        extensions: &["cc", "cpp", "cxx", "hh", "hpp", "hxx", "msg"],
-        build: cpp_language_server,
-    },
-];
 
 pub(super) fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvocation> {
     let path = path?;
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    LANGUAGE_SERVER_RULES
-        .iter()
-        .find(|rule| rule.extensions.contains(&extension.as_str()))
-        .map(|rule| (rule.build)(path, &extension))
+    let (program, arguments, language_id, initialization_options, settings) = match bundled_language_id(path)? {
+        "rust" => ("rust-analyzer", &[][..], "rust", serde_json::Value::Null, serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
+        "javascript" | "typescript" | "tsx" => (
+            "pnpm",
+            &["exec", "typescript-language-server", "--stdio"][..],
+            match extension.as_str() {
+                "ts" | "mts" | "cts" => "typescript",
+                "tsx" => "typescriptreact",
+                "jsx" => "javascriptreact",
+                _ => "javascript",
+            },
+            serde_json::json!({"jsx": {"enabled": true}}),
+            serde_json::json!({
+                "typescript": {
+                    "suggestionActions": {"enabled": true},
+                    "updateImportsOnFileMove": {"enabled": "always"}
+                },
+                "javascript": {"updateImportsOnFileMove": {"enabled": "always"}}
+            }),
+        ),
+        "python" => (
+            "basedpyright-langserver",
+            &["--stdio"][..],
+            "python",
+            serde_json::Value::Null,
+            serde_json::json!({
+                "python": {"pythonPath": python_interpreter(path)},
+                "basedpyright": {"analysis": {
+                    "autoSearchPaths": true,
+                    "useLibraryCodeForTypes": true,
+                    "diagnosticMode": "workspace",
+                    "inlayHints": {
+                        "variableTypes": true,
+                        "callArgumentNames": true,
+                        "functionReturnTypes": true,
+                        "parameterNames": true
+                    }
+                }}
+            }),
+        ),
+        "go" => ("gopls", &[][..], "go", serde_json::Value::Null, serde_json::json!({})),
+        "hcl" => ("terraform-ls", &["serve"][..], "terraform", serde_json::Value::Null, serde_json::json!({})),
+        "nix" => (
+            "nixd",
+            &[][..],
+            "nix",
+            serde_json::Value::Null,
+            serde_json::json!({"nixd": {
+                "nixpkgs": {"expr": nixd_nixpkgs_expression(
+                    nixd_expression_path().as_deref(),
+                    &env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned())
+                )},
+                "formatting": {"command": ["nixfmt"]}
+            }}),
+        ),
+        "haskell" => (
+            "haskell-language-server-wrapper",
+            &["--lsp"][..],
+            "haskell",
+            serde_json::Value::Null,
+            serde_json::json!({"haskell": {
+                "plugin": {
+                    "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
+                    "fourmolu": {"config": {"external": true}}
+                },
+                "formattingProvider": "fourmolu"
+            }}),
+        ),
+        "lua" => (
+            "lua-language-server",
+            &[][..],
+            "lua",
+            serde_json::Value::Null,
+            serde_json::json!({"Lua": {
+                "runtime": {"version": "LuaJIT"},
+                "workspace": {"checkThirdParty": false}
+            }}),
+        ),
+        "bash" => ("bash-language-server", &["start"][..], "shellscript", serde_json::Value::Null, serde_json::json!({})),
+        "c" | "cpp" => ("clangd", &[][..], bundled_language_id(path)?, serde_json::Value::Null, serde_json::json!({})),
+        _ => return None,
+    };
+    Some(language_server(program, arguments, language_id, initialization_options, settings))
 }
 
 fn language_server(
@@ -340,163 +285,11 @@ fn language_server(
 ) -> LanguageServerInvocation {
     LanguageServerInvocation {
         program: program.to_owned(),
-        arguments: arguments
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect(),
+        arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
         language_id: language_id.to_owned(),
         initialization_options,
         settings,
     }
-}
-
-fn rust_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "rust-analyzer",
-        &[],
-        "rust",
-        serde_json::Value::Null,
-        serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}}),
-    )
-}
-
-fn typescript_language_server(_: &Path, extension: &str) -> LanguageServerInvocation {
-    let language_id = match extension {
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "typescriptreact",
-        "jsx" => "javascriptreact",
-        _ => "javascript",
-    };
-    language_server(
-        "pnpm",
-        &["exec", "typescript-language-server", "--stdio"],
-        language_id,
-        serde_json::json!({"jsx": {"enabled": true}}),
-        serde_json::json!({
-            "typescript": {
-                "suggestionActions": {"enabled": true},
-                "updateImportsOnFileMove": {"enabled": "always"}
-            },
-            "javascript": {"updateImportsOnFileMove": {"enabled": "always"}}
-        }),
-    )
-}
-
-fn python_language_server(path: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "basedpyright-langserver",
-        &["--stdio"],
-        "python",
-        serde_json::Value::Null,
-        serde_json::json!({
-            "python": {"pythonPath": python_interpreter(path)},
-            "basedpyright": {"analysis": {
-                "autoSearchPaths": true,
-                "useLibraryCodeForTypes": true,
-                "diagnosticMode": "workspace",
-                "inlayHints": {
-                    "variableTypes": true,
-                    "callArgumentNames": true,
-                    "functionReturnTypes": true,
-                    "parameterNames": true
-                }
-            }}
-        }),
-    )
-}
-
-fn go_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "gopls",
-        &[],
-        "go",
-        serde_json::Value::Null,
-        serde_json::json!({}),
-    )
-}
-
-fn terraform_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "terraform-ls",
-        &["serve"],
-        "terraform",
-        serde_json::Value::Null,
-        serde_json::json!({}),
-    )
-}
-
-fn nix_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    let input = env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned());
-    let expression = nixd_nixpkgs_expression(nixd_expression_path().as_deref(), &input);
-    language_server(
-        "nixd",
-        &[],
-        "nix",
-        serde_json::Value::Null,
-        serde_json::json!({"nixd": {
-            "nixpkgs": {"expr": expression},
-            "formatting": {"command": ["nixfmt"]}
-        }}),
-    )
-}
-
-fn haskell_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "haskell-language-server-wrapper",
-        &["--lsp"],
-        "haskell",
-        serde_json::Value::Null,
-        serde_json::json!({"haskell": {
-            "plugin": {
-                "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
-                "fourmolu": {"config": {"external": true}}
-            },
-            "formattingProvider": "fourmolu"
-        }}),
-    )
-}
-
-fn lua_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "lua-language-server",
-        &[],
-        "lua",
-        serde_json::Value::Null,
-        serde_json::json!({"Lua": {
-            "runtime": {"version": "LuaJIT"},
-            "workspace": {"checkThirdParty": false}
-        }}),
-    )
-}
-
-fn bash_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "bash-language-server",
-        &["start"],
-        "shellscript",
-        serde_json::Value::Null,
-        serde_json::json!({}),
-    )
-}
-
-fn c_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "clangd",
-        &[],
-        "c",
-        serde_json::Value::Null,
-        serde_json::json!({}),
-    )
-}
-
-fn cpp_language_server(_: &Path, _: &str) -> LanguageServerInvocation {
-    language_server(
-        "clangd",
-        &[],
-        "cpp",
-        serde_json::Value::Null,
-        serde_json::json!({}),
-    )
 }
 
 pub(super) fn nixd_nixpkgs_expression(config: Option<&Path>, input: &str) -> String {
@@ -551,104 +344,46 @@ pub(super) fn nixd_expression_path() -> Option<PathBuf> {
 
 pub(super) fn file_uri(path: &Path) -> String {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut encoded = String::new();
-    for byte in path.to_string_lossy().bytes() {
-        if byte == b'/' || byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
-        {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    format!("file://{encoded}")
+    Uri::from_file_path(path).map_or_else(String::new, |uri| uri.as_str().to_owned())
 }
 
 pub(super) fn path_from_file_uri(uri: &str) -> Result<PathBuf> {
-    let encoded = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| anyhow!("unsupported non-file LSP URI {uri}"))?;
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let value = std::str::from_utf8(&bytes[index + 1..index + 3])?;
-            decoded.push(u8::from_str_radix(value, 16)?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
+    let uri = uri.parse::<Uri>()?;
+    if uri.scheme().as_str() != "file" {
+        bail!("unsupported non-file LSP URI {}", uri.as_str());
     }
-    Ok(PathBuf::from(String::from_utf8(decoded)?))
+    uri.to_file_path().map(|path| path.into_owned()).ok_or_else(|| anyhow!("file LSP URI omitted a path: {}", uri.as_str()))
 }
 
 pub(super) fn parse_lsp_locations(value: &serde_json::Value) -> Result<Vec<QuickfixEntry>> {
-    let values = value
-        .as_array()
-        .map_or_else(|| vec![value], |values| values.iter().collect());
-    values
-        .into_iter()
-        .filter(|value| !value.is_null())
-        .map(|location| {
-            let uri = location
-                .get("targetUri")
-                .or_else(|| location.get("uri"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("LSP location omitted URI"))?;
-            let range = location
-                .get("targetSelectionRange")
-                .or_else(|| location.get("range"))
-                .or_else(|| location.get("targetRange"))
-                .ok_or_else(|| anyhow!("LSP location omitted range"))?;
-            let line = range
-                .pointer("/start/line")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0)
-                + 1;
-            let column = range
-                .pointer("/start/character")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(0)
-                + 1;
-            let selection_end = range
-                .pointer("/end/line")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .zip(
-                    range
-                        .pointer("/end/character")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|value| usize::try_from(value).ok()),
-                )
-                .map(|(line, column)| QuickfixPosition {
-                    line: line + 1,
-                    column: column + 1,
-                });
-            Ok(QuickfixEntry {
-                path: path_from_file_uri(uri)?,
-                line,
-                column,
-                selection_end,
-                column_utf16: true,
-                text: "language-server location".to_owned(),
-            })
-        })
-        .collect()
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    if value.as_object().is_some_and(|location| !location.contains_key("uri") && !location.contains_key("targetUri")) {
+        bail!("LSP location omitted URI");
+    }
+    let response = serde_json::from_value::<LspLocations>(value.clone())?;
+    match response {
+        LspLocations::Location(location) => Ok(vec![quickfix_location(&location.uri, location.range)?]),
+        LspLocations::Locations(locations) => locations.into_iter().map(|location| quickfix_location(&location.uri, location.range)).collect(),
+        LspLocations::Link(location) => Ok(vec![quickfix_location(&location.target_uri, location.target_selection_range)?]),
+        LspLocations::Links(locations) => {
+            locations.into_iter().map(|location| quickfix_location(&location.target_uri, location.target_selection_range)).collect()
+        }
+    }
+}
+
+fn quickfix_location(uri: &Uri, range: LspRange) -> Result<QuickfixEntry> {
+    Ok(QuickfixEntry::new(path_from_file_uri(uri.as_str())?, range.start.line as usize + 1, range.start.character as usize + 1, "language-server location")
+        .utf16()
+        .with_end(range.end.line as usize + 1, range.end.character as usize + 1))
 }
 
 pub(super) fn render_lsp_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(render_lsp_text)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · "),
+        serde_json::Value::Array(values) => values.iter().map(render_lsp_text).filter(|value| !value.is_empty()).collect::<Vec<_>>().join(" · "),
         serde_json::Value::Object(values) => {
             for key in ["value", "label", "contents", "signatures", "documentation"] {
                 if let Some(value) = values.get(key) {
@@ -674,11 +409,7 @@ pub(super) fn expand_lsp_snippet_with_stops(snippet: &str) -> (String, Vec<Range
     let mut stops = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'\\'
-            && bytes
-                .get(index + 1)
-                .is_some_and(|next| matches!(next, b'$' | b'}' | b'\\'))
-        {
+        if bytes[index] == b'\\' && bytes.get(index + 1).is_some_and(|next| matches!(next, b'$' | b'}' | b'\\')) {
             output.push(char::from(bytes[index + 1]));
             index += 2;
             continue;
@@ -703,13 +434,7 @@ pub(super) fn expand_lsp_snippet_with_stops(snippet: &str) -> (String, Vec<Range
             if let Some((_, default)) = placeholder.split_once(':') {
                 output.push_str(default);
             } else if let Some((_, choices)) = placeholder.split_once('|') {
-                output.push_str(
-                    choices
-                        .trim_end_matches('|')
-                        .split(',')
-                        .next()
-                        .unwrap_or_default(),
-                );
+                output.push_str(choices.trim_end_matches('|').split(',').next().unwrap_or_default());
             }
             if let Some(stop) = stop {
                 stops.push((stop, start..output.len()));

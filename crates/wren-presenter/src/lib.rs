@@ -65,10 +65,7 @@ impl LatestFrameQueue {
     fn take(&self) -> Result<Option<Arc<DesiredGrid>>, PresenterError> {
         let mut state = self.state.lock().map_err(|_| PresenterError::Poisoned)?;
         while state.slot.is_none() && !state.stopped {
-            state = self
-                .changed
-                .wait(state)
-                .map_err(|_| PresenterError::Poisoned)?;
+            state = self.changed.wait(state).map_err(|_| PresenterError::Poisoned)?;
         }
         Ok(state.slot.take())
     }
@@ -108,10 +105,7 @@ where
         Self::start_observed(backend, None)
     }
 
-    pub fn start_observed(
-        backend: Arc<Mutex<B>>,
-        observer: Option<PresentationObserver>,
-    ) -> Result<Self, PresenterError> {
+    pub fn start_observed(backend: Arc<Mutex<B>>, observer: Option<PresentationObserver>) -> Result<Self, PresenterError> {
         let queue = Arc::new(LatestFrameQueue::default());
         let failure = Arc::new(Mutex::new(None));
         let presented = Arc::new(AtomicU64::new(0));
@@ -126,24 +120,10 @@ where
             .name("wren-presenter".to_owned())
             .spawn(move || {
                 wren_scheduling::mark_interactive();
-                presenter_loop(
-                    &thread_backend,
-                    &thread_queue,
-                    &thread_failure,
-                    &thread_presented,
-                    &thread_last_epoch,
-                    thread_observer.as_ref(),
-                );
+                presenter_loop(&thread_backend, &thread_queue, &thread_failure, &thread_presented, &thread_last_epoch, thread_observer.as_ref());
             })
             .map_err(PresenterError::Spawn)?;
-        Ok(Self {
-            backend,
-            queue,
-            failure,
-            presented,
-            last_epoch,
-            join: Some(join),
-        })
+        Ok(Self { backend, queue, failure, presented, last_epoch, join: Some(join) })
     }
 
     #[must_use]
@@ -268,13 +248,7 @@ mod tests {
     }
 
     fn grid(epoch: u64) -> Arc<DesiredGrid> {
-        Arc::new(DesiredGrid {
-            epoch,
-            width: 1,
-            height: 1,
-            rows: vec![Arc::new(CellRow::default())],
-            cursor: (0, 0),
-        })
+        Arc::new(DesiredGrid { epoch, width: 1, height: 1, rows: vec![Arc::new(CellRow::default())], cursor: (0, 0), raster_overlay: None })
     }
 
     #[test]

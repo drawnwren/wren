@@ -41,13 +41,6 @@ pub(super) struct ProviderCompletion {
     pub(super) byte: usize,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct LspCompletion {
-    pub(super) revision: DocumentRevision,
-    pub(super) replace: Range<usize>,
-    pub(super) candidates: Vec<CompletionCandidate>,
-}
-
 pub(super) struct PersistentLsp {
     pub(super) document_id: DocumentId,
     pub(super) revision: DocumentRevision,
@@ -66,39 +59,15 @@ pub(super) struct LspOpenDocument {
     pub(super) revision: DocumentRevision,
 }
 
-pub(super) enum LspBackgroundOperation {
-    Location {
-        method: String,
-    },
-    Hover {
-        method: String,
-        document_id: DocumentId,
-        revision: DocumentRevision,
-    },
-    Semantic {
-        buffer_id: BufferId,
-        revision: DocumentRevision,
-    },
-}
-
-impl LspBackgroundOperation {
-    pub(super) fn label(&self) -> &str {
-        match self {
-            Self::Location { method } | Self::Hover { method, .. } => method,
-            Self::Semantic { .. } => "textDocument/semanticTokens/full",
-        }
-    }
-}
-
-pub(super) enum LspBackgroundPayload {
-    Response(serde_json::Value),
-    SemanticDecorations(BufferDecorations),
+pub(super) enum LspBackgroundOutcome {
+    Location { method: String, response: Result<serde_json::Value, String> },
+    Hover { method: String, document_id: DocumentId, revision: DocumentRevision, response: Result<serde_json::Value, String> },
+    Semantic { buffer_id: BufferId, revision: DocumentRevision, decorations: Result<BufferDecorations, String> },
 }
 
 pub(super) struct LspBackgroundResult {
     pub(super) lsp: PersistentLsp,
-    pub(super) operation: LspBackgroundOperation,
-    pub(super) outcome: Result<LspBackgroundPayload, String>,
+    pub(super) outcome: LspBackgroundOutcome,
 }
 
 pub(super) enum ProviderWorkerMessage {
@@ -118,21 +87,9 @@ pub(super) struct ImmediateHighlight {
 }
 
 pub(super) enum ProviderWorkerResult {
-    Decorations {
-        buffer_id: BufferId,
-        document_id: DocumentId,
-        revision: DocumentRevision,
-        spans: Vec<HighlightSpan>,
-        ranges: Vec<Range<usize>>,
-    },
-    Completion {
-        document_id: DocumentId,
-        session: CompletionSession,
-    },
-    Failed {
-        document_id: DocumentId,
-        message: String,
-    },
+    Decorations { buffer_id: BufferId, document_id: DocumentId, revision: DocumentRevision, spans: Vec<HighlightSpan>, ranges: Vec<Range<usize>> },
+    Completion { document_id: DocumentId, session: CompletionSession },
+    Failed { document_id: DocumentId, message: String },
 }
 
 pub(super) struct ProviderWorker {
@@ -182,11 +139,7 @@ impl GitHunkWorker {
                 git_hunk_loop(requests, results);
             })
             .context("spawn Git hunk worker")?;
-        Ok(Self {
-            sender,
-            results: receiver,
-            join: Some(join),
-        })
+        Ok(Self { sender, results: receiver, join: Some(join) })
     }
 
     pub(super) fn refresh(&self, request: GitHunkRequest) {
@@ -212,14 +165,7 @@ fn git_hunk_loop(requests: mpsc::Receiver<GitHunkMessage>, results: mpsc::Sender
         };
         let after = request.after.shared();
         let hunks = git_hunks(&request.before, &after);
-        if results
-            .send(GitHunkResult {
-                buffer_id: request.buffer_id,
-                revision: request.revision,
-                hunks,
-            })
-            .is_err()
-        {
+        if results.send(GitHunkResult { buffer_id: request.buffer_id, revision: request.revision, hunks }).is_err() {
             return;
         }
     }
@@ -248,24 +194,15 @@ impl ProviderWorker {
                 provider_process_loop(executable, requests, immediate_requests, results);
             })
             .context("spawn provider supervisor")?;
-        Ok(Self {
-            sender,
-            immediate_sender,
-            results: receiver,
-            join: Some(join),
-        })
+        Ok(Self { sender, immediate_sender, results: receiver, join: Some(join) })
     }
 
     pub(super) fn try_refresh(&self, refresh: ProviderRefresh) -> bool {
-        self.sender
-            .try_send(ProviderWorkerMessage::Refresh(Box::new(refresh)))
-            .is_ok()
+        self.sender.try_send(ProviderWorkerMessage::Refresh(Box::new(refresh))).is_ok()
     }
 
     pub(super) fn try_complete(&self, completion: ProviderCompletion) -> bool {
-        self.sender
-            .try_send(ProviderWorkerMessage::Complete(Box::new(completion)))
-            .is_ok()
+        self.sender.try_send(ProviderWorkerMessage::Complete(Box::new(completion))).is_ok()
     }
 
     pub(super) fn try_result(&self) -> Option<ProviderWorkerResult> {
@@ -281,29 +218,15 @@ impl ProviderWorker {
     ) -> Result<Vec<HighlightSpan>> {
         let (reply, response) = mpsc::channel();
         self.immediate_sender
-            .send(ProviderWorkerMessage::HighlightNow(Box::new(
-                ImmediateHighlight {
-                    document_id,
-                    revision,
-                    text,
-                    bundle,
-                    reply,
-                },
-            )))
+            .send(ProviderWorkerMessage::HighlightNow(Box::new(ImmediateHighlight { document_id, revision, text, bundle, reply })))
             .map_err(|_| anyhow!("provider process stopped"))?;
         // Wake an idle provider without putting the synchronous request behind
         // already queued viewport or completion work. A full background queue
         // already guarantees that the worker is awake.
-        if matches!(
-            self.sender.try_send(ProviderWorkerMessage::Wake),
-            Err(mpsc::TrySendError::Disconnected(_))
-        ) {
+        if matches!(self.sender.try_send(ProviderWorkerMessage::Wake), Err(mpsc::TrySendError::Disconnected(_))) {
             return Err(anyhow!("provider process stopped"));
         }
-        response
-            .recv_timeout(Duration::from_millis(200))
-            .map_err(|_| anyhow!("immediate provider highlight timed out"))?
-            .map_err(anyhow::Error::msg)
+        response.recv_timeout(Duration::from_millis(200)).map_err(|_| anyhow!("immediate provider highlight timed out"))?.map_err(anyhow::Error::msg)
     }
 }
 
@@ -325,12 +248,7 @@ fn provider_process_loop(
     let mut supervisor = match supervisor {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            provider_failures_until_stop(
-                &requests,
-                &immediate_requests,
-                &results,
-                error.to_string(),
-            );
+            provider_failures_until_stop(&requests, &immediate_requests, &results, error.to_string());
             return;
         }
     };
@@ -338,9 +256,7 @@ fn provider_process_loop(
         provider_failures_until_stop(&requests, &immediate_requests, &results, error.to_string());
         return;
     }
-    provider_loop(requests, immediate_requests, results, |request| {
-        supervisor.request(request)
-    });
+    provider_loop(requests, immediate_requests, results, |request| supervisor.request(request));
 }
 
 #[cfg(test)]
@@ -350,9 +266,7 @@ fn provider_actor_loop(
     results: mpsc::Sender<ProviderWorkerResult>,
 ) {
     let mut actor = ProviderActor::default();
-    provider_loop(requests, immediate_requests, results, |request| {
-        actor.handle(request.clone())
-    });
+    provider_loop(requests, immediate_requests, results, |request| actor.handle(request.clone()));
 }
 
 pub(super) fn provider_loop(
@@ -367,8 +281,7 @@ pub(super) fn provider_loop(
     let mut uploaded = UploadedProviderDocuments::new();
     let mut pending = std::collections::VecDeque::new();
     loop {
-        let Some(message) = next_provider_message(&requests, &immediate_requests, &mut pending)
-        else {
+        let Some(message) = next_provider_message(&requests, &immediate_requests, &mut pending) else {
             return;
         };
         match message {
@@ -409,9 +322,7 @@ fn next_provider_message(
 ) -> Option<ProviderWorkerMessage> {
     match immediate_requests.try_recv() {
         Ok(message) => Some(message),
-        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-            pending.pop_front().or_else(|| requests.recv().ok())
-        }
+        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => pending.pop_front().or_else(|| requests.recv().ok()),
     }
 }
 
@@ -422,16 +333,12 @@ fn coalesce_provider_refresh(
 ) -> ProviderRefresh {
     while let Ok(message) = requests.try_recv() {
         match message {
-            ProviderWorkerMessage::Refresh(candidate)
-                if candidate.document_id == newest.document_id =>
-            {
+            ProviderWorkerMessage::Refresh(candidate) if candidate.document_id == newest.document_id => {
                 newest = *candidate;
             }
             ProviderWorkerMessage::Refresh(candidate) => {
                 if let Some(ProviderWorkerMessage::Refresh(queued)) =
-                    pending.iter_mut().find(|message| {
-                        matches!(message, ProviderWorkerMessage::Refresh(queued) if queued.document_id == candidate.document_id)
-                    })
+                    pending.iter_mut().find(|message| matches!(message, ProviderWorkerMessage::Refresh(queued) if queued.document_id == candidate.document_id))
                 {
                     *queued = candidate;
                 } else {
@@ -445,13 +352,8 @@ fn coalesce_provider_refresh(
     newest
 }
 
-fn unexpected_provider_response(
-    context: &str,
-    response: ProviderResponse,
-) -> wren_provider::ProviderError {
-    wren_provider::ProviderError::Json(serde_json::Error::io(std::io::Error::other(format!(
-        "unexpected {context} response {response:?}"
-    ))))
+fn unexpected_provider_response(context: &str, response: ProviderResponse) -> wren_provider::ProviderError {
+    wren_provider::ProviderError::Json(serde_json::Error::io(std::io::Error::other(format!("unexpected {context} response {response:?}"))))
 }
 
 fn ensure_provider_document(
@@ -463,10 +365,7 @@ fn ensure_provider_document(
     request: &mut impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) -> Result<(), wren_provider::ProviderError> {
     let generation = bundle.provider_generation();
-    if uploaded
-        .get(&document_id)
-        .is_some_and(|document| document.revision == revision && document.generation == generation)
-    {
+    if uploaded.get(&document_id).is_some_and(|document| document.revision == revision && document.generation == generation) {
         return Ok(());
     }
     if let Some(document) = uploaded.get(&document_id)
@@ -474,44 +373,17 @@ fn ensure_provider_document(
         && document.text.as_ref() == text.as_ref()
     {
         let from_revision = document.revision;
-        return match request(&ProviderRequest::AdvanceDocumentRevision {
-            document_id,
-            from_revision,
-            revision,
-            generation,
-        })? {
+        return match request(&ProviderRequest::AdvanceDocumentRevision { document_id, from_revision, revision, generation })? {
             ProviderResponse::Updated { .. } => {
-                uploaded.insert(
-                    document_id,
-                    UploadedProviderDocument {
-                        revision,
-                        generation,
-                        text,
-                    },
-                );
+                uploaded.insert(document_id, UploadedProviderDocument { revision, generation, text });
                 Ok(())
             }
-            response => Err(unexpected_provider_response(
-                "document revision advance",
-                response,
-            )),
+            response => Err(unexpected_provider_response("document revision advance", response)),
         };
     }
-    match request(&ProviderRequest::UpdateDocument {
-        document_id,
-        revision,
-        text: text.as_ref().into(),
-        bundle,
-    })? {
+    match request(&ProviderRequest::UpdateDocument { document_id, revision, text: text.as_ref().into(), bundle })? {
         ProviderResponse::Updated { .. } => {
-            uploaded.insert(
-                document_id,
-                UploadedProviderDocument {
-                    revision,
-                    generation,
-                    text,
-                },
-            );
+            uploaded.insert(document_id, UploadedProviderDocument { revision, generation, text });
             Ok(())
         }
         response => Err(unexpected_provider_response("document update", response)),
@@ -526,27 +398,14 @@ fn refresh_provider(
     let document_id = refresh.document_id;
     let revision = refresh.revision;
     let text = refresh.text.shared();
-    let outcome = ensure_provider_document(
-        document_id,
-        revision,
-        text,
-        refresh.bundle,
-        uploaded,
-        request,
-    )
-    .and_then(|()| {
+    let outcome = ensure_provider_document(document_id, revision, text, refresh.bundle, uploaded, request).and_then(|()| {
         request(&ProviderRequest::Demand {
             document_id,
-            demand: ProviderDemand {
-                revision,
-                visible: vec![refresh.visible],
-                near_viewport: vec![refresh.near_viewport],
-                priority: Priority::Visible,
-            },
+            demand: ProviderDemand { revision, visible: vec![refresh.visible], near_viewport: vec![refresh.near_viewport], priority: Priority::Visible },
         })
     });
-    let result = match outcome {
-        Ok(ProviderResponse::Highlight(highlight))
+    checked_provider_response(document_id, uploaded, outcome, |response| match response {
+        ProviderResponse::Highlight(highlight)
             if highlight.freshness == Freshness::Fresh
                 && matches!(
                     highlight.key,
@@ -554,27 +413,17 @@ fn refresh_provider(
                         if document_revision == revision
                 ) =>
         {
-            ProviderWorkerResult::Decorations {
+            Ok(ProviderWorkerResult::Decorations {
                 buffer_id: refresh.buffer_id,
                 document_id,
                 revision,
                 spans: highlight.spans,
                 ranges: highlight.requested_ranges,
-            }
+            })
         }
-        Ok(response) => ProviderWorkerResult::Failed {
-            document_id,
-            message: format!("stale or unexpected highlight {response:?}"),
-        },
-        Err(error) => ProviderWorkerResult::Failed {
-            document_id,
-            message: error.to_string(),
-        },
-    };
-    if matches!(result, ProviderWorkerResult::Failed { .. }) {
-        uploaded.remove(&document_id);
-    }
-    result
+        response => Err(format!("stale or unexpected highlight {response:?}")),
+    })
+    .unwrap_or_else(|message| ProviderWorkerResult::Failed { document_id, message })
 }
 
 fn complete_provider(
@@ -584,45 +433,16 @@ fn complete_provider(
 ) -> ProviderWorkerResult {
     let document_id = completion.document_id;
     let revision = completion.revision;
-    let outcome = ensure_provider_document(
-        document_id,
-        revision,
-        completion.text,
-        completion.bundle,
-        uploaded,
-        request,
-    )
-    .and_then(|()| {
-        request(&ProviderRequest::Complete {
+    let outcome = ensure_provider_document(document_id, revision, completion.text, completion.bundle, uploaded, request)
+        .and_then(|()| request(&ProviderRequest::Complete { document_id, revision, byte: completion.byte }));
+    checked_provider_response(document_id, uploaded, outcome, |response| match response {
+        ProviderResponse::Completion(result) if result.freshness == Freshness::Fresh => Ok(ProviderWorkerResult::Completion {
             document_id,
-            revision,
-            byte: completion.byte,
-        })
-    });
-    let result = match outcome {
-        Ok(ProviderResponse::Completion(result)) if result.freshness == Freshness::Fresh => {
-            ProviderWorkerResult::Completion {
-                document_id,
-                session: CompletionSession {
-                    revision,
-                    replace: result.replace,
-                    candidates: result.candidates,
-                },
-            }
-        }
-        Ok(response) => ProviderWorkerResult::Failed {
-            document_id,
-            message: format!("stale or unexpected completion {response:?}"),
-        },
-        Err(error) => ProviderWorkerResult::Failed {
-            document_id,
-            message: error.to_string(),
-        },
-    };
-    if matches!(result, ProviderWorkerResult::Failed { .. }) {
-        uploaded.remove(&document_id);
-    }
-    result
+            session: CompletionSession { revision, replace: result.replace, candidates: result.candidates },
+        }),
+        response => Err(format!("stale or unexpected completion {response:?}")),
+    })
+    .unwrap_or_else(|message| ProviderWorkerResult::Failed { document_id, message })
 }
 
 fn highlight_immediately(
@@ -630,37 +450,32 @@ fn highlight_immediately(
     uploaded: &mut UploadedProviderDocuments,
     request: &mut impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) {
-    let ImmediateHighlight {
-        document_id,
-        revision,
-        text,
-        bundle,
-        reply,
-    } = highlight;
+    let ImmediateHighlight { document_id, revision, text, bundle, reply } = highlight;
     let text_len = text.len();
-    let outcome = ensure_provider_document(document_id, revision, text, bundle, uploaded, request)
-        .and_then(|()| {
-            request(&ProviderRequest::Demand {
-                document_id,
-                demand: ProviderDemand {
-                    revision,
-                    visible: std::iter::once(0..text_len).collect(),
-                    near_viewport: Vec::new(),
-                    priority: Priority::Visible,
-                },
-            })
-        });
-    let result = match outcome {
-        Ok(ProviderResponse::Highlight(highlight)) if highlight.freshness == Freshness::Fresh => {
-            Ok(highlight.spans)
-        }
-        Ok(response) => Err(format!("stale or unexpected highlight {response:?}")),
-        Err(error) => Err(error.to_string()),
-    };
+    let outcome = ensure_provider_document(document_id, revision, text, bundle, uploaded, request).and_then(|()| {
+        request(&ProviderRequest::Demand {
+            document_id,
+            demand: ProviderDemand { revision, visible: std::iter::once(0..text_len).collect(), near_viewport: Vec::new(), priority: Priority::Visible },
+        })
+    });
+    let result = checked_provider_response(document_id, uploaded, outcome, |response| match response {
+        ProviderResponse::Highlight(highlight) if highlight.freshness == Freshness::Fresh => Ok(highlight.spans),
+        response => Err(format!("stale or unexpected highlight {response:?}")),
+    });
+    let _ = reply.send(result);
+}
+
+fn checked_provider_response<T>(
+    document_id: DocumentId,
+    uploaded: &mut UploadedProviderDocuments,
+    response: Result<ProviderResponse, wren_provider::ProviderError>,
+    accept: impl FnOnce(ProviderResponse) -> Result<T, String>,
+) -> Result<T, String> {
+    let result = response.map_err(|error| error.to_string()).and_then(accept);
     if result.is_err() {
         uploaded.remove(&document_id);
     }
-    let _ = reply.send(result);
+    result
 }
 
 #[cfg(not(test))]
@@ -682,21 +497,13 @@ fn provider_failures_until_stop(
         };
         match request {
             ProviderWorkerMessage::Refresh(refresh) => {
-                let _ = results.send(ProviderWorkerResult::Failed {
-                    document_id: refresh.document_id,
-                    message: message.clone(),
-                });
+                let _ = results.send(ProviderWorkerResult::Failed { document_id: refresh.document_id, message: message.clone() });
             }
             ProviderWorkerMessage::Complete(completion) => {
-                let _ = results.send(ProviderWorkerResult::Failed {
-                    document_id: completion.document_id,
-                    message: message.clone(),
-                });
+                let _ = results.send(ProviderWorkerResult::Failed { document_id: completion.document_id, message: message.clone() });
             }
             ProviderWorkerMessage::HighlightNow(highlight) => {
-                let ImmediateHighlight {
-                    document_id, reply, ..
-                } = *highlight;
+                let ImmediateHighlight { document_id, reply, .. } = *highlight;
                 let _ = reply.send(Err(format!("document {document_id:?}: {message}")));
             }
             ProviderWorkerMessage::Wake => {}

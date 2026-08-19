@@ -9,7 +9,7 @@
 
 The text layer must choose a default only after measuring Ropey, Crop, and an
 experimental piece-tree track on normal, large, long-line, and Unicode-heavy
-documents. The committed `normal.rs` has 2,002 lines; `large-100mb.js` and
+documents. The on-demand `normal.rs` has 2,002 lines; `large-100mb.js` and
 `oneline-8mb.json` are deterministic generated build artifacts.
 
 ## Measurements
@@ -71,4 +71,3 @@ cargo bench -p wren-text --bench textstore
 cargo run -p wren-text --release --example textstore_memory \
   --features memory-profiling -- crop harness/corpus/generated/large-100mb.js
 ```
-

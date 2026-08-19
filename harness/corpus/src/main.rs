@@ -12,24 +12,8 @@ fn root() -> PathBuf {
 }
 
 fn generate_normal(path: &Path) -> Result<()> {
-    let mut output = String::from("// Deterministic, real-looking Rust benchmark corpus.\n\n");
-    for module in 0..250 {
-        output.push_str(&format!(
-            "pub fn transform_{module}(input: &[u64]) -> u64 {{\n"
-        ));
-        output.push_str("    input.iter().copied()\n");
-        output.push_str(&format!(
-            "        .map(|value| value.rotate_left({}))\n",
-            module % 63 + 1
-        ));
-        output.push_str("        .filter(|value| value & 1 == 0)\n");
-        output.push_str(&format!(
-            "        .fold({module}, |sum, value| sum.wrapping_add(value))\n"
-        ));
-        output.push_str("}\n\n");
-        output.push_str(&format!("const CHECK_{module}: u64 = 0x{module:08x};\n"));
-    }
-    fs::write(path, output).with_context(|| format!("write {}", path.display()))
+    let generated = wren_benchmark_support::normal_rust_corpus()?;
+    fs::copy(generated, path).with_context(|| format!("write {}", path.display())).map(|_| ())
 }
 
 fn generate_unicode(path: &Path) -> Result<()> {
@@ -47,19 +31,11 @@ fn generate_unicode(path: &Path) -> Result<()> {
     fs::write(path, output).with_context(|| format!("write {}", path.display()))
 }
 
-fn write_repeated(
-    path: &Path,
-    target: usize,
-    prefix: &[u8],
-    pattern: &[u8],
-    suffix: &[u8],
-) -> Result<()> {
+fn write_repeated(path: &Path, target: usize, prefix: &[u8], pattern: &[u8], suffix: &[u8]) -> Result<()> {
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
     writer.write_all(prefix)?;
-    let body_len = target
-        .checked_sub(prefix.len() + suffix.len())
-        .context("target is smaller than wrapper")?;
+    let body_len = target.checked_sub(prefix.len() + suffix.len()).context("target is smaller than wrapper")?;
     let full = body_len / pattern.len();
     let remainder = body_len % pattern.len();
     for _ in 0..full {
@@ -86,13 +62,7 @@ fn generate_all() -> Result<()> {
         b"export function compute(v) { return (v * 1664525 + 1013904223) >>> 0; }\n",
         b"\n",
     )?;
-    write_repeated(
-        &generated.join("oneline-8mb.json"),
-        8 * MIB,
-        b"[\"",
-        b"abcdef0123456789",
-        b"\"]",
-    )?;
+    write_repeated(&generated.join("oneline-8mb.json"), 8 * MIB, b"[\"", b"abcdef0123456789", b"\"]")?;
     println!("generated deterministic corpus at {}", corpus.display());
     Ok(())
 }

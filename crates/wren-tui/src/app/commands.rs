@@ -1,5 +1,33 @@
 use super::*;
 
+type CustomExHandler = for<'a> fn(&mut App, std::str::SplitWhitespace<'a>) -> Result<()>;
+
+struct CustomExPlugin {
+    names: &'static [&'static str],
+    execute: CustomExHandler,
+}
+
+macro_rules! custom_ex_plugins {
+    ($($names:expr => $execute:expr),+ $(,)?) => {
+        const CUSTOM_EX_PLUGINS: &[CustomExPlugin] = &[
+            $(CustomExPlugin { names: $names, execute: $execute }),+
+        ];
+    };
+}
+
+custom_ex_plugins! {
+    &["FormatToggle"] => |app, _| app.toggle_global_format(),
+    &["FormatToggle!"] => |app, _| app.toggle_buffer_format(),
+    &["colorscheme", "Catppuccin"] => |app, mut args| app.set_colorscheme(args.next()),
+    &["setcolor"] => |app, mut args| app.set_theme_color(args.next(), args.next()),
+    &["Git"] => |app, args| app.open_git_terminal(args),
+    &["Gwrite"] => |app, _| app.git_stage_buffer(),
+    &["Gdiffsplit"] => |app, _| app.git_diff_index(),
+    &["AvanteToggle"] => |app, _| app.toggle_agent_sidebar(),
+    &["Codex", "AvanteChat", "AvanteAsk"] => |app, args| app.open_ai_prompt(args),
+    &["RustLsp"] => |app, mut args| app.open_rust_lsp_action(args.next()),
+}
+
 impl App {
     pub(super) fn execute_ex(&mut self, input: &str) -> Result<()> {
         let input = input.trim();
@@ -13,44 +41,25 @@ impl App {
     }
 
     fn execute_custom_ex(&mut self, input: &str) -> Result<bool> {
-        match input {
-            "FormatToggle" => self.toggle_global_format(),
-            "FormatToggle!" => self.toggle_buffer_format(),
-            _ => return self.execute_named_custom_ex(input),
-        }
-        Ok(true)
-    }
-
-    fn execute_named_custom_ex(&mut self, input: &str) -> Result<bool> {
         let mut words = input.split_whitespace();
         let Some(name) = words.next() else {
             return Ok(false);
         };
-        match name {
-            "colorscheme" | "Catppuccin" => self.set_colorscheme(words.next()),
-            "setcolor" => self.set_theme_color(words.next(), words.next()),
-            "Git" => self.open_git_terminal(words),
-            "Gwrite" => self.git_stage_buffer(),
-            "Gdiffsplit" => self.git_diff_index(),
-            "AvanteToggle" => self.toggle_agent_sidebar(),
-            "Codex" | "AvanteChat" | "AvanteAsk" => self.open_ai_prompt(words),
-            "RustLsp" => self.open_rust_lsp_action(words.next()),
-            _ => return Ok(false),
-        }?;
+        let Some(plugin) = CUSTOM_EX_PLUGINS.iter().find(|plugin| plugin.names.contains(&name)) else {
+            return Ok(false);
+        };
+        (plugin.execute)(self, words)?;
         Ok(true)
     }
 
-    fn toggle_global_format(&mut self) {
+    fn toggle_global_format(&mut self) -> Result<()> {
         self.format_on_save = !self.format_on_save;
-        let state = if self.format_on_save {
-            "enabled"
-        } else {
-            "disabled"
-        };
+        let state = if self.format_on_save { "enabled" } else { "disabled" };
         self.message = format!("format-on-save globally {state}");
+        Ok(())
     }
 
-    fn toggle_buffer_format(&mut self) {
+    fn toggle_buffer_format(&mut self) -> Result<()> {
         let document_id = self.active.document_id;
         let disabled = !self.format_disabled.remove(&document_id);
         if disabled {
@@ -58,12 +67,12 @@ impl App {
         }
         let state = if disabled { "disabled" } else { "enabled" };
         self.message = format!("format-on-save for buffer {state}");
+        Ok(())
     }
 
     fn set_colorscheme(&mut self, requested: Option<&str>) -> Result<()> {
         let requested = requested.unwrap_or("catppuccin");
-        let flavor = CatppuccinFlavor::parse(requested)
-            .ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
+        let flavor = CatppuccinFlavor::parse(requested).ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
         self.theme_flavor = flavor;
         self.theme = CatppuccinPalette::for_flavor(flavor);
         self.message = format!("colorscheme catppuccin-{}", flavor.name());
@@ -73,15 +82,11 @@ impl App {
     fn set_theme_color(&mut self, name: Option<&str>, value: Option<&str>) -> Result<()> {
         let name = name.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
         let value = value.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
-        let color = RgbColor::from_hex(value)
-            .ok_or_else(|| anyhow!("invalid RGB color {value:?}; expected #RRGGBB"))?;
+        let color = RgbColor::from_hex(value).ok_or_else(|| anyhow!("invalid RGB color {value:?}; expected #RRGGBB"))?;
         if !self.theme.set(name, color) {
             bail!("unknown Catppuccin color slot {name:?}");
         }
-        self.message = format!(
-            "theme {name}=#{:02x}{:02x}{:02x}",
-            color.red, color.green, color.blue
-        );
+        self.message = format!("theme {name}=#{:02x}{:02x}{:02x}", color.red, color.green, color.blue);
         Ok(())
     }
 
@@ -110,45 +115,23 @@ impl App {
     pub(super) fn execute_ex_command(&mut self, command: ExCommand) -> Result<()> {
         match command {
             ExCommand::Goto { address } => self.goto_address(&address),
-            ExCommand::Substitute {
-                range,
-                pattern,
-                replacement,
-                flags,
-            } => {
+            ExCommand::Substitute { range, pattern, replacement, flags } => {
                 let range = self.resolve_byte_range(range.as_ref())?;
-                let substitute =
-                    self.resolve_substitute(&pattern, &replacement, flags, vec![range])?;
+                let substitute = self.resolve_substitute(&pattern, &replacement, flags, vec![range])?;
                 self.start_substitution(substitute)
             }
-            ExCommand::SubstituteRepeat {
-                range,
-                use_search_pattern,
-                flags,
-            } => {
+            ExCommand::SubstituteRepeat { range, use_search_pattern, flags } => {
                 let range = self.resolve_byte_range(range.as_ref())?;
-                let substitute =
-                    self.resolve_repeated_substitute(use_search_pattern, flags, vec![range])?;
+                let substitute = self.resolve_repeated_substitute(use_search_pattern, flags, vec![range])?;
                 self.start_substitution(substitute)
             }
-            ExCommand::Global {
-                range,
-                invert,
-                pattern,
-                command,
-            } => self.execute_global(range.as_ref(), invert, &pattern, *command),
+            ExCommand::Global { range, invert, pattern, command } => self.execute_global(range.as_ref(), invert, &pattern, *command),
             ExCommand::Normal { range, keys, .. } => self.execute_normal(range.as_ref(), &keys),
-            ExCommand::Write {
-                range, all, path, ..
-            } => self.write_command(range.as_ref(), all, path.as_deref()),
+            ExCommand::Write { range, all, path, .. } => self.write_command(range.as_ref(), all, path.as_deref()),
             ExCommand::WriteQuit { path, .. } => self.write_quit(path.as_deref()),
             ExCommand::Quit { all, bang } => self.quit_command(all, bang),
             ExCommand::Edit { bang, path } => self.edit_command(bang, path.as_deref()),
-            ExCommand::Buffer {
-                action,
-                bang,
-                target,
-            } => self.buffer_command(action, bang, target.as_deref()),
+            ExCommand::Buffer { action, bang, target } => self.buffer_command(action, bang, target.as_deref()),
             ExCommand::Split { vertical, path } => self.split_command(vertical, path.as_deref()),
             ExCommand::Close { bang } => self.close_command(bang),
             ExCommand::Tab { action, path } => self.tab_command(action, path.as_deref()),
@@ -175,32 +158,24 @@ impl App {
                 Ok(())
             }
             ExCommand::Help { topic } => {
-                self.message = topic.map_or_else(
-                    || "run `wren --help` for the command reference".to_owned(),
-                    |topic| format!("help for {topic}: run `wren --help`"),
-                );
+                self.message =
+                    topic.map_or_else(|| "run `wren --help` for the command reference".to_owned(), |topic| format!("help for {topic}: run `wren --help`"));
                 Ok(())
             }
             ExCommand::Messages => self.show_debug_output(),
             ExCommand::Grep { pattern, paths } => self.grep(&pattern, &paths),
             ExCommand::Cdo { command } => self.execute_cdo(*command),
             ExCommand::ConvertUtf8 => self.convert_active_to_utf8(),
-            ExCommand::Terminal { program, arguments } => {
-                self.open_terminal(program.as_deref(), &arguments)
-            }
+            ExCommand::Terminal { program, arguments } => self.open_terminal(program.as_deref(), &arguments),
             ExCommand::Make { program, arguments } => self.start_make_task(&program, &arguments),
-            ExCommand::Format { program, arguments } => {
-                self.start_format_task(&program, &arguments)
-            }
+            ExCommand::Format { program, arguments } => self.start_format_task(&program, &arguments),
             ExCommand::Find { query } => self.start_file_picker(&query),
         }
     }
 
     fn goto_address(&mut self, address: &ExAddress) -> Result<()> {
         let line = self.resolve_address(address)?;
-        self.active
-            .editor
-            .set_cursor(self.active.editor.text().byte_of_line(line));
+        self.active.editor.set_cursor(self.active.editor.text().byte_of_line(line));
         let Some((pattern, direction)) = address_search_pattern(address) else {
             return Ok(());
         };
@@ -209,16 +184,9 @@ impl App {
         self.synchronize_search(&pattern, direction, persist)
     }
 
-    fn write_command(
-        &mut self,
-        range: Option<&ExRange>,
-        all: bool,
-        path: Option<&str>,
-    ) -> Result<()> {
+    fn write_command(&mut self, range: Option<&ExRange>, all: bool, path: Option<&str>) -> Result<()> {
         if let Some(range) = range {
-            let path = path
-                .map(Path::new)
-                .ok_or_else(|| anyhow!("ranged :write requires a destination path"))?;
+            let path = path.map(Path::new).ok_or_else(|| anyhow!("ranged :write requires a destination path"))?;
             return self.write_range(range, path);
         }
         if all {
@@ -259,11 +227,7 @@ impl App {
         if let Some(path) = path {
             self.open_buffer(Path::new(path))?;
         }
-        let (axis, message) = if vertical {
-            (SplitAxis::Vertical, "vertical split created")
-        } else {
-            (SplitAxis::Horizontal, "horizontal split created")
-        };
+        let (axis, message) = if vertical { (SplitAxis::Vertical, "vertical split created") } else { (SplitAxis::Horizontal, "horizontal split created") };
         self.views.split_active(axis)?;
         self.message = message.to_owned();
         Ok(())
@@ -309,13 +273,7 @@ impl App {
         }
         let converted = self.active.document.convert_to_utf8()?;
         self.active.editor.set_read_only(false);
-        let transaction = Transaction::new(
-            self.active.editor.revision(),
-            vec![Edit::new(
-                0..self.active.editor.text().len_bytes(),
-                converted,
-            )],
-        )?;
+        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..self.active.editor.text().len_bytes(), converted)])?;
         self.active.editor.apply_transaction(transaction.clone())?;
         self.after_transaction(Some(transaction));
         self.message = "converted invalid bytes to explicit UTF-8 \\xNN escapes".to_owned();
@@ -324,11 +282,7 @@ impl App {
 
     pub(super) fn effective_search_pattern(&self, pattern: &str) -> Result<String> {
         if pattern.is_empty() {
-            self.active
-                .editor
-                .last_search()
-                .map(|(pattern, _)| pattern.to_owned())
-                .ok_or_else(|| anyhow!("no previous search pattern"))
+            self.active.editor.last_search().map(|(pattern, _)| pattern.to_owned()).ok_or_else(|| anyhow!("no previous search pattern"))
         } else {
             Ok(pattern.to_owned())
         }
@@ -342,12 +296,9 @@ impl App {
             ExAddress::Current => current,
             ExAddress::Last => last,
             ExAddress::Line(line) => line.saturating_sub(1).min(last),
-            ExAddress::Mark(name) => self
-                .active
-                .editor
-                .mark(*name)
-                .map(|byte| self.active.editor.text().line_of_byte(byte))
-                .ok_or_else(|| anyhow!("mark '{name} is not set"))?,
+            ExAddress::Mark(name) => {
+                self.active.editor.mark(*name).map(|byte| self.active.editor.text().line_of_byte(byte)).ok_or_else(|| anyhow!("mark '{name} is not set"))?
+            }
             ExAddress::SearchForward(pattern) => {
                 let cursor = self.active.editor.primary_cursor().min(text.len());
                 let pattern = self.effective_search_pattern(pattern)?;
@@ -376,17 +327,10 @@ impl App {
 
     pub(super) fn resolve_line_range(&self, range: Option<&ExRange>) -> Result<Range<usize>> {
         let current = self.active.editor.cursor_line_column().0;
-        let last = self
-            .active
-            .editor
-            .text()
-            .line_of_byte(self.active.editor.text().len_bytes());
+        let last = self.active.editor.text().line_of_byte(self.active.editor.text().len_bytes());
         let (start, end) = if let Some(range) = range {
             let start = self.resolve_address(&range.start)?;
-            let end = range
-                .end
-                .as_ref()
-                .map_or(Ok(start), |address| self.resolve_address(address))?;
+            let end = range.end.as_ref().map_or(Ok(start), |address| self.resolve_address(address))?;
             (start.min(end), start.max(end))
         } else {
             (current, current)
@@ -396,16 +340,13 @@ impl App {
 
     pub(super) fn resolve_byte_range(&self, range: Option<&ExRange>) -> Result<Range<usize>> {
         let lines = self.resolve_line_range(range)?;
-        Ok(self.active.editor.text().byte_of_line(lines.start)
-            ..self.active.editor.text().byte_of_line(lines.end))
+        Ok(self.active.editor.text().byte_of_line(lines.start)..self.active.editor.text().byte_of_line(lines.end))
     }
 
     pub(super) fn execute_normal(&mut self, range: Option<&ExRange>, keys: &str) -> Result<()> {
         let lines: Vec<_> = self.resolve_line_range(range)?.collect();
         for line in lines.into_iter().rev() {
-            self.active
-                .editor
-                .set_cursor(self.active.editor.text().byte_of_line(line));
+            self.active.editor.set_cursor(self.active.editor.text().byte_of_line(line));
             for key in ex_normal_keys(keys) {
                 self.dispatch_key(key);
             }
@@ -413,38 +354,20 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn execute_global(
-        &mut self,
-        range: Option<&ExRange>,
-        invert: bool,
-        pattern: &str,
-        command: ExCommand,
-    ) -> Result<()> {
+    pub(super) fn execute_global(&mut self, range: Option<&ExRange>, invert: bool, pattern: &str, command: ExCommand) -> Result<()> {
         let lines = if range.is_some() {
             self.resolve_line_range(range)?
         } else {
-            0..self
-                .active
-                .editor
-                .text()
-                .line_of_byte(self.active.editor.text().len_bytes())
-                .saturating_add(1)
+            0..self.active.editor.text().line_of_byte(self.active.editor.text().len_bytes()).saturating_add(1)
         };
         let persist_pattern = !pattern.is_empty();
         let pattern = self.effective_search_pattern(pattern)?;
-        let compiled = self
-            .active
-            .editor
-            .compile_search_pattern(&pattern, CaseOverride::Default)?;
+        let compiled = self.active.editor.compile_search_pattern(&pattern, CaseOverride::Default)?;
         let text = self.active.editor.contents();
         let mut selected = Vec::new();
         for line in lines {
             let start = self.active.editor.text().byte_of_line(line);
-            let end = self
-                .active
-                .editor
-                .text()
-                .byte_of_line(line.saturating_add(1));
+            let end = self.active.editor.text().byte_of_line(line.saturating_add(1));
             if compiled.is_match(&text[start..end]) != invert {
                 selected.push((line, start..end));
             }
@@ -452,34 +375,18 @@ impl App {
         self.synchronize_search(&pattern, SearchDirection::Forward, persist_pattern)?;
         let selected_ranges = || selected.iter().map(|(_, range)| range.clone()).collect();
         match &command {
-            ExCommand::Substitute {
-                pattern,
-                replacement,
-                flags,
-                ..
-            } => {
-                let substitute =
-                    self.resolve_substitute(pattern, replacement, *flags, selected_ranges())?;
+            ExCommand::Substitute { pattern, replacement, flags, .. } => {
+                let substitute = self.resolve_substitute(pattern, replacement, *flags, selected_ranges())?;
                 return self.start_substitution(substitute);
             }
-            ExCommand::SubstituteRepeat {
-                use_search_pattern,
-                flags,
-                ..
-            } => {
-                let substitute = self.resolve_repeated_substitute(
-                    *use_search_pattern,
-                    *flags,
-                    selected_ranges(),
-                )?;
+            ExCommand::SubstituteRepeat { use_search_pattern, flags, .. } => {
+                let substitute = self.resolve_repeated_substitute(*use_search_pattern, *flags, selected_ranges())?;
                 return self.start_substitution(substitute);
             }
             _ => {}
         }
         for (line, _) in selected.into_iter().rev() {
-            self.active
-                .editor
-                .set_cursor(self.active.editor.text().byte_of_line(line));
+            self.active.editor.set_cursor(self.active.editor.text().byte_of_line(line));
             match &command {
                 ExCommand::Normal { keys, .. } => {
                     for key in ex_normal_keys(keys) {
@@ -494,40 +401,24 @@ impl App {
 
     pub(super) fn open_buffer(&mut self, path: &Path) -> Result<()> {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if self
-            .active
-            .document
-            .presentation_path()
-            .is_some_and(|open| same_path(open, &resolved))
-        {
+        if self.active.document.presentation_path().is_some_and(|open| same_path(open, &resolved)) {
             self.record_file(&resolved);
             return Ok(());
         }
-        if let Some(index) = self.inactive.iter().position(|buffer| {
-            buffer
-                .document
-                .presentation_path()
-                .is_some_and(|open| same_path(open, &resolved))
-        }) {
+        if let Some(index) = self.inactive.iter().position(|buffer| buffer.document.presentation_path().is_some_and(|open| same_path(open, &resolved))) {
             self.switch_to_inactive(index)?;
             self.record_file(&resolved);
             return Ok(());
         }
         let document_id = stable_document_id(Some(&resolved));
-        let buffer_id = self
-            .views
-            .add_buffer(document_id, resolved.display().to_string());
-        let (mut buffer, message) =
-            BufferState::open(buffer_id, document_id, Some(&resolved), None)?;
+        let buffer_id = self.views.add_buffer(document_id, resolved.display().to_string());
+        let (mut buffer, message) = BufferState::open(buffer_id, document_id, Some(&resolved), None)?;
         restore_client_state(&mut buffer, &self.client_state)?;
         if let Some(pattern) = self.client_state.search_history.last() {
-            buffer
-                .editor
-                .restore_search(pattern.clone(), self.last_search_direction)?;
+            buffer.editor.restore_search(pattern.clone(), self.last_search_direction)?;
         }
         let replace_stale = !buffer.editor.is_dirty();
-        self.mutations
-            .register(document_id, buffer.editor.contents(), replace_stale)?;
+        self.mutations.register(document_id, buffer.editor.contents(), replace_stale)?;
         self.autosave_active_if_named()?;
         let previous = std::mem::replace(&mut self.active, buffer);
         self.inactive.push(previous);
@@ -540,47 +431,31 @@ impl App {
     }
 
     pub(super) fn current_jump_location(&self) -> Option<JumpLocation> {
-        self.active
-            .document
-            .presentation_path()
-            .map(|path| JumpLocation {
-                document_id: self.active.document_id,
-                path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-                byte: self.active.editor.primary_cursor(),
-            })
+        self.active.document.presentation_path().map(|path| JumpLocation {
+            document_id: self.active.document_id,
+            path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            byte: self.active.editor.primary_cursor(),
+        })
     }
 
     pub(super) fn entry_cursor_byte(&self, entry: &QuickfixEntry) -> usize {
         let line = entry.line.saturating_sub(1);
         let start = self.active.editor.text().byte_of_line(line);
-        let end = self
-            .active
-            .editor
-            .text()
-            .byte_of_line(line.saturating_add(1));
+        let end = self.active.editor.text().byte_of_line(line.saturating_add(1));
         let text = self.active.editor.contents();
         let line_text = text.get(start..end).unwrap_or_default();
         let column = entry.column.saturating_sub(1);
         if !entry.column_utf16 {
             return start.saturating_add(column.min(line_text.len()));
         }
-        let mut utf16 = 0;
-        for (byte, character) in line_text.char_indices() {
-            if utf16 >= column {
-                return start.saturating_add(byte);
-            }
-            utf16 = utf16.saturating_add(character.len_utf16());
-        }
-        end
+        start.saturating_add(utf16_column_to_byte(line_text, column).unwrap_or(line_text.len()))
     }
 
     pub(super) fn record_navigation(&mut self, origin: JumpLocation, target: JumpLocation) {
         if origin == target {
             return;
         }
-        let retained = self
-            .jump_index
-            .map_or(self.jump_history.len(), |index| index.saturating_add(1));
+        let retained = self.jump_index.map_or(self.jump_history.len(), |index| index.saturating_add(1));
         self.jump_history.truncate(retained);
         if self.jump_history.last() != Some(&origin) {
             self.jump_history.push(origin);
@@ -607,13 +482,7 @@ impl App {
         let Some(index) = self.jump_index else {
             return Ok(false);
         };
-        let next = if backward {
-            index.checked_sub(1)
-        } else {
-            index
-                .checked_add(1)
-                .filter(|next| *next < self.jump_history.len())
-        };
+        let next = if backward { index.checked_sub(1) } else { index.checked_add(1).filter(|next| *next < self.jump_history.len()) };
         let Some(next) = next else {
             return Ok(false);
         };
@@ -632,35 +501,15 @@ impl App {
             .iter()
             .map(|location| DurableJumpEntry {
                 document_id: location.document_id,
-                anchor: Anchor {
-                    byte: location.byte,
-                    bias: Bias::Right,
-                },
-                path_hint: Some(
-                    location
-                        .path
-                        .to_string_lossy()
-                        .into_owned()
-                        .into_boxed_str(),
-                ),
+                anchor: Anchor { byte: location.byte, bias: Bias::Right },
+                path_hint: Some(location.path.to_string_lossy().into_owned().into_boxed_str()),
             })
             .collect();
-        self.after_effect(
-            None,
-            vec![StateDelta::JumpList {
-                entries,
-                current: self.jump_index,
-            }],
-        );
+        self.after_effect(None, vec![StateDelta::JumpList { entries, current: self.jump_index }]);
     }
 
     pub(super) fn record_active_file(&mut self) {
-        if let Some(path) = self
-            .active
-            .document
-            .presentation_path()
-            .map(Path::to_path_buf)
-        {
+        if let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) {
             self.record_file(&path);
         }
     }
@@ -677,10 +526,7 @@ impl App {
 
     pub(super) fn switch_to_inactive(&mut self, index: usize) -> Result<()> {
         self.autosave_active_if_named()?;
-        let buffer = self
-            .inactive
-            .get_mut(index)
-            .ok_or_else(|| anyhow!("buffer index disappeared"))?;
+        let buffer = self.inactive.get_mut(index).ok_or_else(|| anyhow!("buffer index disappeared"))?;
         std::mem::swap(&mut self.active, buffer);
         self.views.set_active_buffer(self.active.buffer_id)?;
         self.message = self.active.name();
@@ -694,20 +540,11 @@ impl App {
         if wanted == self.active.buffer_id {
             return Ok(());
         }
-        let index = self
-            .inactive
-            .iter()
-            .position(|buffer| buffer.buffer_id == wanted)
-            .ok_or_else(|| anyhow!("view references a missing buffer"))?;
+        let index = self.inactive.iter().position(|buffer| buffer.buffer_id == wanted).ok_or_else(|| anyhow!("view references a missing buffer"))?;
         self.switch_to_inactive(index)
     }
 
-    pub(super) fn buffer_command(
-        &mut self,
-        action: BufferAction,
-        bang: bool,
-        target: Option<&str>,
-    ) -> Result<()> {
+    pub(super) fn buffer_command(&mut self, action: BufferAction, bang: bool, target: Option<&str>) -> Result<()> {
         if action == BufferAction::Delete {
             if self.active.editor.is_dirty() && !bang {
                 self.show_error("E89: unsaved changes; use :bdelete!");
@@ -725,17 +562,9 @@ impl App {
             return Ok(());
         }
 
-        let mut ids: Vec<_> = self
-            .inactive
-            .iter()
-            .map(|buffer| buffer.buffer_id)
-            .chain(std::iter::once(self.active.buffer_id))
-            .collect();
+        let mut ids: Vec<_> = self.inactive.iter().map(|buffer| buffer.buffer_id).chain(std::iter::once(self.active.buffer_id)).collect();
         ids.sort_by_key(|id| id.get());
-        let current = ids
-            .iter()
-            .position(|id| *id == self.active.buffer_id)
-            .unwrap_or(0);
+        let current = ids.iter().position(|id| *id == self.active.buffer_id).unwrap_or(0);
         let wanted = match action {
             BufferAction::Next => ids[(current + 1) % ids.len()],
             BufferAction::Previous => ids[(current + ids.len() - 1) % ids.len()],
@@ -743,31 +572,21 @@ impl App {
             BufferAction::Last => ids[ids.len() - 1],
             BufferAction::Select => {
                 let Some(target) = target else {
-                    self.message = format!(
-                        "buffer {}: {}",
-                        self.active.buffer_id.get(),
-                        self.active.name()
-                    );
+                    self.message = format!("buffer {}: {}", self.active.buffer_id.get(), self.active.name());
                     return Ok(());
                 };
                 let numeric = target.parse::<u64>().ok();
                 self.inactive
                     .iter()
                     .chain(std::iter::once(&self.active))
-                    .find(|buffer| {
-                        numeric == Some(buffer.buffer_id.get()) || buffer.name().contains(target)
-                    })
+                    .find(|buffer| numeric == Some(buffer.buffer_id.get()) || buffer.name().contains(target))
                     .map(|buffer| buffer.buffer_id)
                     .ok_or_else(|| anyhow!("no matching buffer: {target}"))?
             }
             BufferAction::Delete => unreachable!(),
         };
         if wanted != self.active.buffer_id {
-            let index = self
-                .inactive
-                .iter()
-                .position(|buffer| buffer.buffer_id == wanted)
-                .ok_or_else(|| anyhow!("buffer disappeared"))?;
+            let index = self.inactive.iter().position(|buffer| buffer.buffer_id == wanted).ok_or_else(|| anyhow!("buffer disappeared"))?;
             self.switch_to_inactive(index)?;
         }
         Ok(())
@@ -815,10 +634,7 @@ impl App {
     }
 
     pub(super) fn autosave_active_if_named(&mut self) -> Result<()> {
-        if self.active.editor.is_dirty()
-            && !self.active.editor.is_read_only()
-            && self.active.document.presentation_path().is_some()
-        {
+        if self.active.editor.is_dirty() && !self.active.editor.is_read_only() && self.active.document.presentation_path().is_some() {
             if self.format_on_save
                 && !self.format_disabled.contains(&self.active.document_id)
                 && let Err(error) = self.format_active_sync(false)
@@ -833,20 +649,13 @@ impl App {
     pub(super) fn write_range(&mut self, range: &ExRange, path: &Path) -> Result<()> {
         let range = self.resolve_byte_range(Some(range))?;
         let contents = self.active.editor.contents();
-        let selected = contents
-            .get(range)
-            .ok_or_else(|| anyhow!("resolved write range is not on UTF-8 boundaries"))?;
-        let (mut target, opened) = LocalDocument::open_or_new(path)
-            .with_context(|| format!("open range destination {}", path.display()))?;
+        let selected = contents.get(range).ok_or_else(|| anyhow!("resolved write range is not on UTF-8 boundaries"))?;
+        let (mut target, opened) = LocalDocument::open_or_new(path).with_context(|| format!("open range destination {}", path.display()))?;
         if opened.read_only {
             bail!("range destination {} is not editable UTF-8", path.display());
         }
         let report = target.save(selected)?;
-        self.message = format!(
-            "{} bytes written to {}",
-            report.bytes_written,
-            path.display()
-        );
+        self.message = format!("{} bytes written to {}", report.bytes_written, path.display());
         Ok(())
     }
 
@@ -857,22 +666,13 @@ impl App {
         Ok(())
     }
 
-    pub(super) fn populate_grep_results(
-        &mut self,
-        pattern: &str,
-        paths: &[Box<str>],
-        root: &Path,
-    ) -> Result<()> {
+    pub(super) fn populate_grep_results(&mut self, pattern: &str, paths: &[Box<str>], root: &Path) -> Result<()> {
         if pattern.is_empty() {
             self.quickfix.clear();
             return Ok(());
         }
         let mut command = Command::new("rg");
-        command
-            .current_dir(root)
-            .arg("--vimgrep")
-            .arg("--")
-            .arg(pattern);
+        command.current_dir(root).arg("--vimgrep").arg("--").arg(pattern);
         if paths.is_empty() {
             command.arg(".");
         } else {
@@ -880,10 +680,7 @@ impl App {
         }
         let output = command.output().context("run native rg search")?;
         if !output.status.success() && output.status.code() != Some(1) {
-            bail!(
-                "rg failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            bail!("rg failed: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
         self.quickfix = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -927,12 +724,7 @@ impl App {
     }
 
     pub(super) fn refresh_diagnostics(&mut self) -> Result<()> {
-        let Some(path) = self
-            .active
-            .document
-            .presentation_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
             self.diagnostics.clear();
             return Ok(());
         };
@@ -950,28 +742,11 @@ impl App {
             .current_dir(&invocation.directory)
             .output()
             .with_context(|| format!("run diagnostics with {}", invocation.program))?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        self.diagnostics = combined
-            .lines()
-            .filter_map(|line| parse_diagnostic_line(line, &invocation.directory))
-            .collect();
+        let combined = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        self.diagnostics = combined.lines().filter_map(|line| parse_diagnostic_line(line, &invocation.directory)).collect();
         if self.diagnostics.is_empty() && !output.status.success() {
-            let detail = combined
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("diagnostic command failed")
-                .trim();
-            self.diagnostics.push(DiagnosticEntry {
-                path,
-                line: 1,
-                column: 1,
-                severity: DiagnosticSeverity::Error,
-                message: detail.to_owned(),
-            });
+            let detail = combined.lines().find(|line| !line.trim().is_empty()).unwrap_or("diagnostic command failed").trim();
+            self.diagnostics.push(DiagnosticEntry { path, line: 1, column: 1, severity: DiagnosticSeverity::Error, message: detail.to_owned() });
         }
         self.diagnostics.sort_by(|left, right| {
             left.severity
@@ -992,30 +767,13 @@ impl App {
             .iter()
             .filter(|entry| path.is_some_and(|path| same_path(path, &entry.path)))
             .min_by_key(|entry| entry.line.abs_diff(cursor_line))
-            .map_or_else(
-                || "no diagnostics".to_owned(),
-                |entry| {
-                    format!(
-                        "{} {}:{}: {}",
-                        entry.severity.label(),
-                        entry.line,
-                        entry.column,
-                        entry.message
-                    )
-                },
-            );
+            .map_or_else(|| "no diagnostics".to_owned(), |entry| format!("{} {}:{}: {}", entry.severity.label(), entry.line, entry.column, entry.message));
         if diagnostic == "no diagnostics" {
             self.popup = None;
             self.popup_deadline = None;
             self.message = diagnostic;
         } else {
-            self.popup = Some(TextPopup {
-                title: "diagnostic".into(),
-                text: diagnostic.into(),
-                scroll: 0,
-                cursor: None,
-                decorations: Vec::new(),
-            });
+            self.popup = Some(TextPopup::new("diagnostic", diagnostic));
             self.popup_deadline = None;
             self.message.clear();
         }
@@ -1024,61 +782,31 @@ impl App {
 
     pub(super) fn move_diagnostic(&mut self, direction: isize) -> Result<()> {
         self.refresh_diagnostics()?;
-        let Some(path) = self
-            .active
-            .document
-            .presentation_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
             self.message = "no diagnostics".to_owned();
             return Ok(());
         };
         let current = self.active.editor.cursor_line_column().0 + 1;
-        let entries = self
-            .diagnostics
-            .iter()
-            .filter(|entry| same_path(&entry.path, &path))
-            .collect::<Vec<_>>();
+        let entries = self.diagnostics.iter().filter(|entry| same_path(&entry.path, &path)).collect::<Vec<_>>();
         let selected = if direction < 0 {
-            entries
-                .iter()
-                .rev()
-                .find(|entry| entry.line < current)
-                .or_else(|| entries.last())
+            entries.iter().rev().find(|entry| entry.line < current).or_else(|| entries.last())
         } else {
-            entries
-                .iter()
-                .find(|entry| entry.line > current)
-                .or_else(|| entries.first())
+            entries.iter().find(|entry| entry.line > current).or_else(|| entries.first())
         };
         let Some(entry) = selected.copied() else {
             self.message = "no diagnostics".to_owned();
             return Ok(());
         };
-        let line_start = self
-            .active
-            .editor
-            .text()
-            .byte_of_line(entry.line.saturating_sub(1));
-        self.active
-            .editor
-            .set_cursor(line_start.saturating_add(entry.column.saturating_sub(1)));
+        let line_start = self.active.editor.text().byte_of_line(entry.line.saturating_sub(1));
+        self.active.editor.set_cursor(line_start.saturating_add(entry.column.saturating_sub(1)));
         self.message = format!("{}: {}", entry.severity.label(), entry.message);
         Ok(())
     }
 
     pub(super) fn active_git_file(&self) -> Result<(PathBuf, PathBuf, PathBuf)> {
-        let path = self
-            .active
-            .document
-            .presentation_path()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| anyhow!("Git action needs a named buffer"))?;
+        let path = self.active.document.presentation_path().map(Path::to_path_buf).ok_or_else(|| anyhow!("Git action needs a named buffer"))?;
         let root = git_root_for(&path)?;
-        let relative = path
-            .strip_prefix(&root)
-            .with_context(|| format!("{} is outside {}", path.display(), root.display()))?
-            .to_path_buf();
+        let relative = path.strip_prefix(&root).with_context(|| format!("{} is outside {}", path.display(), root.display()))?.to_path_buf();
         Ok((root, relative, path))
     }
 
@@ -1099,10 +827,7 @@ impl App {
                 .output()
                 .context("mark untracked file as intent-to-add")?;
             if !output.status.success() {
-                bail!(
-                    "git add --intent-to-add: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
+                bail!("git add --intent-to-add: {}", String::from_utf8_lossy(&output.stderr).trim());
             }
         }
         let before = git_index_contents(&root, &relative)?;
@@ -1114,18 +839,12 @@ impl App {
     pub(super) fn selected_git_patch(&self) -> Result<(PathBuf, Vec<u8>)> {
         let (root, patch) = self.active_git_patch()?;
         let (cursor_line, _) = self.active.editor.cursor_line_column();
-        let line_range =
-            matches!(self.active.editor.mode(), Mode::Visual | Mode::VisualLine).then(|| {
-                let region = self.active.editor.selection_byte_range();
-                let start = self.active.editor.text().line_of_byte(region.start) + 1;
-                let end = self
-                    .active
-                    .editor
-                    .text()
-                    .line_of_byte(region.end.saturating_sub(1))
-                    + 1;
-                start..end.saturating_add(1)
-            });
+        let line_range = matches!(self.active.editor.mode(), Mode::Visual | Mode::VisualLine).then(|| {
+            let region = self.active.editor.selection_byte_range();
+            let start = self.active.editor.text().line_of_byte(region.start) + 1;
+            let end = self.active.editor.text().line_of_byte(region.end.saturating_sub(1)) + 1;
+            start..end.saturating_add(1)
+        });
         let selected = select_git_hunk(&patch, cursor_line + 1, line_range.as_ref())?;
         Ok((root, selected))
     }
@@ -1152,17 +871,10 @@ impl App {
                 hunk.after.start <= cursor && cursor < end
             })
             .ok_or_else(|| anyhow!("cursor is not in a changed Git hunk"))?;
-        let after_range =
-            byte_range_of_lines(&after, hunk.after.start as usize..hunk.after.end as usize);
-        let before_range = byte_range_of_lines(
-            &before,
-            hunk.before.start as usize..hunk.before.end as usize,
-        );
+        let after_range = byte_range_of_lines(&after, hunk.after.start as usize..hunk.after.end as usize);
+        let before_range = byte_range_of_lines(&before, hunk.before.start as usize..hunk.before.end as usize);
         let replacement = before.get(before_range).unwrap_or_default().to_owned();
-        let transaction = Transaction::new(
-            self.active.editor.revision(),
-            vec![Edit::new(after_range, replacement)],
-        )?;
+        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(after_range, replacement)])?;
         self.active.editor.apply_transaction(transaction.clone())?;
         self.after_transaction(Some(transaction));
         self.message = "reset hunk".to_owned();
@@ -1196,13 +908,7 @@ impl App {
 
     pub(super) fn git_preview_hunk(&mut self) -> Result<()> {
         let (_, patch) = self.selected_git_patch()?;
-        self.popup = Some(TextPopup {
-            title: "Git hunk".into(),
-            text: String::from_utf8_lossy(&patch).into_owned().into(),
-            scroll: 0,
-            cursor: None,
-            decorations: Vec::new(),
-        });
+        self.popup = Some(TextPopup::new("Git hunk", String::from_utf8_lossy(&patch).into_owned()));
         self.popup_deadline = None;
         self.message.clear();
         Ok(())
@@ -1220,18 +926,9 @@ impl App {
             .output()
             .context("run git blame")?;
         if !output.status.success() {
-            bail!(
-                "git blame: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            bail!("git blame: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
-        self.popup = Some(TextPopup {
-            title: "Git blame".into(),
-            text: String::from_utf8_lossy(&output.stdout).trim().into(),
-            scroll: 0,
-            cursor: None,
-            decorations: Vec::new(),
-        });
+        self.popup = Some(TextPopup::new("Git blame", String::from_utf8_lossy(&output.stdout).trim()));
         self.popup_deadline = None;
         self.message.clear();
         Ok(())
@@ -1241,45 +938,21 @@ impl App {
         let (root, relative, _) = self.active_git_file()?;
         let root = root.to_string_lossy().into_owned().into_boxed_str();
         let relative = relative.to_string_lossy().into_owned().into_boxed_str();
-        self.open_terminal(
-            Some("git"),
-            &[
-                "-C".into(),
-                root,
-                "--no-pager".into(),
-                "diff".into(),
-                "--".into(),
-                relative,
-            ],
-        )
+        self.open_terminal(Some("git"), &["-C".into(), root, "--no-pager".into(), "diff".into(), "--".into(), relative])
     }
 
     pub(super) fn move_git_hunk(&mut self, direction: isize) -> Result<()> {
         let current = u32::try_from(self.active.editor.cursor_line_column().0).unwrap_or(u32::MAX);
         let selected = if direction < 0 {
-            self.active
-                .git_hunks
-                .iter()
-                .rev()
-                .find(|hunk| hunk.after.start < current)
-                .or_else(|| self.active.git_hunks.last())
+            self.active.git_hunks.iter().rev().find(|hunk| hunk.after.start < current).or_else(|| self.active.git_hunks.last())
         } else {
-            self.active
-                .git_hunks
-                .iter()
-                .find(|hunk| hunk.after.start > current)
-                .or_else(|| self.active.git_hunks.first())
+            self.active.git_hunks.iter().find(|hunk| hunk.after.start > current).or_else(|| self.active.git_hunks.first())
         };
         let Some(hunk) = selected else {
             self.message = "no Git hunks".to_owned();
             return Ok(());
         };
-        self.active.editor.set_cursor(
-            self.active
-                .editor
-                .text()
-                .byte_of_line(hunk.after.start as usize),
-        );
+        self.active.editor.set_cursor(self.active.editor.text().byte_of_line(hunk.after.start as usize));
         self.message = format!(
             "hunk -{},{} +{},{}",
             hunk.before.start + 1,
@@ -1291,21 +964,12 @@ impl App {
     }
 
     pub(super) fn refresh_active_git_baseline(&mut self) {
-        self.active.git_index_text = self
-            .active_git_file()
-            .ok()
-            .and_then(|(root, relative, _)| git_index_contents(&root, &relative).ok())
-            .map(Arc::from);
+        self.active.git_index_text = self.active_git_file().ok().and_then(|(root, relative, _)| git_index_contents(&root, &relative).ok()).map(Arc::from);
         self.active.refresh_git_hunks();
     }
 
     pub(super) fn toggle_breakpoint(&mut self, condition: Option<String>) {
-        let Some(path) = self
-            .active
-            .document
-            .presentation_path()
-            .map(Path::to_path_buf)
-        else {
+        let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
             self.message = "breakpoints need a named buffer".to_owned();
             return;
         };
@@ -1314,10 +978,7 @@ impl App {
         if file.remove(&line).is_some() {
             self.message = format!("removed breakpoint at {}:{line}", path.display());
         } else {
-            let label = condition
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .map_or_else(String::new, |value| format!(" if {value}"));
+            let label = condition.as_deref().filter(|value| !value.is_empty()).map_or_else(String::new, |value| format!(" if {value}"));
             file.insert(line, condition.filter(|value| !value.is_empty()));
             self.message = format!("breakpoint at {}:{line}{label}", path.display());
         }
@@ -1329,67 +990,34 @@ impl App {
             .iter()
             .flat_map(|(path, lines)| {
                 lines.iter().map(move |(line, condition)| {
-                    format!(
-                        "● {}:{line}{}",
-                        path.display(),
-                        condition
-                            .as_deref()
-                            .map_or_else(String::new, |condition| format!(" if {condition}"))
-                    )
+                    format!("● {}:{line}{}", path.display(), condition.as_deref().map_or_else(String::new, |condition| format!(" if {condition}")))
                 })
             })
             .collect::<Vec<_>>()
             .join("\n");
         let (line, column) = self.active.editor.cursor_line_column();
-        let stacks = format!(
-            "▾ current thread\n  {}:{}:{}",
-            self.active.name(),
-            line + 1,
-            column + 1
-        );
-        let repl = self
-            .terminal
-            .as_ref()
-            .map(|_| self.terminal_frame().text.to_string())
-            .unwrap_or_else(|| "Press <Space>dl to start the debugger REPL".to_owned());
+        let stacks = format!("▾ current thread\n  {}:{}:{}", self.active.name(), line + 1, column + 1);
+        let repl =
+            self.terminal.as_ref().map(|_| self.terminal_frame().text.to_string()).unwrap_or_else(|| "Press <Space>dl to start the debugger REPL".to_owned());
         DebugOverlay {
             scopes: "▸ Locals\n▸ Arguments\n▸ Registers".into(),
-            breakpoints: if breakpoints.is_empty() {
-                "No breakpoints".into()
-            } else {
-                breakpoints.into()
-            },
+            breakpoints: if breakpoints.is_empty() { "No breakpoints".into() } else { breakpoints.into() },
             stacks: stacks.into(),
             watches: "Add watches from the REPL".into(),
             repl: repl.into(),
-            console: if self.message.is_empty() {
-                "Debugger console".into()
-            } else {
-                self.message.clone().into()
-            },
+            console: if self.message.is_empty() { "Debugger console".into() } else { self.message.clone().into() },
         }
     }
 
     pub(super) fn open_debug_repl(&mut self) -> Result<()> {
-        let path = self
-            .active
-            .document
-            .presentation_path()
-            .map(|path| path.to_string_lossy().into_owned());
+        let path = self.active.document.presentation_path().map(|path| path.to_string_lossy().into_owned());
         let language = language_bundle(self.active.document.presentation_path()).language_id;
         let (program, arguments): (&str, Vec<Box<str>>) = match language.as_ref() {
-            "python" if executable_exists("python3") => (
-                "python3",
-                path.map_or_else(
-                    || vec!["-m".into(), "pdb".into()],
-                    |path| vec!["-m".into(), "pdb".into(), path.into_boxed_str()],
-                ),
-            ),
+            "python" if executable_exists("python3") => {
+                ("python3", path.map_or_else(|| vec!["-m".into(), "pdb".into()], |path| vec!["-m".into(), "pdb".into(), path.into_boxed_str()]))
+            }
             "go" if executable_exists("dlv") => ("dlv", vec!["debug".into()]),
-            "rust" | "c" | "cpp" if executable_exists("lldb") => (
-                "lldb",
-                path.map_or_else(Vec::new, |path| vec![path.into_boxed_str()]),
-            ),
+            "rust" | "c" | "cpp" if executable_exists("lldb") => ("lldb", path.map_or_else(Vec::new, |path| vec![path.into_boxed_str()])),
             _ => {
                 self.message = format!("no installed debugger for {language}");
                 return Ok(());
@@ -1412,7 +1040,7 @@ impl App {
         };
         if let Some(terminal) = &mut self.terminal {
             terminal.send_input(command.as_bytes())?;
-            self.terminal_focused = true;
+            self.input_focus = InputFocus::Terminal { escape_pending: false };
             self.message = format!("debug {action}");
         }
         Ok(())
@@ -1425,15 +1053,8 @@ impl App {
             return Ok(());
         }
         let url = format!("https://hoogle.haskell.org/?hoogle={}", url_encode(&query));
-        let program = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        Command::new(program)
-            .arg(&url)
-            .spawn()
-            .with_context(|| format!("open {url}"))?;
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(program).arg(&url).spawn().with_context(|| format!("open {url}"))?;
         self.message = format!("Hoogle: {query}");
         Ok(())
     }
@@ -1448,16 +1069,8 @@ impl App {
             self.message = "hoogle is not installed".to_owned();
             return Ok(());
         }
-        let output = Command::new("hoogle")
-            .args(["--count=1", "--color=false", "--"])
-            .arg(&query)
-            .output()
-            .context("run Hoogle")?;
-        self.message = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("no Hoogle result")
-            .to_owned();
+        let output = Command::new("hoogle").args(["--count=1", "--color=false", "--"]).arg(&query).output().context("run Hoogle")?;
+        self.message = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("no Hoogle result").to_owned();
         Ok(())
     }
 
@@ -1468,11 +1081,7 @@ impl App {
         let arguments = if package {
             Vec::new()
         } else {
-            self.active
-                .document
-                .presentation_path()
-                .map(|path| vec![path.to_string_lossy().into_owned().into_boxed_str()])
-                .unwrap_or_default()
+            self.active.document.presentation_path().map(|path| vec![path.to_string_lossy().into_owned().into_boxed_str()]).unwrap_or_default()
         };
         self.open_terminal(Some("ghci"), &arguments)
     }
@@ -1490,9 +1099,7 @@ impl App {
     pub(super) fn evaluate_in_repl(&mut self) -> Result<()> {
         let text = self.active.editor.contents();
         let expression = if matches!(self.active.editor.mode(), Mode::Visual | Mode::VisualLine) {
-            text.get(self.active.editor.selection_byte_range())
-                .unwrap_or_default()
-                .to_owned()
+            text.get(self.active.editor.selection_byte_range()).unwrap_or_default().to_owned()
         } else {
             let line = self.active.editor.cursor_line_column().0;
             let start = self.active.editor.text().byte_of_line(line);
@@ -1505,16 +1112,12 @@ impl App {
         if let Some(terminal) = &mut self.terminal {
             terminal.send_input(expression.as_bytes())?;
             terminal.send_input(b"\n")?;
-            self.terminal_focused = true;
+            self.input_focus = InputFocus::Terminal { escape_pending: false };
         }
         Ok(())
     }
 }
 
 fn joined_entries(entries: Vec<String>, empty: &str) -> String {
-    if entries.is_empty() {
-        empty.to_owned()
-    } else {
-        entries.join("  ")
-    }
+    if entries.is_empty() { empty.to_owned() } else { entries.join("  ") }
 }

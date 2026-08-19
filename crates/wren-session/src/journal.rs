@@ -3,20 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_vendor = "apple",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use wren_types::{
-    ClientMutation, DocumentFrontier, LeaseGrant, MutationResult, SessionEpoch, SessionEvent,
-    SessionId, SessionSequence, StateDelta, WorkspaceGeneration,
+    ClientMutation, DocumentFrontier, LeaseGrant, MutationResult, SessionEpoch, SessionEvent, SessionId, SessionSequence, StateDelta, WorkspaceGeneration,
 };
 
 const MAGIC: &[u8; 8] = b"WRENSES1";
@@ -29,52 +21,15 @@ pub(crate) struct RegisteredDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum JournalEntry {
-    Initialized {
-        session_id: SessionId,
-        session_epoch: SessionEpoch,
-        workspace_generation: WorkspaceGeneration,
-    },
+    Initialized { session_id: SessionId, session_epoch: SessionEpoch, workspace_generation: WorkspaceGeneration },
     DocumentRegistered(RegisteredDocument),
-    MutationCommitted {
-        mutation: ClientMutation,
-        durable: MutationResult,
-        events: Vec<SessionEvent>,
-    },
-    LeaseChanged {
-        grant: LeaseGrant,
-        event: SessionEvent,
-    },
-    StateCheckpointed {
-        client_id: wren_types::ClientId,
-        through_client_sequence: wren_types::ClientSequence,
-        state: Vec<StateDelta>,
-    },
-    ContinuityBroken {
-        new_session_epoch: SessionEpoch,
-        workspace_generation: WorkspaceGeneration,
-        retained_after: SessionSequence,
-    },
+    MutationCommitted { mutation: ClientMutation, durable: MutationResult, events: Vec<SessionEvent> },
+    LeaseChanged { grant: LeaseGrant, event: SessionEvent },
+    StateCheckpointed { client_id: wren_types::ClientId, through_client_sequence: wren_types::ClientSequence, state: Vec<StateDelta> },
+    ContinuityBroken { new_session_epoch: SessionEpoch, workspace_generation: WorkspaceGeneration, retained_after: SessionSequence },
 }
 
-#[derive(Debug, Error)]
-pub enum SessionJournalError {
-    #[error("session journal operation for {path} failed: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("session journal record in {path} has an invalid checksum at byte {offset}")]
-    Checksum { path: PathBuf, offset: usize },
-    #[error("session journal record in {path} is malformed at byte {offset}: {reason}")]
-    Malformed {
-        path: PathBuf,
-        offset: usize,
-        reason: String,
-    },
-    #[error("session journal serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-}
+pub type SessionJournalError = crate::record::DurableRecordError;
 
 #[derive(Debug, Clone)]
 pub struct SessionJournal {
@@ -85,10 +40,7 @@ pub struct SessionJournal {
 impl SessionJournal {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            writer: Arc::new(Mutex::new(None)),
-        }
+        Self { path: path.into(), writer: Arc::new(Mutex::new(None)) }
     }
 
     #[must_use]
@@ -117,84 +69,42 @@ impl SessionJournal {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| self.io(io::Error::other("session journal writer lock poisoned")))?;
+        let mut writer = self.writer.lock().map_err(|_| self.io(io::Error::other("session journal writer lock poisoned")))?;
         if writer.is_none() {
             if let Some(parent) = self.path.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
             }
             let mut options = OpenOptions::new();
             options.create(true).append(true);
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_vendor = "apple",
-                target_os = "netbsd",
-                target_os = "openbsd"
-            ))]
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
             options.custom_flags(nix::fcntl::OFlag::O_DSYNC.bits());
             *writer = Some(options.open(&self.path).map_err(|error| self.io(error))?);
         }
-        let file = writer
-            .as_mut()
-            .ok_or_else(|| self.io(io::Error::other("session journal writer unavailable")))?;
-        crate::record::write_many(file, MAGIC, entries).map_err(|error| self.record(error))?;
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
+        let file = writer.as_mut().ok_or_else(|| self.io(io::Error::other("session journal writer unavailable")))?;
+        self.records().write_many(file, entries)?;
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
         {
             // O_DSYNC makes completion of the record write itself the durable
             // frontier; issuing a second sync syscall adds latency but no
             // stronger guarantee.
             Ok(())
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_vendor = "apple",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        )))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd")))]
         {
             file.sync_data().map_err(|error| self.io(error))
         }
     }
 
     pub(crate) fn recover(&self) -> Result<Vec<JournalEntry>, SessionJournalError> {
-        crate::record::recover(&self.path, MAGIC).map_err(|error| self.record(error))
+        self.records().recover()
     }
 
     fn io(&self, source: io::Error) -> SessionJournalError {
-        SessionJournalError::Io {
-            path: self.path.clone(),
-            source,
-        }
+        self.records().error(source)
     }
 
-    fn record(&self, error: crate::record::RecordError) -> SessionJournalError {
-        match error {
-            crate::record::RecordError::Io(source) => self.io(source),
-            crate::record::RecordError::Checksum { offset } => SessionJournalError::Checksum {
-                path: self.path.clone(),
-                offset,
-            },
-            crate::record::RecordError::Malformed { offset, reason } => {
-                SessionJournalError::Malformed {
-                    path: self.path.clone(),
-                    offset,
-                    reason: reason.into(),
-                }
-            }
-            crate::record::RecordError::Serialization(error) => {
-                SessionJournalError::Serialization(error)
-            }
-        }
+    fn records(&self) -> crate::record::RecordStore<'_> {
+        crate::record::RecordStore::new("session journal", &self.path, MAGIC)
     }
 }
 
@@ -208,11 +118,7 @@ mod tests {
     use super::*;
 
     fn initialized() -> JournalEntry {
-        JournalEntry::Initialized {
-            session_id: SessionId::new(1),
-            session_epoch: SessionEpoch::new(1),
-            workspace_generation: WorkspaceGeneration::new(1),
-        }
+        JournalEntry::Initialized { session_id: SessionId::new(1), session_epoch: SessionEpoch::new(1), workspace_generation: WorkspaceGeneration::new(1) }
     }
 
     #[test]
@@ -220,12 +126,7 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let journal = SessionJournal::in_directory(directory.path());
         journal.append(&initialized()).expect("append");
-        OpenOptions::new()
-            .append(true)
-            .open(journal.path())
-            .expect("open journal")
-            .write_all(b"WRENSES1\x20")
-            .expect("append torn record");
+        OpenOptions::new().append(true).open(journal.path()).expect("open journal").write_all(b"WRENSES1\x20").expect("append torn record");
         assert_eq!(journal.recover().expect("recover"), vec![initialized()]);
     }
 
@@ -237,9 +138,6 @@ mod tests {
         let mut bytes = fs::read(journal.path()).expect("read journal");
         *bytes.last_mut().expect("payload") ^= 1;
         fs::write(journal.path(), bytes).expect("corrupt journal");
-        assert!(matches!(
-            journal.recover(),
-            Err(SessionJournalError::Checksum { .. })
-        ));
+        assert!(matches!(journal.recover(), Err(SessionJournalError::Checksum { .. })));
     }
 }

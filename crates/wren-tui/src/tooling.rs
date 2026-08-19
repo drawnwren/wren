@@ -6,6 +6,55 @@ pub(super) struct FormatterInvocation {
     pub(super) arguments: Vec<String>,
 }
 
+const FILE_ARGUMENT: &str = "$file";
+
+#[derive(Clone, Copy)]
+struct ToolProfile {
+    languages: &'static [&'static str],
+    program: &'static str,
+    arguments: &'static str,
+    parent_directory: bool,
+}
+
+macro_rules! tool {
+    ($languages:expr, $program:literal, $arguments:literal, $parent:literal) => {
+        ToolProfile { languages: $languages, program: $program, arguments: $arguments, parent_directory: $parent }
+    };
+}
+
+const FORMATTER_PROFILES: &[ToolProfile] = &[
+    tool!(&["rust"], "rustfmt", "--emit=stdout", false),
+    tool!(&["python"], "ruff", "format --stdin-filename $file -", false),
+    tool!(&["go"], "gofmt", "", false),
+    tool!(&["hcl"], "tofu", "fmt -", false),
+    tool!(&["nix"], "nixfmt", "", false),
+    tool!(&["haskell"], "fourmolu", "--stdin-input-file $file", false),
+];
+
+const DIAGNOSTIC_PROFILES: &[ToolProfile] = &[
+    tool!(&["rust"], "cargo", "clippy --quiet --message-format=short", false),
+    tool!(&["python"], "ruff", "check --output-format=concise $file", false),
+    tool!(&["javascript", "typescript", "tsx"], "pnpm", "exec tsc --noEmit --pretty false", false),
+    tool!(&["go"], "go", "vet ./...", false),
+    tool!(&["hcl"], "tofu", "validate -no-color", true),
+    tool!(&["nix"], "nix-instantiate", "--parse $file", false),
+    tool!(&["haskell"], "ghc", "-fno-code $file", false),
+    tool!(&["lua"], "luac", "-p $file", false),
+    tool!(&["bash"], "bash", "-n $file", false),
+    tool!(&["c", "cpp"], "clang++", "-fsyntax-only $file", false),
+];
+
+impl ToolProfile {
+    fn for_language(profiles: &'static [Self], language: &str) -> Option<&'static Self> {
+        profiles.iter().find(|profile| profile.languages.contains(&language))
+    }
+
+    fn arguments(&self, path: &Path) -> Vec<String> {
+        let file = path.to_string_lossy();
+        self.arguments.split_ascii_whitespace().map(|argument| if argument == FILE_ARGUMENT { file.as_ref() } else { argument }).map(str::to_owned).collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndentStyle {
     pub(super) expand_tabs: bool,
@@ -26,22 +75,10 @@ pub(super) fn detect_indent_style(text: &str) -> IndentStyle {
         }
     }
     if tab_lines > widths.len() {
-        return IndentStyle {
-            expand_tabs: false,
-            width: 2,
-        };
+        return IndentStyle { expand_tabs: false, width: 2 };
     }
-    let width = widths
-        .into_iter()
-        .filter(|width| *width <= 8)
-        .reduce(greatest_common_divisor)
-        .filter(|width| *width > 1)
-        .unwrap_or(2)
-        .clamp(2, 8);
-    IndentStyle {
-        expand_tabs: true,
-        width,
-    }
+    let width = widths.into_iter().filter(|width| *width <= 8).reduce(greatest_common_divisor).filter(|width| *width > 1).unwrap_or(2).clamp(2, 8);
+    IndentStyle { expand_tabs: true, width }
 }
 
 pub(super) fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
@@ -55,10 +92,7 @@ pub(super) fn wrap_editor_text(source: &str, width: usize) -> String {
     let first = source.lines().next().unwrap_or_default();
     let indentation = &first[..first.len().saturating_sub(first.trim_start().len())];
     let trimmed = first.trim_start();
-    let marker = ["// ", "# ", "-- ", "* "]
-        .into_iter()
-        .find(|marker| trimmed.starts_with(marker))
-        .unwrap_or("");
+    let marker = ["// ", "# ", "-- ", "* "].into_iter().find(|marker| trimmed.starts_with(marker)).unwrap_or("");
     let prefix = format!("{indentation}{marker}");
     let words = source
         .lines()
@@ -95,37 +129,16 @@ pub(super) fn wrap_editor_text(source: &str, width: usize) -> String {
 }
 
 pub(super) fn formatter_invocation(path: &Path) -> Option<FormatterInvocation> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let extension = extension.as_str();
-    let filename = path.to_string_lossy().into_owned();
-    let (program, arguments) = match extension {
-        "rs" => ("rustfmt", vec!["--emit=stdout".to_owned()]),
-        "py" => (
-            "ruff",
-            vec![
-                "format".to_owned(),
-                "--stdin-filename".to_owned(),
-                filename,
-                "-".to_owned(),
-            ],
-        ),
-        "go" => ("gofmt", Vec::new()),
-        "tf" | "tfvars" => ("tofu", vec!["fmt".to_owned(), "-".to_owned()]),
-        "nix" => ("nixfmt", Vec::new()),
-        "hs" | "lhs" => ("fourmolu", vec!["--stdin-input-file".to_owned(), filename]),
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "msg" => {
-            let mut arguments = vec!["--mode=c".to_owned(), "--suffix=none".to_owned()];
-            if let Some(options) = find_upward(path, ".astylerc") {
-                arguments.push(format!("--options={}", options.display()));
-            }
-            ("astyle", arguments)
+    let language = bundled_language_id(path)?;
+    if matches!(language, "c" | "cpp") {
+        let mut arguments = vec!["--mode=c".to_owned(), "--suffix=none".to_owned()];
+        if let Some(options) = find_upward(path, ".astylerc") {
+            arguments.push(format!("--options={}", options.display()));
         }
-        _ => return None,
-    };
-    Some(FormatterInvocation {
-        program: program.to_owned(),
-        arguments,
-    })
+        return Some(FormatterInvocation { program: "astyle".to_owned(), arguments });
+    }
+    let profile = ToolProfile::for_language(FORMATTER_PROFILES, language)?;
+    Some(FormatterInvocation { program: profile.program.to_owned(), arguments: profile.arguments(path) })
 }
 
 pub(super) fn find_upward(path: &Path, name: &str) -> Option<PathBuf> {
@@ -144,9 +157,7 @@ pub(super) fn executable_exists(program: &str) -> bool {
     if program.contains(std::path::MAIN_SEPARATOR) {
         return Path::new(program).is_file();
     }
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|directory| directory.join(program).is_file())
-    })
+    env::var_os("PATH").is_some_and(|path| env::split_paths(&path).any(|directory| directory.join(program).is_file()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,85 +167,11 @@ pub(super) struct DiagnosticInvocation {
     pub(super) directory: PathBuf,
 }
 
-pub(super) fn diagnostic_invocation(
-    path: &Path,
-    workspace_root: &Path,
-) -> Option<DiagnosticInvocation> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let extension = extension.as_str();
-    let file = path.to_string_lossy().into_owned();
-    let (program, arguments, directory) = match extension {
-        "rs" => (
-            "cargo",
-            vec![
-                "clippy".to_owned(),
-                "--quiet".to_owned(),
-                "--message-format=short".to_owned(),
-            ],
-            workspace_root.to_path_buf(),
-        ),
-        "py" => (
-            "ruff",
-            vec![
-                "check".to_owned(),
-                "--output-format=concise".to_owned(),
-                file,
-            ],
-            workspace_root.to_path_buf(),
-        ),
-        "js" | "jsx" | "ts" | "tsx" => (
-            "pnpm",
-            vec![
-                "exec".to_owned(),
-                "tsc".to_owned(),
-                "--noEmit".to_owned(),
-                "--pretty".to_owned(),
-                "false".to_owned(),
-            ],
-            workspace_root.to_path_buf(),
-        ),
-        "go" => (
-            "go",
-            vec!["vet".to_owned(), "./...".to_owned()],
-            workspace_root.to_path_buf(),
-        ),
-        "tf" | "tfvars" => (
-            "tofu",
-            vec!["validate".to_owned(), "-no-color".to_owned()],
-            path.parent().unwrap_or(workspace_root).to_path_buf(),
-        ),
-        "nix" => (
-            "nix-instantiate",
-            vec!["--parse".to_owned(), file],
-            workspace_root.to_path_buf(),
-        ),
-        "hs" | "lhs" => (
-            "ghc",
-            vec!["-fno-code".to_owned(), file],
-            workspace_root.to_path_buf(),
-        ),
-        "lua" => (
-            "luac",
-            vec!["-p".to_owned(), file],
-            workspace_root.to_path_buf(),
-        ),
-        "sh" | "bash" | "zsh" => (
-            "bash",
-            vec!["-n".to_owned(), file],
-            workspace_root.to_path_buf(),
-        ),
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "msg" => (
-            "clang++",
-            vec!["-fsyntax-only".to_owned(), file],
-            workspace_root.to_path_buf(),
-        ),
-        _ => return None,
-    };
-    Some(DiagnosticInvocation {
-        program: program.to_owned(),
-        arguments,
-        directory,
-    })
+pub(super) fn diagnostic_invocation(path: &Path, workspace_root: &Path) -> Option<DiagnosticInvocation> {
+    let language = bundled_language_id(path)?;
+    let profile = ToolProfile::for_language(DIAGNOSTIC_PROFILES, language)?;
+    let directory = profile.parent_directory.then(|| path.parent()).flatten().unwrap_or(workspace_root).to_path_buf();
+    Some(DiagnosticInvocation { program: profile.program.to_owned(), arguments: profile.arguments(path), directory })
 }
 
 pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<DiagnosticEntry> {
@@ -245,17 +182,10 @@ pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<Diag
     let mut parts = line.splitn(4, ':');
     let raw_path = parts.next()?.trim();
     let line_number = parts.next()?.trim().parse::<usize>().ok()?;
-    let column = parts
-        .next()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(1);
+    let column = parts.next().and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(1);
     let message = parts.next().unwrap_or_default().trim();
     let path = PathBuf::from(raw_path);
-    let path = if path.is_absolute() {
-        path
-    } else {
-        directory.join(path)
-    };
+    let path = if path.is_absolute() { path } else { directory.join(path) };
     let lowercase = message.to_ascii_lowercase();
     let severity = if lowercase.contains("error") {
         DiagnosticSeverity::Error
@@ -266,11 +196,5 @@ pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<Diag
     } else {
         DiagnosticSeverity::Information
     };
-    Some(DiagnosticEntry {
-        path,
-        line: line_number.max(1),
-        column: column.max(1),
-        severity,
-        message: message.to_owned(),
-    })
+    Some(DiagnosticEntry { path, line: line_number.max(1), column: column.max(1), severity, message: message.to_owned() })
 }

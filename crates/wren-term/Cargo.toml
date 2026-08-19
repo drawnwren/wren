@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+flate2.workspace = true
 rustix.workspace = true
 termina.workspace = true
 thiserror.workspace = true
 wren-view = { version = "0.1.0", path = "../wren-view" }
+wren-types = { version = "0.1.0", path = "../wren-types" }
 
 [lints]
 workspace = true

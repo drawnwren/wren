@@ -29,8 +29,7 @@ pub struct StateDifference {
 
 impl DivergenceAllowlist {
     pub fn load(path: &Path) -> Result<Self> {
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("read divergence allowlist {}", path.display()))?;
+        let source = fs::read_to_string(path).with_context(|| format!("read divergence allowlist {}", path.display()))?;
         toml::from_str(&source).context("parse divergence allowlist")
     }
 
@@ -39,11 +38,7 @@ impl DivergenceAllowlist {
     }
 }
 
-pub fn compare_states(
-    expected: &OracleState,
-    actual: &OracleState,
-    allowlist: &DivergenceAllowlist,
-) -> Result<Vec<StateDifference>> {
+pub fn compare_states(expected: &OracleState, actual: &OracleState, allowlist: &DivergenceAllowlist) -> Result<Vec<StateDifference>> {
     let expected = serde_json::to_value(expected)?;
     let actual = serde_json::to_value(actual)?;
     let mut paths = BTreeSet::new();
@@ -112,16 +107,7 @@ mod tests {
         };
         let mut changed = value.clone();
         changed.mode = "i".to_owned();
-        let allowlist = DivergenceAllowlist {
-            divergence: vec![Divergence {
-                path: "$/mode".to_owned(),
-                reason: "test".to_owned(),
-            }],
-        };
-        assert!(
-            compare_states(&value, &changed, &allowlist)
-                .expect("comparison")
-                .is_empty()
-        );
+        let allowlist = DivergenceAllowlist { divergence: vec![Divergence { path: "$/mode".to_owned(), reason: "test".to_owned() }] };
+        assert!(compare_states(&value, &changed, &allowlist).expect("comparison").is_empty());
     }
 }

@@ -12,16 +12,16 @@ use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use wren_benchmark_support::{
-    ArgumentCursor, CommonArguments, bare_metal_declared, elapsed_nanos, emit_report, histogram,
-    percentiles, pin_requested_cpu, require_bare_metal_cpu, ten_percent_cut,
+    ArgumentCursor, CommonArguments, bare_metal_declared, elapsed_nanos, emit_report, histogram, percentiles, pin_requested_cpu, require_bare_metal_cpu,
+    ten_percent_cut,
 };
 use wren_client_state::{ClientViewStateStore, PublishedViewport};
 use wren_engine::EngineFrame;
 use wren_session::{SessionAuthority, SessionJournal};
 use wren_shmem::{SharedDocumentHeadReader, SharedDocumentHeadWriter};
 use wren_types::{
-    ClientId, ConfigGeneration, DocumentHead, DocumentId, DocumentRevision, HeadValidation,
-    PublishedViewportKey, ResumeViewState, SelRange, SelectionSet, SessionEpoch, SessionId, ViewId,
+    ClientId, ConfigGeneration, DocumentHead, DocumentId, DocumentRevision, HeadValidation, PublishedViewportKey, ResumeViewState, SelRange, SelectionSet,
+    SessionEpoch, SessionId, ViewId,
 };
 use wren_view::ViewportLayout;
 
@@ -45,11 +45,7 @@ struct Timings {
 
 impl Timings {
     fn new() -> Result<Self> {
-        Ok(Self {
-            speculative: histogram()?,
-            correct: histogram()?,
-            interactive: histogram()?,
-        })
+        Ok(Self { speculative: histogram()?, correct: histogram()?, interactive: histogram()? })
     }
 
     fn record(&mut self, speculative: u64, correct: u64, interactive: u64) -> Result<()> {
@@ -71,11 +67,7 @@ impl Timings {
 }
 
 fn arguments() -> Result<Arguments> {
-    let mut arguments = Arguments {
-        common: CommonArguments::new(1_000),
-        b3_path: None,
-        probe_file: None,
-    };
+    let mut arguments = Arguments { common: CommonArguments::new(1_000), b3_path: None, probe_file: None };
     let mut cursor = ArgumentCursor::from_env();
     while let Some(argument) = cursor.next() {
         if arguments.common.consume(&argument, &mut cursor)? {
@@ -92,12 +84,7 @@ fn arguments() -> Result<Arguments> {
 }
 
 fn validate_gate_environment(arguments: &Arguments, pinned: bool) -> Result<()> {
-    require_bare_metal_cpu(
-        arguments.common.gate,
-        arguments.common.cpu,
-        pinned,
-        "--gate",
-    )
+    require_bare_metal_cpu(arguments.common.gate, arguments.common.cpu, pinned, "--gate")
 }
 
 fn fixture_text() -> String {
@@ -126,15 +113,8 @@ fn mounted_filesystem_type(path: &Path) -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("stat")
-            .args(["-f", "%T"])
-            .arg(canonical)
-            .output()
-            .ok()?;
-        return output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let output = Command::new("stat").args(["-f", "%T"]).arg(canonical).output().ok()?;
+        return output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
     #[allow(unreachable_code)]
     None
@@ -143,11 +123,7 @@ fn mounted_filesystem_type(path: &Path) -> Option<String> {
 fn is_network_or_fuse_path(path: &Path) -> bool {
     mounted_filesystem_type(path).is_some_and(|filesystem| {
         let filesystem = filesystem.to_ascii_lowercase();
-        filesystem.starts_with("fuse")
-            || matches!(
-                filesystem.as_str(),
-                "nfs" | "nfs4" | "cifs" | "smbfs" | "sshfs" | "9p" | "afs" | "davfs"
-            )
+        filesystem.starts_with("fuse") || matches!(filesystem.as_str(), "nfs" | "nfs4" | "cifs" | "smbfs" | "sshfs" | "9p" | "afs" | "davfs")
     })
 }
 
@@ -157,13 +133,7 @@ fn resume_state() -> ResumeViewState {
         view_id: ViewId::new(1),
         document_id: DocumentId::new(1),
         document_revision: DocumentRevision::new(7),
-        selections: SelectionSet {
-            primary: 0,
-            ranges: vec![SelRange {
-                anchor: 32,
-                head: 32,
-            }],
-        },
+        selections: SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 32, head: 32 }] },
         top_line: 400,
         rows: 40,
         columns: 120,
@@ -196,45 +166,25 @@ fn shared_heads(directory: &Path) -> Result<(SharedDocumentHeadWriter, SharedDoc
     Ok((writer, reader))
 }
 
-fn scenario_a(
-    iterations: u64,
-    directory: &Path,
-    text: &str,
-    heads: &SharedDocumentHeadReader,
-) -> Result<Timings> {
+fn scenario_a(iterations: u64, directory: &Path, text: &str, heads: &SharedDocumentHeadReader) -> Result<Timings> {
     let state = resume_state();
-    let frame = EngineFrame {
-        text: text.into(),
-        cursor_byte: state.selections.ranges[0].head,
-    };
+    let frame = EngineFrame::new(text, state.selections.ranges[0].head);
     let mut layout = ViewportLayout::new(state.columns, state.rows);
     layout.top_line = state.top_line;
-    let published = PublishedViewport {
-        session_epoch: SessionEpoch::new(1),
-        document_id: DocumentId::new(1),
-        key: published_key(),
-        grid: layout.desired_grid(&frame),
-    };
+    let published =
+        PublishedViewport { session_epoch: SessionEpoch::new(1), document_id: DocumentId::new(1), key: published_key(), grid: layout.desired_grid(&frame) };
     let store = ClientViewStateStore::new(directory.join("startup-client-state"));
     store.save_resume(&state)?;
     store.save_viewport(&published)?;
     let mut timings = Timings::new()?;
     for _ in 0..iterations {
         let started = Instant::now();
-        let cached = store
-            .load_viewport(ClientId::new(1), ViewId::new(1), DocumentId::new(1))?
-            .context("scenario A published viewport")?;
-        anyhow::ensure!(
-            cached.key == published_key(),
-            "scenario A cache key drifted"
-        );
+        let cached = store.load_viewport(ClientId::new(1), ViewId::new(1), DocumentId::new(1))?.context("scenario A published viewport")?;
+        anyhow::ensure!(cached.key == published_key(), "scenario A cache key drifted");
         let speculative_grid = Arc::new(cached.grid);
         black_box(&speculative_grid);
         let speculative = elapsed_nanos(started);
-        anyhow::ensure!(
-            heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct,
-            "scenario A published viewport was not head-valid"
-        );
+        anyhow::ensure!(heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct, "scenario A published viewport was not head-valid");
         let correct = elapsed_nanos(started);
         black_box((speculative_grid.cursor, state.selections.primary));
         timings.record(speculative, correct, elapsed_nanos(started))?;
@@ -242,12 +192,7 @@ fn scenario_a(
     Ok(timings)
 }
 
-fn scenario_b1(
-    iterations: u64,
-    path: &Path,
-    known_offset: u64,
-    heads: &SharedDocumentHeadReader,
-) -> Result<Timings> {
+fn scenario_b1(iterations: u64, path: &Path, known_offset: u64, heads: &SharedDocumentHeadReader) -> Result<Timings> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut warm = Vec::new();
     File::open(path)?.read_to_end(&mut warm)?;
@@ -259,15 +204,9 @@ fn scenario_b1(
         let bytes = read_at(&file, known_offset, VIEWPORT_BYTES)?;
         let text = std::str::from_utf8(&bytes).context("fixture viewport is UTF-8")?;
         let mut layout = ViewportLayout::new(state.columns, state.rows);
-        let grid = layout.desired_grid(&EngineFrame {
-            text: text.into(),
-            cursor_byte: 0,
-        });
+        let grid = layout.desired_grid(&EngineFrame::new(text, 0));
         let speculative = elapsed_nanos(started);
-        anyhow::ensure!(
-            heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct,
-            "scenario B1 frontier was not head-valid"
-        );
+        anyhow::ensure!(heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct, "scenario B1 frontier was not head-valid");
         black_box(grid);
         let correct = elapsed_nanos(started);
         timings.record(speculative, correct, elapsed_nanos(started))?;
@@ -282,10 +221,7 @@ fn scenario_full_read(iterations: u64, path: &Path) -> Result<Timings> {
         let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let text = String::from_utf8(bytes).context("startup fixture must be UTF-8")?;
         let mut layout = ViewportLayout::new(120, 40);
-        let grid = layout.desired_grid(&EngineFrame {
-            text: text.into(),
-            cursor_byte: 0,
-        });
+        let grid = layout.desired_grid(&EngineFrame::new(text, 0));
         let speculative = elapsed_nanos(started);
         black_box(grid);
         let correct = elapsed_nanos(started);
@@ -297,23 +233,16 @@ fn scenario_full_read(iterations: u64, path: &Path) -> Result<Timings> {
 fn scenario_c(iterations: u64, directory: &Path, text: &str) -> Result<Timings> {
     let session_id = SessionId::new(41);
     {
-        let mut authority =
-            SessionAuthority::open(SessionJournal::in_directory(directory), session_id)?;
+        let mut authority = SessionAuthority::open(SessionJournal::in_directory(directory), session_id)?;
         authority.register_document(DocumentId::new(1), text, ClientId::new(1))?;
     }
     let mut timings = Timings::new()?;
     for _ in 0..iterations {
         let started = Instant::now();
-        let authority =
-            SessionAuthority::open(SessionJournal::in_directory(directory), session_id)?;
-        let document = authority
-            .document(DocumentId::new(1))
-            .context("recovered startup document")?;
+        let authority = SessionAuthority::open(SessionJournal::in_directory(directory), session_id)?;
+        let document = authority.document(DocumentId::new(1)).context("recovered startup document")?;
         let mut layout = ViewportLayout::new(120, 40);
-        let grid = layout.desired_grid(&EngineFrame {
-            text: document.text().into(),
-            cursor_byte: 0,
-        });
+        let grid = layout.desired_grid(&EngineFrame::new(document.text(), 0));
         let speculative = elapsed_nanos(started);
         black_box(grid);
         let correct = elapsed_nanos(started);
@@ -327,11 +256,7 @@ fn scenario_d(iterations: u64, path: &Path) -> Result<Timings> {
     let mut timings = Timings::new()?;
     for _ in 0..iterations.min(10) {
         let started = Instant::now();
-        let status = Command::new(&executable)
-            .arg("--probe-file")
-            .arg(path)
-            .status()
-            .context("spawn cold-process probe")?;
+        let status = Command::new(&executable).arg("--probe-file").arg(path).status().context("spawn cold-process probe")?;
         anyhow::ensure!(status.success(), "cold-process probe failed");
         let elapsed = elapsed_nanos(started);
         timings.record(elapsed, elapsed, elapsed)?;
@@ -343,10 +268,7 @@ fn probe(path: &Path) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("probe read {}", path.display()))?;
     let text = String::from_utf8(bytes).context("probe file must be UTF-8")?;
     let mut layout = ViewportLayout::new(120, 40);
-    black_box(layout.desired_grid(&EngineFrame {
-        text: text.into(),
-        cursor_byte: 0,
-    }));
+    black_box(layout.desired_grid(&EngineFrame::new(text, 0)));
     Ok(())
 }
 
@@ -391,53 +313,24 @@ struct StartupMetrics {
 
 fn startup_metrics(arguments: &Arguments) -> Result<StartupMetrics> {
     if let Some(path) = &arguments.b3_path {
-        anyhow::ensure!(
-            is_network_or_fuse_path(path),
-            "--b3-path must resolve to a mounted network or FUSE filesystem"
-        );
+        anyhow::ensure!(is_network_or_fuse_path(path), "--b3-path must resolve to a mounted network or FUSE filesystem");
     }
     let fixture = fixture_text();
     let directory = tempdir().context("startup fixture directory")?;
     let fixture_path = directory.path().join("fixture.rs");
     fs::write(&fixture_path, &fixture)?;
-    let known_offset = u64::try_from("fn measured_startup() { let β = \"viewport\"; }\n".len())?
-        .saturating_mul(12_000);
+    let known_offset = u64::try_from("fn measured_startup() { let β = \"viewport\"; }\n".len())?.saturating_mul(12_000);
 
     let (_head_writer, head_reader) = shared_heads(directory.path())?;
 
-    let scenario_a = scenario_a(
-        arguments.common.iterations,
-        directory.path(),
-        &fixture,
-        &head_reader,
-    )?;
-    let scenario_b1 = scenario_b1(
-        arguments.common.iterations,
-        &fixture_path,
-        known_offset,
-        &head_reader,
-    )?;
+    let scenario_a = scenario_a(arguments.common.iterations, directory.path(), &fixture, &head_reader)?;
+    let scenario_b1 = scenario_b1(arguments.common.iterations, &fixture_path, known_offset, &head_reader)?;
     let b2_iterations = arguments.common.iterations.min(25);
     let scenario_b2 = scenario_full_read(b2_iterations, &fixture_path)?;
-    let scenario_c = scenario_c(
-        arguments.common.iterations.min(100),
-        &directory.path().join("session"),
-        &fixture,
-    )?;
+    let scenario_c = scenario_c(arguments.common.iterations.min(100), &directory.path().join("session"), &fixture)?;
     let scenario_d = scenario_d(arguments.common.iterations, &fixture_path)?;
-    let scenario_b3 = arguments
-        .b3_path
-        .as_deref()
-        .map(|path| scenario_full_read(b2_iterations, path))
-        .transpose()?;
-    Ok(StartupMetrics {
-        scenario_a,
-        scenario_b1,
-        scenario_b2,
-        scenario_b3,
-        scenario_c,
-        scenario_d,
-    })
+    let scenario_b3 = arguments.b3_path.as_deref().map(|path| scenario_full_read(b2_iterations, path)).transpose()?;
+    Ok(StartupMetrics { scenario_a, scenario_b1, scenario_b2, scenario_b3, scenario_c, scenario_d })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -449,32 +342,19 @@ struct StartupGates {
 impl StartupGates {
     fn evaluate(metrics: &StartupMetrics) -> Self {
         Self {
-            scenario_a: metrics.scenario_a.correct.value_at_quantile(0.99)
-                < SCENARIO_A_P99_GATE_NANOS,
-            scenario_b1: metrics.scenario_b1.correct.value_at_quantile(0.99)
-                < SCENARIO_B1_P99_GATE_NANOS,
+            scenario_a: metrics.scenario_a.correct.value_at_quantile(0.99) < SCENARIO_A_P99_GATE_NANOS,
+            scenario_b1: metrics.scenario_b1.correct.value_at_quantile(0.99) < SCENARIO_B1_P99_GATE_NANOS,
         }
     }
 
     fn enforce(self) -> Result<()> {
-        anyhow::ensure!(
-            self.scenario_a,
-            "scenario A p99 exceeded its tightened gate"
-        );
-        anyhow::ensure!(
-            self.scenario_b1,
-            "scenario B1 p99 exceeded its tightened gate"
-        );
+        anyhow::ensure!(self.scenario_a, "scenario A p99 exceeded its tightened gate");
+        anyhow::ensure!(self.scenario_b1, "scenario B1 p99 exceeded its tightened gate");
         Ok(())
     }
 }
 
-fn report(
-    arguments: &Arguments,
-    cpu_pinned: bool,
-    metrics: &StartupMetrics,
-    gates: StartupGates,
-) -> Value {
+fn report(arguments: &Arguments, cpu_pinned: bool, metrics: &StartupMetrics, gates: StartupGates) -> Value {
     json!({
         "schema": 2,
         "cpu_requested": arguments.common.cpu,
@@ -538,10 +418,7 @@ fn main() -> Result<()> {
     validate_gate_environment(&arguments, cpu_pinned)?;
     let metrics = startup_metrics(&arguments)?;
     let gates = StartupGates::evaluate(&metrics);
-    emit_report(
-        &report(&arguments, cpu_pinned, &metrics, gates),
-        arguments.common.output.as_deref(),
-    )?;
+    emit_report(&report(&arguments, cpu_pinned, &metrics, gates), arguments.common.output.as_deref())?;
     if arguments.common.gate {
         gates.enforce()?;
     }

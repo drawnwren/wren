@@ -12,6 +12,8 @@ repository = "https://example.invalid/wren"
 ropey = "1"
 crop = "0.4"
 imara-diff = "0.2"
+ls-types = "0.0.6"
+logos = "0.16"
 mmap-io = { version = "1", features = ["atomic"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSThread", "NSObjCRuntime"] }
 ast-grep-core = "0.45"
@@ -34,6 +36,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 anyhow = "1"
 base64 = "0.22"
+flate2 = "1"
 bitflags = { version = "2", features = ["serde"] }
 blake3 = "1"
 core_affinity = "0.8"

@@ -39,10 +39,13 @@
                   ".wit"
                 ];
                 checkAsset = pkgs.lib.any (suffix: pkgs.lib.hasSuffix suffix sourcePath) [
+                  "/crates/wren-extension/src/spike.wat"
+                  "/crates/wren-tui/src/help.txt"
                   "/crates/wren-types/proptest-regressions/lib.txt"
                   "/harness/corpus/documents/unicode.txt"
                   "/scripts/layer-check.py"
-                ] || pkgs.lib.hasInfix "/harness/conformance/goldens/" sourcePath;
+                ] || pkgs.lib.hasInfix "/crates/wren-tui/tests/fixtures/" sourcePath
+                  || pkgs.lib.hasInfix "/harness/conformance/goldens/" sourcePath;
               in
                 craneLib.filterCargoSources path type || cargoAsset || checkAsset;
           };

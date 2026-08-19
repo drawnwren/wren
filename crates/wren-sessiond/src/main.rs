@@ -38,30 +38,19 @@ fn arguments() -> Result<Arguments> {
         match values[index].as_str() {
             "--socket" => {
                 index += 1;
-                socket = Some(PathBuf::from(
-                    values.get(index).context("--socket requires a path")?,
-                ));
+                socket = Some(PathBuf::from(values.get(index).context("--socket requires a path")?));
             }
             "--state-dir" => {
                 index += 1;
-                state_dir = Some(PathBuf::from(
-                    values.get(index).context("--state-dir requires a path")?,
-                ));
+                state_dir = Some(PathBuf::from(values.get(index).context("--state-dir requires a path")?));
             }
             "--session-id" => {
                 index += 1;
-                session_id = SessionId::new(
-                    values
-                        .get(index)
-                        .context("--session-id requires an integer")?
-                        .parse()?,
-                );
+                session_id = SessionId::new(values.get(index).context("--session-id requires an integer")?.parse()?);
             }
             "--head-table" => {
                 index += 1;
-                head_table = Some(PathBuf::from(
-                    values.get(index).context("--head-table requires a path")?,
-                ));
+                head_table = Some(PathBuf::from(values.get(index).context("--head-table requires a path")?));
             }
             "--transport" => {
                 index += 1;
@@ -73,24 +62,16 @@ fn arguments() -> Result<Arguments> {
             }
             "--protocol" => {
                 index += 1;
-                let protocol = values
-                    .get(index)
-                    .context("--protocol requires MAJOR.MINOR")?;
-                let (major, _) = protocol
-                    .split_once('.')
-                    .context("--protocol requires MAJOR.MINOR")?;
+                let protocol = values.get(index).context("--protocol requires MAJOR.MINOR")?;
+                let (major, _) = protocol.split_once('.').context("--protocol requires MAJOR.MINOR")?;
                 let major: u16 = major.parse()?;
                 if major != REMOTE_PROTOCOL_MAJOR {
-                    bail!(
-                        "incompatible remote protocol major {major}; expected {REMOTE_PROTOCOL_MAJOR}"
-                    );
+                    bail!("incompatible remote protocol major {major}; expected {REMOTE_PROTOCOL_MAJOR}");
                 }
             }
             "--workspace" => {
                 index += 1;
-                workspace = Some(PathBuf::from(
-                    values.get(index).context("--workspace requires a path")?,
-                ));
+                workspace = Some(PathBuf::from(values.get(index).context("--workspace requires a path")?));
             }
             "-h" | "--help" => {
                 println!(
@@ -103,14 +84,7 @@ fn arguments() -> Result<Arguments> {
         }
         index += 1;
     }
-    Ok(Arguments {
-        socket,
-        state_dir: state_dir.context("--state-dir is required")?,
-        session_id,
-        head_table,
-        transport,
-        workspace,
-    })
+    Ok(Arguments { socket, state_dir: state_dir.context("--state-dir is required")?, session_id, head_table, transport, workspace })
 }
 
 struct StdioConnection {
@@ -138,72 +112,39 @@ impl Write for StdioConnection {
 fn main() -> Result<()> {
     let arguments = arguments()?;
     if let Some(lane) = arguments.transport {
-        let workspace = arguments
-            .workspace
-            .as_ref()
-            .context("--workspace is required with --transport")?;
-        fs::create_dir_all(&arguments.state_dir).with_context(|| {
-            format!(
-                "create remote state directory {}",
-                arguments.state_dir.display()
-            )
-        })?;
+        let workspace = arguments.workspace.as_ref().context("--workspace is required with --transport")?;
+        fs::create_dir_all(&arguments.state_dir).with_context(|| format!("create remote state directory {}", arguments.state_dir.display()))?;
         let journal = SessionJournal::in_directory(arguments.state_dir.join(match lane {
             TransportLane::Control => "session",
             TransportLane::Bulk => "bulk-session",
         }));
         let restarted = journal.path().exists();
-        let mut authority = SessionAuthority::open(journal, arguments.session_id)
-            .context("open durable remote session authority")?;
+        let mut authority = SessionAuthority::open(journal, arguments.session_id).context("open durable remote session authority")?;
         if lane == TransportLane::Control && restarted {
-            authority
-                .break_event_continuity()
-                .context("advance remote session epoch after daemon restart")?;
+            authority.break_event_continuity().context("advance remote session epoch after daemon restart")?;
         }
-        let server = SessionServer::new(authority).with_remote_workspace(
-            workspace,
-            arguments.state_dir.join("blob-cache"),
-            512 * 1024 * 1024,
-            lane,
-        )?;
-        let mut connection = StdioConnection {
-            input: io::stdin(),
-            output: io::stdout(),
-        };
+        let server = SessionServer::new(authority).with_remote_workspace(workspace, arguments.state_dir.join("blob-cache"), 512 * 1024 * 1024, lane)?;
+        let mut connection = StdioConnection { input: io::stdin(), output: io::stdout() };
         server.serve_connection(&mut connection)?;
         return Ok(());
     }
-    let socket = arguments
-        .socket
-        .as_ref()
-        .context("--socket is required without --transport")?;
+    let socket = arguments.socket.as_ref().context("--socket is required without --transport")?;
     if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create socket directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create socket directory {}", parent.display()))?;
     }
     let journal = SessionJournal::in_directory(&arguments.state_dir);
     let restarted = journal.path().exists();
-    let mut authority = SessionAuthority::open(journal, arguments.session_id)
-        .context("open durable session authority")?;
+    let mut authority = SessionAuthority::open(journal, arguments.session_id).context("open durable session authority")?;
     if restarted {
-        authority
-            .break_event_continuity()
-            .context("advance session epoch after daemon restart")?;
+        authority.break_event_continuity().context("advance session epoch after daemon restart")?;
     }
-    let head_path = arguments
-        .head_table
-        .unwrap_or_else(|| arguments.state_dir.join("document-heads.link"));
+    let head_path = arguments.head_table.unwrap_or_else(|| arguments.state_dir.join("document-heads.link"));
     let head_writer = std::sync::Arc::new(
-        SharedDocumentHeadWriter::create_or_replace_stale(&head_path, 4_096)
-            .with_context(|| format!("create shared head table {}", head_path.display()))?,
+        SharedDocumentHeadWriter::create_or_replace_stale(&head_path, 4_096).with_context(|| format!("create shared head table {}", head_path.display()))?,
     );
-    let server = SessionServer::new(authority)
-        .with_head_writer(head_writer)
-        .context("publish initial document heads")?;
-    let listener = UnixListener::bind(socket)
-        .with_context(|| format!("bind control socket {}", socket.display()))?;
-    fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("secure control socket {}", socket.display()))?;
+    let server = SessionServer::new(authority).with_head_writer(head_writer).context("publish initial document heads")?;
+    let listener = UnixListener::bind(socket).with_context(|| format!("bind control socket {}", socket.display()))?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).with_context(|| format!("secure control socket {}", socket.display()))?;
     for connection in listener.incoming() {
         let mut connection = connection.context("accept control connection")?;
         let server = server.clone();

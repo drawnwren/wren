@@ -3,33 +3,22 @@ use super::*;
 impl App {
     pub(super) fn open(path: Option<&Path>, line: Option<usize>) -> Result<Self> {
         let (document, opened) = match path {
-            Some(path) => LocalDocument::open_or_new(path)
-                .with_context(|| format!("open {}", path.display()))?,
+            Some(path) => LocalDocument::open_or_new(path).with_context(|| format!("open {}", path.display()))?,
             None => LocalDocument::unnamed(),
         };
         #[cfg(not(test))]
-        let wal = document
-            .presentation_path()
-            .map(LocalWal::for_document)
-            .transpose()
-            .context("locate recovery WAL")?;
+        let wal = document.presentation_path().map(LocalWal::for_document).transpose().context("locate recovery WAL")?;
         #[cfg(test)]
         let wal = None;
         Self::from_opened(document, opened, line, wal)
     }
 
-    pub(super) fn from_opened(
-        document: LocalDocument,
-        opened: OpenedDocument,
-        line: Option<usize>,
-        wal: Option<LocalWal>,
-    ) -> Result<Self> {
+    pub(super) fn from_opened(document: LocalDocument, opened: OpenedDocument, line: Option<usize>, wal: Option<LocalWal>) -> Result<Self> {
         #[cfg(not(test))]
         wren_scheduling::mark_interactive();
         let buffer_id = BufferId::new(1);
         let document_id = stable_document_id(document.presentation_path());
-        let (mut active, opened_message) =
-            BufferState::from_opened(buffer_id, document_id, document, opened, line, wal)?;
+        let (mut active, opened_message) = BufferState::from_opened(buffer_id, document_id, document, opened, line, wal)?;
         let mut messages = Vec::new();
         push_message(&mut messages, opened_message);
         let (client_state_worker, client_state) = ClientStateWorker::open(ClientId::new(1))?;
@@ -41,34 +30,18 @@ impl App {
             .jump_list
             .iter()
             .filter_map(|entry| {
-                entry.path_hint.as_deref().map(|path| JumpLocation {
-                    document_id: entry.document_id,
-                    path: PathBuf::from(path),
-                    byte: entry.anchor.byte,
-                })
+                entry.path_hint.as_deref().map(|path| JumpLocation { document_id: entry.document_id, path: PathBuf::from(path), byte: entry.anchor.byte })
             })
             .collect();
-        let jump_index = client_state
-            .jump_index
-            .filter(|index| *index < jump_history.len());
-        let root_workspace = env::current_dir()
-            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-            .unwrap_or_else(|_| PathBuf::from("."));
+        let jump_index = client_state.jump_index.filter(|index| *index < jump_history.len());
+        let root_workspace = env::current_dir().map(|path| std::fs::canonicalize(&path).unwrap_or(path)).unwrap_or_else(|_| PathBuf::from("."));
         let mutations = MutationWorker::start(&root_workspace)?;
-        mutations.register(
-            document_id,
-            active.editor.frame().text.as_ref().to_owned(),
-            !active.editor.is_dirty(),
-        )?;
+        mutations.register(document_id, active.editor.frame().text.as_ref().to_owned(), !active.editor.is_dirty())?;
         let (theme_flavor, theme, theme_message) = load_theme();
         push_message(&mut messages, theme_message);
         let (keymap, keymap_message) = load_keymap();
         push_message(&mut messages, keymap_message);
-        let last_search_direction = if client_state.search_backward {
-            SearchDirection::Backward
-        } else {
-            SearchDirection::Forward
-        };
+        let last_search_direction = if client_state.search_backward { SearchDirection::Backward } else { SearchDirection::Forward };
         let mut app = Self {
             active,
             inactive: Vec::new(),
@@ -98,8 +71,7 @@ impl App {
             active_task: None,
             next_task_id: 1,
             terminal: None,
-            terminal_focused: false,
-            terminal_escape_pending: false,
+            input_focus: InputFocus::Editor,
             mouse_selection: None,
             picker_files: Vec::new(),
             picker_matches: Vec::new(),
@@ -131,8 +103,7 @@ impl App {
             lsp_start: None,
             lsp_background: None,
             lsp_semantic_dirty: false,
-            pending_lsp_hover: None,
-            pending_lsp_location: None,
+            pending_lsp_request: None,
             leader_keys: None,
             leader_deadline: None,
             keymap,
@@ -148,8 +119,6 @@ impl App {
             workspace_folders: vec![root_workspace],
             debug_ui_visible: false,
             agent_terminal: None,
-            agent_terminal_escape_pending: false,
-            agent_window_prefix_pending: false,
             agent_sidebar: AgentSidebarState::default(),
             last_staged_patch: None,
             theme_flavor,
@@ -175,7 +144,7 @@ impl App {
     }
 
     pub(super) fn shows_startup_screen(&self) -> bool {
-        !self.terminal_focused
+        !self.input_focus.is_terminal()
             && self.active.document.presentation_path().is_none()
             && self.active.display_name.is_none()
             && self.active.editor.text().len_bytes() == 0
@@ -192,13 +161,10 @@ impl App {
     /// live document.
     pub(super) fn prepare_realtime_paths(&mut self) -> Result<()> {
         let source = "pub fn warm() { let value = 1; value }\n";
-        let store = DefaultText::from_reader(Cursor::new(source.as_bytes()))
-            .context("create realtime preparation text store")?;
+        let store = DefaultText::from_reader(Cursor::new(source.as_bytes())).context("create realtime preparation text store")?;
         let mut editor = Editor::with_contents(store, source.to_owned());
         let _ = editor.handle_key(KeyEvent::character('i'))?;
-        let _ = editor
-            .handle_key(KeyEvent::character('x'))?
-            .ok_or_else(|| anyhow!("realtime preparation edit produced no transaction"))?;
+        let _ = editor.handle_key(KeyEvent::character('x'))?.ok_or_else(|| anyhow!("realtime preparation edit produced no transaction"))?;
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Backspace))?;
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Escape))?;
         std::hint::black_box(editor.frame());
