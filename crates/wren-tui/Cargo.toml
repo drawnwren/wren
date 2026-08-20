@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-glam.workspace = true
 ls-types.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
@@ -28,6 +27,7 @@ wren-config = { version = "0.1.0", path = "../wren-config" }
 wren-engine = { version = "0.1.0", path = "../wren-engine" }
 wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
 wren-position = { version = "0.1.0", path = "../wren-position" }
+wren-penrose = { version = "0.1.0", path = "../wren-penrose" }
 wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
 wren-provider = { version = "0.1.0", path = "../wren-provider" }
 wren-session = { version = "0.1.0", path = "../wren-session" }

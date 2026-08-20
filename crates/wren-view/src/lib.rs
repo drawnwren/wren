@@ -712,6 +712,13 @@ pub struct RasterOverlay {
 pub struct RasterQuad {
     pub vertices: [[f32; 2]; 4],
     pub color: RgbColor,
+    pub border: Option<RasterBorder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RasterBorder {
+    pub color: RgbColor,
+    pub width: f32,
 }
 
 impl PartialEq for RasterOverlay {
@@ -3246,6 +3253,11 @@ pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, update: 
         for row_index in present_rows.max(raster_rows)..desired.height {
             update.rows.push((row_index, Arc::default()));
         }
+        // A clear invalidates the terminal's raster state along with its cell
+        // grid, so the desired overlay must always be submitted again. Besides
+        // being the correct resize behavior, this avoids comparing overlays on
+        // the full-refresh hot path.
+        update.raster_overlay = Some(desired.raster_overlay.clone());
     } else if let Some(previous) = previous {
         for row_index in 0..desired.height {
             let row = desired.rows.get(row_index).cloned().unwrap_or_default();
@@ -3253,9 +3265,9 @@ pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, update: 
                 update.rows.push((row_index, row));
             }
         }
+        let previous_overlay = previous.raster_overlay.as_ref();
+        update.raster_overlay = (previous_overlay != desired.raster_overlay.as_ref()).then(|| desired.raster_overlay.clone());
     }
-    let previous_overlay = previous.and_then(|grid| grid.raster_overlay.as_ref());
-    update.raster_overlay = (previous_overlay != desired.raster_overlay.as_ref()).then(|| desired.raster_overlay.clone());
     update.cursor = (desired.cursor.0.min(desired.width.saturating_sub(1)), desired.cursor.1.min(desired.height.saturating_sub(1)));
 }
 

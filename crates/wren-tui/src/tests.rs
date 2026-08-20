@@ -424,6 +424,21 @@ fn file_picker_is_a_telescope_surface_with_results_and_preview() {
 }
 
 #[test]
+fn ghostty_pixel_only_resize_rebuilds_the_startup_canvas_at_physical_aspect() {
+    let mut app = App::open(None, None).expect("app");
+    let mut layout = dotfile_layout(80, 24);
+    app.resize_terminal_to(TerminalDimensions { columns: 80, rows: 24, pixel_width: Some(800), pixel_height: Some(480) });
+    let initial = desired_frame(&mut layout, &app);
+    assert_eq!(initial.raster_overlay.as_ref().map(|overlay| (overlay.width, overlay.height)), Some((480, 276)));
+
+    // Ghostty can change only the backing pixel dimensions when its font or
+    // display scale changes, while retaining the same terminal cell grid.
+    app.resize_terminal_to(TerminalDimensions { columns: 80, rows: 24, pixel_width: Some(960), pixel_height: Some(720) });
+    let resized = desired_frame(&mut layout, &app);
+    assert_eq!(resized.raster_overlay.as_ref().map(|overlay| (overlay.width, overlay.height)), Some((480, 345)));
+}
+
+#[test]
 fn colorscheme_and_runtime_color_override_are_customizable() {
     let mut app = App::open(None, None).expect("app");
     app.test_ex("colorscheme catppuccin-latte");

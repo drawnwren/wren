@@ -40,7 +40,7 @@ use wren_provider::{
     lexical_highlight_text,
 };
 use wren_session::{DocumentEncoding, LocalDocument, LocalWal, MutationOutbox, OpenedDocument, RecoveredState, SaveWarning, SessionAuthority, SessionJournal};
-use wren_term::{ClipboardSelection, MouseAction, SystemTerminalBackend, TerminaBackend, TerminalInput, TerminalKey, TerminalKeyCode};
+use wren_term::{ClipboardSelection, MouseAction, SystemTerminalBackend, TerminaBackend, TerminalDimensions, TerminalInput, TerminalKey, TerminalKeyCode};
 use wren_text::{DefaultText, TextStore};
 use wren_types::{
     Anchor, Bias, BufferId, ClientId, ClientMutation, ClientSequence, CommandClass, CommandSchema, CommandTask, CommandTaskId, DocumentClass, DocumentId,
@@ -138,12 +138,13 @@ pub fn main_entry() -> Result<()> {
 fn run_editor(cli: &Cli) -> Result<()> {
     let mut app = App::open(cli.path.as_deref(), cli.line)?;
     let mut terminal = SystemTerminalBackend::open().context("open interactive terminal")?;
-    let (columns, rows) = terminal.size().context("query terminal size")?;
+    let dimensions = terminal.size().context("query terminal size")?;
+    let (columns, rows) = (dimensions.columns, dimensions.rows);
     let output = Arc::new(LocalMutex::new(TerminaBackend::new(std::io::stdout())));
     let presenter = Presenter::start(Arc::clone(&output))?;
     let mut layout = ViewportLayout::new(columns, rows);
     layout.configure_dotfile_profile();
-    app.resize_terminal(rows, columns);
+    app.resize_terminal_to(dimensions);
     app.schedule_provider_refreshes(layout.height);
     presenter.publish(desired_frame(&mut layout, &app))?;
     let mut pending_input = None;
@@ -224,9 +225,9 @@ fn handle_terminal_event(
     output: &SharedPresenterBackend,
     layout: &mut ViewportLayout,
 ) -> bool {
-    if let TerminalInput::Resized { columns, rows } = event {
-        layout.resize(columns, rows);
-        app.resize_terminal(rows, columns);
+    if let TerminalInput::Resized(dimensions) = event {
+        layout.resize(dimensions.columns, dimensions.rows);
+        app.resize_terminal_to(dimensions);
         return true;
     }
     if matches!(event, TerminalInput::Ignored) {

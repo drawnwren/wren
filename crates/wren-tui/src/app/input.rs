@@ -34,7 +34,7 @@ impl App {
             TerminalInput::Mouse { action: MouseAction::Scroll(lines), column, row } => self.handle_mouse_scroll_at(lines, column, row),
             // The application loop owns rendered geometry and handles clicks
             // through `handle_mouse_click` before generic input dispatch.
-            TerminalInput::Mouse { .. } | TerminalInput::Ignored | TerminalInput::Resized { .. } => Ok(()),
+            TerminalInput::Mouse { .. } | TerminalInput::Ignored | TerminalInput::Resized(_) => Ok(()),
         }
     }
 

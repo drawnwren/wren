@@ -70,11 +70,7 @@ impl App {
 
     pub(super) fn handle_agent_input(&mut self, input: TerminalInput) -> Result<()> {
         match input {
-            TerminalInput::Resized { columns, rows } => {
-                self.viewport_rows = rows.max(1);
-                self.viewport_columns = columns.max(1);
-                self.resize_agent_terminal();
-            }
+            TerminalInput::Resized(dimensions) => self.resize_terminal_to(dimensions),
             TerminalInput::Paste(text) => crate::app_terminal::send_pty(&mut self.agent_terminal, text.as_bytes())?,
             TerminalInput::Key(key) => self.handle_agent_key(key)?,
             event @ TerminalInput::Mouse { .. } => self.send_agent_mouse_input(&event)?,
@@ -146,7 +142,7 @@ impl App {
         let start = ViewportLayout::terminal_sidebar_column_for_size(self.viewport_columns, self.viewport_rows)?.saturating_add(1);
         match event {
             TerminalInput::Mouse { action, column, row } => Some(TerminalInput::Mouse { action: *action, column: column.saturating_sub(start), row: *row }),
-            TerminalInput::Key(_) | TerminalInput::Paste(_) | TerminalInput::Resized { .. } | TerminalInput::Ignored => None,
+            TerminalInput::Key(_) | TerminalInput::Paste(_) | TerminalInput::Resized(_) | TerminalInput::Ignored => None,
         }
     }
 

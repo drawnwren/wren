@@ -27,9 +27,29 @@ pub trait TerminalBackend {
 pub enum TerminalInput {
     Key(TerminalKey),
     Paste(String),
-    Resized { columns: usize, rows: usize },
+    Resized(TerminalDimensions),
     Mouse { action: MouseAction, column: usize, row: usize },
     Ignored,
+}
+
+/// Cell and pixel dimensions reported by the terminal for one viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalDimensions {
+    pub columns: usize,
+    pub rows: usize,
+    pub pixel_width: Option<usize>,
+    pub pixel_height: Option<usize>,
+}
+
+impl TerminalDimensions {
+    #[must_use]
+    pub fn cell_height_to_width(self) -> Option<f64> {
+        let pixel_width = self.pixel_width.filter(|width| *width > 0)? as f64;
+        let pixel_height = self.pixel_height.filter(|height| *height > 0)? as f64;
+        let columns = self.columns.max(1) as f64;
+        let rows = self.rows.max(1) as f64;
+        Some((pixel_height * columns) / (pixel_width * rows))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,11 +128,8 @@ impl SystemTerminalBackend {
         Ok(Self { terminal, renderer: Renderer::new(), deferred_parser: Parser::default(), deferred_input: VecDeque::new() })
     }
 
-    pub fn size(&mut self) -> Result<(usize, usize), TerminalError> {
-        self.terminal
-            .get_dimensions()
-            .map(|size| (usize::from(size.cols.max(1)), usize::from(size.rows.max(1))))
-            .map_err(|error| TerminalError::Input(error.to_string()))
+    pub fn size(&mut self) -> Result<TerminalDimensions, TerminalError> {
+        self.terminal.get_dimensions().map(terminal_dimensions).map_err(|error| TerminalError::Input(error.to_string()))
     }
 
     pub fn poll_input(&mut self, timeout: Option<Duration>) -> Result<Option<TerminalInput>, TerminalError> {
@@ -383,9 +400,16 @@ fn rasterize_quads(width: usize, height: usize, background: wren_view::RgbColor,
         pixel.copy_from_slice(&[background.red, background.green, background.blue]);
     }
     for quad in quads {
-        if quad.vertices.iter().flatten().any(|coordinate| !coordinate.is_finite()) {
+        if quad.vertices.iter().flatten().any(|coordinate| !coordinate.is_finite())
+            || quad.border.is_some_and(|border| !border.width.is_finite() || border.width < 0.0)
+        {
             return Err(TerminalError::Render("raster overlay contains a non-finite quad".to_owned()));
         }
+        let inverse_edge_lengths = std::array::from_fn(|edge| {
+            let start = quad.vertices[edge];
+            let end = quad.vertices[(edge + 1) % 4];
+            (end[0] - start[0]).hypot(end[1] - start[1]).max(f32::EPSILON).recip()
+        });
         let min_x = quad.vertices.iter().map(|point| point[0]).fold(f32::INFINITY, f32::min).floor().clamp(0.0, width as f32) as usize;
         let max_x = quad.vertices.iter().map(|point| point[0]).fold(f32::NEG_INFINITY, f32::max).ceil().clamp(0.0, width as f32) as usize;
         let min_y = quad.vertices.iter().map(|point| point[1]).fold(f32::INFINITY, f32::min).floor().clamp(0.0, height as f32) as usize;
@@ -393,11 +417,12 @@ fn rasterize_quads(width: usize, height: usize, background: wren_view::RgbColor,
         for row in min_y..max_y {
             for column in min_x..max_x {
                 let point = [column as f32 + 0.5, row as f32 + 0.5];
-                if !point_in_quad(point, quad.vertices) {
+                let Some(edge_distance) = point_in_quad(point, quad.vertices, inverse_edge_lengths) else {
                     continue;
-                }
+                };
+                let color = quad.border.filter(|border| edge_distance <= border.width).map_or(quad.color, |border| border.color);
                 let offset = (row * width + column) * 3;
-                rgb[offset..offset + 3].copy_from_slice(&[quad.color.red, quad.color.green, quad.color.blue]);
+                rgb[offset..offset + 3].copy_from_slice(&[color.red, color.green, color.blue]);
             }
         }
     }
@@ -405,9 +430,10 @@ fn rasterize_quads(width: usize, height: usize, background: wren_view::RgbColor,
 }
 
 #[inline]
-fn point_in_quad(point: [f32; 2], vertices: [[f32; 2]; 4]) -> bool {
+fn point_in_quad(point: [f32; 2], vertices: [[f32; 2]; 4], inverse_edge_lengths: [f32; 4]) -> Option<f32> {
     let mut has_positive = false;
     let mut has_negative = false;
+    let mut edge_distance = f32::INFINITY;
     for edge in 0..4 {
         let start = vertices[edge];
         let end = vertices[(edge + 1) % 4];
@@ -415,10 +441,11 @@ fn point_in_quad(point: [f32; 2], vertices: [[f32; 2]; 4]) -> bool {
         has_positive |= cross > 0.0;
         has_negative |= cross < 0.0;
         if has_positive && has_negative {
-            return false;
+            return None;
         }
+        edge_distance = edge_distance.min(cross.abs() * inverse_edge_lengths[edge]);
     }
-    true
+    Some(edge_distance)
 }
 
 fn write_style_if_changed(output: &mut impl Write, style: CellStyle, active_style: &mut Option<CellStyle>, cache: &mut StyleCache) -> io::Result<()> {
@@ -490,7 +517,7 @@ fn map_input(input: Event) -> TerminalInput {
             TerminalInput::Key(TerminalKey::modified(code, modifiers))
         }
         Event::Paste(text) => TerminalInput::Paste(text),
-        Event::WindowResized(size) => TerminalInput::Resized { columns: usize::from(size.cols.max(1)), rows: usize::from(size.rows.max(1)) },
+        Event::WindowResized(size) => TerminalInput::Resized(terminal_dimensions(size)),
         Event::Mouse(event) => match event.kind {
             MouseEventKind::Down(MouseButton::Left) => TerminalInput::click(usize::from(event.column), usize::from(event.row)),
             MouseEventKind::Drag(MouseButton::Left) => TerminalInput::drag(usize::from(event.column), usize::from(event.row)),
@@ -501,6 +528,15 @@ fn map_input(input: Event) -> TerminalInput {
             _ => TerminalInput::Ignored,
         },
         Event::Key(_) | Event::FocusIn | Event::FocusOut | Event::Csi(_) | Event::Osc(_) | Event::Dcs(_) => TerminalInput::Ignored,
+    }
+}
+
+fn terminal_dimensions(size: termina::WindowSize) -> TerminalDimensions {
+    TerminalDimensions {
+        columns: usize::from(size.cols.max(1)),
+        rows: usize::from(size.rows.max(1)),
+        pixel_width: size.pixel_width.filter(|width| *width > 0).map(usize::from),
+        pixel_height: size.pixel_height.filter(|height| *height > 0).map(usize::from),
     }
 }
 
@@ -628,6 +664,21 @@ mod tests {
     }
 
     #[test]
+    fn resize_events_preserve_terminal_pixel_dimensions() {
+        let input = map_input(Event::WindowResized(termina::WindowSize { cols: 83, rows: 27, pixel_width: Some(913), pixel_height: Some(621) }));
+        let TerminalInput::Resized(dimensions) = input else { panic!("resize event") };
+        assert_eq!(dimensions.columns, 83);
+        assert_eq!(dimensions.rows, 27);
+        assert_eq!((dimensions.pixel_width, dimensions.pixel_height), (Some(913), Some(621)));
+        let expected = (621.0 * 83.0) / (913.0 * 27.0);
+        assert!((dimensions.cell_height_to_width().expect("cell aspect") - expected).abs() < f64::EPSILON);
+
+        let without_pixels = terminal_dimensions(termina::WindowSize { cols: 0, rows: 0, pixel_width: Some(0), pixel_height: Some(0) });
+        assert_eq!((without_pixels.columns, without_pixels.rows), (1, 1));
+        assert_eq!(without_pixels.cell_height_to_width(), None);
+    }
+
+    #[test]
     fn control_d_is_a_key_in_raw_and_enhanced_protocols() {
         let expected = TerminalInput::Key(TerminalKey::modified(TerminalKeyCode::Char('d'), Modifiers::CONTROL));
         assert_eq!(parse_one(b"\x04"), expected);
@@ -672,9 +723,26 @@ mod tests {
 
     #[test]
     fn quad_rasterizer_clips_exact_geometry_to_image_bounds() {
-        let quad = RasterQuad { vertices: [[-1.0, -1.0], [1.0, -1.0], [1.0, 3.0], [-1.0, 3.0]], color: wren_view::RgbColor::new(200, 210, 220) };
+        let quad = RasterQuad { vertices: [[-1.0, -1.0], [1.0, -1.0], [1.0, 3.0], [-1.0, 3.0]], color: wren_view::RgbColor::new(200, 210, 220), border: None };
         let pixels = rasterize_quads(2, 2, wren_view::RgbColor::new(10, 20, 30), &[quad]).expect("rasterize");
         assert_eq!(pixels, vec![200, 210, 220, 10, 20, 30, 200, 210, 220, 10, 20, 30]);
+    }
+
+    #[test]
+    fn quad_rasterizer_draws_a_subpixel_border_without_insetting_geometry() {
+        let border = wren_view::RgbColor::new(1, 2, 3);
+        let fill = wren_view::RgbColor::new(200, 210, 220);
+        let quad = RasterQuad {
+            vertices: [[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0]],
+            color: fill,
+            border: Some(wren_view::RasterBorder { color: border, width: 0.75 }),
+        };
+        let pixels = rasterize_quads(3, 3, wren_view::RgbColor::new(10, 20, 30), &[quad]).expect("rasterize");
+        let colors = pixels.chunks_exact(3).map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect::<Vec<_>>();
+        assert_eq!(colors[4], [fill.red, fill.green, fill.blue]);
+        for index in [0, 1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(colors[index], [border.red, border.green, border.blue]);
+        }
     }
 
     #[test]

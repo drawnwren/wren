@@ -23,7 +23,7 @@ impl App {
 
     pub(super) fn handle_terminal_input(&mut self, input: TerminalInput) -> Result<()> {
         match input {
-            TerminalInput::Resized { columns, rows } => self.resize_terminal(rows, columns),
+            TerminalInput::Resized(dimensions) => self.resize_terminal_to(dimensions),
             TerminalInput::Paste(text) => send_pty(&mut self.terminal, text.as_bytes())?,
             TerminalInput::Key(key) => {
                 let escape_pending = matches!(self.input_focus, InputFocus::Terminal { escape_pending: true });
@@ -62,6 +62,13 @@ impl App {
             self.show_error(format!("terminal resize: {error}"));
         }
         self.resize_agent_terminal();
+    }
+
+    pub(super) fn resize_terminal_to(&mut self, dimensions: TerminalDimensions) {
+        if let Some(cell_height_to_width) = dimensions.cell_height_to_width() {
+            self.startup_screen.get_mut().set_cell_height_to_width(cell_height_to_width);
+        }
+        self.resize_terminal(dimensions.rows, dimensions.columns);
     }
 
     pub(super) fn take_normal_count(&mut self) -> Option<usize> {

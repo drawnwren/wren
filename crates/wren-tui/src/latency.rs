@@ -229,6 +229,7 @@ impl TilingProbe {
         // clock, matching the allocation-returning `diff` baseline whose
         // result was dropped after its measured interval.
         self.diagnostic_update.rows.clear();
+        self.diagnostic_update.raster_overlay = None;
         let diff_started = Instant::now();
         diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_update);
         let diff_nanos = elapsed_nanos(diff_started);
