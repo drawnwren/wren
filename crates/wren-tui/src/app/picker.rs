@@ -220,14 +220,14 @@ impl App {
             .provider
             .highlight_now(stable_document_id(Some(&path)), revision, Arc::from(self.picker_preview.as_str()), bundle)
             .unwrap_or_else(|_| lexical_highlight_text(&self.picker_preview));
-        self.picker_preview_decorations = spans.into_iter().map(|span| provider_decoration(span, self.theme)).collect();
+        self.picker_preview_decorations = spans.into_iter().map(provider_decoration).collect();
         if let Some(entry) = selected_entry {
             let line = entry.line.saturating_sub(1);
             self.picker_preview_scroll = line.saturating_sub(5);
             if let Some(range) = entry.selection_byte_range(&self.picker_preview) {
                 self.picker_preview_decorations.push(DecorationSpan::new(
                     range,
-                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(self.theme.color(CatppuccinColor::Surface0))),
+                    CellStyle::default().without_foreground().with_background(CellColor::Theme(CatppuccinColor::Surface0)),
                     u32::MAX,
                 ));
             } else {

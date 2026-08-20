@@ -19,7 +19,13 @@ fn main() -> io::Result<()> {
             edge: Rgb8::new(0x11, 0x11, 0x1b),
             shadow: Rgb8::new(0x18, 0x18, 0x25),
             midtone: Rgb8::new(0x45, 0x47, 0x5a),
-            highlight: Rgb8::new(0xcb, 0xa6, 0xf7),
+            accents: [
+                Rgb8::new(0xcb, 0xa6, 0xf7),
+                Rgb8::new(0x89, 0xb4, 0xfa),
+                Rgb8::new(0x94, 0xe2, 0xd5),
+                Rgb8::new(0xa6, 0xe3, 0xa1),
+                Rgb8::new(0xfa, 0xb3, 0x87),
+            ],
         },
         ..Shading::default()
     };

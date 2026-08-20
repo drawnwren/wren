@@ -381,14 +381,13 @@ impl App {
         };
         self.lsps[index].semantic_due = None;
         let buffer_id = self.active.buffer_id;
-        let theme = self.theme;
         self.start_lsp_background_task("semantic", "", move |lsp, _, revision, text, prepared| {
             let decorations = prepared.and_then(|()| {
                 let response = lsp
                     .client
                     .request("textDocument/semanticTokens/full", serde_json::json!({"textDocument": {"uri": lsp.uri}}))
                     .map_err(|error| error.to_string())?;
-                let spans = parse_semantic_tokens(text, &response, &legend).into_iter().map(|span| provider_decoration(span, theme)).collect();
+                let spans = parse_semantic_tokens(text, &response, &legend).into_iter().map(provider_decoration).collect();
                 Ok(BufferDecorations::new(revision, spans))
             });
             semantic_lsp_completion(buffer_id, revision, decorations)
@@ -408,7 +407,7 @@ impl App {
             self.close_editor_popup();
             self.message = format!("{method}: no information");
         } else {
-            let (text, decorations) = lsp_popup_markdown(&rendered, self.theme);
+            let (text, decorations) = lsp_popup_markdown(&rendered);
             self.popup = Some(TextPopup::new("", text).with_decorations(decorations));
             self.popup_deadline = Some(Instant::now() + Duration::from_secs(6));
             self.message.clear();

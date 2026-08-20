@@ -69,17 +69,17 @@ const HIGHLIGHT_RULES: &[HighlightRule] = &[
     HighlightRule::new(CatppuccinColor::Text, &[], &["variable"], &[]),
 ];
 
-pub(super) fn provider_decoration(span: HighlightSpan, theme: CatppuccinPalette) -> DecorationSpan {
-    DecorationSpan::new(span.range, provider_cell_style(&span.kind, theme), span.priority)
+pub(super) fn provider_decoration(span: HighlightSpan) -> DecorationSpan {
+    DecorationSpan::new(span.range, provider_cell_style(&span.kind), span.priority)
 }
 
-pub(super) fn provider_decorations(spans: Vec<HighlightSpan>, theme: CatppuccinPalette) -> Vec<DecorationSpan> {
+pub(super) fn provider_decorations(spans: Vec<HighlightSpan>) -> Vec<DecorationSpan> {
     let mut styles = HashMap::<Arc<str>, CellStyle>::new();
     spans
         .into_iter()
         .map(|span| {
             let style = styles.get(span.kind.as_ref()).copied().unwrap_or_else(|| {
-                let style = provider_cell_style(&span.kind, theme);
+                let style = provider_cell_style(&span.kind);
                 styles.insert(Arc::clone(&span.kind), style);
                 style
             });
@@ -88,18 +88,14 @@ pub(super) fn provider_decorations(spans: Vec<HighlightSpan>, theme: CatppuccinP
         .collect()
 }
 
-fn provider_cell_style(kind: &str, theme: CatppuccinPalette) -> CellStyle {
+fn provider_cell_style(kind: &str) -> CellStyle {
     let rule = HIGHLIGHT_RULES.iter().find(|rule| rule.matches(kind));
     let color = rule.map_or(CatppuccinColor::Text, |rule| rule.color);
     let attributes = rule.map_or(0, |rule| rule.attributes);
-    CellStyle {
-        attributes,
-        foreground: Some(CellColor::Rgb(theme.color(color))),
-        background: rule.and_then(|rule| rule.background).map(|color| CellColor::Rgb(theme.color(color))),
-    }
+    CellStyle { attributes, foreground: Some(CellColor::Theme(color)), background: rule.and_then(|rule| rule.background).map(CellColor::Theme) }
 }
 
-pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (String, Vec<DecorationSpan>) {
+pub(super) fn lsp_popup_markdown(markdown: &str) -> (String, Vec<DecorationSpan>) {
     let mut text = String::new();
     let mut code_block = None::<(usize, String)>;
     let mut code_spans = Vec::new();
@@ -107,7 +103,7 @@ pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (S
         let trimmed = line.trim();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if let Some((start, language)) = code_block.take() {
-                append_fenced_highlights(&text, start, &language, theme, &mut code_spans);
+                append_fenced_highlights(&text, start, &language, &mut code_spans);
             } else {
                 code_block = Some((text.len(), fence.trim().to_owned()));
             }
@@ -116,18 +112,18 @@ pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (S
         text.push_str(line);
     }
     if let Some((start, language)) = code_block {
-        append_fenced_highlights(&text, start, &language, theme, &mut code_spans);
+        append_fenced_highlights(&text, start, &language, &mut code_spans);
     }
     while text.ends_with('\n') {
         text.pop();
     }
-    let mut decorations = provider_decorations(highlight_text(&text, "markdown"), theme);
+    let mut decorations = provider_decorations(highlight_text(&text, "markdown"));
     decorations.extend(code_spans);
     (text, decorations)
 }
 
-fn append_fenced_highlights(text: &str, start: usize, language: &str, theme: CatppuccinPalette, output: &mut Vec<DecorationSpan>) {
-    output.extend(provider_decorations(highlight_text(&text[start..], normalized_fence_language(language)), theme).into_iter().map(|mut span| {
+fn append_fenced_highlights(text: &str, start: usize, language: &str, output: &mut Vec<DecorationSpan>) {
+    output.extend(provider_decorations(highlight_text(&text[start..], normalized_fence_language(language))).into_iter().map(|mut span| {
         span.range = start + span.range.start..start + span.range.end;
         span
     }));

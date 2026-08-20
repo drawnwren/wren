@@ -477,6 +477,7 @@ fn style_key(style: CellStyle) -> u128 {
 const fn color_key(color: Option<CellColor>) -> u32 {
     match color {
         None => 0,
+        Some(CellColor::Theme(_)) => 3,
         Some(CellColor::Palette(index)) => 1 | (index as u32) << 2,
         Some(CellColor::Rgb(color)) => 2 | (color.red as u32) << 2 | (color.green as u32) << 10 | (color.blue as u32) << 18,
     }
@@ -497,6 +498,7 @@ fn write_style(output: &mut impl Write, style: CellStyle) -> io::Result<()> {
 fn write_color(output: &mut impl Write, channel: u8, color: Option<CellColor>) -> io::Result<()> {
     match color {
         None => Ok(()),
+        Some(CellColor::Theme(_)) => Err(io::Error::new(io::ErrorKind::InvalidData, "editor theme color reached the terminal before resolution")),
         Some(CellColor::Palette(index)) => write!(output, ";{channel};5;{index}"),
         Some(CellColor::Rgb(color)) => write!(output, ";{channel};2;{};{};{}", color.red, color.green, color.blue),
     }

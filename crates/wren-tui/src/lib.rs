@@ -48,10 +48,12 @@ use wren_types::{
     ProviderDemand, SemanticGroupId, SemanticGroupKind, SessionId, StateDelta, Transaction, identifier_prefix_start, identifier_range, merge_ranges,
     ranges_overlap, stable_hash,
 };
+#[cfg(test)]
+use wren_view::CatppuccinPalette;
 use wren_view::{
-    AceJumpOverlay, AceJumpTarget, CatppuccinColor, CatppuccinFlavor, CatppuccinPalette, Cell as ViewCell, CellColor, CellRow, CellStyle, ClientViewModel,
-    CompletionOverlay, DebugOverlay, DebugPanel, DecorationSpan, DesiredGrid, LineDecoration, MenuOverlayRow, PickerOverlay, RgbColor, SharedDecorations,
-    SplitAxis, StatusOverlay, StatusSegment, TerminalSidebar, TextPopup, ViewportLayout, WindowDirection,
+    AceJumpOverlay, AceJumpTarget, CatppuccinColor, CatppuccinFlavor, Cell as ViewCell, CellColor, CellRow, CellStyle, ClientViewModel, CompletionOverlay,
+    DebugOverlay, DebugPanel, DecorationSpan, DesiredGrid, EditorTheme, LineDecoration, MenuOverlayRow, PickerOverlay, RgbColor, SharedDecorations, SplitAxis,
+    StatusOverlay, StatusSegment, TerminalSidebar, TextPopup, ViewportLayout, WindowDirection,
 };
 use wren_workflow::{
     GitHunk, LspClient, LspPosition, LspTextEdit, PtySession, TaskSpec as WorkflowTaskSpec, TaskSupervisor, TerminalColor, WorkflowError, git_hunks,
@@ -310,7 +312,9 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     layout.set_theme(app.theme);
     layout.set_terminal_sidebar_visible(app.agent_sidebar_visible && !app.input_focus.is_terminal());
     if app.input_focus.is_terminal() {
-        return Arc::new(app.desired_terminal_grid(layout));
+        let mut grid = app.desired_terminal_grid(layout);
+        grid.resolve_theme(app.theme);
+        return Arc::new(grid);
     }
     let frame = app.active.editor.frame();
     layout.ensure_cursor_visible(&frame, 1);
@@ -328,7 +332,9 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     }
     prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     prefetch_document_end(layout, app, &frames, &line_decorations);
-    Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()))
+    let mut grid = apply_editor_overlays(layout, app, grid, prompt.is_none());
+    grid.resolve_theme(app.theme);
+    Arc::new(grid)
 }
 
 fn prepare_realtime_view_updates(
@@ -459,7 +465,9 @@ fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<Desire
     layout.set_theme(app.theme);
     layout.set_terminal_sidebar_visible(app.agent_sidebar_visible && !app.input_focus.is_terminal());
     if app.input_focus.is_terminal() {
-        return (Arc::new(app.desired_terminal_grid(layout)), timings);
+        let mut grid = app.desired_terminal_grid(layout);
+        grid.resolve_theme(app.theme);
+        return (Arc::new(grid), timings);
     }
     let frame = app.active.editor.frame();
     layout.ensure_cursor_visible(&frame, 1);
@@ -483,7 +491,9 @@ fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<Desire
     }
     prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     prefetch_document_end(layout, app, &frames, &line_decorations);
-    let grid = Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()));
+    let mut grid = apply_editor_overlays(layout, app, grid, prompt.is_none());
+    grid.resolve_theme(app.theme);
+    let grid = Arc::new(grid);
     measure(7);
     timings.total = total_at.elapsed();
     (grid, timings)
@@ -588,27 +598,24 @@ fn search_decorations(app: &App, buffer: &BufferState, range: Range<usize>) -> V
             let current = buffer.buffer_id == app.active.buffer_id && range.start == app.active.editor.primary_cursor();
             DecorationSpan::new(
                 range,
-                CellStyle::rgb(
-                    app.theme.color(CatppuccinColor::Crust),
-                    if current { app.theme.color(CatppuccinColor::Peach) } else { app.theme.color(CatppuccinColor::Yellow) },
-                ),
+                CellStyle::themed(CatppuccinColor::Crust, if current { CatppuccinColor::Peach } else { CatppuccinColor::Yellow }),
                 3_000_000,
             )
         })
         .collect()
 }
 
-fn add_git_decorations(buffer: &BufferState, theme: CatppuccinPalette, lines: &mut Vec<LineDecoration>) {
+fn add_git_decorations(buffer: &BufferState, lines: &mut Vec<LineDecoration>) {
     lines.extend(buffer.git_hunks.iter().map(|hunk| {
         let line = if hunk.after.start == hunk.after.end { hunk.after.start.saturating_sub(1) } else { hunk.after.start } as usize;
         let color = if hunk.before.start == hunk.before.end {
-            theme.color(CatppuccinColor::Green)
+            CatppuccinColor::Green
         } else if hunk.after.start == hunk.after.end {
-            theme.color(CatppuccinColor::Red)
+            CatppuccinColor::Red
         } else {
-            theme.color(CatppuccinColor::Yellow)
+            CatppuccinColor::Yellow
         };
-        LineDecoration { line, style: CellStyle::default().with_foreground(CellColor::Rgb(color)).with_bold() }
+        LineDecoration { line, style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold() }
     }));
 }
 
@@ -617,13 +624,14 @@ fn add_diagnostic_decorations(app: &App, buffer: &BufferState, path: &Path, span
         let start = buffer.editor.text().byte_of_line(diagnostic.line.saturating_sub(1));
         let end = buffer.editor.text().byte_of_line(diagnostic.line).saturating_sub(1).max(start.saturating_add(1)).min(buffer.editor.text().len_bytes());
         let color = match diagnostic.severity {
-            Severity::Error => app.theme.color(CatppuccinColor::Red),
-            Severity::Warning => app.theme.color(CatppuccinColor::Yellow),
-            Severity::Info => app.theme.color(CatppuccinColor::Blue),
-            Severity::Hint | Severity::None => app.theme.color(CatppuccinColor::Teal),
+            Severity::Error => CatppuccinColor::Red,
+            Severity::Warning => CatppuccinColor::Yellow,
+            Severity::Info => CatppuccinColor::Blue,
+            Severity::Hint | Severity::None => CatppuccinColor::Teal,
         };
-        spans.push(DecorationSpan::new(start..end, CellStyle::default().with_foreground(CellColor::Rgb(color)).with_underline(), 2_000_000));
-        lines.push(LineDecoration { line: diagnostic.line.saturating_sub(1), style: CellStyle::default().with_foreground(CellColor::Rgb(color)).with_bold() });
+        spans.push(DecorationSpan::new(start..end, CellStyle::default().with_foreground(CellColor::Theme(color)).with_underline(), 2_000_000));
+        lines
+            .push(LineDecoration { line: diagnostic.line.saturating_sub(1), style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold() });
     }
 }
 
@@ -631,10 +639,11 @@ fn add_breakpoint_decorations(app: &App, path: &Path, lines: &mut Vec<LineDecora
     let Some(breakpoints) = app.breakpoints.get(path) else {
         return;
     };
-    lines.extend(breakpoints.keys().map(|line| LineDecoration {
-        line: line.saturating_sub(1),
-        style: CellStyle::rgb(app.theme.color(CatppuccinColor::Red), app.theme.color(CatppuccinColor::Surface0)).with_bold(),
-    }));
+    lines.extend(
+        breakpoints
+            .keys()
+            .map(|line| LineDecoration { line: line.saturating_sub(1), style: CellStyle::themed(CatppuccinColor::Red, CatppuccinColor::Surface0).with_bold() }),
+    );
 }
 
 fn add_buffer_decorations(app: &App, decorations: &mut DecorationSetBuilder) -> Vec<(BufferId, Vec<LineDecoration>)> {
@@ -645,7 +654,7 @@ fn add_buffer_decorations(app: &App, decorations: &mut DecorationSetBuilder) -> 
         };
         let lines = decoration_bucket(&mut line_decorations, buffer.buffer_id);
         let mut added = Vec::new();
-        add_git_decorations(buffer, app.theme, lines);
+        add_git_decorations(buffer, lines);
         add_diagnostic_decorations(app, buffer, path, &mut added, lines);
         add_breakpoint_decorations(app, path, lines);
         added.sort_by(decoration_order);
@@ -667,7 +676,7 @@ fn add_selection_decoration(app: &App, decorations: &mut DecorationSetBuilder) {
         app.active.buffer_id,
         vec![DecorationSpan::new(
             selection,
-            CellStyle::default().without_foreground().with_background(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface2))),
+            CellStyle::default().without_foreground().with_background(CellColor::Theme(CatppuccinColor::Surface2)),
             // Selection is appended after syntax and semantic decorations, so
             // tying their maximum priority lets it own the background while
             // retaining the highlighter's foreground and text attributes.
@@ -931,19 +940,19 @@ fn load_user_config<T>(path: Option<PathBuf>, kind: &str, fallback: impl FnOnce(
 }
 
 #[cfg(test)]
-fn load_theme() -> (CatppuccinPalette, String) {
-    (CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha), String::new())
+fn load_theme() -> (EditorTheme, String) {
+    (EditorTheme::for_flavor(CatppuccinFlavor::Mocha), String::new())
 }
 
 #[cfg(not(test))]
-fn load_theme() -> (CatppuccinPalette, String) {
+fn load_theme() -> (EditorTheme, String) {
     let (config, mut message) = load_user_config(config_file("theme.toml"), "theme", ThemeConfig::default, |source| Ok(toml::from_str(source)?));
     let requested = env::var("WREN_CATPPUCCIN_FLAVOR").ok().or(config.flavor).unwrap_or_else(|| "mocha".to_owned());
     let flavor = parse_catppuccin_flavor(&requested).unwrap_or_else(|| {
         message = format!("unknown Catppuccin flavor {requested:?}; using mocha");
         CatppuccinFlavor::Mocha
     });
-    let mut palette = CatppuccinPalette::for_flavor(flavor);
+    let mut palette = EditorTheme::for_flavor(flavor);
     for (name, value) in config.colors {
         let Some(color) = RgbColor::from_hex(&value) else {
             message = format!("invalid theme color {name}={value:?}");
@@ -1340,7 +1349,7 @@ struct App {
     agent_terminal: Option<PtySession>,
     agent_sidebar_visible: bool,
     last_staged_patch: Option<Vec<u8>>,
-    theme: CatppuccinPalette,
+    theme: EditorTheme,
     viewport_rows: usize,
     viewport_columns: usize,
     realtime_decorations_prepared: Cell<bool>,

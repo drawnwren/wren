@@ -451,7 +451,7 @@ fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<Prepa
                 .cloned()
                 .map(|mut span| {
                     span.priority = 2_000_000;
-                    span.style = span.style.with_foreground(CellColor::Rgb(app.theme.color(CatppuccinColor::Lavender)));
+                    span.style = span.style.with_foreground(CellColor::Theme(CatppuccinColor::Lavender));
                     span
                 })
                 .collect::<Vec<_>>()

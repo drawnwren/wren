@@ -385,23 +385,36 @@ fn equalize_split_tree(tree: &mut SplitTree) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CellColor {
+    /// A semantic editor color resolved from the active theme at render time.
+    Theme(CatppuccinColor),
+    /// A terminal-native indexed color supplied by embedded terminal content.
     Palette(u8),
+    /// An explicit color supplied by external content or a resolved theme.
     Rgb(RgbColor),
 }
 
 impl CellColor {
+    #[must_use]
+    pub const fn theme(color: CatppuccinColor) -> Self {
+        Self::Theme(color)
+    }
+
     #[must_use]
     pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
         Self::Rgb(RgbColor::new(red, green, blue))
     }
 }
 
+/// The single source of truth for every editor-owned color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatppuccinPalette {
+pub struct EditorTheme {
     slots: [RgbColor; 26],
 }
 
-impl CatppuccinPalette {
+/// Backwards-compatible name for Wren's Catppuccin-backed editor theme.
+pub type CatppuccinPalette = EditorTheme;
+
+impl EditorTheme {
     #[must_use]
     pub fn for_flavor(flavor: CatppuccinFlavor) -> Self {
         let colors = &catppuccin::PALETTE[flavor].colors;
@@ -419,20 +432,25 @@ impl CatppuccinPalette {
 
     pub fn set(&mut self, name: &str, color: RgbColor) -> bool {
         let Ok(name) = name.parse::<CatppuccinColor>() else { return false };
-        self.slots[catppuccin::PALETTE.mocha.colors[name].order as usize] = color;
+        self.set_color(name, color);
         true
     }
 
-    fn remap_from_mocha(self, color: CellColor) -> CellColor {
-        let CellColor::Rgb(rgb) = color else {
-            return color;
-        };
-        Self::for_flavor(CatppuccinFlavor::Mocha)
-            .slots
-            .into_iter()
-            .zip(self.slots)
-            .find_map(|(source, target)| (source == rgb).then_some(CellColor::Rgb(target)))
-            .unwrap_or(color)
+    pub fn set_color(&mut self, name: CatppuccinColor, color: RgbColor) {
+        self.slots[catppuccin::PALETTE.mocha.colors[name].order as usize] = color;
+    }
+
+    #[must_use]
+    pub fn resolve(self, color: CellColor) -> CellColor {
+        match color {
+            CellColor::Theme(name) => CellColor::Rgb(self.color(name)),
+            explicit => explicit,
+        }
+    }
+
+    #[must_use]
+    pub fn contains(self, color: RgbColor) -> bool {
+        self.slots.contains(&color)
     }
 }
 
@@ -447,15 +465,15 @@ pub struct CellStyle {
 
 impl Default for CellStyle {
     fn default() -> Self {
-        Self {
-            attributes: 0,
-            foreground: Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Text))),
-            background: Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Base))),
-        }
+        Self::themed(CatppuccinColor::Text, CatppuccinColor::Base)
     }
 }
 
 impl CellStyle {
+    pub const fn themed(foreground: CatppuccinColor, background: CatppuccinColor) -> Self {
+        Self { attributes: 0, foreground: Some(CellColor::Theme(foreground)), background: Some(CellColor::Theme(background)) }
+    }
+
     pub const fn rgb(foreground: RgbColor, background: RgbColor) -> Self {
         Self { attributes: 0, foreground: Some(CellColor::Rgb(foreground)), background: Some(CellColor::Rgb(background)) }
     }
@@ -692,6 +710,20 @@ impl DesiredGrid {
     #[cfg(test)]
     pub fn text(&self) -> String {
         self.rows.iter().map(|row| row.text()).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Resolve every semantic editor color after all overlays have been
+    /// composed. Explicit terminal colors remain untouched.
+    pub fn resolve_theme(&mut self, theme: EditorTheme) {
+        for row in &mut self.rows {
+            if row
+                .cells
+                .iter()
+                .any(|cell| matches!(cell.style.foreground, Some(CellColor::Theme(_))) || matches!(cell.style.background, Some(CellColor::Theme(_))))
+            {
+                apply_theme_to_rows(std::slice::from_mut(Arc::make_mut(row)), theme);
+            }
+        }
     }
 }
 
@@ -1238,7 +1270,7 @@ impl ViewportLayout {
             cursor.0 = cursor.0.saturating_add(layout.gutter);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(&mut rows, layout.gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.color(CatppuccinColor::Mantle));
+            mark_color_column(&mut rows, layout.gutter.saturating_add(column.saturating_sub(1)), self.width, CatppuccinColor::Mantle);
         }
         RenderedEditorContent { rows, row_lines, cursor }
     }
@@ -1383,7 +1415,7 @@ impl ViewportLayout {
         );
         if self.relative_numbers && !exact {
             for row in &mut rows {
-                replace_line_number(Arc::make_mut(row), line, cursor_line, self.number_width, true, request.line_decorations);
+                replace_line_number(Arc::make_mut(row), line, cursor_line, self.number_width, true, request.line_decorations, self.theme);
             }
         }
         if row_count <= remaining && !exact {
@@ -1463,7 +1495,7 @@ impl ViewportLayout {
             prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, gutter, self.relative_numbers, line_decorations);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(&mut rows, gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.color(CatppuccinColor::Mantle));
+            mark_color_column(&mut rows, gutter.saturating_add(column.saturating_sub(1)), self.width, CatppuccinColor::Mantle);
         }
         ensure_row_backgrounds(&mut rows);
         apply_theme_to_rows(&mut rows, self.theme);
@@ -2282,12 +2314,9 @@ fn occupied_cells_under_popup(grid: &DesiredGrid, placement: PopupPlacement, wid
 }
 
 fn apply_theme_to_rows(rows: &mut [CellRow], theme: CatppuccinPalette) {
-    if theme == CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha) {
-        return;
-    }
     for cell in rows.iter_mut().flat_map(|row| &mut row.cells) {
-        cell.style.foreground = cell.style.foreground.map(|color| theme.remap_from_mocha(color));
-        cell.style.background = cell.style.background.map(|color| theme.remap_from_mocha(color));
+        cell.style.foreground = cell.style.foreground.map(|color| theme.resolve(color));
+        cell.style.background = cell.style.background.map(|color| theme.resolve(color));
     }
 }
 
@@ -2522,7 +2551,7 @@ fn materialize_row_tail(row: &mut CellRow, width: usize) {
     row.cells.extend((current..width).map(|_| Cell { grapheme: " ".into(), width: 1, style }));
 }
 
-fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: RgbColor) {
+fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: CatppuccinColor) {
     if column >= width {
         return;
     }
@@ -2535,13 +2564,13 @@ fn mark_color_column(rows: &mut [CellRow], column: usize, width: usize, color: R
             // ClearToEndOfLine; applying it to every occupied cell at or past
             // the limit keeps long and wrapped rows on the same vertical edge.
             if column < end {
-                cell.style.background = Some(CellColor::Rgb(color));
+                cell.style.background = Some(CellColor::Theme(color));
             }
             display_column = end;
         }
         if display_column <= column {
             pad_row_to(row, column);
-            row.cells.push(Cell { grapheme: " ".into(), width: 1, style: CellStyle::default().with_background(CellColor::Rgb(color)) });
+            row.cells.push(Cell { grapheme: " ".into(), width: 1, style: CellStyle::default().with_background(CellColor::Theme(color)) });
         }
     }
 }
@@ -2869,18 +2898,26 @@ fn prepend_line_numbers(
     }
 }
 
-fn replace_line_number(row: &mut CellRow, logical_line: usize, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) {
-    let prefix = line_number_prefix(Some(logical_line), cursor_line, width, relative, line_decorations);
+fn replace_line_number(
+    row: &mut CellRow,
+    logical_line: usize,
+    cursor_line: usize,
+    width: usize,
+    relative: bool,
+    line_decorations: &[LineDecoration],
+    theme: EditorTheme,
+) {
+    let mut prefix = line_number_prefix(Some(logical_line), cursor_line, width, relative, line_decorations);
+    apply_theme_to_rows(std::slice::from_mut(&mut prefix), theme);
     for (target, replacement) in row.cells.iter_mut().zip(prefix.cells) {
         *target = replacement;
     }
 }
 
 fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) -> CellRow {
-    let style = logical_line.and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line)).map_or(
-        CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Overlay1))),
-        |decoration| decoration.style,
-    );
+    let style = logical_line
+        .and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line))
+        .map_or(CellStyle::default().with_foreground(CellColor::Theme(CatppuccinColor::Overlay1)), |decoration| decoration.style);
     let mut cells = vec![Cell { grapheme: single_byte_grapheme(b' '), width: 1, style }; width];
     if let Some(line) = logical_line {
         let mut number = if relative && line != cursor_line { line.abs_diff(cursor_line) } else { line.saturating_add(1) };
@@ -3242,7 +3279,12 @@ pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, update: 
     if update.rows.capacity() < desired.height {
         update.rows.reserve(desired.height - update.rows.capacity());
     }
-    let full_refresh = previous.is_none_or(|old| old.width != desired.width || old.height != desired.height);
+    // Kitty graphics with a negative z-index sit behind terminal cells. When
+    // the raster returns after a text overlay (for example, closing the file
+    // picker on the startup screen), the old text must be cleared even when
+    // the desired backing rows themselves are unchanged.
+    let raster_restored = previous.is_some_and(|old| old.raster_overlay.is_none() && desired.raster_overlay.is_some());
+    let full_refresh = previous.is_none_or(|old| old.width != desired.width || old.height != desired.height) || raster_restored;
     let raster_rows = desired.raster_overlay.as_ref().map_or(0, |overlay| overlay.rows.min(desired.height));
     if full_refresh {
         update.clear = true;
@@ -3561,6 +3603,7 @@ mod tests {
 
     #[test]
     fn catppuccin_flavors_are_exact_truecolor_and_overridable() {
+        assert_eq!(CellStyle::default(), CellStyle::themed(CatppuccinColor::Text, CatppuccinColor::Base));
         assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Base), RgbColor::new(0x1e, 0x1e, 0x2e));
         assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Text), RgbColor::new(0xcd, 0xd6, 0xf4));
         assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte).color(CatppuccinColor::Base), RgbColor::new(0xef, 0xf1, 0xf5));
@@ -3613,6 +3656,10 @@ mod tests {
         let mut without_overlay = with_overlay.clone();
         without_overlay.raster_overlay = None;
         assert_eq!(diff(Some(&with_overlay), &without_overlay).raster_overlay, Some(None));
+
+        let restored = diff(Some(&without_overlay), &with_overlay);
+        assert!(restored.clear, "restoring a behind-text raster must erase stale terminal cells");
+        assert!(matches!(restored.raster_overlay, Some(Some(_))));
     }
 
     #[test]
@@ -3782,8 +3829,13 @@ mod tests {
             "",
             None,
         );
-        let styled: String =
-            grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.style == keyword).map(|cell| cell.grapheme.as_str()).collect();
+        let styled: String = grid
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter())
+            .filter(|cell| cell.style.foreground == Some(CellColor::Palette(12)) && cell.style.bold())
+            .map(|cell| cell.grapheme.as_str())
+            .collect();
         assert_eq!(styled, "fnlet");
     }
 

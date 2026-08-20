@@ -16,7 +16,7 @@ impl App {
         let language_id = bundle.language_id.clone();
         let frame = self.active.editor.frame();
         let text = frame.text.as_ref();
-        let spans = provider_decorations(highlight_text(text, &language_id), self.theme);
+        let spans = provider_decorations(highlight_text(text, &language_id));
         self.decorations.insert(self.active.buffer_id, BufferDecorations::new(revision, spans));
         self.provider_refresh_ranges.entry(self.active.document_id).or_insert_with(|| Vec::with_capacity(4));
     }
@@ -31,7 +31,7 @@ impl App {
         }
         let frame = self.active.editor.frame();
         let language_id = language_bundle(self.active.document.presentation_path()).language_id;
-        let (mut targets, replacement) = changed_syntax(&frame.text, transaction, &language_id, self.theme);
+        let (mut targets, replacement) = changed_syntax(&frame.text, transaction, &language_id);
         if targets.is_empty() {
             return;
         }
@@ -94,7 +94,7 @@ impl App {
             let visible = start..preview.byte_of_line(top_line.saturating_add(rows).saturating_add(1));
 
             if let Some(syntax) = self.decorations.get(&self.active.buffer_id).filter(|state| state.revision == revision) {
-                let (targets, replacement) = changed_syntax(&preview, &transaction, &language_id, self.theme);
+                let (targets, replacement) = changed_syntax(&preview, &transaction, &language_id);
                 syntax.prepare_replaced_visible(&transaction, &targets, replacement, visible.clone());
             }
             if let Some(semantic) = self.semantic_decorations.get(&self.active.buffer_id).filter(|state| state.revision == revision) {
@@ -182,7 +182,7 @@ impl App {
                     if current_revision != Some(revision) {
                         continue;
                     }
-                    let spans = spans.into_iter().map(|span| provider_decoration(span, self.theme)).collect::<Vec<_>>();
+                    let spans = spans.into_iter().map(provider_decoration).collect::<Vec<_>>();
                     let state = self.decorations.entry(buffer_id).or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
                     if state.revision == revision {
                         state.state.replace_ranges(&ranges, spans);
@@ -498,7 +498,7 @@ impl App {
     }
 }
 
-fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str, theme: CatppuccinPalette) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
+fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
     let text_len = text.len();
     let mut targets = transaction
         .edits()
@@ -519,9 +519,9 @@ fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str
         .flat_map(|target| {
             let slice = text.slice(target.clone());
             let spans = if language_id == "markdown" {
-                provider_decorations(highlight_text(slice.as_ref(), language_id), theme)
+                provider_decorations(highlight_text(slice.as_ref(), language_id))
             } else {
-                provider_decorations(lexical_highlight_text(slice.as_ref()), theme)
+                provider_decorations(lexical_highlight_text(slice.as_ref()))
             };
             spans.into_iter().map(|mut span| {
                 span.range.start = span.range.start.saturating_add(target.start);

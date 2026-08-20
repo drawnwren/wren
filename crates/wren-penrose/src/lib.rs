@@ -4,10 +4,11 @@
 //! public boundary deliberately stops at canvas geometry and RGB samples so
 //! terminal, Metal, Core Graphics, and other renderers can share one tiling.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 use std::time::Duration;
 
 const FAMILY_COUNT: usize = 5;
+pub const FACET_ACCENT_COUNT: usize = FAMILY_COUNT;
 const GEOMETRY_EPSILON: f64 = 1.0e-9;
 const DEFAULT_EDGE_LENGTH: f64 = 12.0;
 const LIGHT_MEAN_ROTATION_RADIANS_PER_SECOND: f64 = 0.21;
@@ -17,6 +18,8 @@ const ARC_SPATIAL_FREQUENCY: f64 = 0.032;
 const ARC_LIGHT_BEND: f64 = 0.24;
 const HIGHLIGHT_FADE_START: f64 = 0.90;
 const HIGHLIGHT_PEAK_START: f64 = 0.993;
+const SHADOW_ACCENT_WEIGHT: f64 = 0.10;
+const MIDTONE_ACCENT_WEIGHT: f64 = 0.48;
 
 // A regular, non-singular pentagrid needs offsets whose sum is zero and for
 // which no three family lines meet. Keeping these fixed makes the scene stable
@@ -107,6 +110,7 @@ impl TileId {
 pub struct Tile {
     id: TileId,
     kind: TileKind,
+    facet_axis: u8,
     vertices: [Point; 4],
     center: Point,
     edge_length: f64,
@@ -121,6 +125,12 @@ impl Tile {
     #[must_use]
     pub const fn kind(&self) -> TileKind {
         self.kind
+    }
+
+    /// One of the five unoriented axes used for stable facet coloring.
+    #[must_use]
+    pub const fn facet_axis(&self) -> usize {
+        self.facet_axis as usize
     }
 
     /// Counter-clockwise rhombus vertices, without canvas clipping.
@@ -214,7 +224,8 @@ impl Tiling {
                             .map(|point| Point::new(point.x.mul_add(edge_length, canvas.width / 2.0), point.y.mul_add(edge_length, canvas.height / 2.0)));
                         let center = (vertices[0] + vertices[2]) * 0.5;
                         let kind = if first.dot(second).abs() < 0.5 { TileKind::Thick } else { TileKind::Thin };
-                        tiles.push(Tile { id: TileId(tile_hash(first_family, second_family, mesh)), kind, vertices, center, edge_length });
+                        let facet_axis = facet_axis_for_vertices(&vertices) as u8;
+                        tiles.push(Tile { id: TileId(tile_hash(first_family, second_family, mesh)), kind, facet_axis, vertices, center, edge_length });
                     }
                 }
             }
@@ -267,7 +278,8 @@ pub struct Palette {
     pub edge: Rgb8,
     pub shadow: Rgb8,
     pub midtone: Rgb8,
-    pub highlight: Rgb8,
+    /// Stable colors assigned to the five unoriented Penrose facet axes.
+    pub accents: [Rgb8; FACET_ACCENT_COUNT],
 }
 
 impl Default for Palette {
@@ -277,7 +289,13 @@ impl Default for Palette {
             edge: Rgb8::new(0x11, 0x11, 0x1b),
             shadow: Rgb8::new(0x18, 0x18, 0x25),
             midtone: Rgb8::new(0x45, 0x47, 0x5a),
-            highlight: Rgb8::new(0xcb, 0xa6, 0xf7),
+            accents: [
+                Rgb8::new(0xcb, 0xa6, 0xf7),
+                Rgb8::new(0x89, 0xb4, 0xfa),
+                Rgb8::new(0x94, 0xe2, 0xd5),
+                Rgb8::new(0xa6, 0xe3, 0xa1),
+                Rgb8::new(0xfa, 0xb3, 0x87),
+            ],
         }
     }
 }
@@ -341,7 +359,13 @@ impl Shading {
     pub fn tile_color(&self, tile: &Tile, elapsed: Duration) -> Rgb8 {
         let seconds = elapsed.as_secs_f64() * self.speed.max(0.0);
         let level = self.tile_level(tile, seconds).clamp(0.0, 1.0);
-        self.color_for_level(level)
+        self.color_for_level(tile, level)
+    }
+
+    /// Returns the stable theme accent selected by this tile's facet axis.
+    #[must_use]
+    pub fn tile_accent(&self, tile: &Tile) -> Rgb8 {
+        self.palette.accents[tile_accent_index(tile)]
     }
 
     /// Samples one point using the rasterizer's flat fill and hard edge.
@@ -351,9 +375,7 @@ impl Shading {
     }
 
     fn tile_level(&self, tile: &Tile, seconds: f64) -> f64 {
-        let first_diagonal = tile.vertices[2] - tile.vertices[0];
-        let second_diagonal = tile.vertices[3] - tile.vertices[1];
-        let long_axis = if first_diagonal.dot(first_diagonal) >= second_diagonal.dot(second_diagonal) { first_diagonal } else { second_diagonal };
+        let long_axis = tile_long_axis(tile);
         let orientation = long_axis.y.atan2(long_axis.x);
         let light_angle = self.light_motion(seconds) + self.arc_offset(tile.center);
         let facing = (2.0 * (orientation - light_angle)).cos();
@@ -369,23 +391,46 @@ impl Shading {
         (((center - self.arc_origin).length()) * ARC_SPATIAL_FREQUENCY).sin() * ARC_LIGHT_BEND
     }
 
-    fn color_for_level(&self, level: f64) -> Rgb8 {
+    fn color_for_level(&self, tile: &Tile, level: f64) -> Rgb8 {
+        let accent = self.tile_accent(tile);
+        let shadow = mix_rgb(self.palette.shadow, accent, SHADOW_ACCENT_WEIGHT);
+        let midtone = mix_rgb(self.palette.midtone, accent, MIDTONE_ACCENT_WEIGHT);
         if level < 0.30 {
-            self.palette.shadow
+            shadow
         } else if level < 0.38 {
-            mix_rgb(self.palette.shadow, self.palette.midtone, smoothstep(0.30, 0.38, level))
+            mix_rgb(shadow, midtone, smoothstep(0.30, 0.38, level))
         } else if level < HIGHLIGHT_FADE_START {
-            self.palette.midtone
+            midtone
         } else if level < HIGHLIGHT_PEAK_START {
-            mix_rgb(self.palette.midtone, self.palette.highlight, smoothstep(HIGHLIGHT_FADE_START, HIGHLIGHT_PEAK_START, level))
+            mix_rgb(midtone, accent, smoothstep(HIGHLIGHT_FADE_START, HIGHLIGHT_PEAK_START, level))
         } else {
-            self.palette.highlight
+            accent
         }
     }
 
     fn apply_edge(&self, fill: Rgb8, edge_distance: f64) -> Rgb8 {
         if edge_distance <= self.edge_width.max(GEOMETRY_EPSILON) { self.palette.edge } else { fill }
     }
+}
+
+fn tile_long_axis(tile: &Tile) -> Point {
+    long_axis_for_vertices(&tile.vertices)
+}
+
+fn long_axis_for_vertices(vertices: &[Point; 4]) -> Point {
+    let first_diagonal = vertices[2] - vertices[0];
+    let second_diagonal = vertices[3] - vertices[1];
+    if first_diagonal.dot(first_diagonal) >= second_diagonal.dot(second_diagonal) { first_diagonal } else { second_diagonal }
+}
+
+fn facet_axis_for_vertices(vertices: &[Point; 4]) -> usize {
+    let long_axis = long_axis_for_vertices(vertices);
+    let unoriented_angle = long_axis.y.atan2(long_axis.x).rem_euclid(PI);
+    ((unoriented_angle / (PI / FACET_ACCENT_COUNT as f64)).round() as usize) % FACET_ACCENT_COUNT
+}
+
+fn tile_accent_index(tile: &Tile) -> usize {
+    tile.facet_axis()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,7 +557,7 @@ impl Rasterizer {
             .map(|tile| {
                 reveal.is_none_or(|reveal| reveal.tile_is_visible(tile, tiling.canvas, elapsed)).then(|| {
                     let level = shading.tile_level(tile, seconds).clamp(0.0, 1.0);
-                    shading.color_for_level(level)
+                    shading.color_for_level(tile, level)
                 })
             })
             .collect::<Vec<_>>();
@@ -741,15 +786,26 @@ mod tests {
     }
 
     #[test]
-    fn directional_shading_has_three_dominant_facet_tones() {
+    fn directional_shading_uses_all_five_accent_families_with_dominant_facet_tones() {
         let tiling = Tiling::cover(Canvas::new(160.0, 90.0), 7.0);
         let shading = Shading::default();
         let colors = tiling.tiles().iter().map(|tile| shading.tile_color(tile, Duration::from_millis(4_250))).collect::<Vec<_>>();
-        for expected in [shading.palette.shadow, shading.palette.midtone, shading.palette.highlight] {
-            assert!(colors.contains(&expected), "missing dominant facet tone {expected:?}");
+        let color_count = colors.len();
+        for accent in shading.palette.accents {
+            assert!(tiling.tiles().iter().any(|tile| shading.tile_accent(tile) == accent), "missing facet accent {accent:?}");
         }
-        let dominant = colors.iter().filter(|color| [shading.palette.shadow, shading.palette.midtone, shading.palette.highlight].contains(color)).count();
-        assert!(dominant * 4 >= colors.len() * 3, "crossfades covered too many facets");
+        let dominant = tiling
+            .tiles()
+            .iter()
+            .zip(colors)
+            .filter(|(tile, color)| {
+                let accent = shading.tile_accent(tile);
+                let shadow = mix_rgb(shading.palette.shadow, accent, SHADOW_ACCENT_WEIGHT);
+                let midtone = mix_rgb(shading.palette.midtone, accent, MIDTONE_ACCENT_WEIGHT);
+                [shadow, midtone, accent].contains(color)
+            })
+            .count();
+        assert!(dominant * 4 >= color_count * 3, "crossfades covered too many facets");
     }
 
     #[test]
@@ -763,7 +819,7 @@ mod tests {
             let mut longest_run = 0_usize;
             for sample in 0..1_500_u64 {
                 let elapsed = Duration::from_millis(sample * sample_millis);
-                if shading.tile_color(tile, elapsed) == shading.palette.highlight {
+                if shading.tile_level(tile, elapsed.as_secs_f64() * shading.speed.max(0.0)) >= HIGHLIGHT_PEAK_START {
                     current_run += 1;
                     longest_run = longest_run.max(current_run);
                 } else {

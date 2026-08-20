@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wren_penrose::{Canvas, Palette, Point, RadialReveal, Shading, Tiling};
 #[cfg(test)]
 use wren_view::CatppuccinFlavor;
-use wren_view::{CatppuccinColor, CatppuccinPalette, DesiredGrid, RasterBorder, RasterOverlay, RasterQuad};
+#[cfg(test)]
+use wren_view::CatppuccinPalette;
+use wren_view::{CatppuccinColor, DesiredGrid, EditorTheme, RasterBorder, RasterOverlay, RasterQuad};
 
 pub(super) const ANIMATION_FRAME_MILLIS: u64 = 83;
 pub(super) const ANIMATION_FRAME_PERIOD: Duration = Duration::from_millis(ANIMATION_FRAME_MILLIS);
@@ -67,7 +69,7 @@ impl StartupScreen {
         }
     }
 
-    pub(super) fn paint(&mut self, mut grid: DesiredGrid, elapsed: Duration, theme: CatppuccinPalette) -> DesiredGrid {
+    pub(super) fn paint(&mut self, mut grid: DesiredGrid, elapsed: Duration, theme: EditorTheme) -> DesiredGrid {
         let content_rows = grid.height.saturating_sub(1);
         if grid.width == 0 || content_rows == 0 {
             return grid;
@@ -154,14 +156,20 @@ fn seed_unit(seed: u64) -> f64 {
     (seed >> 11) as f64 / (1_u64 << 53) as f64
 }
 
-fn tiling_shading(theme: CatppuccinPalette, canvas: Canvas, arc_origin_fraction: Point, motion_phase: f64) -> Shading {
+fn tiling_shading(theme: EditorTheme, canvas: Canvas, arc_origin_fraction: Point, motion_phase: f64) -> Shading {
     Shading {
         palette: Palette {
             background: theme.color(CatppuccinColor::Base),
             edge: theme.color(CatppuccinColor::Crust),
             shadow: theme.color(CatppuccinColor::Mantle),
             midtone: theme.color(CatppuccinColor::Surface1),
-            highlight: theme.color(CatppuccinColor::Mauve),
+            accents: [
+                theme.color(CatppuccinColor::Mauve),
+                theme.color(CatppuccinColor::Blue),
+                theme.color(CatppuccinColor::Teal),
+                theme.color(CatppuccinColor::Green),
+                theme.color(CatppuccinColor::Peach),
+            ],
         },
         edge_width: 0.0,
         arc_origin: Point::new(canvas.width * arc_origin_fraction.x, canvas.height * arc_origin_fraction.y),
@@ -207,6 +215,26 @@ mod tests {
         assert_eq!((first.background, later.background), (theme.color(CatppuccinColor::Base), theme.color(CatppuccinColor::Base)));
         assert!(first.quads.is_empty());
         assert!(!later.quads.is_empty());
+    }
+
+    #[test]
+    fn startup_assigns_five_active_theme_accents_by_facet_axis() {
+        let theme = CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha);
+        let canvas = Canvas::new(160.0, 90.0);
+        let shading = tiling_shading(theme, canvas, Point::new(0.5, 0.5), 0.0);
+        let expected = [
+            theme.color(CatppuccinColor::Mauve),
+            theme.color(CatppuccinColor::Blue),
+            theme.color(CatppuccinColor::Teal),
+            theme.color(CatppuccinColor::Green),
+            theme.color(CatppuccinColor::Peach),
+        ];
+        assert_eq!(shading.palette.accents, expected);
+
+        let tiling = Tiling::cover(canvas, 7.0);
+        for accent in expected {
+            assert!(tiling.tiles().iter().any(|tile| shading.tile_accent(tile) == accent), "tiling did not use theme accent {accent:?}");
+        }
     }
 
     #[test]

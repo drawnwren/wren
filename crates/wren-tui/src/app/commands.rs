@@ -57,7 +57,7 @@ impl App {
     fn set_colorscheme(&mut self, mut words: std::str::SplitWhitespace<'_>) -> Result<()> {
         let requested = words.next().unwrap_or("catppuccin");
         let flavor = parse_catppuccin_flavor(requested).ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
-        self.theme = CatppuccinPalette::for_flavor(flavor);
+        self.theme = EditorTheme::for_flavor(flavor);
         self.set_message(format!("colorscheme catppuccin-{}", flavor.identifier()))
     }
 

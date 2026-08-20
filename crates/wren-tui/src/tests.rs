@@ -421,6 +421,14 @@ fn file_picker_is_a_telescope_surface_with_results_and_preview() {
     assert!(frame.rows.iter().any(|row| {
         row.cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))))
     }));
+
+    app.test_prompt_key(terminal_key(TerminalKeyCode::Escape));
+    let restored = desired_frame(&mut layout, &app);
+    assert!(restored.raster_overlay.is_some(), "closing the picker must restore the startup tiling");
+    assert!(!grid_text(&restored).contains("Find Files"));
+    let restored_update = wren_view::diff(Some(&frame), &restored);
+    assert!(restored_update.clear, "restoring the tiling must clear picker cells that would otherwise remain above it");
+    assert!(matches!(restored_update.raster_overlay, Some(Some(_))));
 }
 
 #[test]
@@ -446,6 +454,76 @@ fn colorscheme_and_runtime_color_override_are_customizable() {
     app.test_ex("setcolor mauve #010203");
     assert_eq!(app.theme.color(CatppuccinColor::Mauve), RgbColor::new(1, 2, 3));
     assert!(app.execute_ex("setcolor missing #ffffff").is_err());
+}
+
+#[test]
+fn cached_syntax_resolves_against_the_current_theme_on_every_frame() {
+    let mut app = app_with_text("fn main() {}\n");
+    let buffer_id = app.active.buffer_id;
+    let revision = app.active.editor.revision();
+    app.decorations.insert(buffer_id, BufferDecorations::new(revision, vec![provider_decoration(HighlightSpan::new(0..2, "function", 1_000_000))]));
+    let mut layout = dotfile_layout(40, 6);
+    let before = desired_frame(&mut layout, &app);
+    let before_color = before.rows[0].cells.iter().find(|cell| cell.grapheme.as_str() == "f").and_then(|cell| cell.style.foreground);
+    assert_eq!(before_color, Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Blue))));
+
+    let replacement = RgbColor::new(3, 101, 211);
+    app.theme.set_color(CatppuccinColor::Blue, replacement);
+    let after = desired_frame(&mut layout, &app);
+    let after_color = after.rows[0].cells.iter().find(|cell| cell.grapheme.as_str() == "f").and_then(|cell| cell.style.foreground);
+    assert_eq!(after_color, Some(CellColor::Rgb(replacement)));
+    assert_eq!(app.decorations[&buffer_id].spans[0].style.foreground, Some(CellColor::Theme(CatppuccinColor::Blue)));
+}
+
+#[test]
+fn final_editor_frame_contains_only_colors_from_the_active_theme() {
+    const SLOTS: [CatppuccinColor; 26] = [
+        CatppuccinColor::Rosewater,
+        CatppuccinColor::Flamingo,
+        CatppuccinColor::Pink,
+        CatppuccinColor::Mauve,
+        CatppuccinColor::Red,
+        CatppuccinColor::Maroon,
+        CatppuccinColor::Peach,
+        CatppuccinColor::Yellow,
+        CatppuccinColor::Green,
+        CatppuccinColor::Teal,
+        CatppuccinColor::Sky,
+        CatppuccinColor::Sapphire,
+        CatppuccinColor::Blue,
+        CatppuccinColor::Lavender,
+        CatppuccinColor::Text,
+        CatppuccinColor::Subtext1,
+        CatppuccinColor::Subtext0,
+        CatppuccinColor::Overlay2,
+        CatppuccinColor::Overlay1,
+        CatppuccinColor::Overlay0,
+        CatppuccinColor::Surface2,
+        CatppuccinColor::Surface1,
+        CatppuccinColor::Surface0,
+        CatppuccinColor::Base,
+        CatppuccinColor::Mantle,
+        CatppuccinColor::Crust,
+    ];
+
+    let mut app = app_with_text("fn themed() {}\n");
+    for (index, slot) in SLOTS.into_iter().enumerate() {
+        app.theme.set_color(slot, RgbColor::new(7 + index as u8, 67 + index as u8, 127 + index as u8));
+    }
+    let buffer_id = app.active.buffer_id;
+    app.decorations
+        .insert(buffer_id, BufferDecorations::new(app.active.editor.revision(), vec![provider_decoration(HighlightSpan::new(0..2, "keyword", 1_000_000))]));
+
+    let frame = desired_frame(&mut dotfile_layout(60, 8), &app);
+    for cell in frame.rows.iter().flat_map(|row| &row.cells) {
+        for color in [cell.style.foreground, cell.style.background].into_iter().flatten() {
+            match color {
+                CellColor::Rgb(color) => assert!(app.theme.contains(color), "editor frame color {color:?} bypassed EditorTheme"),
+                CellColor::Theme(slot) => panic!("unresolved editor theme slot reached the final frame: {slot:?}"),
+                CellColor::Palette(index) => panic!("editor-owned frame unexpectedly used terminal palette index {index}"),
+            }
+        }
+    }
 }
 
 #[test]
@@ -886,7 +964,7 @@ fn changed_provider_revision_waits_for_the_typing_quiet_period() {
 #[test]
 fn hover_text_renders_as_a_rounded_float_not_status_text() {
     let mut app = App::open(None, None).expect("app");
-    let (text, decorations) = lsp_popup_markdown("```rust\nfn hover() -> i32\n```", app.theme);
+    let (text, decorations) = lsp_popup_markdown("```rust\nfn hover() -> i32\n```");
     app.popup = Some(TextPopup::new("", text).with_decorations(decorations));
     let mut layout = ViewportLayout::new(100, 30);
     let frame = desired_frame(&mut layout, &app);
@@ -2161,7 +2239,7 @@ fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
     assert!(app.picker_preview_decorations.iter().any(|decoration| {
         decoration.range == (8..14)
             && decoration.style.foreground.is_none()
-            && decoration.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface0)))
+            && decoration.style.background == Some(CellColor::Theme(CatppuccinColor::Surface0))
             && decoration.priority == u32::MAX
     }));
 
@@ -2170,9 +2248,9 @@ fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
     assert_eq!(app.picker_preview, second_source);
     assert_eq!(app.picker_preview_highlight_line, None);
     assert!(
-        app.picker_preview_decorations.iter().any(|decoration| {
-            decoration.range == (3..18) && decoration.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface0)))
-        })
+        app.picker_preview_decorations
+            .iter()
+            .any(|decoration| { decoration.range == (3..18) && decoration.style.background == Some(CellColor::Theme(CatppuccinColor::Surface0)) })
     );
     assert!(!app.picker_preview_decorations.iter().any(|decoration| decoration.range == (8..14) && decoration.priority == u32::MAX));
 }
@@ -2198,15 +2276,14 @@ fn lsp_semantic_tokens_override_tree_sitter_with_dotfile_groups() {
     let mut app = app_with_text(text);
     let buffer_id = app.active.buffer_id;
     let revision = app.active.editor.revision();
-    app.decorations
-        .insert(buffer_id, BufferDecorations::new(revision, vec![provider_decoration(HighlightSpan::new(value..value + 5, "function", 1_000_000), app.theme)]));
+    app.decorations.insert(buffer_id, BufferDecorations::new(revision, vec![provider_decoration(HighlightSpan::new(value..value + 5, "function", 1_000_000))]));
     let mut layout = dotfile_layout(80, 8);
     let tree_sitter_frame = desired_frame(&mut layout, &app);
     let tree_sitter_value =
         tree_sitter_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_str() == "v").expect("Tree-sitter value cell");
     assert_eq!(tree_sitter_value.style.foreground, Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Blue))));
 
-    app.semantic_decorations.insert(buffer_id, BufferDecorations::new(revision, spans.into_iter().map(|span| provider_decoration(span, app.theme)).collect()));
+    app.semantic_decorations.insert(buffer_id, BufferDecorations::new(revision, spans.into_iter().map(provider_decoration).collect()));
     let semantic_frame = desired_frame(&mut layout, &app);
     let semantic_value = semantic_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_str() == "v").expect("semantic value cell");
     assert_eq!(
@@ -2269,12 +2346,11 @@ fn rust_semantic_tokens_preserve_transparent_tree_sitter_colors() {
             revision,
             [(0..4, "variable.builtin"), (5..14, "variable.member"), (15..19, "function.call"), (20..28, "constant")]
                 .into_iter()
-                .map(|(range, kind)| provider_decoration(HighlightSpan::new(range, kind, 1_000_000), app.theme))
+                .map(|(range, kind)| provider_decoration(HighlightSpan::new(range, kind, 1_000_000)))
                 .collect(),
         ),
     );
-    app.semantic_decorations
-        .insert(buffer_id, BufferDecorations::new(revision, semantic.into_iter().map(|span| provider_decoration(span, app.theme)).collect()));
+    app.semantic_decorations.insert(buffer_id, BufferDecorations::new(revision, semantic.into_iter().map(provider_decoration).collect()));
 
     let mut layout = dotfile_layout(60, 5);
     let grid = desired_frame(&mut layout, &app);
