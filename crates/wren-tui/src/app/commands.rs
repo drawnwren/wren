@@ -1,32 +1,22 @@
 use super::*;
 
-type CustomExHandler = for<'a> fn(&mut App, std::str::SplitWhitespace<'a>) -> Result<()>;
-
 struct CustomExPlugin {
     names: &'static [&'static str],
-    execute: CustomExHandler,
+    execute: for<'a> fn(&mut App, std::str::SplitWhitespace<'a>) -> Result<()>,
 }
 
-macro_rules! custom_ex_plugins {
-    ($($names:expr => $execute:expr),+ $(,)?) => {
-        const CUSTOM_EX_PLUGINS: &[CustomExPlugin] = &[
-            $(CustomExPlugin { names: $names, execute: $execute }),+
-        ];
-    };
-}
-
-custom_ex_plugins! {
-    &["FormatToggle"] => |app, _| app.toggle_global_format(),
-    &["FormatToggle!"] => |app, _| app.toggle_buffer_format(),
-    &["colorscheme", "Catppuccin"] => |app, mut args| app.set_colorscheme(args.next()),
-    &["setcolor"] => |app, mut args| app.set_theme_color(args.next(), args.next()),
-    &["Git"] => |app, args| app.open_git_terminal(args),
-    &["Gwrite"] => |app, _| app.git_stage_buffer(),
-    &["Gdiffsplit"] => |app, _| app.git_diff_index(),
-    &["AvanteToggle"] => |app, _| app.toggle_agent_sidebar(),
-    &["Codex", "AvanteChat", "AvanteAsk"] => |app, args| app.open_ai_prompt(args),
-    &["RustLsp"] => |app, mut args| app.open_rust_lsp_action(args.next()),
-}
+const CUSTOM_EX_PLUGINS: &[CustomExPlugin] = &[
+    CustomExPlugin { names: &["FormatToggle"], execute: |app, _| app.toggle_global_format() },
+    CustomExPlugin { names: &["FormatToggle!"], execute: |app, _| app.toggle_buffer_format() },
+    CustomExPlugin { names: &["colorscheme", "Catppuccin"], execute: App::set_colorscheme },
+    CustomExPlugin { names: &["setcolor"], execute: App::set_theme_color },
+    CustomExPlugin { names: &["Git"], execute: App::open_git },
+    CustomExPlugin { names: &["Gwrite"], execute: |app, _| app.git_stage_buffer() },
+    CustomExPlugin { names: &["Gdiffsplit"], execute: |app, _| app.git_diff_index() },
+    CustomExPlugin { names: &["AvanteToggle"], execute: |app, _| app.toggle_agent_sidebar() },
+    CustomExPlugin { names: &["Codex", "AvanteChat", "AvanteAsk"], execute: App::run_ai_prompt },
+    CustomExPlugin { names: &["RustLsp"], execute: App::run_rust_lsp_command },
+];
 
 impl App {
     pub(super) fn execute_ex(&mut self, input: &str) -> Result<()> {
@@ -54,58 +44,46 @@ impl App {
 
     fn toggle_global_format(&mut self) -> Result<()> {
         self.format_on_save = !self.format_on_save;
-        let state = if self.format_on_save { "enabled" } else { "disabled" };
-        self.message = format!("format-on-save globally {state}");
-        Ok(())
+        self.set_message(format!("format-on-save globally {}", if self.format_on_save { "enabled" } else { "disabled" }))
     }
 
     fn toggle_buffer_format(&mut self) -> Result<()> {
         let document_id = self.active.document_id;
         let disabled = !self.format_disabled.remove(&document_id);
-        if disabled {
-            self.format_disabled.insert(document_id);
-        }
-        let state = if disabled { "disabled" } else { "enabled" };
-        self.message = format!("format-on-save for buffer {state}");
-        Ok(())
+        self.format_disabled.extend(disabled.then_some(document_id));
+        self.set_message(format!("format-on-save for buffer {}", if disabled { "disabled" } else { "enabled" }))
     }
 
-    fn set_colorscheme(&mut self, requested: Option<&str>) -> Result<()> {
-        let requested = requested.unwrap_or("catppuccin");
-        let flavor = CatppuccinFlavor::parse(requested).ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
-        self.theme_flavor = flavor;
+    fn set_colorscheme(&mut self, mut words: std::str::SplitWhitespace<'_>) -> Result<()> {
+        let requested = words.next().unwrap_or("catppuccin");
+        let flavor = parse_catppuccin_flavor(requested).ok_or_else(|| anyhow!("unknown Catppuccin flavor {requested:?}"))?;
         self.theme = CatppuccinPalette::for_flavor(flavor);
-        self.message = format!("colorscheme catppuccin-{}", flavor.name());
-        Ok(())
+        self.set_message(format!("colorscheme catppuccin-{}", flavor.identifier()))
     }
 
-    fn set_theme_color(&mut self, name: Option<&str>, value: Option<&str>) -> Result<()> {
-        let name = name.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
-        let value = value.ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
+    fn set_theme_color(&mut self, mut words: std::str::SplitWhitespace<'_>) -> Result<()> {
+        let name = words.next().ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
+        let value = words.next().ok_or_else(|| anyhow!("usage: setcolor SLOT #RRGGBB"))?;
         let color = RgbColor::from_hex(value).ok_or_else(|| anyhow!("invalid RGB color {value:?}; expected #RRGGBB"))?;
         if !self.theme.set(name, color) {
             bail!("unknown Catppuccin color slot {name:?}");
         }
-        self.message = format!("theme {name}=#{:02x}{:02x}{:02x}", color.red, color.green, color.blue);
-        Ok(())
+        self.set_message(format!("theme {name}=#{:02x}{:02x}{:02x}", color.red, color.green, color.blue))
     }
 
-    fn open_git_terminal<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> Result<()> {
+    fn open_git(&mut self, words: std::str::SplitWhitespace<'_>) -> Result<()> {
         let arguments = words.map(Box::<str>::from).collect::<Vec<_>>();
         let root = self.active_git_root()?;
         self.open_terminal_in(Some(git_ex_program(&arguments)), &arguments, &root)
     }
 
-    fn open_ai_prompt<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> Result<()> {
+    fn run_ai_prompt(&mut self, words: std::str::SplitWhitespace<'_>) -> Result<()> {
         let prompt = words.collect::<Vec<_>>().join(" ");
-        if prompt.is_empty() {
-            return self.open_agent_sidebar();
-        }
-        self.start_ai_task(&prompt)
+        if prompt.is_empty() { self.open_agent_sidebar() } else { self.start_ai_task(&prompt) }
     }
 
-    fn open_rust_lsp_action(&mut self, action: Option<&str>) -> Result<()> {
-        match action {
+    fn run_rust_lsp_command(&mut self, mut words: std::str::SplitWhitespace<'_>) -> Result<()> {
+        match words.next() {
             Some("testables" | "test") => self.open_terminal(Some("cargo"), &["test".into()]),
             Some("debuggables" | "debug") => self.open_debug_repl(),
             _ => self.open_terminal(Some("cargo"), &["run".into()]),
@@ -114,7 +92,16 @@ impl App {
 
     pub(super) fn execute_ex_command(&mut self, command: ExCommand) -> Result<()> {
         match command {
-            ExCommand::Goto { address } => self.goto_address(&address),
+            ExCommand::Goto { address } => {
+                let line = self.resolve_address(&address)?;
+                self.active.editor.set_cursor(self.active.editor.text().byte_of_line(line));
+                if let Some((pattern, direction)) = address_search_pattern(&address) {
+                    let persist = !pattern.is_empty();
+                    let pattern = self.effective_search_pattern(pattern)?;
+                    self.synchronize_search(&pattern, direction, persist)?;
+                }
+                Ok(())
+            }
             ExCommand::Substitute { range, pattern, replacement, flags } => {
                 let range = self.resolve_byte_range(range.as_ref())?;
                 let substitute = self.resolve_substitute(&pattern, &replacement, flags, vec![range])?;
@@ -127,13 +114,53 @@ impl App {
             }
             ExCommand::Global { range, invert, pattern, command } => self.execute_global(range.as_ref(), invert, &pattern, *command),
             ExCommand::Normal { range, keys, .. } => self.execute_normal(range.as_ref(), &keys),
-            ExCommand::Write { range, all, path, .. } => self.write_command(range.as_ref(), all, path.as_deref()),
-            ExCommand::WriteQuit { path, .. } => self.write_quit(path.as_deref()),
-            ExCommand::Quit { all, bang } => self.quit_command(all, bang),
-            ExCommand::Edit { bang, path } => self.edit_command(bang, path.as_deref()),
+            ExCommand::Write { range: Some(range), path: Some(path), .. } => self.write_range(&range, Path::new(path.as_ref())),
+            ExCommand::Write { range: Some(_), path: None, .. } => Err(anyhow!("ranged :write requires a destination path")),
+            ExCommand::Write { all: true, .. } => self.save_all(),
+            ExCommand::Write { path, .. } => self.save(path.as_deref().map(Path::new)),
+            ExCommand::WriteQuit { path, .. } => {
+                self.save(path.as_deref().map(Path::new))?;
+                self.quit = true;
+                Ok(())
+            }
+            ExCommand::Quit { all, bang } => {
+                let dirty = self.active.editor.is_dirty() || all && self.inactive.iter().any(|buffer| buffer.editor.is_dirty());
+                if dirty && !bang {
+                    self.show_error("E37: unsaved changes; use :q!")
+                } else {
+                    self.quit = true
+                };
+                Ok(())
+            }
+            ExCommand::Edit { bang, path } => match path {
+                None => {
+                    self.show_error("usage: :e[!] FILE");
+                    Ok(())
+                }
+                Some(_) if self.active.editor.is_dirty() && !bang => {
+                    self.show_error("E37: unsaved changes; use :e!");
+                    Ok(())
+                }
+                Some(path) => self.open_buffer(Path::new(path.as_ref())),
+            },
             ExCommand::Buffer { action, bang, target } => self.buffer_command(action, bang, target.as_deref()),
-            ExCommand::Split { vertical, path } => self.split_command(vertical, path.as_deref()),
-            ExCommand::Close { bang } => self.close_command(bang),
+            ExCommand::Split { vertical, path } => {
+                if let Some(path) = path {
+                    self.open_buffer(Path::new(path.as_ref()))?;
+                }
+                let (axis, message) =
+                    if vertical { (SplitAxis::Vertical, "vertical split created") } else { (SplitAxis::Horizontal, "horizontal split created") };
+                self.views.split_active(axis)?;
+                self.set_message(message.to_owned())
+            }
+            ExCommand::Close { bang } => {
+                if self.active.editor.is_dirty() && !bang {
+                    self.show_error("E37: unsaved changes; use :close!");
+                    return Ok(());
+                }
+                self.views.close_active_window()?;
+                self.activate_view_buffer()
+            }
             ExCommand::Tab { action, path } => self.tab_command(action, path.as_deref()),
             ExCommand::Undo => {
                 let transaction = self.active.editor.undo()?;
@@ -147,137 +174,53 @@ impl App {
             }
             ExCommand::Echo { expression } => {
                 let value = evaluate_expression(&expression, &self.expression_context())?;
-                self.message = value.to_editor_text();
-                Ok(())
+                self.set_message(expression_editor_text(&value))
             }
-            ExCommand::Registers { names } => self.show_registers(&names),
-            ExCommand::Marks { names } => self.show_marks(&names),
+            ExCommand::Registers { names } => {
+                let entries = self
+                    .active
+                    .editor
+                    .registers()
+                    .filter(|(name, _)| names.is_empty() || names.contains(*name))
+                    .map(|(name, value)| format!("\"{name} {}", compact(value.text.as_ref(), 24)))
+                    .collect();
+                self.set_message(joined_entries(entries, "no registers"))
+            }
+            ExCommand::Marks { names } => {
+                let entries = self
+                    .active
+                    .editor
+                    .marks()
+                    .filter(|(name, _)| names.is_empty() || names.contains(*name))
+                    .map(|(name, byte)| format!("'{name}={byte}"))
+                    .collect();
+                self.set_message(joined_entries(entries, "no marks"))
+            }
             ExCommand::NoHighlight => {
                 self.search_highlight = false;
                 self.message.clear();
                 Ok(())
             }
-            ExCommand::Help { topic } => {
-                self.message =
-                    topic.map_or_else(|| "run `wren --help` for the command reference".to_owned(), |topic| format!("help for {topic}: run `wren --help`"));
-                Ok(())
-            }
+            ExCommand::Help { topic } => self.set_message(
+                topic.map_or_else(|| "run `wren --help` for the command reference".to_owned(), |topic| format!("help for {topic}: run `wren --help`")),
+            ),
             ExCommand::Messages => self.show_debug_output(),
             ExCommand::Grep { pattern, paths } => self.grep(&pattern, &paths),
             ExCommand::Cdo { command } => self.execute_cdo(*command),
-            ExCommand::ConvertUtf8 => self.convert_active_to_utf8(),
+            ExCommand::ConvertUtf8 if self.active.document.encoding() == DocumentEncoding::Utf8 => self.set_message("document is already UTF-8".to_owned()),
+            ExCommand::ConvertUtf8 => {
+                let converted = self.active.document.convert_to_utf8()?;
+                self.active.editor.set_read_only(false);
+                let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..self.active.editor.text().len_bytes(), converted)])?;
+                self.active.editor.apply_transaction(transaction.clone())?;
+                self.after_transaction(Some(transaction));
+                self.set_message("converted invalid bytes to explicit UTF-8 \\xNN escapes".to_owned())
+            }
             ExCommand::Terminal { program, arguments } => self.open_terminal(program.as_deref(), &arguments),
             ExCommand::Make { program, arguments } => self.start_make_task(&program, &arguments),
             ExCommand::Format { program, arguments } => self.start_format_task(&program, &arguments),
             ExCommand::Find { query } => self.start_file_picker(&query),
         }
-    }
-
-    fn goto_address(&mut self, address: &ExAddress) -> Result<()> {
-        let line = self.resolve_address(address)?;
-        self.active.editor.set_cursor(self.active.editor.text().byte_of_line(line));
-        let Some((pattern, direction)) = address_search_pattern(address) else {
-            return Ok(());
-        };
-        let persist = !pattern.is_empty();
-        let pattern = self.effective_search_pattern(pattern)?;
-        self.synchronize_search(&pattern, direction, persist)
-    }
-
-    fn write_command(&mut self, range: Option<&ExRange>, all: bool, path: Option<&str>) -> Result<()> {
-        if let Some(range) = range {
-            let path = path.map(Path::new).ok_or_else(|| anyhow!("ranged :write requires a destination path"))?;
-            return self.write_range(range, path);
-        }
-        if all {
-            return self.save_all();
-        }
-        self.save(path.map(Path::new))
-    }
-
-    fn write_quit(&mut self, path: Option<&str>) -> Result<()> {
-        self.save(path.map(Path::new))?;
-        self.quit = true;
-        Ok(())
-    }
-
-    fn quit_command(&mut self, all: bool, bang: bool) -> Result<()> {
-        let inactive_dirty = all && self.inactive.iter().any(|buffer| buffer.editor.is_dirty());
-        if (self.active.editor.is_dirty() || inactive_dirty) && !bang {
-            self.show_error("E37: unsaved changes; use :q!");
-            return Ok(());
-        }
-        self.quit = true;
-        Ok(())
-    }
-
-    fn edit_command(&mut self, bang: bool, path: Option<&str>) -> Result<()> {
-        let Some(path) = path else {
-            self.show_error("usage: :e[!] FILE");
-            return Ok(());
-        };
-        if self.active.editor.is_dirty() && !bang {
-            self.show_error("E37: unsaved changes; use :e!");
-            return Ok(());
-        }
-        self.open_buffer(Path::new(path))
-    }
-
-    fn split_command(&mut self, vertical: bool, path: Option<&str>) -> Result<()> {
-        if let Some(path) = path {
-            self.open_buffer(Path::new(path))?;
-        }
-        let (axis, message) = if vertical { (SplitAxis::Vertical, "vertical split created") } else { (SplitAxis::Horizontal, "horizontal split created") };
-        self.views.split_active(axis)?;
-        self.message = message.to_owned();
-        Ok(())
-    }
-
-    fn close_command(&mut self, bang: bool) -> Result<()> {
-        if self.active.editor.is_dirty() && !bang {
-            self.show_error("E37: unsaved changes; use :close!");
-            return Ok(());
-        }
-        self.views.close_active_window()?;
-        self.activate_view_buffer()
-    }
-
-    fn show_registers(&mut self, names: &str) -> Result<()> {
-        let entries = self
-            .active
-            .editor
-            .registers()
-            .filter(|(name, _)| names.is_empty() || names.contains(*name))
-            .map(|(name, value)| format!("\"{name} {}", compact(value.text.as_ref(), 24)))
-            .collect::<Vec<_>>();
-        self.message = joined_entries(entries, "no registers");
-        Ok(())
-    }
-
-    fn show_marks(&mut self, names: &str) -> Result<()> {
-        let entries = self
-            .active
-            .editor
-            .marks()
-            .filter(|(name, _)| names.is_empty() || names.contains(*name))
-            .map(|(name, byte)| format!("'{name}={byte}"))
-            .collect::<Vec<_>>();
-        self.message = joined_entries(entries, "no marks");
-        Ok(())
-    }
-
-    fn convert_active_to_utf8(&mut self) -> Result<()> {
-        if self.active.document.encoding() == DocumentEncoding::Utf8 {
-            self.message = "document is already UTF-8".to_owned();
-            return Ok(());
-        }
-        let converted = self.active.document.convert_to_utf8()?;
-        self.active.editor.set_read_only(false);
-        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..self.active.editor.text().len_bytes(), converted)])?;
-        self.active.editor.apply_transaction(transaction.clone())?;
-        self.after_transaction(Some(transaction));
-        self.message = "converted invalid bytes to explicit UTF-8 \\xNN escapes".to_owned();
-        Ok(())
     }
 
     pub(super) fn effective_search_pattern(&self, pattern: &str) -> Result<String> {
@@ -411,7 +354,7 @@ impl App {
             return Ok(());
         }
         let document_id = stable_document_id(Some(&resolved));
-        let buffer_id = self.views.add_buffer(document_id, resolved.display().to_string());
+        let buffer_id = self.views.add_buffer();
         let (mut buffer, message) = BufferState::open(buffer_id, document_id, Some(&resolved), None)?;
         restore_client_state(&mut buffer, &self.client_state)?;
         if let Some(pattern) = self.client_state.search_history.last() {
@@ -422,19 +365,19 @@ impl App {
         self.autosave_active_if_named()?;
         let previous = std::mem::replace(&mut self.active, buffer);
         self.inactive.push(previous);
-        self.views.set_active_buffer(buffer_id)?;
+        self.views.set_active_buffer(buffer_id);
         self.message = message;
         self.record_active_file();
         self.prime_active_syntax();
-        self.ensure_workspace_lsp_started();
+        self.begin_lsp_start();
         Ok(())
     }
 
-    pub(super) fn current_jump_location(&self) -> Option<JumpLocation> {
-        self.active.document.presentation_path().map(|path| JumpLocation {
+    pub(super) fn current_jump_location(&self) -> Option<DurableJumpEntry> {
+        self.active.document.presentation_path().map(|path| DurableJumpEntry {
             document_id: self.active.document_id,
-            path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-            byte: self.active.editor.primary_cursor(),
+            anchor: Anchor { byte: self.active.editor.primary_cursor(), bias: Bias::Right },
+            path_hint: Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned().into_boxed_str()),
         })
     }
 
@@ -451,7 +394,7 @@ impl App {
         start.saturating_add(utf16_column_to_byte(line_text, column).unwrap_or(line_text.len()))
     }
 
-    pub(super) fn record_navigation(&mut self, origin: JumpLocation, target: JumpLocation) {
+    pub(super) fn record_navigation(&mut self, origin: DurableJumpEntry, target: DurableJumpEntry) {
         if origin == target {
             return;
         }
@@ -487,8 +430,8 @@ impl App {
             return Ok(false);
         };
         let target = self.jump_history[next].clone();
-        self.open_buffer(&target.path)?;
-        self.active.editor.set_cursor(target.byte);
+        self.open_buffer(Path::new(target.path_hint.as_deref().ok_or_else(|| anyhow!("jump has no path"))?))?;
+        self.active.editor.set_cursor(target.anchor.byte);
         self.jump_index = Some(next);
         self.persist_jump_list();
         self.message = format!("jump {} of {}", next + 1, self.jump_history.len());
@@ -496,16 +439,7 @@ impl App {
     }
 
     pub(super) fn persist_jump_list(&mut self) {
-        let entries = self
-            .jump_history
-            .iter()
-            .map(|location| DurableJumpEntry {
-                document_id: location.document_id,
-                anchor: Anchor { byte: location.byte, bias: Bias::Right },
-                path_hint: Some(location.path.to_string_lossy().into_owned().into_boxed_str()),
-            })
-            .collect();
-        self.after_effect(None, vec![StateDelta::JumpList { entries, current: self.jump_index }]);
+        self.after_effect(None, vec![StateDelta::JumpList { entries: self.jump_history.clone(), current: self.jump_index }]);
     }
 
     pub(super) fn record_active_file(&mut self) {
@@ -528,10 +462,10 @@ impl App {
         self.autosave_active_if_named()?;
         let buffer = self.inactive.get_mut(index).ok_or_else(|| anyhow!("buffer index disappeared"))?;
         std::mem::swap(&mut self.active, buffer);
-        self.views.set_active_buffer(self.active.buffer_id)?;
+        self.views.set_active_buffer(self.active.buffer_id);
         self.message = self.active.name();
         self.prime_active_syntax();
-        self.ensure_workspace_lsp_started();
+        self.begin_lsp_start();
         Ok(())
     }
 
@@ -551,15 +485,13 @@ impl App {
                 return Ok(());
             }
             let Some(mut replacement) = self.inactive.pop() else {
-                self.message = "cannot delete the final buffer".to_owned();
-                return Ok(());
+                return self.set_message("cannot delete the final buffer".to_owned());
             };
             let deleted = self.active.buffer_id;
             std::mem::swap(&mut self.active, &mut replacement);
-            self.views.remove_buffer(deleted, self.active.buffer_id)?;
-            self.views.set_active_buffer(self.active.buffer_id)?;
-            self.message = "buffer deleted".to_owned();
-            return Ok(());
+            self.views.remove_buffer(deleted, self.active.buffer_id);
+            self.views.set_active_buffer(self.active.buffer_id);
+            return self.set_message("buffer deleted".to_owned());
         }
 
         let mut ids: Vec<_> = self.inactive.iter().map(|buffer| buffer.buffer_id).chain(std::iter::once(self.active.buffer_id)).collect();
@@ -572,8 +504,7 @@ impl App {
             BufferAction::Last => ids[ids.len() - 1],
             BufferAction::Select => {
                 let Some(target) = target else {
-                    self.message = format!("buffer {}: {}", self.active.buffer_id.get(), self.active.name());
-                    return Ok(());
+                    return self.set_message(format!("buffer {}: {}", self.active.buffer_id.get(), self.active.name()));
                 };
                 let numeric = target.parse::<u64>().ok();
                 self.inactive
@@ -598,7 +529,7 @@ impl App {
                 if let Some(path) = path {
                     self.open_buffer(Path::new(path))?;
                 }
-                self.views.new_tab(self.active.buffer_id)?;
+                self.views.new_tab(self.active.buffer_id);
             }
             TabAction::Next => self.views.cycle_tab(1),
             TabAction::Previous => self.views.cycle_tab(-1),
@@ -629,8 +560,7 @@ impl App {
                 saved += 1;
             }
         }
-        self.message = format!("{saved} buffer(s) written");
-        Ok(())
+        self.set_message(format!("{saved} buffer(s) written"))
     }
 
     pub(super) fn autosave_active_if_named(&mut self) -> Result<()> {
@@ -655,15 +585,13 @@ impl App {
             bail!("range destination {} is not editable UTF-8", path.display());
         }
         let report = target.save(selected)?;
-        self.message = format!("{} bytes written to {}", report.bytes_written, path.display());
-        Ok(())
+        self.set_message(format!("{} bytes written to {}", report.bytes_written, path.display()))
     }
 
     pub(super) fn grep(&mut self, pattern: &str, paths: &[Box<str>]) -> Result<()> {
         let root = self.workspace_root();
         self.populate_grep_results(pattern, paths, &root)?;
-        self.message = format!("{} grep result(s)", self.quickfix.len());
-        Ok(())
+        self.set_message(format!("{} grep result(s)", self.quickfix.len()))
     }
 
     pub(super) fn populate_grep_results(&mut self, pattern: &str, paths: &[Box<str>], root: &Path) -> Result<()> {
@@ -705,17 +633,7 @@ impl App {
             .map(Path::to_path_buf)
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let root = Command::new("git")
-            .arg("-C")
-            .arg(&start)
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|root| PathBuf::from(root.trim()))
-            .filter(|root| !root.as_os_str().is_empty())
-            .unwrap_or(start);
+        let root = git_root_for(&start).unwrap_or(start);
         std::fs::canonicalize(&root).unwrap_or(root)
     }
 
@@ -734,8 +652,7 @@ impl App {
         };
         if !executable_exists(&invocation.program) {
             self.diagnostics.clear();
-            self.message = format!("diagnostic tool {} is not installed", invocation.program);
-            return Ok(());
+            return self.set_message(format!("diagnostic tool {} is not installed", invocation.program));
         }
         let output = Command::new(&invocation.program)
             .args(&invocation.arguments)
@@ -746,7 +663,7 @@ impl App {
         self.diagnostics = combined.lines().filter_map(|line| parse_diagnostic_line(line, &invocation.directory)).collect();
         if self.diagnostics.is_empty() && !output.status.success() {
             let detail = combined.lines().find(|line| !line.trim().is_empty()).unwrap_or("diagnostic command failed").trim();
-            self.diagnostics.push(DiagnosticEntry { path, line: 1, column: 1, severity: DiagnosticSeverity::Error, message: detail.to_owned() });
+            self.diagnostics.push(QuickfixEntry::diagnostic(path, 1, 1, Severity::Error, detail));
         }
         self.diagnostics.sort_by(|left, right| {
             left.severity
@@ -767,10 +684,9 @@ impl App {
             .iter()
             .filter(|entry| path.is_some_and(|path| same_path(path, &entry.path)))
             .min_by_key(|entry| entry.line.abs_diff(cursor_line))
-            .map_or_else(|| "no diagnostics".to_owned(), |entry| format!("{} {}:{}: {}", entry.severity.label(), entry.line, entry.column, entry.message));
+            .map_or_else(|| "no diagnostics".to_owned(), |entry| format!("{} {}:{}: {}", entry.severity.label(), entry.line, entry.column, entry.text));
         if diagnostic == "no diagnostics" {
-            self.popup = None;
-            self.popup_deadline = None;
+            self.close_editor_popup();
             self.message = diagnostic;
         } else {
             self.popup = Some(TextPopup::new("diagnostic", diagnostic));
@@ -783,8 +699,7 @@ impl App {
     pub(super) fn move_diagnostic(&mut self, direction: isize) -> Result<()> {
         self.refresh_diagnostics()?;
         let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
-            self.message = "no diagnostics".to_owned();
-            return Ok(());
+            return self.set_message("no diagnostics".to_owned());
         };
         let current = self.active.editor.cursor_line_column().0 + 1;
         let entries = self.diagnostics.iter().filter(|entry| same_path(&entry.path, &path)).collect::<Vec<_>>();
@@ -794,20 +709,18 @@ impl App {
             entries.iter().find(|entry| entry.line > current).or_else(|| entries.first())
         };
         let Some(entry) = selected.copied() else {
-            self.message = "no diagnostics".to_owned();
-            return Ok(());
+            return self.set_message("no diagnostics".to_owned());
         };
         let line_start = self.active.editor.text().byte_of_line(entry.line.saturating_sub(1));
         self.active.editor.set_cursor(line_start.saturating_add(entry.column.saturating_sub(1)));
-        self.message = format!("{}: {}", entry.severity.label(), entry.message);
-        Ok(())
+        self.set_message(format!("{}: {}", entry.severity.label(), entry.text))
     }
 
-    pub(super) fn active_git_file(&self) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    pub(super) fn active_git_file(&self) -> Result<(PathBuf, PathBuf)> {
         let path = self.active.document.presentation_path().map(Path::to_path_buf).ok_or_else(|| anyhow!("Git action needs a named buffer"))?;
         let root = git_root_for(&path)?;
         let relative = path.strip_prefix(&root).with_context(|| format!("{} is outside {}", path.display(), root.display()))?.to_path_buf();
-        Ok((root, relative, path))
+        Ok((root, relative))
     }
 
     pub(super) fn active_git_root(&self) -> Result<PathBuf> {
@@ -818,7 +731,7 @@ impl App {
     }
 
     pub(super) fn active_git_patch(&self) -> Result<(PathBuf, Vec<u8>)> {
-        let (root, relative, _) = self.active_git_file()?;
+        let (root, relative) = self.active_git_file()?;
         if !git_path_tracked(&root, &relative)? {
             let output = Command::new("git")
                 .current_dir(&root)
@@ -854,12 +767,11 @@ impl App {
         git_apply_patch(&root, &patch, true, false)?;
         self.last_staged_patch = Some(patch);
         self.refresh_active_git_baseline();
-        self.message = "staged hunk".to_owned();
-        Ok(())
+        self.set_message("staged hunk".to_owned())
     }
 
     pub(super) fn git_reset_hunk(&mut self) -> Result<()> {
-        let (root, relative, _) = self.active_git_file()?;
+        let (root, relative) = self.active_git_file()?;
         let before = git_index_contents(&root, &relative)?;
         let after = self.active.editor.contents();
         let cursor = u32::try_from(self.active.editor.cursor_line_column().0).unwrap_or(u32::MAX);
@@ -877,33 +789,28 @@ impl App {
         let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(after_range, replacement)])?;
         self.active.editor.apply_transaction(transaction.clone())?;
         self.after_transaction(Some(transaction));
-        self.message = "reset hunk".to_owned();
-        Ok(())
+        self.set_message("reset hunk".to_owned())
     }
 
     pub(super) fn git_stage_buffer(&mut self) -> Result<()> {
         let (root, patch) = self.active_git_patch()?;
         if patch.is_empty() {
-            self.message = "buffer has no changes".to_owned();
-            return Ok(());
+            return self.set_message("buffer has no changes".to_owned());
         }
         git_apply_patch(&root, &patch, true, false)?;
         self.last_staged_patch = Some(patch);
         self.refresh_active_git_baseline();
-        self.message = "staged buffer".to_owned();
-        Ok(())
+        self.set_message("staged buffer".to_owned())
     }
 
     pub(super) fn git_undo_stage_hunk(&mut self) -> Result<()> {
         let Some(patch) = self.last_staged_patch.take() else {
-            self.message = "no staged hunk to undo".to_owned();
-            return Ok(());
+            return self.set_message("no staged hunk to undo".to_owned());
         };
-        let (root, _, _) = self.active_git_file()?;
+        let (root, _) = self.active_git_file()?;
         git_apply_patch(&root, &patch, true, true)?;
         self.refresh_active_git_baseline();
-        self.message = "undid staged hunk".to_owned();
-        Ok(())
+        self.set_message("undid staged hunk".to_owned())
     }
 
     pub(super) fn git_preview_hunk(&mut self) -> Result<()> {
@@ -915,7 +822,7 @@ impl App {
     }
 
     pub(super) fn git_blame_line(&mut self) -> Result<()> {
-        let (root, relative, _) = self.active_git_file()?;
+        let (root, relative) = self.active_git_file()?;
         let line = self.active.editor.cursor_line_column().0 + 1;
         let output = Command::new("git")
             .current_dir(root)
@@ -935,7 +842,7 @@ impl App {
     }
 
     pub(super) fn git_diff_index(&mut self) -> Result<()> {
-        let (root, relative, _) = self.active_git_file()?;
+        let (root, relative) = self.active_git_file()?;
         let root = root.to_string_lossy().into_owned().into_boxed_str();
         let relative = relative.to_string_lossy().into_owned().into_boxed_str();
         self.open_terminal(Some("git"), &["-C".into(), root, "--no-pager".into(), "diff".into(), "--".into(), relative])
@@ -949,8 +856,7 @@ impl App {
             self.active.git_hunks.iter().find(|hunk| hunk.after.start > current).or_else(|| self.active.git_hunks.first())
         };
         let Some(hunk) = selected else {
-            self.message = "no Git hunks".to_owned();
-            return Ok(());
+            return self.set_message("no Git hunks".to_owned());
         };
         self.active.editor.set_cursor(self.active.editor.text().byte_of_line(hunk.after.start as usize));
         self.message = format!(
@@ -964,14 +870,13 @@ impl App {
     }
 
     pub(super) fn refresh_active_git_baseline(&mut self) {
-        self.active.git_index_text = self.active_git_file().ok().and_then(|(root, relative, _)| git_index_contents(&root, &relative).ok()).map(Arc::from);
+        self.active.git_index_text = self.active_git_file().ok().and_then(|(root, relative)| git_index_contents(&root, &relative).ok()).map(Arc::from);
         self.active.refresh_git_hunks();
     }
 
-    pub(super) fn toggle_breakpoint(&mut self, condition: Option<String>) {
+    pub(super) fn toggle_breakpoint(&mut self, condition: Option<String>) -> Result<()> {
         let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
-            self.message = "breakpoints need a named buffer".to_owned();
-            return;
+            return self.set_message("breakpoints need a named buffer");
         };
         let line = self.active.editor.cursor_line_column().0 + 1;
         let file = self.breakpoints.entry(path.clone()).or_default();
@@ -982,6 +887,7 @@ impl App {
             file.insert(line, condition.filter(|value| !value.is_empty()));
             self.message = format!("breakpoint at {}:{line}{label}", path.display());
         }
+        Ok(())
     }
 
     pub(super) fn debug_overlay(&self) -> DebugOverlay {
@@ -1000,12 +906,14 @@ impl App {
         let repl =
             self.terminal.as_ref().map(|_| self.terminal_frame().text.to_string()).unwrap_or_else(|| "Press <Space>dl to start the debugger REPL".to_owned());
         DebugOverlay {
-            scopes: "▸ Locals\n▸ Arguments\n▸ Registers".into(),
-            breakpoints: if breakpoints.is_empty() { "No breakpoints".into() } else { breakpoints.into() },
-            stacks: stacks.into(),
-            watches: "Add watches from the REPL".into(),
-            repl: repl.into(),
-            console: if self.message.is_empty() { "Debugger console".into() } else { self.message.clone().into() },
+            panels: [
+                DebugPanel { title: "Scopes", text: "▸ Locals\n▸ Arguments\n▸ Registers".into() },
+                DebugPanel { title: "Breakpoints", text: if breakpoints.is_empty() { "No breakpoints".into() } else { breakpoints.into() } },
+                DebugPanel { title: "Stacks", text: stacks.into() },
+                DebugPanel { title: "Watches", text: "Add watches from the REPL".into() },
+                DebugPanel { title: "REPL", text: repl.into() },
+                DebugPanel { title: "Console", text: if self.message.is_empty() { "Debugger console".into() } else { self.message.clone().into() } },
+            ],
         }
     }
 
@@ -1019,8 +927,7 @@ impl App {
             "go" if executable_exists("dlv") => ("dlv", vec!["debug".into()]),
             "rust" | "c" | "cpp" if executable_exists("lldb") => ("lldb", path.map_or_else(Vec::new, |path| vec![path.into_boxed_str()])),
             _ => {
-                self.message = format!("no installed debugger for {language}");
-                return Ok(());
+                return self.set_message(format!("no installed debugger for {language}"));
             }
         };
         self.open_terminal(Some(program), &arguments)
@@ -1049,29 +956,23 @@ impl App {
     pub(super) fn open_hoogle(&mut self) -> Result<()> {
         let query = self.word_under_cursor().unwrap_or_default();
         if query.is_empty() {
-            self.message = "no Haskell identifier under cursor".to_owned();
-            return Ok(());
+            return self.set_message("no Haskell identifier under cursor".to_owned());
         }
         let url = format!("https://hoogle.haskell.org/?hoogle={}", url_encode(&query));
-        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-        Command::new(program).arg(&url).spawn().with_context(|| format!("open {url}"))?;
-        self.message = format!("Hoogle: {query}");
-        Ok(())
+        Command::new("open").arg(&url).spawn().with_context(|| format!("open {url}"))?;
+        self.set_message(format!("Hoogle: {query}"))
     }
 
     pub(super) fn hoogle_signature(&mut self) -> Result<()> {
         let query = self.word_under_cursor().unwrap_or_default();
         if query.is_empty() {
-            self.message = "no Haskell identifier under cursor".to_owned();
-            return Ok(());
+            return self.set_message("no Haskell identifier under cursor".to_owned());
         }
         if !executable_exists("hoogle") {
-            self.message = "hoogle is not installed".to_owned();
-            return Ok(());
+            return self.set_message("hoogle is not installed".to_owned());
         }
         let output = Command::new("hoogle").args(["--count=1", "--color=false", "--"]).arg(&query).output().context("run Hoogle")?;
-        self.message = String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("no Hoogle result").to_owned();
-        Ok(())
+        self.set_message(String::from_utf8_lossy(&output.stdout).lines().next().unwrap_or("no Hoogle result").to_owned())
     }
 
     pub(super) fn open_haskell_repl(&mut self, package: bool) -> Result<()> {

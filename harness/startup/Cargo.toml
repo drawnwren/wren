@@ -11,11 +11,11 @@ serde_json.workspace = true
 tempfile.workspace = true
 wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
 wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
-wren-client-state = { version = "0.1.0", path = "../../crates/wren-client-state" }
+wren-client-state = { version = "0.1.0", path = "../../crates/wren-client-state", features = ["benchmarking"] }
 wren-session = { version = "0.1.0", path = "../../crates/wren-session" }
-wren-shmem = { version = "0.1.0", path = "../../crates/wren-shmem" }
-wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
-wren-view = { version = "0.1.0", path = "../../crates/wren-view" }
+wren-shmem = { version = "0.1.0", path = "../../crates/wren-shmem", features = ["benchmarking"] }
+wren-types = { version = "0.1.0", path = "../../crates/wren-types", features = ["benchmarking"] }
+wren-view = { version = "0.1.0", path = "../../crates/wren-view", features = ["benchmarking"] }
 
 [lints]
 workspace = true

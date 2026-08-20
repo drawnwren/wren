@@ -5,26 +5,29 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ls_types::{DocumentChangeOperation, DocumentChanges, OneOf, WorkspaceEdit};
+use ls_types::{CodeActionOrCommand, CodeActionResponse, CodeLens, Command as LspCommand, DocumentChangeOperation, DocumentChanges, OneOf, WorkspaceEdit};
+use parking_lot::Mutex as LocalMutex;
 use serde::{Deserialize, Serialize};
 use wren_client_state::{ClientViewStateStore, DurableClientState};
-use wren_command::{CancellationToken, TaskFailure, TaskResult, TaskRunner};
+use wren_command::{CancellationToken, TaskContext, TaskFailure, TaskRunner};
 use wren_config::{CommandRegistry, WorkspaceTrust, executable_hash, parse_and_validate};
 use wren_engine::{
     CaseOverride, DurableUndoState, Editor, EngineError, FrameText, Mode, SearchDirection, VimPattern, VimReplacement, resolve_previous_replacement,
 };
 use wren_grammar::{
     BufferAction, EX_COMMAND_COMPLETIONS, ExAddress, ExCommand, ExRange, ExpressionContext, KeyCode, KeyEvent, Modifiers, ParseState, SubstituteFlags,
-    TabAction, Value, evaluate_expression, parse_ex,
+    TabAction, Value, evaluate_expression, expression_editor_text, parse_ex,
 };
 use wren_position::{utf16_column_to_byte, utf16_position_to_byte};
 use wren_presenter::Presenter;
@@ -36,22 +39,19 @@ use wren_provider::{
     CompletionCandidate, CompletionSession, HighlightSpan, ProviderRequest, ProviderResponse, bundled_language_id, fuzzy_rank, highlight_text,
     lexical_highlight_text,
 };
-use wren_session::{
-    DocumentEncoding, LocalDocument, LocalWal, MutationOutbox, MutationSubmission, OpenedDocument, RecoveredState, SaveWarning, SessionAuthority,
-    SessionJournal,
-};
+use wren_session::{DocumentEncoding, LocalDocument, LocalWal, MutationOutbox, OpenedDocument, RecoveredState, SaveWarning, SessionAuthority, SessionJournal};
 use wren_term::{ClipboardSelection, MouseAction, SystemTerminalBackend, TerminaBackend, TerminalInput, TerminalKey, TerminalKeyCode};
 use wren_text::{DefaultText, TextStore};
 use wren_types::{
-    Anchor, Bias, BufferId, ClientId, ClientMutation, ClientSequence, CommandClass, CommandInvocation, CommandSchema, CommandTask, CommandTaskId,
-    DocumentClass, DocumentId, DocumentMutation, DocumentRevision, DurableJumpEntry, Edit, EditProposal, Effects, Freshness, FreshnessKey, LanguageBundle,
-    MutationId, OffsetMapping, Priority, ProviderDemand, SemanticGroupId, SemanticGroupKind, SessionId, StateDelta, Transaction, merge_ranges, ranges_overlap,
-    stable_hash,
+    Anchor, Bias, BufferId, ClientId, ClientMutation, ClientSequence, CommandClass, CommandSchema, CommandTask, CommandTaskId, DocumentClass, DocumentId,
+    DocumentMutation, DocumentRevision, DurableJumpEntry, Edit, EditProposal, Effects, Freshness, FreshnessKey, LanguageBundle, MutationId, Priority,
+    ProviderDemand, SemanticGroupId, SemanticGroupKind, SessionId, StateDelta, Transaction, identifier_prefix_start, identifier_range, merge_ranges,
+    ranges_overlap, stable_hash,
 };
 use wren_view::{
-    AceJumpOverlay, AceJumpTarget, CatppuccinFlavor, CatppuccinPalette, Cell as ViewCell, CellColor, CellRow, CellStyle, ClientViewModel, CompletionOverlay,
-    CompletionOverlayRow, DebugOverlay, DecorationSpan, DesiredGrid, LineDecoration, MessageEntry, MessageSeverity, PickerOverlay, PickerOverlayRow, RgbColor,
-    SharedDecorations, SplitAxis, StatusOverlay, StatusSegment, TerminalSidebar, TextPopup, ViewportLayout, WindowDirection,
+    AceJumpOverlay, AceJumpTarget, CatppuccinColor, CatppuccinFlavor, CatppuccinPalette, Cell as ViewCell, CellColor, CellRow, CellStyle, ClientViewModel,
+    CompletionOverlay, DebugOverlay, DebugPanel, DecorationSpan, DesiredGrid, LineDecoration, MenuOverlayRow, PickerOverlay, RgbColor, SharedDecorations,
+    SplitAxis, StatusOverlay, StatusSegment, TerminalSidebar, TextPopup, ViewportLayout, WindowDirection,
 };
 use wren_workflow::{
     GitHunk, LspClient, LspPosition, LspTextEdit, PtySession, TaskSpec as WorkflowTaskSpec, TaskSupervisor, TerminalColor, WorkflowError, git_hunks,
@@ -100,7 +100,9 @@ mod app_providers;
 #[path = "app/terminal.rs"]
 mod app_terminal;
 
+#[cfg(feature = "benchmarking")]
 mod latency;
+#[cfg(feature = "benchmarking")]
 pub use latency::{
     ProductionLatencyReport, ProductionLatencySample, TilingPerformanceReport, TilingPerformanceSample, run_production_latency_probe,
     run_tiling_performance_probe,
@@ -113,7 +115,7 @@ const GIT_HUNK_IDLE_PERIOD: Duration = Duration::from_millis(50);
 const LSP_START_IDLE_PERIOD: Duration = Duration::from_millis(750);
 const LSP_SEMANTIC_IDLE_PERIOD: Duration = Duration::from_millis(750);
 type PresenterBackend = TerminaBackend<std::io::Stdout>;
-type SharedPresenterBackend = Arc<Mutex<PresenterBackend>>;
+type SharedPresenterBackend = Arc<LocalMutex<PresenterBackend>>;
 
 pub fn main_entry() -> Result<()> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-provider-host")) {
@@ -137,7 +139,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
     let mut app = App::open(cli.path.as_deref(), cli.line)?;
     let mut terminal = SystemTerminalBackend::open().context("open interactive terminal")?;
     let (columns, rows) = terminal.size().context("query terminal size")?;
-    let output = Arc::new(Mutex::new(TerminaBackend::new(std::io::stdout(), columns, rows).context("open terminal presenter")?));
+    let output = Arc::new(LocalMutex::new(TerminaBackend::new(std::io::stdout())));
     let presenter = Presenter::start(Arc::clone(&output))?;
     let mut layout = ViewportLayout::new(columns, rows);
     layout.configure_dotfile_profile();
@@ -156,7 +158,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
         if let Some(input) = input {
             let (input, next) = coalesce_mouse_scroll_input(input, |timeout| terminal.poll_input(Some(timeout)).context("drain terminal input"))?;
             pending_input = next;
-            needs_render |= handle_terminal_event(input, &mut app, &mut terminal, &output, &mut layout)?;
+            needs_render |= handle_terminal_event(input, &mut app, &mut terminal, &output, &mut layout);
         }
         // Quitting is a local editor action. Once accepted, leave the event
         // loop before polling providers or language servers so their state can
@@ -164,8 +166,18 @@ fn run_editor(cli: &Cli) -> Result<()> {
         if app.quit {
             break;
         }
-        needs_render |= poll_app_work(&mut app)?;
-        needs_render |= startup_animation_due(&app, &mut next_startup_frame);
+        if !std::mem::take(&mut app.foreground_frame_pending) {
+            needs_render |= poll_app_work(&mut app)?;
+        }
+        let now = Instant::now();
+        if app.shows_startup_screen() && now >= next_startup_frame {
+            while next_startup_frame <= now {
+                next_startup_frame += STARTUP_ANIMATION_FRAME_PERIOD;
+            }
+            needs_render = true;
+        } else if !app.shows_startup_screen() {
+            next_startup_frame = now + STARTUP_ANIMATION_FRAME_PERIOD;
+        }
         app.capture_debug_output();
         presenter.check_failure()?;
         // Provider refinement is independently debounced from rendering. Poll
@@ -177,23 +189,8 @@ fn run_editor(cli: &Cli) -> Result<()> {
         }
     }
     app.flush_wal()?;
-    let _stats = presenter.finish()?;
+    presenter.finish()?;
     Ok(())
-}
-
-fn startup_animation_due(app: &App, next_frame: &mut Instant) -> bool {
-    let now = Instant::now();
-    if !app.shows_startup_screen() {
-        *next_frame = now + STARTUP_ANIMATION_FRAME_PERIOD;
-        return false;
-    }
-    if now < *next_frame {
-        return false;
-    }
-    while *next_frame <= now {
-        *next_frame += STARTUP_ANIMATION_FRAME_PERIOD;
-    }
-    true
 }
 
 const fn clipboard_selection(register: char) -> ClipboardSelection {
@@ -220,56 +217,39 @@ fn restore_clipboard_for_input(app: &mut App, terminal: &mut SystemTerminalBacke
     }
 }
 
-fn dispatch_terminal_event(app: &mut App, layout: &ViewportLayout, event: TerminalInput) {
-    app.foreground_frame_pending = true;
-    let result = match event {
-        TerminalInput::Mouse { action: MouseAction::Click, column, row } => app.handle_mouse_click(layout, column, row),
-        TerminalInput::Mouse { action: MouseAction::Drag, column, row } => app.handle_mouse_drag(layout, column, row),
-        TerminalInput::Mouse { action: MouseAction::Release, column, row } => app.handle_mouse_release(layout, column, row),
-        event => app.handle_input(event),
-    };
-    if let Err(error) = result {
-        app.show_error(error);
-    }
-}
-
-fn flush_clipboard_writes(app: &mut App, output: &SharedPresenterBackend) -> Result<()> {
-    for (register, text) in app.take_clipboard_writes() {
-        if let Err(error) = output.lock().map_err(|_| anyhow!("presenter backend lock is poisoned"))?.copy_osc52(clipboard_selection(register), &text) {
-            app.show_error(format!("clipboard: {error}"));
-        }
-    }
-    Ok(())
-}
-
 fn handle_terminal_event(
     event: TerminalInput,
     app: &mut App,
     terminal: &mut SystemTerminalBackend,
     output: &SharedPresenterBackend,
     layout: &mut ViewportLayout,
-) -> Result<bool> {
+) -> bool {
     if let TerminalInput::Resized { columns, rows } = event {
         layout.resize(columns, rows);
         app.resize_terminal(rows, columns);
-        output.lock().map_err(|_| anyhow!("presenter backend lock is poisoned"))?.resize(columns, rows);
-        return Ok(true);
+        return true;
     }
-    if !input_requires_render(&event) {
-        return Ok(false);
+    if matches!(event, TerminalInput::Ignored) {
+        return false;
     }
     restore_clipboard_for_input(app, terminal, &event);
-    dispatch_terminal_event(app, layout, event);
-    app.capture_debug_output();
-    flush_clipboard_writes(app, output)?;
-    Ok(true)
-}
-
-fn poll_app_work(app: &mut App) -> Result<bool> {
-    if std::mem::take(&mut app.foreground_frame_pending) {
-        return Ok(false);
+    app.foreground_frame_pending = true;
+    let result = match event {
+        TerminalInput::Mouse { action: action @ (MouseAction::Click | MouseAction::Drag | MouseAction::Release), column, row } => {
+            app.handle_mouse_pointer(layout, action, column, row)
+        }
+        event => app.handle_input(event),
+    };
+    if let Err(error) = result {
+        app.show_error(error);
     }
-    APP_POLL_PLUGINS.iter().try_fold(false, |changed, poll| Ok(changed | poll(app)?))
+    app.capture_debug_output();
+    for (register, text) in app.take_clipboard_writes() {
+        if let Err(error) = output.lock().copy_osc52(clipboard_selection(register), &text) {
+            app.show_error(format!("clipboard: {error}"));
+        }
+    }
+    true
 }
 
 type AppPollPlugin = fn(&mut App) -> Result<bool>;
@@ -277,17 +257,20 @@ type AppPollPlugin = fn(&mut App) -> Result<bool>;
 const APP_POLL_PLUGINS: &[AppPollPlugin] = &[
     App::poll_task_results,
     App::poll_agent_terminal,
-    App::poll_provider_results,
-    App::poll_git_hunk_results,
-    App::poll_grep_picker,
-    App::poll_lsp_start_due,
-    App::poll_lsp_start,
-    App::poll_lsp_background,
+    |app| Ok(app.poll_provider_results()),
+    |app| Ok(app.poll_git_hunk_results()),
+    |app| Ok(app.poll_grep_picker()),
+    |app| Ok(app.poll_lsp_start_due()),
+    |app| Ok(app.poll_lsp()),
     App::poll_lsp_semantic_due,
     App::poll_terminal,
     App::poll_mapping_timeout,
-    App::poll_popup_timeout,
+    |app| Ok(app.poll_popup_timeout()),
 ];
+
+fn poll_app_work(app: &mut App) -> Result<bool> {
+    APP_POLL_PLUGINS.iter().try_fold(false, |changed, poll| Ok(changed | poll(app)?))
+}
 
 fn coalesce_mouse_scroll_input(
     first: TerminalInput,
@@ -317,17 +300,14 @@ fn coalesce_mouse_scroll_input(
     Ok((TerminalInput::Mouse { action: MouseAction::Scroll(lines), column, row }, None))
 }
 
+#[cfg(test)]
 fn input_requires_render(input: &TerminalInput) -> bool {
     !matches!(input, TerminalInput::Ignored)
 }
 
 fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
-    desired_frame_with_probe(layout, app, |_| {})
-}
-
-fn desired_frame_with_probe(layout: &mut ViewportLayout, app: &App, mut probe: impl FnMut(DesiredFrameStage)) -> Arc<DesiredGrid> {
     layout.set_theme(app.theme);
-    layout.set_terminal_sidebar_visible(app.agent_sidebar.visible && !app.input_focus.is_terminal());
+    layout.set_terminal_sidebar_visible(app.agent_sidebar_visible && !app.input_focus.is_terminal());
     if app.input_focus.is_terminal() {
         return Arc::new(app.desired_terminal_grid(layout));
     }
@@ -335,40 +315,19 @@ fn desired_frame_with_probe(layout: &mut ViewportLayout, app: &App, mut probe: i
     layout.ensure_cursor_visible(&frame, 1);
     let frames = buffer_frames(app, frame);
     let prompt = prompt_text(app);
-    probe(DesiredFrameStage::Inputs);
     let mut decorations = syntax_decorations(app);
-    probe(DesiredFrameStage::Syntax);
     add_search_decorations(app, &mut decorations);
-    probe(DesiredFrameStage::Search);
     let line_decorations = add_buffer_decorations(app, &mut decorations);
-    probe(DesiredFrameStage::BufferDecorations);
     add_selection_decoration(app, &mut decorations);
-    probe(DesiredFrameStage::Selection);
     let decoration_layers = decorations.finish();
     let decorations = layout.compose_shared_decoration_layers(&decoration_layers);
-    probe(DesiredFrameStage::DecorationMerge);
     let mut grid = layout.desired_workspace_grid_with_shared_decorations(&app.views, &frames, &decorations, &line_decorations, " ", prompt.as_deref());
-    probe(DesiredFrameStage::Render);
     if app.shows_startup_screen() {
         grid = app.startup_screen.borrow_mut().paint(grid, app.started_at.elapsed(), app.theme);
     }
     prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
     prefetch_document_end(layout, app, &frames, &line_decorations);
-    let grid = Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()));
-    probe(DesiredFrameStage::Overlays);
-    grid
-}
-
-#[derive(Clone, Copy)]
-enum DesiredFrameStage {
-    Inputs,
-    Syntax,
-    Search,
-    BufferDecorations,
-    Selection,
-    DecorationMerge,
-    Render,
-    Overlays,
+    Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()))
 }
 
 fn prepare_realtime_view_updates(
@@ -396,7 +355,7 @@ fn prefetch_document_end(
 ) {
     if app.active.editor.revision().get() != 0
         || app.active.editor.mode() != Mode::Normal
-        || app.views.windows.len() != 1
+        || app.views.window_count() != 1
         || !app.active.class.policy().whole_document_syntax
         || language_bundle(app.active.document.presentation_path()).language_id.as_ref() == "markdown"
     {
@@ -470,24 +429,18 @@ fn prefetch_editor_viewport(
 #[cfg(test)]
 #[derive(Default)]
 struct DesiredFrameTimings {
-    inputs: Duration,
-    syntax: Duration,
-    search: Duration,
-    buffer_decorations: Duration,
-    selection: Duration,
-    decoration_merge: Duration,
-    render: Duration,
-    overlays: Duration,
+    stages: [Duration; 8],
     total: Duration,
 }
 
 #[cfg(test)]
 impl std::fmt::Display for DesiredFrameTimings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [inputs, syntax, search, buffer_decorations, selection, decoration_merge, render, overlays] = self.stages;
         write!(
             formatter,
             "total={:?} inputs={:?} syntax={:?} search={:?} buffer_decorations={:?} selection={:?} decoration_merge={:?} render={:?} overlays={:?}",
-            self.total, self.inputs, self.syntax, self.search, self.buffer_decorations, self.selection, self.decoration_merge, self.render, self.overlays,
+            self.total, inputs, syntax, search, buffer_decorations, selection, decoration_merge, render, overlays,
         )
     }
 }
@@ -497,21 +450,40 @@ fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<Desire
     let total_at = Instant::now();
     let mut stage_at = total_at;
     let mut timings = DesiredFrameTimings::default();
-    let grid = desired_frame_with_probe(layout, app, |stage| {
+    let mut measure = |stage| {
         let now = Instant::now();
-        let elapsed = now.duration_since(stage_at);
-        *match stage {
-            DesiredFrameStage::Inputs => &mut timings.inputs,
-            DesiredFrameStage::Syntax => &mut timings.syntax,
-            DesiredFrameStage::Search => &mut timings.search,
-            DesiredFrameStage::BufferDecorations => &mut timings.buffer_decorations,
-            DesiredFrameStage::Selection => &mut timings.selection,
-            DesiredFrameStage::DecorationMerge => &mut timings.decoration_merge,
-            DesiredFrameStage::Render => &mut timings.render,
-            DesiredFrameStage::Overlays => &mut timings.overlays,
-        } = elapsed;
+        timings.stages[stage] = now.duration_since(stage_at);
         stage_at = now;
-    });
+    };
+    layout.set_theme(app.theme);
+    layout.set_terminal_sidebar_visible(app.agent_sidebar_visible && !app.input_focus.is_terminal());
+    if app.input_focus.is_terminal() {
+        return (Arc::new(app.desired_terminal_grid(layout)), timings);
+    }
+    let frame = app.active.editor.frame();
+    layout.ensure_cursor_visible(&frame, 1);
+    let frames = buffer_frames(app, frame);
+    let prompt = prompt_text(app);
+    measure(0);
+    let mut decorations = syntax_decorations(app);
+    measure(1);
+    add_search_decorations(app, &mut decorations);
+    measure(2);
+    let line_decorations = add_buffer_decorations(app, &mut decorations);
+    measure(3);
+    add_selection_decoration(app, &mut decorations);
+    measure(4);
+    let decorations = layout.compose_shared_decoration_layers(&decorations.finish());
+    measure(5);
+    let mut grid = layout.desired_workspace_grid_with_shared_decorations(&app.views, &frames, &decorations, &line_decorations, " ", prompt.as_deref());
+    measure(6);
+    if app.shows_startup_screen() {
+        grid = app.startup_screen.borrow_mut().paint(grid, app.started_at.elapsed(), app.theme);
+    }
+    prepare_realtime_view_updates(layout, app, &frames, &decorations, &line_decorations);
+    prefetch_document_end(layout, app, &frames, &line_decorations);
+    let grid = Arc::new(apply_editor_overlays(layout, app, grid, prompt.is_none()));
+    measure(7);
     timings.total = total_at.elapsed();
     (grid, timings)
 }
@@ -563,14 +535,7 @@ impl DecorationSetBuilder {
 
 fn syntax_decorations(app: &App) -> DecorationSetBuilder {
     let mut decorations = DecorationSetBuilder::default();
-    for (buffer_id, state) in &app.decorations {
-        if let Some(spans) = app.buffer(*buffer_id).and_then(|buffer| {
-            (buffer.editor.revision() == state.revision).then(|| visible_byte_range(app, *buffer_id)).flatten().map(|range| state.spans_in_shared(range))
-        }) {
-            decorations.push_shared(*buffer_id, spans);
-        }
-    }
-    for (buffer_id, state) in &app.semantic_decorations {
+    for (buffer_id, state) in app.decorations.iter().chain(&app.semantic_decorations) {
         if let Some(spans) = app.buffer(*buffer_id).and_then(|buffer| {
             (buffer.editor.revision() == state.revision).then(|| visible_byte_range(app, *buffer_id)).flatten().map(|range| state.spans_in_shared(range))
         }) {
@@ -583,16 +548,15 @@ fn syntax_decorations(app: &App) -> DecorationSetBuilder {
 fn visible_byte_range(app: &App, buffer_id: BufferId) -> Option<Range<usize>> {
     let buffer = app.buffer(buffer_id)?;
     let viewport_rows = app.viewport_rows.max(1);
-    app.views
-        .windows
-        .iter()
-        .filter(|window| window.buffer_id == buffer_id)
-        .map(|window| {
+    let mut visible: Option<Range<usize>> = None;
+    app.views.visit_windows(|window| {
+        if window.buffer_id == buffer_id {
             let start = buffer.editor.text().byte_of_line(window.top_line);
             let end = buffer.editor.text().byte_of_line(window.top_line.saturating_add(viewport_rows).saturating_add(1)).max(start);
-            start..end
-        })
-        .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))
+            visible = Some(visible.take().map_or(start..end, |previous| previous.start.min(start)..previous.end.max(end)));
+        }
+    });
+    visible
 }
 
 fn add_search_decorations(app: &App, decorations: &mut DecorationSetBuilder) {
@@ -600,18 +564,18 @@ fn add_search_decorations(app: &App, decorations: &mut DecorationSetBuilder) {
         return;
     }
     let previewing = app.prompt.as_ref().is_some_and(|prompt| prompt.kind.is_search());
-    for window in &app.views.windows {
+    app.views.visit_windows(|window| {
         if previewing && window.buffer_id != app.active.buffer_id {
-            continue;
+            return;
         }
         let Some(buffer) = app.buffer(window.buffer_id) else {
-            continue;
+            return;
         };
         let visible_start = buffer.editor.text().byte_of_line(window.top_line);
         let visible_end = buffer.editor.text().byte_of_line(window.top_line.saturating_add(app.viewport_rows.max(1)));
         let spans = search_decorations(app, buffer, visible_start..visible_end);
         decorations.push(window.buffer_id, spans);
-    }
+    });
 }
 
 fn search_decorations(app: &App, buffer: &BufferState, range: Range<usize>) -> Vec<DecorationSpan> {
@@ -621,7 +585,14 @@ fn search_decorations(app: &App, buffer: &BufferState, range: Range<usize>) -> V
         .into_iter()
         .map(|range| {
             let current = buffer.buffer_id == app.active.buffer_id && range.start == app.active.editor.primary_cursor();
-            DecorationSpan::new(range, CellStyle::rgb(app.theme.crust, if current { app.theme.peach } else { app.theme.yellow }), 3_000_000)
+            DecorationSpan::new(
+                range,
+                CellStyle::rgb(
+                    app.theme.color(CatppuccinColor::Crust),
+                    if current { app.theme.color(CatppuccinColor::Peach) } else { app.theme.color(CatppuccinColor::Yellow) },
+                ),
+                3_000_000,
+            )
         })
         .collect()
 }
@@ -630,11 +601,11 @@ fn add_git_decorations(buffer: &BufferState, theme: CatppuccinPalette, lines: &m
     lines.extend(buffer.git_hunks.iter().map(|hunk| {
         let line = if hunk.after.start == hunk.after.end { hunk.after.start.saturating_sub(1) } else { hunk.after.start } as usize;
         let color = if hunk.before.start == hunk.before.end {
-            theme.green
+            theme.color(CatppuccinColor::Green)
         } else if hunk.after.start == hunk.after.end {
-            theme.red
+            theme.color(CatppuccinColor::Red)
         } else {
-            theme.yellow
+            theme.color(CatppuccinColor::Yellow)
         };
         LineDecoration { line, style: CellStyle::default().with_foreground(CellColor::Rgb(color)).with_bold() }
     }));
@@ -645,10 +616,10 @@ fn add_diagnostic_decorations(app: &App, buffer: &BufferState, path: &Path, span
         let start = buffer.editor.text().byte_of_line(diagnostic.line.saturating_sub(1));
         let end = buffer.editor.text().byte_of_line(diagnostic.line).saturating_sub(1).max(start.saturating_add(1)).min(buffer.editor.text().len_bytes());
         let color = match diagnostic.severity {
-            DiagnosticSeverity::Error => app.theme.red,
-            DiagnosticSeverity::Warning => app.theme.yellow,
-            DiagnosticSeverity::Information => app.theme.blue,
-            DiagnosticSeverity::Hint => app.theme.teal,
+            Severity::Error => app.theme.color(CatppuccinColor::Red),
+            Severity::Warning => app.theme.color(CatppuccinColor::Yellow),
+            Severity::Info => app.theme.color(CatppuccinColor::Blue),
+            Severity::Hint | Severity::None => app.theme.color(CatppuccinColor::Teal),
         };
         spans.push(DecorationSpan::new(start..end, CellStyle::default().with_foreground(CellColor::Rgb(color)).with_underline(), 2_000_000));
         lines.push(LineDecoration { line: diagnostic.line.saturating_sub(1), style: CellStyle::default().with_foreground(CellColor::Rgb(color)).with_bold() });
@@ -659,9 +630,10 @@ fn add_breakpoint_decorations(app: &App, path: &Path, lines: &mut Vec<LineDecora
     let Some(breakpoints) = app.breakpoints.get(path) else {
         return;
     };
-    lines.extend(
-        breakpoints.keys().map(|line| LineDecoration { line: line.saturating_sub(1), style: CellStyle::rgb(app.theme.red, app.theme.surface0).with_bold() }),
-    );
+    lines.extend(breakpoints.keys().map(|line| LineDecoration {
+        line: line.saturating_sub(1),
+        style: CellStyle::rgb(app.theme.color(CatppuccinColor::Red), app.theme.color(CatppuccinColor::Surface0)).with_bold(),
+    }));
 }
 
 fn add_buffer_decorations(app: &App, decorations: &mut DecorationSetBuilder) -> Vec<(BufferId, Vec<LineDecoration>)> {
@@ -672,9 +644,6 @@ fn add_buffer_decorations(app: &App, decorations: &mut DecorationSetBuilder) -> 
         };
         let lines = decoration_bucket(&mut line_decorations, buffer.buffer_id);
         let mut added = Vec::new();
-        if language_bundle(Some(path)).language_id.as_ref() == "markdown" {
-            added.extend(markdown_decorations(&buffer.editor.contents(), app.theme));
-        }
         add_git_decorations(buffer, app.theme, lines);
         add_diagnostic_decorations(app, buffer, path, &mut added, lines);
         add_breakpoint_decorations(app, path, lines);
@@ -697,7 +666,7 @@ fn add_selection_decoration(app: &App, decorations: &mut DecorationSetBuilder) {
         app.active.buffer_id,
         vec![DecorationSpan::new(
             selection,
-            CellStyle::default().without_foreground().with_background(CellColor::Rgb(app.theme.surface2)),
+            CellStyle::default().without_foreground().with_background(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface2))),
             // Selection is appended after syntax and semantic decorations, so
             // tying their maximum priority lets it own the background while
             // retaining the highlighter's foreground and text attributes.
@@ -828,19 +797,31 @@ enum PickerSource {
     Diagnostics,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickerFamily {
-    Path,
-    Grep,
-    Location,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickerItem {
+    Path(PathBuf),
+    Location(QuickfixEntry),
 }
 
-impl PickerSource {
-    const fn family(self) -> PickerFamily {
+impl PickerItem {
+    fn path(&self) -> &Path {
         match self {
-            Self::Grep => PickerFamily::Grep,
-            Self::Jumps | Self::Diagnostics => PickerFamily::Location,
-            Self::Files | Self::Browser | Self::Buffers | Self::Recent => PickerFamily::Path,
+            Self::Path(path) => path,
+            Self::Location(entry) => &entry.path,
+        }
+    }
+
+    fn location(&self) -> Option<&QuickfixEntry> {
+        match self {
+            Self::Location(entry) => Some(entry),
+            Self::Path(_) => None,
+        }
+    }
+
+    fn search_text(&self) -> String {
+        match self {
+            Self::Path(path) => path.to_string_lossy().into_owned(),
+            Self::Location(entry) => entry.display(),
         }
     }
 }
@@ -850,6 +831,71 @@ enum ViewPosition {
     Top,
     Middle,
     Bottom,
+}
+
+struct PrefixBinding {
+    prefix: char,
+    key: char,
+    description: &'static str,
+    execute: fn(&mut App, char, char) -> Result<()>,
+    enabled: Option<fn(LspNavigationCapabilities) -> bool>,
+}
+
+impl PrefixBinding {
+    const fn new(prefix: char, key: char, description: &'static str, execute: fn(&mut App, char, char) -> Result<()>) -> Self {
+        Self { prefix, key, description, execute, enabled: None }
+    }
+
+    const fn when(mut self, enabled: fn(LspNavigationCapabilities) -> bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+}
+
+const PREFIX_TITLES: &[(char, &str)] = &[('g', " goto "), ('[', " previous "), (']', " next "), ('z', " viewport "), ('Z', " quit "), ('\u{17}', " window ")];
+
+const PREFIX_BINDINGS: &[PrefixBinding] = &[
+    PrefixBinding::new('g', 'g', "first line / [count] line", App::execute_grammar_prefix),
+    PrefixBinding::new('g', 'e', "previous word end", App::execute_grammar_prefix),
+    PrefixBinding::new('g', 'E', "previous WORD end", App::execute_grammar_prefix),
+    PrefixBinding::new('g', '0', "line start", App::execute_grammar_prefix),
+    PrefixBinding::new('g', '$', "line end", App::execute_grammar_prefix),
+    PrefixBinding::new('g', '_', "last nonblank", App::execute_grammar_prefix),
+    PrefixBinding::new('g', 'q', "format to text width", |app, _, _| app.format_text_width()),
+    PrefixBinding::new('g', ';', "older change", |app, _, _| app.execute_change_prefix(true)),
+    PrefixBinding::new('g', ',', "newer change", |app, _, _| app.execute_change_prefix(false)),
+    PrefixBinding::new('g', 'D', "declaration", |app, _, _| app.dispatch_lsp_cursor_request(PendingLspRequest::DECLARATION))
+        .when(|navigation| navigation.declaration),
+    PrefixBinding::new('g', 'd', "definition", |app, _, _| app.dispatch_lsp_cursor_request(PendingLspRequest::DEFINITION))
+        .when(|navigation| navigation.definition),
+    PrefixBinding::new('g', 'i', "implementation", |app, _, _| app.dispatch_lsp_cursor_request(PendingLspRequest::IMPLEMENTATION))
+        .when(|navigation| navigation.implementation),
+    PrefixBinding::new('g', 'r', "references", |app, _, _| app.lsp_references()).when(|navigation| navigation.references),
+    PrefixBinding::new('[', 'c', "previous Git hunk", |app, _, _| app.move_git_hunk(-1)),
+    PrefixBinding::new('[', 'd', "previous diagnostic", |app, _, _| app.move_diagnostic(-1)),
+    PrefixBinding::new(']', 'c', "next Git hunk", |app, _, _| app.move_git_hunk(1)),
+    PrefixBinding::new(']', 'd', "next diagnostic", |app, _, _| app.move_diagnostic(1)),
+    PrefixBinding::new('z', 'b', "cursor line at bottom", |app, _, _| app.execute_center_prefix(ViewPosition::Bottom)),
+    PrefixBinding::new('z', 't', "cursor line at top", |app, _, _| app.execute_center_prefix(ViewPosition::Top)),
+    PrefixBinding::new('z', 'z', "cursor line centered", |app, _, _| app.execute_center_prefix(ViewPosition::Middle)),
+    PrefixBinding::new('Z', 'Q', "quit without saving", |app, _, _| app.execute_ex("q!")),
+    PrefixBinding::new('Z', 'Z', "write and quit", |app, _, _| app.execute_ex("wq")),
+    PrefixBinding::new('\u{17}', 'h', "focus left", |app, _, _| app.focus_prefixed_window(WindowDirection::Left)),
+    PrefixBinding::new('\u{17}', 'j', "focus down", |app, _, _| app.focus_prefixed_window(WindowDirection::Down)),
+    PrefixBinding::new('\u{17}', 'k', "focus up / signature help", |app, _, _| app.focus_prefixed_window(WindowDirection::Up)),
+    PrefixBinding::new('\u{17}', 'l', "focus right", |app, _, _| app.focus_prefixed_window(WindowDirection::Right)),
+    PrefixBinding::new('\u{17}', 's', "horizontal split", |app, _, _| app.execute_split_prefix(SplitAxis::Horizontal)),
+    PrefixBinding::new('\u{17}', 'v', "vertical split", |app, _, _| app.execute_split_prefix(SplitAxis::Vertical)),
+    PrefixBinding::new('\u{17}', 'c', "close window", |app, _, _| app.execute_close_prefix()),
+    PrefixBinding::new('\u{17}', 'q', "close window", |app, _, _| app.execute_close_prefix()),
+    PrefixBinding::new('\u{17}', 'o', "close other windows", |app, _, _| app.execute_only_prefix()),
+    PrefixBinding::new('\u{17}', 'w', "next window", |app, _, _| app.execute_cycle_prefix(1)),
+    PrefixBinding::new('\u{17}', 'W', "previous window", |app, _, _| app.execute_cycle_prefix(-1)),
+    PrefixBinding::new('\u{17}', '=', "equalize windows", |app, _, _| app.execute_equalize_prefix()),
+];
+
+fn prefix_binding(prefix: char, key: char) -> Option<&'static PrefixBinding> {
+    PREFIX_BINDINGS.iter().find(|binding| binding.prefix == prefix && binding.key == key)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -866,37 +912,33 @@ struct ThemeConfig {
     colors: BTreeMap<String, String>,
 }
 
-#[cfg(test)]
-fn load_theme() -> (CatppuccinFlavor, CatppuccinPalette, String) {
-    (CatppuccinFlavor::Mocha, CatppuccinPalette::MOCHA, String::new())
+#[cfg(not(test))]
+fn config_file(name: &str) -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|directory| directory.join("wren").join(name))
 }
 
 #[cfg(not(test))]
-fn load_theme() -> (CatppuccinFlavor, CatppuccinPalette, String) {
-    let path = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|directory| directory.join("wren/theme.toml"));
-    let mut message = String::new();
-    let config = path
-        .as_deref()
-        .filter(|path| path.exists())
-        .and_then(|path| match std::fs::read_to_string(path) {
-            Ok(source) => match toml::from_str::<ThemeConfig>(&source) {
-                Ok(config) => Some(config),
-                Err(error) => {
-                    message = format!("theme config {}: {error}", path.display());
-                    None
-                }
-            },
-            Err(error) => {
-                message = format!("theme config {}: {error}", path.display());
-                None
-            }
-        })
-        .unwrap_or_default();
+fn load_user_config<T>(path: Option<PathBuf>, kind: &str, fallback: impl FnOnce() -> T, parse: impl FnOnce(&str) -> Result<T>) -> (T, String) {
+    let Some(path) = path.filter(|path| path.exists()) else { return (fallback(), String::new()) };
+    match std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display())).and_then(|source| parse(&source)) {
+        Ok(config) => (config, String::new()),
+        Err(error) => (fallback(), format!("{kind} config {}: {error:#}", path.display())),
+    }
+}
+
+#[cfg(test)]
+fn load_theme() -> (CatppuccinPalette, String) {
+    (CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha), String::new())
+}
+
+#[cfg(not(test))]
+fn load_theme() -> (CatppuccinPalette, String) {
+    let (config, mut message) = load_user_config(config_file("theme.toml"), "theme", ThemeConfig::default, |source| Ok(toml::from_str(source)?));
     let requested = env::var("WREN_CATPPUCCIN_FLAVOR").ok().or(config.flavor).unwrap_or_else(|| "mocha".to_owned());
-    let flavor = CatppuccinFlavor::parse(&requested).unwrap_or_else(|| {
+    let flavor = parse_catppuccin_flavor(&requested).unwrap_or_else(|| {
         message = format!("unknown Catppuccin flavor {requested:?}; using mocha");
         CatppuccinFlavor::Mocha
     });
@@ -910,12 +952,18 @@ fn load_theme() -> (CatppuccinFlavor, CatppuccinPalette, String) {
             message = format!("unknown theme color slot {name:?}");
         }
     }
-    (flavor, palette, message)
+    (palette, message)
+}
+
+fn parse_catppuccin_flavor(value: &str) -> Option<CatppuccinFlavor> {
+    let value = value.to_ascii_lowercase();
+    let value = value.strip_prefix("catppuccin-").unwrap_or(&value);
+    if value == "catppuccin" { Some(CatppuccinFlavor::Mocha) } else { value.parse().ok() }
 }
 
 #[derive(Debug, Clone)]
 struct RuntimeBinding {
-    invocation: CommandInvocation,
+    execute: fn(&mut App) -> Result<()>,
     when: Option<Box<str>>,
     description: Box<str>,
 }
@@ -926,6 +974,12 @@ struct NativeCommand {
     description: &'static str,
     class: CommandClass,
     execute: fn(&mut App) -> Result<()>,
+}
+
+impl NativeCommand {
+    const fn new(sequence: &'static str, name: &'static str, description: &'static str, class: CommandClass, execute: fn(&mut App) -> Result<()>) -> Self {
+        Self { sequence, name, description, class, execute }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -940,11 +994,7 @@ impl RuntimeKeymap {
         for command in NATIVE_COMMANDS {
             leader.insert(
                 Box::<str>::from(command.sequence),
-                RuntimeBinding {
-                    invocation: CommandInvocation { command: Box::<str>::from(command.name), arguments: BTreeMap::new() },
-                    when: None,
-                    description: Box::<str>::from(command.description),
-                },
+                RuntimeBinding { execute: command.execute, when: None, description: Box::<str>::from(command.description) },
             );
         }
         Self {
@@ -979,10 +1029,14 @@ impl RuntimeKeymap {
                     continue;
                 };
                 let invocation = registry.validate(&binding.command, &binding.args).map_err(|error| anyhow!(error))?;
+                let command = NATIVE_COMMANDS
+                    .iter()
+                    .find(|command| command.name == invocation.command.as_ref())
+                    .ok_or_else(|| anyhow!("validated command {} has no runtime implementation", invocation.command))?;
                 let description = descriptions.get(binding.command.as_str()).copied().unwrap_or(binding.command.as_str());
                 self.leader.insert(
                     sequence.into_boxed_str(),
-                    RuntimeBinding { invocation, when: binding.when.as_deref().map(Box::<str>::from), description: description.into() },
+                    RuntimeBinding { execute: command.execute, when: binding.when.as_deref().map(Box::<str>::from), description: description.into() },
                 );
             }
         }
@@ -990,66 +1044,67 @@ impl RuntimeKeymap {
     }
 }
 
-macro_rules! native_commands {
-    ($($sequence:literal, $name:literal, $description:literal, $class:ident => |$app:ident| $body:block)*) => {
-        const NATIVE_COMMANDS: &[NativeCommand] = &[$(NativeCommand {
-            sequence: $sequence,
-            name: $name,
-            description: $description,
-            class: CommandClass::$class,
-            execute: |$app| $body,
-        },)*];
-    };
-}
-
-native_commands! {
-    " ",  "selection.line",              "select line",             Realtime => |app| { app.dispatch_key(KeyEvent::character('V')); Ok(()) }
-    "q",  "editor.quit",                 "quit",                    Realtime => |app| { app.execute_ex("q") }
-    "w",  "file.write",                  "write",                   Task => |app| { app.save(None) }
-    "x",  "search.clear",                "clear search",            Realtime => |app| { app.search_highlight = false; app.message.clear(); Ok(()) }
-    "b",  "picker.buffers",              "buffers",                 Task => |app| { app.start_buffer_picker() }
-    "a",  "ai.chat",                     "Oh My Pi pane",           Realtime => |app| { app.toggle_agent_sidebar() }
-    "jj", "jump.ace",                    "visible character",       Realtime => |app| { app.start_ace_jump(); Ok(()) }
-    "f",  "format.document",             "format",                  Task => |app| { app.format_active_language() }
-    "ff", "picker.files",                "files",                   Task => |app| { app.start_file_picker("") }
-    "fb", "picker.browser",              "file browser",            Task => |app| { app.start_file_browser() }
-    "f.", "picker.resume",               "resume picker",           Task => |app| { app.resume_picker() }
-    "fo", "picker.recent",               "recent files",            Task => |app| { app.start_recent_picker() }
-    "fr", "picker.grep",                 "grep Git root",           Task => |app| { app.start_grep_picker("") }
-    "fw", "picker.grep_word",            "grep word",               Task => |app| { app.start_grep_word_picker() }
-    "fj", "picker.jumplist",             "jumplist",                Task => |app| { app.start_jumplist_picker() }
-    "fd", "picker.diagnostics",          "diagnostics",             Task => |app| { app.start_diagnostic_picker() }
-    "e",  "diagnostic.show",             "diagnostic float",        Realtime => |app| { app.show_cursor_diagnostic() }
-    "ea", "repl.evaluate",               "evaluate selection",      Task => |app| { app.evaluate_in_repl() }
-    "dt", "debug.toggle",                "toggle UI",               Task => |app| { app.toggle_debug_ui(); Ok(()) }
-    "db", "debug.breakpoint",            "breakpoint",              Task => |app| { app.toggle_breakpoint(None); Ok(()) }
-    "dB", "debug.conditional_breakpoint", "conditional breakpoint",  Task => |app| { app.open_conditional_breakpoint_prompt(); Ok(()) }
-    "dl", "debug.repl",                  "REPL",                    Task => |app| { app.open_debug_repl() }
-    "dc", "debug.continue",              "continue",                Task => |app| { app.run_debug_action("dc") }
-    "ds", "debug.step_into",             "step into",               Task => |app| { app.run_debug_action("ds") }
-    "dn", "debug.step_over",             "step over",               Task => |app| { app.run_debug_action("dn") }
-    "do", "debug.step_out",              "step out",                Task => |app| { app.run_debug_action("do") }
-    "dr", "debug.restart",               "restart",                 Task => |app| { app.run_debug_action("dr") }
-    "gs", "git.stage_hunk",              "stage hunk",              Task => |app| { app.git_stage_hunk() }
-    "gr", "git.reset_hunk",              "reset hunk",              Task => |app| { app.git_reset_hunk() }
-    "gS", "git.stage_buffer",            "stage buffer",            Task => |app| { app.git_stage_buffer() }
-    "gu", "git.undo_stage",              "undo stage",              Task => |app| { app.git_undo_stage_hunk() }
-    "gp", "git.preview_hunk",            "preview hunk",            Task => |app| { app.git_preview_hunk() }
-    "gb", "git.blame_line",              "blame line",              Task => |app| { app.git_blame_line() }
-    "gd", "git.diff_index",              "diff index",              Task => |app| { app.git_diff_index() }
-    "rn", "lsp.rename",                  "rename",                  Task => |app| { app.open_rename_prompt(); Ok(()) }
-    "ca", "lsp.code_action",             "code action",             Task => |app| { app.lsp_code_action() }
-    "D",  "lsp.type_definition",         "type definition",         Task => |app| { app.lsp_location("textDocument/typeDefinition") }
-    "Wa", "workspace.add_folder",        "add workspace folder",    Realtime => |app| { app.lsp_workspace_folder("workspace/didChangeWorkspaceFolders", true) }
-    "Wr", "workspace.remove_folder",     "remove workspace folder", Realtime => |app| { app.lsp_workspace_folder("workspace/didChangeWorkspaceFolders", false) }
-    "Wl", "workspace.list_folders",      "list workspace folders",  Realtime => |app| { app.list_workspace_folders(); Ok(()) }
-    "hw", "haskell.hoogle",              "Hoogle",                  Task => |app| { app.open_hoogle() }
-    "hs", "haskell.signature",           "signature",               Task => |app| { app.hoogle_signature() }
-    "hl", "haskell.code_lens",           "code lens",               Task => |app| { app.lsp_code_lens() }
-    "rr", "haskell.repl_package",        "package GHCi",            Task => |app| { app.open_haskell_repl(true) }
-    "rf", "haskell.repl_file",           "file GHCi",               Task => |app| { app.open_haskell_repl(false) }
-    "rq", "haskell.repl_quit",           "quit GHCi",               Task => |app| { app.quit_repl() }
-}
+const NATIVE_COMMANDS: &[NativeCommand] = &[
+    NativeCommand::new(" ", "selection.line", "select line", CommandClass::Realtime, |app| {
+        app.dispatch_key(KeyEvent::character('V'));
+        Ok(())
+    }),
+    NativeCommand::new("q", "editor.quit", "quit", CommandClass::Realtime, |app| app.execute_ex("q")),
+    NativeCommand::new("w", "file.write", "write", CommandClass::Task, |app| app.save(None)),
+    NativeCommand::new("x", "search.clear", "clear search", CommandClass::Realtime, |app| {
+        app.search_highlight = false;
+        app.message.clear();
+        Ok(())
+    }),
+    NativeCommand::new("b", "picker.buffers", "buffers", CommandClass::Task, App::start_buffer_picker),
+    NativeCommand::new("a", "ai.chat", "Oh My Pi pane", CommandClass::Realtime, App::toggle_agent_sidebar),
+    NativeCommand::new("jj", "jump.ace", "visible character", CommandClass::Realtime, App::start_ace_jump),
+    NativeCommand::new("f", "format.document", "format", CommandClass::Task, App::format_active_language),
+    NativeCommand::new("ff", "picker.files", "files", CommandClass::Task, |app| app.start_file_picker("")),
+    NativeCommand::new("fb", "picker.browser", "file browser", CommandClass::Task, App::start_file_browser),
+    NativeCommand::new("f.", "picker.resume", "resume picker", CommandClass::Task, App::resume_picker),
+    NativeCommand::new("fo", "picker.recent", "recent files", CommandClass::Task, App::start_recent_picker),
+    NativeCommand::new("fr", "picker.grep", "grep Git root", CommandClass::Task, |app| app.start_grep_picker("")),
+    NativeCommand::new("fw", "picker.grep_word", "grep word", CommandClass::Task, App::start_grep_word_picker),
+    NativeCommand::new("fj", "picker.jumplist", "jumplist", CommandClass::Task, App::start_jumplist_picker),
+    NativeCommand::new("fd", "picker.diagnostics", "diagnostics", CommandClass::Task, App::start_diagnostic_picker),
+    NativeCommand::new("e", "diagnostic.show", "diagnostic float", CommandClass::Realtime, App::show_cursor_diagnostic),
+    NativeCommand::new("ea", "repl.evaluate", "evaluate selection", CommandClass::Task, App::evaluate_in_repl),
+    NativeCommand::new("dt", "debug.toggle", "toggle UI", CommandClass::Task, App::toggle_debug_ui),
+    NativeCommand::new("db", "debug.breakpoint", "breakpoint", CommandClass::Task, |app| app.toggle_breakpoint(None)),
+    NativeCommand::new("dB", "debug.conditional_breakpoint", "conditional breakpoint", CommandClass::Task, App::open_conditional_breakpoint_prompt),
+    NativeCommand::new("dl", "debug.repl", "REPL", CommandClass::Task, App::open_debug_repl),
+    NativeCommand::new("dc", "debug.continue", "continue", CommandClass::Task, |app| app.run_debug_action("dc")),
+    NativeCommand::new("ds", "debug.step_into", "step into", CommandClass::Task, |app| app.run_debug_action("ds")),
+    NativeCommand::new("dn", "debug.step_over", "step over", CommandClass::Task, |app| app.run_debug_action("dn")),
+    NativeCommand::new("do", "debug.step_out", "step out", CommandClass::Task, |app| app.run_debug_action("do")),
+    NativeCommand::new("dr", "debug.restart", "restart", CommandClass::Task, |app| app.run_debug_action("dr")),
+    NativeCommand::new("gs", "git.stage_hunk", "stage hunk", CommandClass::Task, App::git_stage_hunk),
+    NativeCommand::new("gr", "git.reset_hunk", "reset hunk", CommandClass::Task, App::git_reset_hunk),
+    NativeCommand::new("gS", "git.stage_buffer", "stage buffer", CommandClass::Task, App::git_stage_buffer),
+    NativeCommand::new("gu", "git.undo_stage", "undo stage", CommandClass::Task, App::git_undo_stage_hunk),
+    NativeCommand::new("gp", "git.preview_hunk", "preview hunk", CommandClass::Task, App::git_preview_hunk),
+    NativeCommand::new("gb", "git.blame_line", "blame line", CommandClass::Task, App::git_blame_line),
+    NativeCommand::new("gd", "git.diff_index", "diff index", CommandClass::Task, App::git_diff_index),
+    NativeCommand::new("rn", "lsp.rename", "rename", CommandClass::Task, App::open_rename_prompt),
+    NativeCommand::new("ca", "lsp.code_action", "code action", CommandClass::Task, App::lsp_code_action),
+    NativeCommand::new("D", "lsp.type_definition", "type definition", CommandClass::Task, |app| {
+        app.dispatch_lsp_cursor_request(PendingLspRequest::TYPE_DEFINITION)
+    }),
+    NativeCommand::new("Wa", "workspace.add_folder", "add workspace folder", CommandClass::Realtime, |app| {
+        app.lsp_workspace_folder("workspace/didChangeWorkspaceFolders", true)
+    }),
+    NativeCommand::new("Wr", "workspace.remove_folder", "remove workspace folder", CommandClass::Realtime, |app| {
+        app.lsp_workspace_folder("workspace/didChangeWorkspaceFolders", false)
+    }),
+    NativeCommand::new("Wl", "workspace.list_folders", "list workspace folders", CommandClass::Realtime, App::list_workspace_folders),
+    NativeCommand::new("hw", "haskell.hoogle", "Hoogle", CommandClass::Task, App::open_hoogle),
+    NativeCommand::new("hs", "haskell.signature", "signature", CommandClass::Task, App::hoogle_signature),
+    NativeCommand::new("hl", "haskell.code_lens", "code lens", CommandClass::Task, App::lsp_code_lens),
+    NativeCommand::new("rr", "haskell.repl_package", "package GHCi", CommandClass::Task, |app| app.open_haskell_repl(true)),
+    NativeCommand::new("rf", "haskell.repl_file", "file GHCi", CommandClass::Task, |app| app.open_haskell_repl(false)),
+    NativeCommand::new("rq", "haskell.repl_quit", "quit GHCi", CommandClass::Task, App::quit_repl),
+];
 
 fn native_command_schemas() -> Vec<CommandSchema> {
     NATIVE_COMMANDS
@@ -1072,26 +1127,17 @@ fn load_keymap() -> (RuntimeKeymap, String) {
 
 #[cfg(not(test))]
 fn load_keymap() -> (RuntimeKeymap, String) {
-    let mut keymap = RuntimeKeymap::defaults();
-    let path = env::var_os("WREN_CONFIG").map(PathBuf::from).or_else(|| {
-        env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .map(|directory| directory.join("wren/config.toml"))
-    });
-    let Some(path) = path.filter(|path| path.exists()) else {
-        return (keymap, String::new());
-    };
-    match std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display())).and_then(|source| keymap.overlay_user_config(&source)) {
-        Ok(()) => (keymap, String::new()),
-        Err(error) => (RuntimeKeymap::defaults(), format!("config {}: {error:#}", path.display())),
-    }
+    load_user_config(env::var_os("WREN_CONFIG").map(PathBuf::from).or_else(|| config_file("config.toml")), "keymap", RuntimeKeymap::defaults, |source| {
+        let mut keymap = RuntimeKeymap::defaults();
+        keymap.overlay_user_config(source)?;
+        Ok(keymap)
+    })
 }
 
 struct BufferState {
     buffer_id: BufferId,
     document_id: DocumentId,
-    editor: Editor<DefaultText>,
+    editor: Editor,
     document: LocalDocument,
     class: DocumentClass,
     mixed_line_endings: bool,
@@ -1112,10 +1158,7 @@ struct MouseSelection {
 
 impl BufferState {
     fn open(buffer_id: BufferId, document_id: DocumentId, path: Option<&Path>, line: Option<usize>) -> Result<(Self, String)> {
-        let (document, opened) = match path {
-            Some(path) => LocalDocument::open_or_new(path).with_context(|| format!("open {}", path.display()))?,
-            None => LocalDocument::unnamed(),
-        };
+        let (document, opened) = app_lifecycle::open_document(path)?;
         #[cfg(not(test))]
         let wal = document.presentation_path().map(LocalWal::for_document).transpose().context("locate recovery WAL")?;
         #[cfg(test)]
@@ -1150,7 +1193,7 @@ impl BufferState {
         let indent = detect_indent_style(&text);
         let initial_git_hunks = git_index_text.as_ref().map_or_else(Vec::new, |index_text| git_hunks(index_text, &text));
         let store = DefaultText::from_reader(Cursor::new(text.as_bytes())).context("create text store")?;
-        let mut editor = Editor::with_contents(store, text);
+        let mut editor = Editor::new(store);
         editor.set_search_options(true, true);
         editor.set_clipboard_unnamed(true);
         editor.set_indent_options(indent.expand_tabs, indent.width, indent.width, true);
@@ -1183,7 +1226,7 @@ impl BufferState {
                 document,
                 class: opened.class,
                 mixed_line_endings: opened.mixed_line_endings,
-                wal: wal.map(WalWorker::start),
+                wal: wal.map(WalWorker::start).transpose()?,
                 base_hash,
                 git_index_text,
                 git_hunks: initial_git_hunks,
@@ -1224,7 +1267,7 @@ struct App {
     inactive: Vec<BufferState>,
     views: ClientViewModel,
     quickfix: Vec<QuickfixEntry>,
-    jump_history: Vec<JumpLocation>,
+    jump_history: Vec<DurableJumpEntry>,
     jump_index: Option<usize>,
     mutations: MutationWorker,
     client_state: DurableClientState,
@@ -1244,14 +1287,15 @@ struct App {
     last_substitute: Option<LastSubstitute>,
     substitute_confirmation: Option<SubstituteConfirmation>,
     message: String,
+    debug_messages: Vec<(Severity, Box<str>)>,
     tasks: TaskRunner,
     active_task: Option<CancellationToken>,
     next_task_id: u64,
     terminal: Option<PtySession>,
     input_focus: InputFocus,
     mouse_selection: Option<MouseSelection>,
-    picker_files: Vec<String>,
-    picker_matches: Vec<PathBuf>,
+    picker_candidates: Vec<PickerItem>,
+    picker_items: Vec<PickerItem>,
     picker_index: usize,
     picker_directory: Option<PathBuf>,
     picker_preview_title: String,
@@ -1273,12 +1317,9 @@ struct App {
     snippet_stops: Vec<Range<usize>>,
     snippet_stop_index: usize,
     lsp_completion: Option<CompletionSession>,
-    lsp: Option<PersistentLsp>,
-    parked_lsps: Vec<PersistentLsp>,
-    lsp_navigation_capabilities: BTreeMap<Box<str>, LspNavigationCapabilities>,
+    lsps: Vec<PersistentLsp>,
+    lsp_job: Option<LspJob>,
     lsp_start_due: Option<Instant>,
-    lsp_start: Option<mpsc::Receiver<Result<PersistentLsp, String>>>,
-    lsp_background: Option<mpsc::Receiver<LspBackgroundResult>>,
     lsp_semantic_dirty: bool,
     pending_lsp_request: Option<PendingLspRequest>,
     leader_keys: Option<String>,
@@ -1288,7 +1329,7 @@ struct App {
     last_picker_query: String,
     last_picker_source: Option<PickerSource>,
     recent_files: Vec<PathBuf>,
-    diagnostics: Vec<DiagnosticEntry>,
+    diagnostics: Vec<QuickfixEntry>,
     format_on_save: bool,
     format_disabled: BTreeSet<DocumentId>,
     breakpoints: BTreeMap<PathBuf, BTreeMap<usize, Option<String>>>,
@@ -1296,9 +1337,8 @@ struct App {
     workspace_folders: Vec<PathBuf>,
     debug_ui_visible: bool,
     agent_terminal: Option<PtySession>,
-    agent_sidebar: AgentSidebarState,
+    agent_sidebar_visible: bool,
     last_staged_patch: Option<Vec<u8>>,
-    theme_flavor: CatppuccinFlavor,
     theme: CatppuccinPalette,
     viewport_rows: usize,
     viewport_columns: usize,
@@ -1307,11 +1347,6 @@ struct App {
     started_at: Instant,
     foreground_frame_pending: bool,
     quit: bool,
-}
-
-#[derive(Debug, Default)]
-struct AgentSidebarState {
-    visible: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1342,24 +1377,54 @@ impl InputFocus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PendingLspRequest {
-    Hover(String),
-    Location(String),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingLspRequest {
+    method: &'static str,
+    hover: bool,
+}
+
+struct LspJob {
+    starting: bool,
+    language_id: Box<str>,
+    navigation: Option<LspNavigationCapabilities>,
+    receiver: mpsc::Receiver<LspCompletion>,
 }
 
 impl PendingLspRequest {
-    fn method(&self) -> &str {
-        match self {
-            Self::Hover(method) | Self::Location(method) => method,
-        }
+    const HOVER: Self = Self::new("textDocument/hover", true);
+    const SIGNATURE_HELP: Self = Self::new("textDocument/signatureHelp", true);
+    const DECLARATION: Self = Self::new("textDocument/declaration", false);
+    const DEFINITION: Self = Self::new("textDocument/definition", false);
+    const TYPE_DEFINITION: Self = Self::new("textDocument/typeDefinition", false);
+    const IMPLEMENTATION: Self = Self::new("textDocument/implementation", false);
+
+    const fn new(method: &'static str, hover: bool) -> Self {
+        Self { method, hover }
     }
 
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::Hover(_) => "hover",
-            Self::Location(_) => "definition",
-        }
+    const fn label(self) -> &'static str {
+        if self.hover { "hover" } else { "definition" }
+    }
+
+    fn completion(self, document_id: DocumentId, revision: DocumentRevision, response: Result<serde_json::Value, String>) -> LspCompletion {
+        Box::new(move |app| {
+            let method = self.method;
+            let value = match response {
+                Ok(value) => value,
+                Err(error) => return app.show_error(format!("{method}: {error}")),
+            };
+            match self.hover {
+                false => {
+                    if let Err(error) = app.finish_lsp_location(method, &value) {
+                        app.show_error(format!("{method}: {error}"));
+                    }
+                }
+                true if app.active.document_id == document_id && app.active.editor.revision() == revision => {
+                    app.finish_lsp_hover(method, &value);
+                }
+                true => {}
+            }
+        })
     }
 }
 
@@ -1402,7 +1467,7 @@ impl DecorationState {
     fn advance(&mut self, transaction: &Transaction) {
         self.overrides = std::mem::take(&mut self.overrides).into_iter().filter_map(|span| map_decoration_span(span, transaction)).collect();
         self.invalidated = std::mem::take(&mut self.invalidated).into_iter().filter_map(|range| map_range(range, transaction)).collect();
-        if self.transforms.last().and_then(|previous| previous.then(transaction).ok()).is_some_and(|composed| composed.is_empty()) {
+        if self.transforms.last().is_some_and(|previous| previous.is_mapping_inverse(transaction)) {
             self.transforms.pop();
         } else {
             self.transforms.push(transaction.clone());
@@ -1430,7 +1495,10 @@ impl DecorationState {
     }
 
     fn same_mapping(&self, other: &Self) -> bool {
-        decoration_transforms_equal(&self.transforms, &other.transforms) && self.overrides == other.overrides && self.invalidated == other.invalidated
+        self.transforms.len() == other.transforms.len()
+            && self.transforms.iter().zip(&other.transforms).all(|(left, right)| left.has_same_mapping_as(right))
+            && self.overrides == other.overrides
+            && self.invalidated == other.invalidated
     }
 }
 
@@ -1466,10 +1534,6 @@ impl BufferDecorations {
         self.state.advance(transaction);
         self.state.replace_ranges(ranges, replacement);
         self.revision = revision;
-    }
-
-    fn replace_current_ranges(&mut self, ranges: &[Range<usize>], replacement: Vec<DecorationSpan>) {
-        self.state.replace_ranges(ranges, replacement);
     }
 
     #[cfg(test)]
@@ -1538,50 +1602,32 @@ impl BufferDecorations {
         let base_range = state.transforms.iter().rev().fold(range.clone(), unmap_range);
         let first = self.prefix_max_end.partition_point(|maximum_end| *maximum_end <= base_range.start);
         let last = self.spans.partition_point(|span| span.range.start < base_range.end);
-        let mappings = state.transforms.iter().map(Transaction::offset_mapping).collect::<Vec<_>>();
-        let spans = self.spans[first..last]
-            .iter()
-            .cloned()
-            .filter_map(|span| {
-                let span = mappings.iter().try_fold(span, map_decoration_span_with)?;
-                (ranges_overlap(&span.range, &range) && !state.invalidated.iter().any(|invalidated| ranges_overlap(&span.range, invalidated))).then_some(span)
-            })
-            .collect::<Vec<_>>();
-        merge_sorted_decorations(spans.into_iter(), state.overrides.iter().filter(|span| ranges_overlap(&span.range, &range)).cloned())
+        let spans = self.spans[first..last].iter().cloned().filter_map(|span| {
+            let span = state.transforms.iter().try_fold(span, map_decoration_span)?;
+            (ranges_overlap(&span.range, &range) && !state.invalidated.iter().any(|invalidated| ranges_overlap(&span.range, invalidated))).then_some(span)
+        });
+        merge_sorted_decorations(spans, state.overrides.iter().filter(|span| ranges_overlap(&span.range, &range)).cloned())
     }
 }
 
-fn map_decoration_span_with(span: DecorationSpan, mapping: &OffsetMapping<'_>) -> Option<DecorationSpan> {
-    let range = mapping.map_range(span.range, Bias::Left, Bias::Right).ok()?;
+fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Option<DecorationSpan> {
+    let range = transaction.map_range(span.range, Bias::Left, Bias::Right).ok()?;
     (!range.is_empty()).then_some(DecorationSpan::new(range, span.style, span.priority))
 }
 
-fn map_decoration_span(span: DecorationSpan, transaction: &Transaction) -> Option<DecorationSpan> {
-    map_decoration_span_with(span, &transaction.offset_mapping())
-}
-
 fn map_range(range: Range<usize>, transaction: &Transaction) -> Option<Range<usize>> {
-    map_range_with(range, &transaction.offset_mapping())
-}
-
-fn decoration_transforms_equal(left: &[Transaction], right: &[Transaction]) -> bool {
-    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| left.has_same_mapping_as(right))
-}
-
-fn map_range_with(range: Range<usize>, mapping: &OffsetMapping<'_>) -> Option<Range<usize>> {
-    let start = mapping.map_offset(range.start, Bias::Left).ok()?;
-    let end = mapping.map_offset(range.end, Bias::Right).ok()?;
+    let start = transaction.map_offset(range.start, Bias::Left).ok()?;
+    let end = transaction.map_offset(range.end, Bias::Right).ok()?;
     (start < end).then_some(start..end)
 }
 
 fn transaction_current_edit_ranges(transaction: &Transaction) -> Vec<Range<usize>> {
-    let mapping = transaction.offset_mapping();
     transaction
         .edits()
         .iter()
         .filter_map(|edit| {
-            let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
-            let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
+            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
+            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
             (start < end).then_some(start..end)
         })
         .collect()
@@ -1674,10 +1720,7 @@ struct Substitute {
     needle: String,
     replacement: String,
     ranges: Vec<Range<usize>>,
-    global: bool,
-    case_override: CaseOverride,
-    confirm: bool,
-    print: bool,
+    flags: SubstituteFlags,
     persist_pattern: bool,
 }
 
@@ -1699,18 +1742,13 @@ struct SubstituteConfirmation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QuickfixPosition {
-    line: usize,
-    column: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct QuickfixEntry {
     path: PathBuf,
     line: usize,
     column: usize,
-    selection_end: Option<QuickfixPosition>,
+    selection_end: Option<(usize, usize)>,
     column_utf16: bool,
+    severity: Severity,
     text: String,
 }
 
@@ -1723,7 +1761,7 @@ struct GrepPickerRequest {
 struct GrepPickerTask {
     generation: u64,
     query: String,
-    child: Arc<Mutex<Option<std::process::Child>>>,
+    child: Arc<LocalMutex<Option<std::process::Child>>>,
     cancelled: Arc<AtomicBool>,
     receiver: mpsc::Receiver<std::result::Result<Vec<QuickfixEntry>, String>>,
 }
@@ -1731,9 +1769,7 @@ struct GrepPickerTask {
 impl GrepPickerTask {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Ok(mut child) = self.child.lock()
-            && let Some(child) = child.as_mut()
-        {
+        if let Some(child) = self.child.lock().as_mut() {
             let _ = child.kill();
         }
     }
@@ -1747,7 +1783,11 @@ impl Drop for GrepPickerTask {
 
 impl QuickfixEntry {
     fn new(path: impl Into<PathBuf>, line: usize, column: usize, text: impl Into<String>) -> Self {
-        Self { path: path.into(), line, column, selection_end: None, column_utf16: false, text: text.into() }
+        Self { path: path.into(), line, column, selection_end: None, column_utf16: false, severity: Severity::None, text: text.into() }
+    }
+
+    fn diagnostic(path: impl Into<PathBuf>, line: usize, column: usize, severity: Severity, message: impl Into<String>) -> Self {
+        Self { severity, ..Self::new(path, line, column, message) }
     }
 
     fn utf16(mut self) -> Self {
@@ -1756,19 +1796,21 @@ impl QuickfixEntry {
     }
 
     fn with_end(mut self, line: usize, column: usize) -> Self {
-        self.selection_end = Some(QuickfixPosition { line, column });
+        self.selection_end = Some((line, column));
         self
     }
 
     fn display(&self) -> String {
-        format!("{}:{}:{}  {}", self.path.display(), self.line, self.column, compact(&self.text, 80))
+        let severity = self.severity.label();
+        let separator = if severity.is_empty() { "" } else { ": " };
+        format!("{}:{}:{}  {severity}{separator}{}", self.path.display(), self.line, self.column, compact(&self.text, 80))
     }
 
     fn selection_byte_range(&self, text: &str) -> Option<Range<usize>> {
-        let end = self.selection_end.as_ref()?;
+        let (end_line, end_column) = self.selection_end?;
         let line_starts = std::iter::once(0).chain(text.match_indices('\n').map(|(byte, _)| byte.saturating_add(1))).collect::<Vec<_>>();
         let start = quickfix_position_byte(text, &line_starts, self.line, self.column, self.column_utf16)?;
-        let end = quickfix_position_byte(text, &line_starts, end.line, end.column, self.column_utf16)?;
+        let end = quickfix_position_byte(text, &line_starts, end_line, end_column, self.column_utf16)?;
         (start < end).then_some(start..end)
     }
 }
@@ -1785,42 +1827,23 @@ fn quickfix_position_byte(text: &str, line_starts: &[usize], line: usize, column
     utf16_column_to_byte(line_text, column).ok().map(|byte| line_start + byte)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiagnosticEntry {
-    path: PathBuf,
-    line: usize,
-    column: usize,
-    severity: DiagnosticSeverity,
-    message: String,
-}
-
-impl DiagnosticEntry {
-    fn quickfix(&self) -> QuickfixEntry {
-        QuickfixEntry::new(self.path.clone(), self.line, self.column, format!("{}: {}", self.severity.label(), self.message))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum DiagnosticSeverity {
+enum Severity {
     Error,
     Warning,
-    Information,
+    Info,
     Hint,
+    None,
 }
 
-impl DiagnosticSeverity {
+impl Severity {
     const fn label(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warning => "warning",
-            Self::Information => "info",
-            Self::Hint => "hint",
-        }
+        ["error", "warning", "info", "hint", ""][self as usize]
     }
 }
 
 fn is_navigation_key(key: TerminalKey) -> bool {
-    if key.control() || key.alt() || key.super_key() {
+    if key.command_modified() {
         return false;
     }
     matches!(
@@ -2037,23 +2060,12 @@ fn parse_vimgrep_line(line: &str) -> Option<QuickfixEntry> {
     Some(QuickfixEntry::new(fields.next()?, fields.next()?.parse().ok()?, fields.next()?.parse().ok()?, fields.next().unwrap_or_default()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct JumpLocation {
-    document_id: DocumentId,
-    path: PathBuf,
-    byte: usize,
-}
-
 fn stable_document_id(path: Option<&Path>) -> DocumentId {
     let Some(path) = path else {
         return DocumentId::new(1);
     };
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     DocumentId::new(stable_hash(canonical.to_string_lossy().bytes()).max(2))
-}
-
-fn virtual_document_id(name: &str, text: &str) -> DocumentId {
-    DocumentId::new(stable_hash(b"wren:virtual-buffer\0".iter().copied().chain(name.bytes()).chain(std::iter::once(0)).chain(text.bytes())).max(2))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -2088,20 +2100,8 @@ fn complete_path(fragment: &str) -> Option<String> {
     Some(completed)
 }
 
-fn system_clipboard_text(register: char) -> Option<String> {
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbpaste", &[])]
-    } else if register == '*' {
-        &[("wl-paste", &["--primary", "--no-newline"]), ("xclip", &["-selection", "primary", "-o"])]
-    } else {
-        &[("wl-paste", &["--no-newline"]), ("xclip", &["-selection", "clipboard", "-o"])]
-    };
-    candidates.iter().find_map(|(program, arguments)| {
-        if !executable_exists(program) {
-            return None;
-        }
-        Command::new(program).args(*arguments).output().ok().filter(|output| output.status.success()).and_then(|output| String::from_utf8(output.stdout).ok())
-    })
+fn system_clipboard_text(_register: char) -> Option<String> {
+    Command::new("pbpaste").output().ok().filter(|output| output.status.success()).and_then(|output| String::from_utf8(output.stdout).ok())
 }
 
 fn save_buffer(buffer: &mut BufferState) -> Result<()> {
@@ -2147,10 +2147,6 @@ fn grammar_key(key: TerminalKey) -> Option<KeyEvent> {
     Some(KeyEvent::modified(code, key.modifiers))
 }
 
-fn format_key_sequence(sequence: &[KeyEvent]) -> String {
-    sequence.iter().map(format_key_event).collect()
-}
-
 fn format_key_event(key: &KeyEvent) -> String {
     let base = match key.code {
         KeyCode::Char(' ') => "Space".to_owned(),
@@ -2176,60 +2172,44 @@ fn format_key_event(key: &KeyEvent) -> String {
             _ => format!("<{base}>"),
         };
     }
-    let mut modifiers = Vec::with_capacity(4);
-    if key.modifiers.contains(Modifiers::CONTROL) {
-        modifiers.push("C");
-    }
-    if key.modifiers.contains(Modifiers::SHIFT) {
-        modifiers.push("S");
-    }
-    if key.modifiers.contains(Modifiers::ALT) {
-        modifiers.push("A");
-    }
-    if key.modifiers.contains(Modifiers::SUPER) {
-        modifiers.push("D");
-    }
+    let modifiers = [(Modifiers::CONTROL, "C"), (Modifiers::SHIFT, "S"), (Modifiers::ALT, "A"), (Modifiers::SUPER, "D")]
+        .into_iter()
+        .filter_map(|(flag, label)| key.modifiers.contains(flag).then_some(label))
+        .collect::<Vec<_>>();
     format!("<{}-{base}>", modifiers.join("-"))
 }
 
-fn register_snapshot(editor: &Editor<DefaultText>) -> BTreeMap<char, (Box<str>, bool)> {
-    editor.registers().map(|(name, value)| (name, (value.text.clone(), value.linewise))).collect()
-}
-
-fn mark_snapshot(editor: &Editor<DefaultText>) -> BTreeMap<char, usize> {
-    editor.marks().collect()
-}
-
-fn macro_snapshot(editor: &Editor<DefaultText>) -> BTreeMap<char, Vec<KeyEvent>> {
-    editor.macros().map(|(name, keys)| (name, keys.to_vec())).collect()
-}
-
-fn changed_macros(before: &BTreeMap<char, Vec<KeyEvent>>, editor: &Editor<DefaultText>) -> Vec<StateDelta> {
-    editor
-        .macros()
-        .filter(|(name, keys)| before.get(name).is_none_or(|old| old.as_slice() != *keys))
-        .filter_map(|(name, keys)| {
-            let raw_keys = serde_json::to_vec(keys).ok()?;
-            let lowered_ir = serde_json::to_vec(&keys.iter().map(|key| format!("{:?}:{:?}", key.modifiers, key.code)).collect::<Vec<_>>()).ok()?;
-            Some(StateDelta::MacroRecording { name, raw_keys, lowered_ir })
+fn changed_editor_state(
+    registers_before: &BTreeMap<char, (Box<str>, bool)>,
+    marks_before: &BTreeMap<char, usize>,
+    macros_before: &BTreeMap<char, Vec<KeyEvent>>,
+    editor: &Editor,
+    document_id: DocumentId,
+) -> Vec<StateDelta> {
+    let mut changed = Vec::new();
+    changed.extend(
+        editor
+            .registers()
+            .filter(|(name, value)| {
+                registers_before.get(name).map(|(text, linewise)| (text.as_ref(), *linewise)) != Some((value.text.as_ref(), value.linewise))
+            })
+            .map(|(name, value)| StateDelta::Register { name, text: value.text.clone(), linewise: value.linewise }),
+    );
+    changed.extend(
+        editor.marks().filter(|(name, byte)| name.is_ascii_uppercase() && marks_before.get(name) != Some(byte)).map(|(name, byte)| StateDelta::GlobalMark {
+            name,
+            document_id,
+            anchor: Anchor { byte, bias: Bias::Right },
+        }),
+    );
+    changed.extend(editor.macros().filter(|(name, keys)| macros_before.get(name).is_none_or(|old| old.as_slice() != *keys)).filter_map(|(name, keys)| {
+        Some(StateDelta::MacroRecording {
+            name,
+            raw_keys: serde_json::to_vec(keys).ok()?,
+            lowered_ir: serde_json::to_vec(&keys.iter().map(|key| format!("{:?}:{:?}", key.modifiers, key.code)).collect::<Vec<_>>()).ok()?,
         })
-        .collect()
-}
-
-fn changed_registers(before: &BTreeMap<char, (Box<str>, bool)>, editor: &Editor<DefaultText>) -> Vec<StateDelta> {
-    editor
-        .registers()
-        .filter(|(name, value)| before.get(name) != Some(&(value.text.clone(), value.linewise)))
-        .map(|(name, value)| StateDelta::Register { name, text: value.text.clone(), linewise: value.linewise })
-        .collect()
-}
-
-fn changed_global_marks(before: &BTreeMap<char, usize>, editor: &Editor<DefaultText>, document_id: DocumentId) -> Vec<StateDelta> {
-    editor
-        .marks()
-        .filter(|(name, byte)| name.is_ascii_uppercase() && before.get(name) != Some(byte))
-        .map(|(name, byte)| StateDelta::GlobalMark { name, document_id, anchor: Anchor { byte, bias: Bias::Right } })
-        .collect()
+    }));
+    changed
 }
 
 #[cfg(test)]

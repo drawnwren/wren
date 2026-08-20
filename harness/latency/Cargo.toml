@@ -6,21 +6,22 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+parking_lot.workspace = true
 hdrhistogram.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-wren-command = { version = "0.1.0", path = "../../crates/wren-command" }
+wren-command = { version = "0.1.0", path = "../../crates/wren-command", features = ["benchmarking"] }
 wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
 wren-engine = { version = "0.1.0", path = "../../crates/wren-engine" }
 wren-grammar = { version = "0.1.0", path = "../../crates/wren-grammar" }
-wren-presenter = { version = "0.1.0", path = "../../crates/wren-presenter" }
+wren-presenter = { version = "0.1.0", path = "../../crates/wren-presenter", features = ["benchmarking"] }
 wren-provider = { version = "0.1.0", path = "../../crates/wren-provider" }
 wren-term = { version = "0.1.0", path = "../../crates/wren-term" }
 wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
-wren-tui = { version = "0.1.0", path = "../../crates/wren-tui" }
+wren-tui = { version = "0.1.0", path = "../../crates/wren-tui", features = ["benchmarking"] }
 wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
-wren-view = { version = "0.1.0", path = "../../crates/wren-view" }
+wren-view = { version = "0.1.0", path = "../../crates/wren-view", features = ["benchmarking"] }
 
 [lints]
 workspace = true

@@ -19,11 +19,12 @@ fn editor_session(contents: &str) -> (TempDir, NamedTempFile, PtySession) {
     let state_variable = format!("XDG_STATE_HOME={}/state", home.path().display());
     let data_variable = format!("XDG_DATA_HOME={}/data", home.path().display());
     let config_variable = format!("XDG_CONFIG_HOME={}/config", home.path().display());
-    let session = PtySession::spawn(
+    let session = PtySession::spawn_in(
         "env",
         &[home_variable.as_str(), state_variable.as_str(), data_variable.as_str(), config_variable.as_str(), env!("CARGO_BIN_EXE_wren"), path.as_str()],
         24,
         80,
+        Path::new("."),
     )
     .expect("spawn Wren in a real PTY");
     (home, file, session)
@@ -35,11 +36,12 @@ fn spawn_editor(home: &Path, path: &Path, rows: u16, columns: u16) -> PtySession
     let state_variable = format!("XDG_STATE_HOME={}/state", home.display());
     let data_variable = format!("XDG_DATA_HOME={}/data", home.display());
     let config_variable = format!("XDG_CONFIG_HOME={}/config", home.display());
-    PtySession::spawn(
+    PtySession::spawn_in(
         "env",
         &[home_variable.as_str(), state_variable.as_str(), data_variable.as_str(), config_variable.as_str(), env!("CARGO_BIN_EXE_wren"), path.as_str()],
         rows,
         columns,
+        Path::new("."),
     )
     .expect("spawn Wren in a real PTY")
 }
@@ -89,7 +91,7 @@ fn workspace_lsp_starts_on_open_even_while_input_remains_busy() {
     let data_variable = format!("XDG_DATA_HOME={}/data", home.path().display());
     let config_variable = format!("XDG_CONFIG_HOME={}/config", home.path().display());
     let source_argument = source.to_string_lossy().into_owned();
-    let mut session = PtySession::spawn(
+    let mut session = PtySession::spawn_in(
         "env",
         &[
             home_variable.as_str(),
@@ -103,6 +105,7 @@ fn workspace_lsp_starts_on_open_even_while_input_remains_busy() {
         ],
         24,
         80,
+        Path::new("."),
     )
     .expect("spawn Wren with fake workspace LSP");
 

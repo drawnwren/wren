@@ -4,7 +4,7 @@
 ] @variable
 
 ((preproc_arg) @constant.macro
-  (#lua-match? @constant.macro "^[_A-Z][_A-Z0-9]*$"))
+  (#match? @constant.macro "^[_A-Z][_A-Z0-9]*$"))
 
 ((identifier) @keyword
   (#eq? @keyword "value")
@@ -143,13 +143,13 @@
 (comment) @comment @spell
 
 ((comment) @comment.documentation
-  (#lua-match? @comment.documentation "^/[*][*][^*].*[*]/$"))
+  (#match? @comment.documentation "^/[*][*][^*].*[*]/$"))
 
 ((comment) @comment.documentation
-  (#lua-match? @comment.documentation "^///[^/]"))
+  (#match? @comment.documentation "^///[^/]"))
 
 ((comment) @comment.documentation
-  (#lua-match? @comment.documentation "^///$"))
+  (#match? @comment.documentation "^///$"))
 
 (using_directive
   (identifier) @type)

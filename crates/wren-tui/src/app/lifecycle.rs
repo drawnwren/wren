@@ -2,10 +2,7 @@ use super::*;
 
 impl App {
     pub(super) fn open(path: Option<&Path>, line: Option<usize>) -> Result<Self> {
-        let (document, opened) = match path {
-            Some(path) => LocalDocument::open_or_new(path).with_context(|| format!("open {}", path.display()))?,
-            None => LocalDocument::unnamed(),
-        };
+        let (document, opened) = open_document(path)?;
         #[cfg(not(test))]
         let wal = document.presentation_path().map(LocalWal::for_document).transpose().context("locate recovery WAL")?;
         #[cfg(test)]
@@ -25,19 +22,12 @@ impl App {
         if let Err(error) = restore_client_state(&mut active, &client_state) {
             messages.push(format!("client state: {error}"));
         }
-        let name = active.name();
-        let jump_history: Vec<JumpLocation> = client_state
-            .jump_list
-            .iter()
-            .filter_map(|entry| {
-                entry.path_hint.as_deref().map(|path| JumpLocation { document_id: entry.document_id, path: PathBuf::from(path), byte: entry.anchor.byte })
-            })
-            .collect();
+        let jump_history = client_state.jump_list.iter().filter(|entry| entry.path_hint.is_some()).cloned().collect::<Vec<_>>();
         let jump_index = client_state.jump_index.filter(|index| *index < jump_history.len());
         let root_workspace = env::current_dir().map(|path| std::fs::canonicalize(&path).unwrap_or(path)).unwrap_or_else(|_| PathBuf::from("."));
         let mutations = MutationWorker::start(&root_workspace)?;
         mutations.register(document_id, active.editor.frame().text.as_ref().to_owned(), !active.editor.is_dirty())?;
-        let (theme_flavor, theme, theme_message) = load_theme();
+        let (theme, theme_message) = load_theme();
         push_message(&mut messages, theme_message);
         let (keymap, keymap_message) = load_keymap();
         push_message(&mut messages, keymap_message);
@@ -45,7 +35,7 @@ impl App {
         let mut app = Self {
             active,
             inactive: Vec::new(),
-            views: ClientViewModel::new(document_id, name),
+            views: ClientViewModel::initial(),
             quickfix: Vec::new(),
             jump_history,
             jump_index,
@@ -67,14 +57,15 @@ impl App {
             last_substitute: None,
             substitute_confirmation: None,
             message: messages.join("; "),
+            debug_messages: Vec::new(),
             tasks: TaskRunner::new(1, 8)?,
             active_task: None,
             next_task_id: 1,
             terminal: None,
             input_focus: InputFocus::Editor,
             mouse_selection: None,
-            picker_files: Vec::new(),
-            picker_matches: Vec::new(),
+            picker_candidates: Vec::new(),
+            picker_items: Vec::new(),
             picker_index: 0,
             picker_directory: None,
             picker_preview_title: String::new(),
@@ -96,12 +87,9 @@ impl App {
             snippet_stops: Vec::new(),
             snippet_stop_index: 0,
             lsp_completion: None,
-            lsp: None,
-            parked_lsps: Vec::new(),
-            lsp_navigation_capabilities: BTreeMap::new(),
+            lsps: Vec::new(),
+            lsp_job: None,
             lsp_start_due: None,
-            lsp_start: None,
-            lsp_background: None,
             lsp_semantic_dirty: false,
             pending_lsp_request: None,
             leader_keys: None,
@@ -119,9 +107,8 @@ impl App {
             workspace_folders: vec![root_workspace],
             debug_ui_visible: false,
             agent_terminal: None,
-            agent_sidebar: AgentSidebarState::default(),
+            agent_sidebar_visible: false,
             last_staged_patch: None,
-            theme_flavor,
             theme,
             viewport_rows: 24,
             viewport_columns: 80,
@@ -145,13 +132,13 @@ impl App {
 
     pub(super) fn shows_startup_screen(&self) -> bool {
         !self.input_focus.is_terminal()
+            && !self.prompt.as_ref().is_some_and(|prompt| prompt.kind.is_picker())
             && self.active.document.presentation_path().is_none()
             && self.active.display_name.is_none()
             && self.active.editor.text().len_bytes() == 0
             && !self.active.editor.is_dirty()
             && self.inactive.is_empty()
-            && self.views.buffers.len() == 1
-            && self.views.windows.len() == 1
+            && self.views.window_count() == 1
             && self.views.tabs.len() == 1
     }
 
@@ -162,7 +149,7 @@ impl App {
     pub(super) fn prepare_realtime_paths(&mut self) -> Result<()> {
         let source = "pub fn warm() { let value = 1; value }\n";
         let store = DefaultText::from_reader(Cursor::new(source.as_bytes())).context("create realtime preparation text store")?;
-        let mut editor = Editor::with_contents(store, source.to_owned());
+        let mut editor = Editor::new(store);
         let _ = editor.handle_key(KeyEvent::character('i'))?;
         let _ = editor.handle_key(KeyEvent::character('x'))?.ok_or_else(|| anyhow!("realtime preparation edit produced no transaction"))?;
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Backspace))?;
@@ -176,9 +163,12 @@ impl App {
         self.active.editor.set_cursor(0);
         self.dispatch_key(KeyEvent::character('h'));
         self.active.editor.set_cursor(cursor);
-        self.message = message;
-        Ok(())
+        self.set_message(message)
     }
+}
+
+pub(super) fn open_document(path: Option<&Path>) -> Result<(LocalDocument, OpenedDocument)> {
+    path.map_or_else(|| Ok(LocalDocument::unnamed()), |path| LocalDocument::open_or_new(path).with_context(|| format!("open {}", path.display())))
 }
 
 fn push_message(messages: &mut Vec<String>, message: String) {

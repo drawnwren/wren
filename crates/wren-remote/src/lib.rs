@@ -4,25 +4,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "client"))]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use wren_types::{
-    ClientId, ClientMutation, DocumentId, DocumentRevision, FileIdentity, LeaseEpoch, MutationResult, RemoteOpenState, Resume, ResumeResult, SaveRequest,
-    Saved, SessionEpoch, WorkspaceGeneration,
-};
+#[cfg(any(test, feature = "benchmarking"))]
+use wren_types::RemoteOpenState;
+use wren_types::{ClientId, DocumentId, DocumentRevision, FileIdentity, LeaseEpoch, SessionEpoch, WorkspaceGeneration};
+#[cfg(any(test, feature = "client"))]
+use wren_types::{ClientMutation, MutationResult, Resume, ResumeResult, SaveRequest, Saved};
 
 pub const REMOTE_PROTOCOL_MAJOR: u16 = wren_proto::PROTOCOL_MAJOR as u16;
 pub const REMOTE_PROTOCOL_MINOR: u16 = wren_proto::PROTOCOL_MINOR as u16;
+#[cfg(any(test, feature = "client"))]
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RemoteError {
     #[error("remote I/O failed: {0}")]
     Io(#[from] io::Error),
-    #[error("remote protobuf transport failed: {0}")]
+    #[error("remote protocol transport failed: {0}")]
     Protocol(#[from] wren_proto::TransportError),
     #[error("incompatible remote protocol major {remote}; local is {local}")]
     IncompatibleProtocol { local: u16, remote: u16 },
@@ -50,15 +53,14 @@ pub enum TransportLane {
     Bulk,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl TransportLane {
     const fn argument(self) -> &'static str {
-        match self {
-            Self::Control => "control",
-            Self::Bulk => "bulk",
-        }
+        ["control", "bulk"][self as usize]
     }
 }
 
+#[cfg(any(test, feature = "client"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSshSpec {
     pub executable: PathBuf,
@@ -72,6 +74,7 @@ pub struct OpenSshSpec {
     pub remote_state_dir: Option<PathBuf>,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl OpenSshSpec {
     #[must_use]
     pub fn arguments(&self, lane: TransportLane) -> Vec<String> {
@@ -115,6 +118,7 @@ impl OpenSshSpec {
     }
 }
 
+#[cfg(any(test, feature = "client"))]
 fn shell_quote(value: &str) -> String {
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':')) {
         return value.to_owned();
@@ -122,12 +126,14 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(any(test, feature = "client"))]
 pub struct OpenSshChannel {
     child: Child,
     input: ChildStdin,
     output: ChildStdout,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl OpenSshChannel {
     pub fn connect(spec: &OpenSshSpec, lane: TransportLane) -> Result<Self, RemoteError> {
         let mut child =
@@ -212,11 +218,13 @@ impl OpenSshChannel {
     }
 }
 
+#[cfg(any(test, feature = "client"))]
 pub struct DualOpenSshTransport {
     pub control: OpenSshChannel,
     pub bulk: OpenSshChannel,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl DualOpenSshTransport {
     pub fn connect(spec: &OpenSshSpec) -> Result<Self, RemoteError> {
         let mut control = OpenSshChannel::connect(spec, TransportLane::Control)?;
@@ -238,6 +246,16 @@ pub enum RemoteCall {
     Open { document_id: DocumentId, client_id: ClientId, path: Box<str>, cached_hash: Option<[u8; 32]> },
     Blob { hash: [u8; 32] },
     Search { needle: Box<str>, maximum_results: usize },
+}
+
+impl RemoteCall {
+    #[must_use]
+    pub const fn lane(&self) -> TransportLane {
+        match self {
+            Self::Heartbeat { .. } | Self::Manifest { .. } | Self::Open { .. } => TransportLane::Control,
+            Self::Blob { .. } | Self::Search { .. } => TransportLane::Bulk,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +284,7 @@ pub enum RemoteReply {
 
 pub const REMOTE_CAPABILITIES: &[&str] = &["remote.manifest.v1", "remote.open.v1", "remote.blob.v1", "remote.search.v1", "remote.heartbeat.v1"];
 
+#[cfg(any(test, feature = "client"))]
 pub struct RemoteWorkspaceClient {
     spec: OpenSshSpec,
     transport: DualOpenSshTransport,
@@ -274,6 +293,7 @@ pub struct RemoteWorkspaceClient {
     pub negotiated_bulk: RemoteCapabilities,
 }
 
+#[cfg(any(test, feature = "client"))]
 impl RemoteWorkspaceClient {
     pub fn connect(spec: &OpenSshSpec) -> Result<Self, RemoteError> {
         let (transport, negotiated_control, negotiated_bulk) = Self::connect_transport(spec)?;
@@ -298,16 +318,16 @@ impl RemoteWorkspaceClient {
         request_id
     }
 
-    fn call(&mut self, lane: TransportLane, call: RemoteCall) -> Result<RemoteReply, RemoteError> {
+    fn call(&mut self, call: RemoteCall) -> Result<RemoteReply, RemoteError> {
         let request_id = self.request_id();
-        match lane {
+        match call.lane() {
             TransportLane::Control => self.transport.control.call(request_id, &call),
             TransportLane::Bulk => self.transport.bulk.call(request_id, &call),
         }
     }
 
     pub fn manifest(&mut self, generation: WorkspaceGeneration) -> Result<MerkleManifest, RemoteError> {
-        match self.call(TransportLane::Control, RemoteCall::Manifest { generation })? {
+        match self.call(RemoteCall::Manifest { generation })? {
             RemoteReply::Manifest { manifest } => Ok(manifest),
             _ => Err(RemoteError::UnexpectedResponse),
         }
@@ -317,7 +337,7 @@ impl RemoteWorkspaceClient {
     /// control lane. OpenSSH keepalives detect a dead transport; this message
     /// additionally proves that the remote session loop is responsive.
     pub fn heartbeat(&mut self, nonce: u64) -> Result<(), RemoteError> {
-        match self.call(TransportLane::Control, RemoteCall::Heartbeat { nonce })? {
+        match self.call(RemoteCall::Heartbeat { nonce })? {
             RemoteReply::Heartbeat { nonce: returned_nonce } if returned_nonce == nonce => Ok(()),
             _ => Err(RemoteError::UnexpectedResponse),
         }
@@ -330,11 +350,11 @@ impl RemoteWorkspaceClient {
     pub fn reconnect(&mut self, resume: &Resume) -> Result<ResumeResult, RemoteError> {
         let (mut replacement, negotiated_control, negotiated_bulk) = Self::connect_transport(&self.spec)?;
         let request_id = self.request_id();
-        let result = replacement.control.request(request_id, wren_proto::envelope::Payload::Resume(wren_proto::Resume::from(resume)), |payload| {
+        let result = replacement.control.request(request_id, wren_proto::envelope::Payload::Resume(resume.clone()), |payload| {
             let wren_proto::envelope::Payload::ResumeResult(result) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            ResumeResult::try_from(result).map(Some).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))
+            Ok(Some(result))
         })?;
         let previous = std::mem::replace(&mut self.transport, replacement);
         self.negotiated_control = negotiated_control;
@@ -351,14 +371,14 @@ impl RemoteWorkspaceClient {
         path: impl Into<Box<str>>,
         cached_hash: Option<[u8; 32]>,
     ) -> Result<RemoteOpened, RemoteError> {
-        match self.call(TransportLane::Control, RemoteCall::Open { document_id, client_id, path: path.into(), cached_hash })? {
+        match self.call(RemoteCall::Open { document_id, client_id, path: path.into(), cached_hash })? {
             RemoteReply::Opened { opened } => Ok(opened),
             _ => Err(RemoteError::UnexpectedResponse),
         }
     }
 
     pub fn blob(&mut self, hash: [u8; 32]) -> Result<Vec<u8>, RemoteError> {
-        match self.call(TransportLane::Bulk, RemoteCall::Blob { hash })? {
+        match self.call(RemoteCall::Blob { hash })? {
             RemoteReply::Blob { hash: returned_hash, bytes } if returned_hash == hash && blake3::hash(&bytes).as_bytes() == &hash => Ok(bytes),
             RemoteReply::Blob { .. } => Err(RemoteError::HashMismatch),
             _ => Err(RemoteError::UnexpectedResponse),
@@ -366,7 +386,7 @@ impl RemoteWorkspaceClient {
     }
 
     pub fn search(&mut self, needle: impl Into<Box<str>>, maximum_results: usize) -> Result<Vec<SearchHit>, RemoteError> {
-        match self.call(TransportLane::Bulk, RemoteCall::Search { needle: needle.into(), maximum_results })? {
+        match self.call(RemoteCall::Search { needle: needle.into(), maximum_results })? {
             RemoteReply::Search { hits } => Ok(hits),
             _ => Err(RemoteError::UnexpectedResponse),
         }
@@ -374,22 +394,21 @@ impl RemoteWorkspaceClient {
 
     pub fn submit(&mut self, mutation: &ClientMutation) -> Result<MutationResult, RemoteError> {
         let request_id = self.request_id();
-        self.transport.control.request(request_id, wren_proto::envelope::Payload::ClientMutation(wren_proto::ClientMutation::from(mutation)), |payload| {
+        self.transport.control.request(request_id, wren_proto::envelope::Payload::ClientMutation(mutation.clone()), |payload| {
             let wren_proto::envelope::Payload::MutationResult(result) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            let result = MutationResult::try_from(result).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))?;
             Ok((!matches!(result, MutationResult::Received { .. })).then_some(result))
         })
     }
 
     pub fn save(&mut self, request: &SaveRequest) -> Result<Saved, RemoteError> {
         let request_id = self.request_id();
-        self.transport.control.request(request_id, wren_proto::envelope::Payload::SaveRequest(wren_proto::SaveRequest::from(request)), |payload| {
+        self.transport.control.request(request_id, wren_proto::envelope::Payload::SaveRequest(request.clone()), |payload| {
             let wren_proto::envelope::Payload::Saved(saved) = payload else {
                 return Err(RemoteError::UnexpectedResponse);
             };
-            Saved::try_from(saved).map(Some).map_err(|error| RemoteError::Peer(error.to_string().into_boxed_str()))
+            Ok(Some(saved))
         })
     }
 
@@ -530,70 +549,42 @@ fn hash_file(path: &Path) -> Result<[u8; 32], RemoteError> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-#[cfg(unix)]
 fn metadata_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     metadata.mode()
-}
-
-#[cfg(not(unix))]
-fn metadata_mode(_metadata: &fs::Metadata) -> u32 {
-    0
 }
 
 fn modified_nanos(metadata: &fs::Metadata) -> u64 {
     metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
 }
 
-#[cfg(unix)]
 fn metadata_identity(metadata: &fs::Metadata) -> RemoteIdentity {
     use std::os::unix::fs::MetadataExt;
     RemoteIdentity { device: metadata.dev(), inode: metadata.ino(), modified_nanos: modified_nanos(metadata) }
 }
 
-#[cfg(not(unix))]
-fn metadata_identity(metadata: &fs::Metadata) -> RemoteIdentity {
-    RemoteIdentity { device: 0, inode: 0, modified_nanos: modified_nanos(metadata) }
-}
-
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentChunk {
     pub range: std::ops::Range<usize>,
     pub hash: [u8; 32],
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[must_use]
 pub fn fastcdc_chunks(bytes: &[u8], min: usize, average: usize, max: usize) -> Vec<ContentChunk> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    let min = min.max(64).min(bytes.len());
-    let average = average.max(min.next_power_of_two());
-    let max = max.max(average).min(bytes.len());
-    let mask = average.next_power_of_two().saturating_sub(1) as u64;
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < bytes.len() {
-        let upper = start.saturating_add(max).min(bytes.len());
-        let mut end = start.saturating_add(min).min(upper);
-        let mut rolling = 0_u64;
-        while end < upper {
-            rolling = rolling.rotate_left(1) ^ gear(bytes[end]);
-            end += 1;
-            if rolling & mask == 0 {
-                break;
-            }
-        }
-        let range = start..end;
-        chunks.push(ContentChunk { hash: *blake3::hash(&bytes[range.clone()]).as_bytes(), range });
-        start = end;
-    }
-    chunks
-}
-
-const fn gear(byte: u8) -> u64 {
-    let value = byte as u64 + 1;
-    value.wrapping_mul(0x9e37_79b1_85eb_ca87).rotate_left(byte as u32 & 31)
+    let min = min.clamp(fastcdc::v2020::MINIMUM_MIN, fastcdc::v2020::MINIMUM_MAX);
+    let average = average.max(min.next_power_of_two()).clamp(fastcdc::v2020::AVERAGE_MIN, fastcdc::v2020::AVERAGE_MAX);
+    let max = max.max(average).clamp(fastcdc::v2020::MAXIMUM_MIN, fastcdc::v2020::MAXIMUM_MAX);
+    fastcdc::v2020::FastCDC::new(bytes, min, average, max)
+        .map(|chunk| {
+            let range = chunk.offset..chunk.offset + chunk.length;
+            ContentChunk { hash: *blake3::hash(&bytes[range.clone()]).as_bytes(), range }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -691,11 +682,8 @@ impl BlobCache {
             let temporary = self.root.join(format!(".tmp-{}-{nonce}", std::process::id()));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
             let mut file = options.open(&temporary)?;
             file.write_all(bytes)?;
             // This content-addressed cache is reconstructible from the
@@ -766,21 +754,16 @@ impl BlobCache {
     }
 }
 
-#[cfg(unix)]
 fn set_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn touch(path: &Path) -> io::Result<()> {
     filetime::set_file_mtime(path, filetime::FileTime::now())
 }
 
+#[cfg(test)]
 pub fn reuse_git_index_blob(workspace: &Path, relative_path: &Path, expected_hash: [u8; 32]) -> Result<Option<Vec<u8>>, RemoteError> {
     let path = normalized_relative(relative_path)?;
     let output = Command::new("git").current_dir(workspace).args(["show", &format!(":./{path}")]).stderr(Stdio::null()).output()?;
@@ -790,12 +773,14 @@ pub fn reuse_git_index_blob(workspace: &Path, relative_path: &Path, expected_has
     Ok(Some(output.stdout))
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatFingerprint {
     pub identity: RemoteIdentity,
     pub size: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationReason {
     WatchSuspicion,
@@ -807,6 +792,7 @@ pub enum VerificationReason {
     ManualRefresh,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoherenceDecision {
     Unchanged,
@@ -814,12 +800,14 @@ pub enum CoherenceDecision {
     FullScanRequired,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct CoherenceTracker {
     known: BTreeMap<Box<str>, StatFingerprint>,
     watch_sequence: u64,
 }
 
+#[cfg(test)]
 impl CoherenceTracker {
     pub fn seed(&mut self, path: impl Into<Box<str>>, fingerprint: StatFingerprint) {
         self.known.insert(path.into(), fingerprint);
@@ -844,34 +832,6 @@ impl CoherenceTracker {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct HashBudget {
-    bytes_per_second: u64,
-    available: u64,
-    last_refill: Instant,
-}
-
-impl HashBudget {
-    #[must_use]
-    pub fn new(bytes_per_second: u64) -> Self {
-        Self { bytes_per_second, available: bytes_per_second, last_refill: Instant::now() }
-    }
-
-    pub fn try_charge(&mut self, bytes: u64) -> bool {
-        let elapsed = self.last_refill.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            let periods = elapsed.as_secs();
-            self.available = self.available.saturating_add(periods.saturating_mul(self.bytes_per_second)).min(self.bytes_per_second);
-            self.last_refill = Instant::now();
-        }
-        if bytes > self.available {
-            return false;
-        }
-        self.available -= bytes;
-        true
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchHit {
     pub path: Box<str>,
@@ -880,6 +840,7 @@ pub struct SearchHit {
     pub preview: Box<str>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirtyDocument {
     pub revision: DocumentRevision,
@@ -887,11 +848,13 @@ pub struct DirtyDocument {
     pub symbols: Vec<Box<str>>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct DirtyOverlay {
     documents: BTreeMap<Box<str>, DirtyDocument>,
 }
 
+#[cfg(test)]
 impl DirtyOverlay {
     pub fn update(&mut self, path: impl Into<Box<str>>, document: DirtyDocument) {
         self.documents.insert(path.into(), document);
@@ -929,33 +892,7 @@ impl DirtyOverlay {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolView {
-    LocalDirty,
-    RemoteAcked,
-    PersistedDisk,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkspaceTool {
-    Lsp,
-    GitSigns,
-    Search,
-    Symbols,
-    Formatter,
-    BuildTask,
-}
-
-#[must_use]
-pub const fn tool_reads(tool: WorkspaceTool) -> &'static [ToolView] {
-    match tool {
-        WorkspaceTool::Lsp => &[ToolView::RemoteAcked],
-        WorkspaceTool::GitSigns | WorkspaceTool::Search | WorkspaceTool::Symbols => &[ToolView::LocalDirty, ToolView::PersistedDisk],
-        WorkspaceTool::Formatter => &[ToolView::LocalDirty],
-        WorkspaceTool::BuildTask => &[ToolView::PersistedDisk],
-    }
-}
-
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone)]
 pub struct RemoteMaterializer {
     revision: DocumentRevision,
@@ -964,6 +901,7 @@ pub struct RemoteMaterializer {
     bytes: Vec<u8>,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl RemoteMaterializer {
     #[must_use]
     pub fn new(revision: DocumentRevision, expected_size: u64, expected_hash: [u8; 32]) -> Self {
@@ -996,6 +934,7 @@ impl RemoteMaterializer {
     }
 }
 
+#[cfg(test)]
 pub fn validate_cached_open(cached_revision: DocumentRevision, authoritative_revision: Option<DocumentRevision>) -> Result<RemoteOpenState, RemoteError> {
     match authoritative_revision {
         Some(revision) if revision == cached_revision => Ok(RemoteOpenState::CachedHeadValidated { revision }),
@@ -1004,80 +943,20 @@ pub fn validate_cached_open(cached_revision: DocumentRevision, authoritative_rev
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LineChange {
-    before: std::ops::Range<usize>,
-    replacement: Vec<Box<str>>,
-}
-
-fn line_changes(base: &str, side: &str) -> Vec<LineChange> {
-    use imara_diff::{Algorithm, Diff, InternedInput};
-    let input = InternedInput::new(base, side);
-    let mut diff = Diff::compute(Algorithm::Histogram, &input);
-    diff.postprocess_lines(&input);
-    let side_lines = side.split_inclusive('\n').map(Into::<Box<str>>::into).collect::<Vec<_>>();
-    diff.hunks()
-        .map(|hunk| LineChange {
-            before: hunk.before.start as usize..hunk.before.end as usize,
-            replacement: side_lines[hunk.after.start as usize..hunk.after.end as usize].to_vec(),
-        })
-        .collect()
-}
-
+#[cfg(test)]
 pub fn reconcile_three_way(base: &str, local: &str, remote: &str) -> Result<String, RemoteError> {
-    if local == remote {
-        return Ok(local.to_owned());
-    }
-    if local == base {
-        return Ok(remote.to_owned());
-    }
-    if remote == base {
-        return Ok(local.to_owned());
-    }
-    let mut local_changes = line_changes(base, local);
-    let remote_changes = line_changes(base, remote);
-    for remote_change in remote_changes {
-        let conflict = local_changes.iter().any(|local_change| ranges_conflict(&local_change.before, &remote_change.before) && local_change != &remote_change);
-        if conflict {
-            return Err(RemoteError::ReconcileConflict);
-        }
-        if !local_changes.contains(&remote_change) {
-            local_changes.push(remote_change);
-        }
-    }
-    local_changes.sort_by_key(|change| (change.before.start, change.before.end));
     let base_lines = base.split_inclusive('\n').collect::<Vec<_>>();
+    let local_lines = local.split_inclusive('\n').collect::<Vec<_>>();
+    let remote_lines = remote.split_inclusive('\n').collect::<Vec<_>>();
     let mut merged = String::new();
-    let mut cursor = 0;
-    for change in local_changes {
-        if change.before.start < cursor || change.before.end > base_lines.len() {
-            return Err(RemoteError::ReconcileConflict);
-        }
-        for line in &base_lines[cursor..change.before.start] {
-            merged.push_str(line);
-        }
-        for line in change.replacement {
-            merged.push_str(&line);
-        }
-        cursor = change.before.end;
-    }
-    for line in &base_lines[cursor..] {
-        merged.push_str(line);
+    for group in merge3::Merge3::new(&base_lines, &local_lines, &remote_lines).merge_groups() {
+        let lines = match group {
+            merge3::MergeGroup::Unchanged(lines) | merge3::MergeGroup::Same(lines) | merge3::MergeGroup::A(lines) | merge3::MergeGroup::B(lines) => lines,
+            merge3::MergeGroup::Conflict(..) => return Err(RemoteError::ReconcileConflict),
+        };
+        merged.extend(lines.iter().copied());
     }
     Ok(merged)
-}
-
-fn ranges_conflict(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
-    if left.is_empty() && right.is_empty() {
-        return left.start == right.start;
-    }
-    if left.is_empty() {
-        return right.start <= left.start && left.start < right.end;
-    }
-    if right.is_empty() {
-        return left.start <= right.start && right.start < left.end;
-    }
-    left.start < right.end && right.start < left.end
 }
 
 #[cfg(test)]

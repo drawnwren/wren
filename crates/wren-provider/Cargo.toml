@@ -4,25 +4,24 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = []
+
 [[bin]]
 name = "wren-client-providers"
 path = "src/main.rs"
-
-[features]
-default = ["gpu"]
-gpu = ["dep:pollster", "dep:wgpu"]
 
 [dependencies]
 ast-grep-core.workspace = true
 ast-grep-language.workspace = true
 nucleo-matcher.workspace = true
-regex.workspace = true
+parking_lot.workspace = true
 tree-sitter.workspace = true
-pollster = { workspace = true, optional = true }
+pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-wgpu = { workspace = true, optional = true }
+wgpu.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
 [dev-dependencies]
@@ -31,7 +30,6 @@ criterion.workspace = true
 [[bench]]
 name = "provider_acceleration"
 harness = false
-required-features = ["gpu"]
-
+required-features = ["benchmarking"]
 [lints]
 workspace = true

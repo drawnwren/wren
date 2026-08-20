@@ -3,12 +3,15 @@
 use std::borrow::Cow;
 use std::io::{self, Read};
 use std::ops::Range;
+#[cfg(any(test, feature = "benchmarking"))]
 use std::sync::Arc;
 
 use wren_types::Transaction;
 
+#[cfg(any(test, feature = "benchmarking"))]
 mod snapshot;
 
+#[cfg(any(test, feature = "benchmarking"))]
 pub use snapshot::{HeldSnapshot, SnapshotError, SnapshotHandle, SnapshotManager, SnapshotMetrics, SnapshotQuota};
 
 /// Cloneable storage for UTF-8 editor text.
@@ -31,11 +34,13 @@ pub trait TextStore: Clone {
 }
 
 /// Ropey-backed candidate.
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone)]
 pub struct RopeyText {
     rope: ropey::Rope,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl TextStore for RopeyText {
     fn from_reader(reader: impl Read) -> io::Result<Self> {
         ropey::Rope::from_reader(reader).map(|rope| Self { rope })
@@ -119,7 +124,11 @@ impl TextStore for CropText {
     }
 
     fn line_of_byte(&self, byte: usize) -> usize {
-        self.rope.line_of_byte(byte.min(self.rope.byte_len()))
+        let mut byte = byte.min(self.rope.byte_len());
+        while !self.rope.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        self.rope.line_of_byte(byte)
     }
 
     fn byte_of_line(&self, line: usize) -> usize {
@@ -138,11 +147,13 @@ impl TextStore for CropText {
 /// It is deliberately functionally correct but does not claim mmap or append
 /// buffer performance. The bake-off keeps it visible as the baseline that must
 /// be replaced if large-file measurements justify novel implementation work.
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone)]
 pub struct PieceTreeStub {
     text: Arc<str>,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl TextStore for PieceTreeStub {
     fn from_reader(mut reader: impl Read) -> io::Result<Self> {
         let mut text = String::new();

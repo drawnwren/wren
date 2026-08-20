@@ -3,17 +3,17 @@ use std::env;
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wren_benchmark_support::{
-    ArgumentCursor, CommonArguments, SampleSeries, bare_metal_declared, distribution, elapsed_nanos, emit_report, pin_requested_cpu, require_bare_metal_cpu,
-    ten_percent_cut,
+    CommonArguments, SampleSeries, bare_metal_declared, distribution, elapsed_nanos, emit_report, isolated_child_report, pin_requested_cpu,
+    require_bare_metal_cpu, ten_percent_cut,
 };
 use wren_command::{TaskResult, TaskRunner};
 use wren_engine::Editor;
@@ -24,7 +24,7 @@ use wren_term::{TerminaBackend, TerminalBackend, TerminalError};
 use wren_text::{DefaultText, TextStore};
 use wren_tui::ProductionLatencyReport;
 use wren_types::{BufferId, CommandTask, CommandTaskId, DocumentId, Effects};
-use wren_view::{ClientViewModel, TerminalPatch, ViewportLayout};
+use wren_view::{ClientViewModel, TerminalUpdate, ViewportLayout};
 
 const REALTIME_AGGREGATE_P99_GATE_NANOS: u64 = ten_percent_cut(86_283);
 const REALTIME_MAX_GATE_NANOS: u64 = 100_000;
@@ -36,18 +36,6 @@ const TASK_YIELD_MAX_GATE_NANOS: u64 = ten_percent_cut(71_077);
 const TERMINAL_WRITE_P99_GATE_NANOS: u64 = ten_percent_cut(115_141);
 
 type Arguments = CommonArguments;
-
-fn arguments() -> Result<Arguments> {
-    let mut arguments = Arguments::new(10_000);
-    let mut cursor = ArgumentCursor::from_env();
-    while let Some(argument) = cursor.next() {
-        if !arguments.consume(&argument, &mut cursor)? {
-            anyhow::bail!("unknown argument: {argument}");
-        }
-    }
-    arguments.validate()?;
-    Ok(arguments)
-}
 
 fn validate_gate_environment(arguments: &Arguments, pinned: bool) -> Result<()> {
     require_bare_metal_cpu(arguments.gate, arguments.cpu, pinned, "--gate")
@@ -62,20 +50,7 @@ fn run_production_probe_child(arguments: &[String]) -> Result<()> {
 }
 
 fn production_probe(iterations: u64) -> Result<ProductionLatencyReport> {
-    let isolated = tempfile::tempdir().context("create isolated production probe home")?;
-    let executable = env::current_exe().context("locate latency harness executable")?;
-    let output = Command::new(executable)
-        .arg("--production-probe-child")
-        .arg(iterations.to_string())
-        .current_dir(isolated.path())
-        .env("HOME", isolated.path())
-        .env("XDG_STATE_HOME", isolated.path().join("state"))
-        .env("XDG_DATA_HOME", isolated.path().join("data"))
-        .env("XDG_CONFIG_HOME", isolated.path().join("config"))
-        .output()
-        .context("run isolated full-production latency probe")?;
-    anyhow::ensure!(output.status.success(), "full-production latency probe failed: {}", String::from_utf8_lossy(&output.stderr));
-    let report: ProductionLatencyReport = serde_json::from_slice(&output.stdout).context("decode full-production latency probe report")?;
+    let report: ProductionLatencyReport = isolated_child_report("--production-probe-child", iterations, "full-production latency probe")?;
     anyhow::ensure!(report.schema == 2, "unsupported production probe schema");
     anyhow::ensure!(!report.samples.is_empty(), "production probe returned no samples");
     Ok(report)
@@ -162,19 +137,23 @@ struct MeasuringBackend {
 }
 
 impl MeasuringBackend {
-    fn new() -> Result<Self> {
-        Ok(Self { terminal: TerminaBackend::new(CountingWriter::default(), 120, 40)?, writes: 0, patches: 0 })
+    fn new() -> Self {
+        Self { terminal: TerminaBackend::new(CountingWriter::default()), writes: 0, patches: 0 }
     }
 }
 
 impl TerminalBackend for MeasuringBackend {
     type Error = TerminalError;
 
-    fn submit(&mut self, patches: &[TerminalPatch]) -> Result<(), Self::Error> {
+    fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
         self.writes = self.writes.saturating_add(1);
-        self.patches = self.patches.saturating_add(u64::try_from(patches.len()).unwrap_or(u64::MAX));
-        self.terminal.submit(patches)
+        self.patches = self.patches.saturating_add(u64::try_from(terminal_update_operations(update)).unwrap_or(u64::MAX));
+        self.terminal.submit(update)
     }
+}
+
+fn terminal_update_operations(update: &TerminalUpdate) -> usize {
+    2 + update.rows.len() + usize::from(update.clear) + usize::from(update.raster_overlay.is_some())
 }
 
 struct TerminalLatency {
@@ -188,29 +167,25 @@ impl TerminalLatency {
     }
 
     fn begin(&self, epoch: u64, started: Instant) {
-        if let Ok(mut starts) = self.starts.lock() {
-            starts.insert(epoch, started);
-        }
+        self.starts.lock().insert(epoch, started);
     }
 
     fn completed(&self, epoch: u64) {
-        let started = self.starts.lock().ok().and_then(|mut starts| starts.remove(&epoch));
-        if let Some(started) = started
-            && let Ok(mut samples) = self.samples.lock()
-        {
+        if let Some(started) = self.starts.lock().remove(&epoch) {
+            let mut samples = self.samples.lock();
             let _ = samples.record(elapsed_nanos(started));
         }
     }
 
     fn measurements(&self) -> Result<SampleSeries> {
-        self.samples.lock().map(|samples| samples.clone()).map_err(|_| anyhow::anyhow!("terminal histogram lock poisoned"))
+        Ok(self.samples.lock().clone())
     }
 }
 
 fn wait_result(runner: &TaskRunner) -> Result<TaskResult> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(result) = runner.try_result()? {
+        if let Some(result) = runner.try_result() {
             return Ok(result);
         }
         anyhow::ensure!(Instant::now() < deadline, "TaskCommand benchmark timed out");
@@ -295,14 +270,14 @@ const REALTIME_CASES: [RealtimeCase; 7] = [
     RealtimeCase { name: "completion_acceptance", p99_gate_nanos: ten_percent_cut(86_283), preparation: None, action: RealtimeAction::Completion },
 ];
 
-fn fixture_editor() -> Result<Editor<DefaultText>> {
+fn fixture_editor() -> Result<Editor> {
     let source = (0..256).map(|line| format!("fn item_{line}() {{ let value = {line}; }}\n")).collect::<String>();
     let text = DefaultText::from_reader(Cursor::new(source)).context("build realtime fixture")?;
     Ok(Editor::new(text))
 }
 
 struct PreparedRealtimeCase {
-    editor: Editor<DefaultText>,
+    editor: Editor,
     layout: ViewportLayout,
     model: ClientViewModel,
     buffer_id: BufferId,
@@ -333,7 +308,7 @@ fn prepare_realtime_case(case: RealtimeCase) -> Result<PreparedRealtimeCase> {
     });
     let mut layout = ViewportLayout::new(120, 40);
     layout.configure_dotfile_profile();
-    let model = ClientViewModel::new(DocumentId::new(1), "benchmark.rs");
+    let model = ClientViewModel::initial();
     let buffer_id = model.active_buffer();
     // Physical input begins from an already presented editor. Prime retained
     // production workspace state before the clock starts instead of
@@ -407,7 +382,7 @@ fn production_metrics(iterations: u64) -> Result<ProductionMetrics> {
 }
 
 fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
-    let backend = Arc::new(Mutex::new(MeasuringBackend::new()?));
+    let backend = Arc::new(Mutex::new(MeasuringBackend::new()));
     let terminal_latency = Arc::new(TerminalLatency::new()?);
     let observer_latency = Arc::clone(&terminal_latency);
     let (presented_sender, presented_receiver) = mpsc::sync_channel(1);
@@ -453,8 +428,10 @@ fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
         anyhow::ensure!(presented_epoch == desired_epoch, "presenter completed an unexpected frame epoch");
     }
     let presenter = presenter.finish()?;
-    let (backend_writes, terminal_patches) =
-        backend.lock().map(|backend| (backend.writes, backend.patches)).map_err(|_| anyhow::anyhow!("measurement backend lock poisoned"))?;
+    let (backend_writes, terminal_patches) = {
+        let backend = backend.lock();
+        (backend.writes, backend.patches)
+    };
     let terminal = terminal_latency.measurements()?;
     Ok(RealtimeMetrics { commit, frame_snapshot, grid_build, desired_grid, cases, terminal, presenter, backend_writes, terminal_patches })
 }
@@ -775,7 +752,7 @@ fn main() -> Result<()> {
     if process_arguments.first().map(String::as_str) == Some("--production-probe-child") {
         return run_production_probe_child(&process_arguments[1..]);
     }
-    let arguments = arguments()?;
+    let arguments = Arguments::parse(10_000)?;
     let pinned = pin_requested_cpu(arguments.cpu);
     validate_gate_environment(&arguments, pinned)?;
     let production = production_metrics(arguments.iterations)?;

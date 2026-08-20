@@ -131,118 +131,55 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     parse_named_ex(range, name, bang, argument)
 }
 
-macro_rules! ex_commands {
-    (|$range:ident, $name:ident, $bang:ident, $argument:ident| $($canonical:literal: $pattern:pat => $body:expr,)*) => {
-        pub const EX_COMMAND_NAMES: &[&str] = &[
-            $($canonical),*
-        ];
+pub const EX_COMMAND_COMPLETIONS: &str = include_str!("ex-commands.txt");
 
-        fn parse_named_ex(
-            $range: Option<ExRange>, $name: &str, $bang: bool, $argument: &str,
-        ) -> Result<ExCommand, ExError> {
-            match $name {
-                $($pattern => $body,)*
-                _ => Err(ExError::UnknownCommand($name.into())),
-            }
+fn parse_named_ex(range: Option<ExRange>, name: &str, bang: bool, argument: &str) -> Result<ExCommand, ExError> {
+    match name {
+        "bn" | "bnext" => Ok(buffer(BufferAction::Next, bang, argument)),
+        "bp" | "bprevious" => Ok(buffer(BufferAction::Previous, bang, argument)),
+        "bf" | "bfirst" => Ok(buffer(BufferAction::First, bang, argument)),
+        "bl" | "blast" => Ok(buffer(BufferAction::Last, bang, argument)),
+        "bd" | "bdelete" => Ok(buffer(BufferAction::Delete, bang, argument)),
+        "b" | "buffer" => Ok(buffer(BufferAction::Select, bang, argument)),
+        "tabnew" | "tabe" | "tabedit" => Ok(tab(TabAction::New, argument)),
+        "tabn" | "tabnext" => Ok(tab(TabAction::Next, argument)),
+        "tabp" | "tabprevious" => Ok(tab(TabAction::Previous, argument)),
+        "tabfirst" => Ok(tab(TabAction::First, argument)),
+        "tablast" => Ok(tab(TabAction::Last, argument)),
+        "tabclose" => Ok(tab(TabAction::Close, argument)),
+        "s" | "substitute" => parse_substitute(range, argument),
+        "g" | "global" => parse_global(range, false, argument, name),
+        "v" | "vglobal" => parse_global(range, true, argument, name),
+        "norm" | "normal" => Ok(ExCommand::Normal { range, bang, keys: argument.into() }),
+        "w" | "write" => Ok(ExCommand::Write { range, all: false, bang, path: optional_argument(argument) }),
+        "wa" | "wall" => Ok(ExCommand::Write { range, all: true, bang, path: optional_argument(argument) }),
+        "wq" | "x" | "xit" => Ok(ExCommand::WriteQuit { bang, path: optional_argument(argument) }),
+        "q" | "quit" => Ok(ExCommand::Quit { all: false, bang }),
+        "qa" | "qall" => Ok(ExCommand::Quit { all: true, bang }),
+        "e" | "edit" => Ok(ExCommand::Edit { bang, path: optional_argument(argument) }),
+        "sp" | "split" => Ok(ExCommand::Split { vertical: false, path: optional_argument(argument) }),
+        "vs" | "vsplit" => Ok(ExCommand::Split { vertical: true, path: optional_argument(argument) }),
+        "clo" | "close" => Ok(ExCommand::Close { bang }),
+        "marks" => Ok(ExCommand::Marks { names: argument.into() }),
+        "reg" | "registers" => Ok(ExCommand::Registers { names: argument.into() }),
+        "grep" | "vimgrep" => parse_grep(argument, name),
+        "cdo" => parse_cdo(argument, name),
+        "u" | "undo" => Ok(ExCommand::Undo),
+        "redo" => Ok(ExCommand::Redo),
+        "echo" => Ok(ExCommand::Echo { expression: argument.into() }),
+        "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
+        "h" | "help" => Ok(ExCommand::Help { topic: optional_argument(argument) }),
+        "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
+        "convertutf8" => Ok(ExCommand::ConvertUtf8),
+        "term" | "terminal" => {
+            let mut words = argument.split_whitespace();
+            Ok(ExCommand::Terminal { program: words.next().map(Into::into), arguments: words.map(Into::into).collect() })
         }
-    };
-}
-
-pub const EX_COMMAND_COMPLETIONS: &[&str] = &[
-    "bdelete",
-    "buffer",
-    "cdo",
-    "close",
-    "debuglog",
-    "edit",
-    "find",
-    "format",
-    "grep",
-    "help",
-    "make",
-    "marks",
-    "messages",
-    "nohlsearch",
-    "normal",
-    "quit",
-    "registers",
-    "redo",
-    "split",
-    "tabnew",
-    "terminal",
-    "undo",
-    "vsplit",
-    "write",
-    "wq",
-];
-
-ex_commands! { |range, name, bang, argument|
-        "bnext": "bn" | "bnext" => buffer(BufferAction::Next, bang, argument),
-        "bprevious": "bp" | "bprevious" => buffer(BufferAction::Previous, bang, argument),
-        "bfirst": "bf" | "bfirst" => buffer(BufferAction::First, bang, argument),
-        "blast": "bl" | "blast" => buffer(BufferAction::Last, bang, argument),
-        "bdelete": "bd" | "bdelete" => buffer(BufferAction::Delete, bang, argument),
-        "buffer": "b" | "buffer" => buffer(BufferAction::Select, bang, argument),
-        "tabnew": "tabnew" | "tabe" | "tabedit" => tab(TabAction::New, argument),
-        "tabnext": "tabn" | "tabnext" => tab(TabAction::Next, argument),
-        "tabprevious": "tabp" | "tabprevious" => tab(TabAction::Previous, argument),
-        "tabfirst": "tabfirst" => tab(TabAction::First, argument),
-        "tablast": "tablast" => tab(TabAction::Last, argument),
-        "tabclose": "tabclose" => tab(TabAction::Close, argument),
-        "substitute": "s" | "substitute" => parse_substitute(range, argument),
-        "global": "g" | "global" => parse_global(range, false, argument, name),
-        "vglobal": "v" | "vglobal" => parse_global(range, true, argument, name),
-        "normal": "norm" | "normal" => Ok(ExCommand::Normal {
-            range,
-            bang,
-            keys: argument.into(),
-        }),
-        "write": "w" | "write" => Ok(ExCommand::Write {
-            range,
-            all: false,
-            bang,
-            path: optional_argument(argument),
-        }),
-        "wall": "wa" | "wall" => Ok(ExCommand::Write {
-            range,
-            all: true,
-            bang,
-            path: optional_argument(argument),
-        }),
-        "wq": "wq" | "x" | "xit" => Ok(ExCommand::WriteQuit {
-            bang,
-            path: optional_argument(argument),
-        }),
-        "quit": "q" | "quit" => Ok(ExCommand::Quit { all: false, bang }),
-        "qall": "qa" | "qall" => Ok(ExCommand::Quit { all: true, bang }),
-        "edit": "e" | "edit" => Ok(ExCommand::Edit {
-            bang,
-            path: optional_argument(argument),
-        }),
-        "split": "sp" | "split" => Ok(ExCommand::Split {
-            vertical: false,
-            path: optional_argument(argument),
-        }),
-        "vsplit": "vs" | "vsplit" => Ok(ExCommand::Split {
-            vertical: true,
-            path: optional_argument(argument),
-        }),
-        "close": "clo" | "close" => Ok(ExCommand::Close { bang }),
-        "marks": "marks" => Ok(ExCommand::Marks { names: argument.into() }),
-        "registers": "reg" | "registers" => Ok(ExCommand::Registers { names: argument.into() }),
-        "grep": "grep" | "vimgrep" => parse_grep(argument, name),
-        "cdo": "cdo" => parse_cdo(argument, name),
-        "undo": "u" | "undo" => Ok(ExCommand::Undo),
-        "redo": "redo" => Ok(ExCommand::Redo),
-        "echo": "echo" => Ok(ExCommand::Echo { expression: argument.into() }),
-        "nohlsearch": "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
-        "help": "h" | "help" => Ok(ExCommand::Help { topic: optional_argument(argument) }),
-        "messages": "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
-        "convertutf8": "convertutf8" => Ok(ExCommand::ConvertUtf8),
-        "terminal": "term" | "terminal" => Ok(parse_terminal(argument)),
-        "make": "make" => parse_required_process(argument, name, ProcessCommand::Make),
-        "format": "format" => parse_required_process(argument, name, ProcessCommand::Format),
-        "find": "find" => Ok(ExCommand::Find { query: argument.into() }),
+        "make" => parse_required_process(argument, name, ProcessCommand::Make),
+        "format" => parse_required_process(argument, name, ProcessCommand::Format),
+        "find" => Ok(ExCommand::Find { query: argument.into() }),
+        _ => Err(ExError::UnknownCommand(name.into())),
+    }
 }
 
 fn parse_cdo(argument: &str, name: &str) -> Result<ExCommand, ExError> {
@@ -252,11 +189,6 @@ fn parse_cdo(argument: &str, name: &str) -> Result<ExCommand, ExError> {
     parse_ex(argument)
         .map(|command| ExCommand::Cdo { command: Box::new(command) })
         .map_err(|source| ExError::Nested { command: name.into(), source: Box::new(source) })
-}
-
-fn parse_terminal(argument: &str) -> ExCommand {
-    let mut words = argument.split_whitespace();
-    ExCommand::Terminal { program: words.next().map(Into::into), arguments: words.map(Into::into).collect() }
 }
 
 enum ProcessCommand {
@@ -445,12 +377,12 @@ fn optional_argument(argument: &str) -> Option<Box<str>> {
     (!argument.is_empty()).then(|| argument.into())
 }
 
-fn buffer(action: BufferAction, bang: bool, argument: &str) -> Result<ExCommand, ExError> {
-    Ok(ExCommand::Buffer { action, bang, target: optional_argument(argument) })
+fn buffer(action: BufferAction, bang: bool, argument: &str) -> ExCommand {
+    ExCommand::Buffer { action, bang, target: optional_argument(argument) }
 }
 
-fn tab(action: TabAction, argument: &str) -> Result<ExCommand, ExError> {
-    Ok(ExCommand::Tab { action, path: optional_argument(argument) })
+fn tab(action: TabAction, argument: &str) -> ExCommand {
+    ExCommand::Tab { action, path: optional_argument(argument) }
 }
 
 #[cfg(test)]

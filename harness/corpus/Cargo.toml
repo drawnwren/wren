@@ -8,7 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
+wren-text = { version = "0.1.0", path = "../../crates/wren-text", features = ["benchmarking"] }
 wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
 wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
 

@@ -1,7 +1,8 @@
 # Mutation, durability, and recovery protocol
 
-The semantic contract lives in `wren-types`; the explicitly versioned Prost
-transport lives in `wren-proto`. `ClientMutation` is one semantic atomic unit:
+The semantic contract lives in `wren-types`; the explicitly versioned, compact
+transport lives in `wren-proto` and serializes those validated types without a
+parallel DTO graph. `ClientMutation` is one semantic atomic unit:
 its state deltas and every document transaction are accepted or rejected
 together. `wren-session::SessionAuthority` is the executable authority and
 `wren-sessiond::SessionServer` exposes the same contract over a control socket.

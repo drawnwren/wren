@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::time::Duration;
@@ -8,24 +7,22 @@ use std::time::Duration;
 use base64::Engine as _;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use termina::escape::csi::{
-    Csi, Cursor, DecPrivateMode, DecPrivateModeCode, Edit, EraseInDisplay, EraseInLine, Keyboard, KittyKeyboardFlags, Mode, Sgr, SgrAttributes, SgrModifiers,
-};
+use termina::escape::csi::{Csi, Keyboard, KittyKeyboardFlags};
 use termina::escape::osc::{Osc, Selection};
 use termina::event::{KeyCode as TermKeyCode, KeyEventKind, Modifiers as TermModifiers, MouseButton, MouseEventKind};
-use termina::style::{ColorSpec, RgbColor};
-use termina::{Event, OneBased, Parser, PlatformTerminal, Terminal};
+use termina::{Event, Parser, PlatformTerminal, Terminal};
 use thiserror::Error;
 use wren_types::Modifiers;
 pub use wren_types::{KeyCode as TerminalKeyCode, KeyEvent as TerminalKey};
-use wren_view::{CellColor, CellStyle, RasterQuad, RasterSource, TerminalPatch};
+use wren_view::{CellColor, CellStyle, RasterQuad, TerminalUpdate};
 
 pub trait TerminalBackend {
     type Error;
 
-    fn submit(&mut self, patch: &[TerminalPatch]) -> Result<(), Self::Error>;
+    fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error>;
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalInput {
     Key(TerminalKey),
@@ -45,29 +42,20 @@ pub enum MouseAction {
 }
 
 impl TerminalInput {
-    #[must_use]
-    pub const fn mouse(action: MouseAction, column: usize, row: usize) -> Self {
-        Self::Mouse { action, column, row }
-    }
-
-    #[must_use]
     pub const fn scroll(lines: isize, column: usize, row: usize) -> Self {
-        Self::mouse(MouseAction::Scroll(lines), column, row)
+        Self::Mouse { action: MouseAction::Scroll(lines), column, row }
     }
 
-    #[must_use]
     pub const fn click(column: usize, row: usize) -> Self {
-        Self::mouse(MouseAction::Click, column, row)
+        Self::Mouse { action: MouseAction::Click, column, row }
     }
 
-    #[must_use]
     pub const fn drag(column: usize, row: usize) -> Self {
-        Self::mouse(MouseAction::Drag, column, row)
+        Self::Mouse { action: MouseAction::Drag, column, row }
     }
 
-    #[must_use]
     pub const fn release(column: usize, row: usize) -> Self {
-        Self::mouse(MouseAction::Release, column, row)
+        Self::Mouse { action: MouseAction::Release, column, row }
     }
 }
 
@@ -79,10 +67,7 @@ pub enum ClipboardSelection {
 
 impl ClipboardSelection {
     const fn termina(self) -> Selection {
-        match self {
-            Self::Clipboard => Selection::CLIPBOARD,
-            Self::Primary => Selection::PRIMARY,
-        }
+        [Selection::CLIPBOARD, Selection::PRIMARY][self as usize]
     }
 }
 
@@ -145,7 +130,6 @@ impl SystemTerminalBackend {
     /// This deliberately operates on `/dev/tty`: stdout may be forwarded over
     /// SSH, while the terminal device remains the client-services boundary.
     /// Bytes typed during the bounded query are parsed and replayed afterward.
-    #[cfg(unix)]
     pub fn paste_osc52(&mut self, selection: ClipboardSelection, timeout: Duration) -> Result<Option<String>, TerminalError> {
         use std::fs::OpenOptions;
         use std::io::{ErrorKind, Read};
@@ -186,11 +170,6 @@ impl SystemTerminalBackend {
             }
         }
         self.defer_terminal_bytes(&response);
-        Ok(None)
-    }
-
-    #[cfg(not(unix))]
-    pub fn paste_osc52(&mut self, _selection: ClipboardSelection, _timeout: Duration) -> Result<Option<String>, TerminalError> {
         Ok(None)
     }
 
@@ -254,8 +233,8 @@ impl Drop for SystemTerminalBackend {
 impl TerminalBackend for SystemTerminalBackend {
     type Error = TerminalError;
 
-    fn submit(&mut self, patch: &[TerminalPatch]) -> Result<(), Self::Error> {
-        self.renderer.submit(&mut self.terminal, patch)
+    fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
+        self.renderer.submit(&mut self.terminal, update)
     }
 }
 
@@ -266,16 +245,9 @@ pub struct TerminaBackend<W> {
 }
 
 impl<W: Write> TerminaBackend<W> {
-    pub fn new(writer: W, _width: usize, _height: usize) -> Result<Self, TerminalError> {
-        Ok(Self { writer, renderer: Renderer::new() })
+    pub fn new(writer: W) -> Self {
+        Self { writer, renderer: Renderer::new() }
     }
-
-    #[must_use]
-    pub fn into_inner(self) -> W {
-        self.writer
-    }
-
-    pub fn resize(&mut self, _width: usize, _height: usize) {}
 
     /// Copies through the client terminal, so workspace-side code never gains
     /// access to the local clipboard. OSC 52 is bounded to avoid turning a
@@ -294,8 +266,8 @@ impl<W: Write> TerminaBackend<W> {
 impl<W: Write> TerminalBackend for TerminaBackend<W> {
     type Error = TerminalError;
 
-    fn submit(&mut self, patch: &[TerminalPatch]) -> Result<(), Self::Error> {
-        self.renderer.submit(&mut self.writer, patch)
+    fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
+        self.renderer.submit(&mut self.writer, update)
     }
 }
 
@@ -310,123 +282,63 @@ impl Renderer {
         Self { raster_rows: None, buffer: Vec::with_capacity(64 * 1024), style_cache: StyleCache::default() }
     }
 
-    fn submit(&mut self, writer: &mut impl Write, patch: &[TerminalPatch]) -> Result<(), TerminalError> {
+    fn submit(&mut self, writer: &mut impl Write, update: &TerminalUpdate) -> Result<(), TerminalError> {
         self.buffer.clear();
         self.buffer.extend_from_slice(SYNCHRONIZED_OUTPUT_BEGIN);
-        render_patches(&mut self.buffer, patch, &mut self.raster_rows, &mut self.style_cache)?;
+        render_update(&mut self.buffer, update, &mut self.raster_rows, &mut self.style_cache)?;
         self.buffer.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
         writer.write_all(&self.buffer)?;
         writer.flush().map_err(|error| TerminalError::Render(error.to_string()))
     }
 }
 
-// These invariant encodings are kept out of the formatter hot path. A test
-// pins them to Termina's typed DEC mode representation.
 const SYNCHRONIZED_OUTPUT_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNCHRONIZED_OUTPUT_END: &[u8] = b"\x1b[?2026l";
-
-fn dec_mode(code: DecPrivateModeCode) -> DecPrivateMode {
-    DecPrivateMode::Code(code)
-}
-
-const TERMINAL_MODES: [DecPrivateModeCode; 6] = [
-    DecPrivateModeCode::ClearAndEnableAlternateScreen,
-    DecPrivateModeCode::BracketedPaste,
-    DecPrivateModeCode::MouseTracking,
-    DecPrivateModeCode::ButtonEventMouse,
-    DecPrivateModeCode::SGRMouse,
-    DecPrivateModeCode::GraphemeClustering,
-];
-
-fn write_terminal_modes(output: &mut impl Write, enabled: bool) -> io::Result<()> {
-    if enabled {
-        for code in TERMINAL_MODES {
-            write!(output, "{}", Csi::Mode(Mode::SetDecPrivateMode(dec_mode(code))))?;
-        }
-    } else {
-        for code in TERMINAL_MODES.into_iter().rev() {
-            write!(output, "{}", Csi::Mode(Mode::ResetDecPrivateMode(dec_mode(code))))?;
-        }
-    }
-    Ok(())
-}
+const TERMINAL_MODES_ON: &[u8] = b"\x1b[?1049h\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2027h";
+const TERMINAL_MODES_OFF: &[u8] = b"\x1b[?2027l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l";
 
 fn initialize_terminal(output: &mut impl Write) -> io::Result<()> {
     // Button-event tracking reports motion only while a button is held. That
     // is enough for selection without the unbounded idle pointer stream from
     // any-event mode 1003.
-    write_terminal_modes(output, true)?;
+    output.write_all(TERMINAL_MODES_ON)?;
     write!(output, "{}", Csi::Keyboard(Keyboard::PushFlags(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)),)?;
     output.flush()
 }
 
 fn cleanup_terminal(output: &mut impl Write) -> io::Result<()> {
-    write!(
-        output,
-        "\x1b_Ga=d,d=I,i={KITTY_RASTER_IMAGE_ID},q=2\x1b\\{}{}{}{}",
-        Csi::Sgr(Sgr::Reset),
-        Csi::Mode(Mode::ResetDecPrivateMode(dec_mode(DecPrivateModeCode::SynchronizedOutput))),
-        Csi::Mode(Mode::SetDecPrivateMode(dec_mode(DecPrivateModeCode::ShowCursor))),
-        Csi::Keyboard(Keyboard::PopFlags(1)),
-    )?;
-    write_terminal_modes(output, false)
+    write!(output, "\x1b_Ga=d,d=I,i={KITTY_RASTER_IMAGE_ID},q=2\x1b\\\x1b[m\x1b[?2026l\x1b[?25h\x1b[<1u")?;
+    output.write_all(TERMINAL_MODES_OFF)
 }
 
-fn render_patches(
-    output: &mut impl Write,
-    patch: &[TerminalPatch],
-    raster_rows: &mut Option<usize>,
-    style_cache: &mut StyleCache,
-) -> Result<(), TerminalError> {
-    let mut raster_rows_for_submit = *raster_rows;
-    for change in patch {
-        if let TerminalPatch::SetRasterOverlay(overlay) = change {
-            raster_rows_for_submit = overlay.as_ref().map(|overlay| overlay.rows);
-        }
-    }
+fn render_update(output: &mut impl Write, update: &TerminalUpdate, raster_rows: &mut Option<usize>, style_cache: &mut StyleCache) -> Result<(), TerminalError> {
+    let raster_rows_for_submit = update.raster_overlay.as_ref().map_or(*raster_rows, |overlay| overlay.as_ref().map(|overlay| overlay.rows));
     let mut active_style = None;
-    let mut current_row = None;
-    for change in patch {
-        match change {
-            TerminalPatch::Clear => {
-                write!(output, "{}{}", Csi::Sgr(Sgr::Reset), Csi::Edit(Edit::EraseInDisplay(EraseInDisplay::EraseDisplay)))?;
-                active_style = None;
-            }
-            TerminalPatch::ClearToEndOfLine(style) => {
-                if current_row.is_some_and(|row| raster_rows_for_submit.is_some_and(|raster_rows| row < raster_rows)) {
-                    continue;
-                }
-                write_style_if_changed(output, *style, &mut active_style, style_cache)?;
-                write!(output, "{}", Csi::Edit(Edit::EraseInLine(EraseInLine::EraseToEndOfLine)))?;
-            }
-            TerminalPatch::MoveTo { column, row } => {
-                current_row = Some(*row);
-                write!(output, "{}", Csi::Cursor(Cursor::Position { line: terminal_coordinate(*row)?, col: terminal_coordinate(*column)? }))?;
-            }
-            TerminalPatch::SetStyle(style) => write_style_if_changed(output, *style, &mut active_style, style_cache)?,
-            TerminalPatch::Put(cell) => output.write_all(cell.grapheme.as_bytes())?,
-            TerminalPatch::PutRow(row) => {
-                if current_row.is_some_and(|row| raster_rows_for_submit.is_some_and(|raster_rows| row < raster_rows)) {
-                    continue;
-                }
-                for cell in &row.cells {
-                    write_style_if_changed(output, cell.style, &mut active_style, style_cache)?;
-                    output.write_all(cell.grapheme.as_bytes())?;
-                }
-            }
-            TerminalPatch::SetRasterOverlay(overlay) => {
-                match overlay {
-                    Some(overlay) => write_kitty_raster_overlay(output, overlay)?,
-                    None => delete_kitty_raster_overlay(output)?,
-                }
-                *raster_rows = overlay.as_ref().map(|overlay| overlay.rows);
-            }
-            TerminalPatch::ShowCursor(visible) => {
-                let mode = dec_mode(DecPrivateModeCode::ShowCursor);
-                write!(output, "{}", Csi::Mode(if *visible { Mode::SetDecPrivateMode(mode) } else { Mode::ResetDecPrivateMode(mode) }))?;
-            }
-        }
+    output.write_all(b"\x1b[?25l")?;
+    if update.clear {
+        output.write_all(b"\x1b[m\x1b[2J")?;
     }
+    for (row, cells) in &update.rows {
+        if raster_rows_for_submit.is_some_and(|raster_rows| *row < raster_rows) {
+            continue;
+        }
+        write!(output, "\x1b[{};1H", row.saturating_add(1))?;
+        for cell in &cells.cells {
+            write_style_if_changed(output, cell.style, &mut active_style, style_cache)?;
+            output.write_all(cell.grapheme.as_bytes())?;
+        }
+        let clear_style = cells.cells.last().map_or_else(CellStyle::default, |cell| cell.style);
+        write_style_if_changed(output, clear_style, &mut active_style, style_cache)?;
+        output.write_all(b"\x1b[K")?;
+    }
+    if let Some(overlay) = &update.raster_overlay {
+        match overlay {
+            Some(overlay) => write_kitty_raster_overlay(output, overlay)?,
+            None => write!(output, "\x1b_Ga=d,d=I,i={KITTY_RASTER_IMAGE_ID},q=2\x1b\\")?,
+        }
+        *raster_rows = overlay.as_ref().map(|overlay| overlay.rows);
+    }
+    write!(output, "\x1b[{};{}H\x1b[?25h", update.cursor.1.saturating_add(1), update.cursor.0.saturating_add(1))?;
     Ok(())
 }
 
@@ -435,38 +347,20 @@ const KITTY_RASTER_PLACEMENT_ID: u32 = 1;
 const KITTY_PAYLOAD_CHUNK_BYTES: usize = 4096;
 
 fn write_kitty_raster_overlay(output: &mut impl Write, overlay: &wren_view::RasterOverlay) -> Result<(), TerminalError> {
-    let expected_bytes = overlay
-        .width
-        .checked_mul(overlay.height)
-        .and_then(|pixels| pixels.checked_mul(3))
-        .ok_or_else(|| TerminalError::Render("raster overlay dimensions overflow".to_owned()))?;
-    let (rgb, compressed) = match &overlay.source {
-        RasterSource::Rgb(rgb) => {
-            if rgb.len() != expected_bytes {
-                return Err(TerminalError::Render(format!("raster overlay contains {} bytes, expected {expected_bytes}", rgb.len())));
-            }
-            (Cow::Borrowed(rgb.as_slice()), false)
-        }
-        RasterSource::Quads { background, quads } => (Cow::Owned(rasterize_quads(overlay.width, overlay.height, *background, quads)?), true),
-    };
-    let payload = if compressed {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&rgb)?;
-        Cow::Owned(encoder.finish()?)
-    } else {
-        rgb
-    };
-    write!(output, "{}", Csi::Cursor(Cursor::Position { line: terminal_coordinate(0)?, col: terminal_coordinate(0)? }))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_ref());
+    let rgb = rasterize_quads(overlay.width, overlay.height, overlay.background, &overlay.quads)?;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&rgb)?;
+    let payload = encoder.finish()?;
+    output.write_all(b"\x1b[1;1H")?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
     let mut chunks = encoded.as_bytes().chunks(KITTY_PAYLOAD_CHUNK_BYTES).peekable();
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let more = usize::from(chunks.peek().is_some());
         if first {
-            let compression = if compressed { ",o=z" } else { "" };
             write!(
                 output,
-                "\x1b_Ga=T,f=24{compression},s={},v={},i={KITTY_RASTER_IMAGE_ID},p={KITTY_RASTER_PLACEMENT_ID},c={},r={},C=1,z=-1,q=2,m={more};",
+                "\x1b_Ga=T,f=24,o=z,s={},v={},i={KITTY_RASTER_IMAGE_ID},p={KITTY_RASTER_PLACEMENT_ID},c={},r={},C=1,z=-1,q=2,m={more};",
                 overlay.width, overlay.height, overlay.columns, overlay.rows,
             )?;
             first = false;
@@ -527,42 +421,30 @@ fn point_in_quad(point: [f32; 2], vertices: [[f32; 2]; 4]) -> bool {
     true
 }
 
-fn delete_kitty_raster_overlay(output: &mut impl Write) -> io::Result<()> {
-    write!(output, "\x1b_Ga=d,d=I,i={KITTY_RASTER_IMAGE_ID},q=2\x1b\\")
-}
-
 fn write_style_if_changed(output: &mut impl Write, style: CellStyle, active_style: &mut Option<CellStyle>, cache: &mut StyleCache) -> io::Result<()> {
     if *active_style == Some(style) {
         return Ok(());
     }
     *active_style = Some(style);
     let key = style_key(style);
-    if let Some(bytes) = cache.entries.get(&key) {
+    if let Some(bytes) = cache.get(&key) {
         return output.write_all(bytes);
     }
     let mut bytes = Vec::with_capacity(48);
     write_style(&mut bytes, style)?;
     output.write_all(&bytes)?;
-    if cache.entries.len() < STYLE_CACHE_CAPACITY {
-        cache.entries.insert(key, bytes.into_boxed_slice());
+    if cache.len() < STYLE_CACHE_CAPACITY {
+        cache.insert(key, bytes.into_boxed_slice());
     }
     Ok(())
 }
 
 const STYLE_CACHE_CAPACITY: usize = 65_536;
 
-#[derive(Default)]
-struct StyleCache {
-    entries: HashMap<u128, Box<[u8]>>,
-}
+type StyleCache = HashMap<u128, Box<[u8]>>;
 
 fn style_key(style: CellStyle) -> u128 {
-    let flags = u128::from(style.bold)
-        | (u128::from(style.italic) << 1)
-        | (u128::from(style.underline) << 2)
-        | (u128::from(style.strikethrough) << 3)
-        | (u128::from(style.reverse) << 4);
-    flags | (u128::from(color_key(style.foreground)) << 8) | (u128::from(color_key(style.background)) << 40)
+    u128::from(style.attributes) | (u128::from(color_key(style.foreground)) << 8) | (u128::from(color_key(style.background)) << 40)
 }
 
 const fn color_key(color: Option<CellColor>) -> u32 {
@@ -573,43 +455,23 @@ const fn color_key(color: Option<CellColor>) -> u32 {
     }
 }
 
-fn terminal_coordinate(zero_based: usize) -> Result<OneBased, TerminalError> {
-    let zero_based = u16::try_from(zero_based).map_err(|_| TerminalError::Render(format!("terminal coordinate {zero_based} exceeds u16")))?;
-    if zero_based == u16::MAX {
-        return Err(TerminalError::Render("terminal coordinate 65535 cannot be represented as one-based".to_owned()));
-    }
-    Ok(OneBased::from_zero_based(zero_based))
-}
-
 fn write_style(output: &mut impl Write, style: CellStyle) -> io::Result<()> {
-    let mut attributes = SgrAttributes {
-        foreground: style.foreground.map(color_spec),
-        background: style.background.map(color_spec),
-        modifiers: SgrModifiers::RESET,
-        ..SgrAttributes::default()
-    };
-    if style.bold {
-        attributes.modifiers |= SgrModifiers::INTENSITY_BOLD;
+    output.write_all(b"\x1b[0")?;
+    for (enabled, code) in [(style.bold(), 1), (style.italic(), 3), (style.underline(), 4), (style.reverse(), 7), (style.strikethrough(), 9)] {
+        if enabled {
+            write!(output, ";{code}")?;
+        }
     }
-    if style.underline {
-        attributes.modifiers |= SgrModifiers::UNDERLINE_SINGLE;
-    }
-    if style.italic {
-        attributes.modifiers |= SgrModifiers::ITALIC;
-    }
-    if style.strikethrough {
-        attributes.modifiers |= SgrModifiers::STRIKE_THROUGH;
-    }
-    if style.reverse {
-        attributes.modifiers |= SgrModifiers::REVERSE;
-    }
-    write!(output, "{}", Csi::Sgr(Sgr::Attributes(attributes)))
+    write_color(output, 38, style.foreground)?;
+    write_color(output, 48, style.background)?;
+    output.write_all(b"m")
 }
 
-fn color_spec(color: CellColor) -> ColorSpec {
+fn write_color(output: &mut impl Write, channel: u8, color: Option<CellColor>) -> io::Result<()> {
     match color {
-        CellColor::Palette(index) => ColorSpec::PaletteIndex(index),
-        CellColor::Rgb(color) => ColorSpec::from(RgbColor::new(color.red, color.green, color.blue)),
+        None => Ok(()),
+        Some(CellColor::Palette(index)) => write!(output, ";{channel};5;{index}"),
+        Some(CellColor::Rgb(color)) => write!(output, ";{channel};2;{};{};{}", color.red, color.green, color.blue),
     }
 }
 
@@ -696,25 +558,21 @@ mod tests {
 
     #[test]
     fn termina_submits_each_complete_patch_set_with_one_writer_call() {
-        let mut backend = TerminaBackend::new(CountingSink::default(), 80, 24).expect("backend");
-        backend
-            .submit(&[TerminalPatch::MoveTo { column: 2, row: 3 }, TerminalPatch::SetStyle(CellStyle::default()), TerminalPatch::ShowCursor(true)])
-            .expect("submit patches");
-        let sink = backend.into_inner();
+        let mut sink = CountingSink::default();
+        TerminaBackend::new(&mut sink).submit(&TerminalUpdate { cursor: (2, 3), ..TerminalUpdate::default() }).expect("submit update");
         assert_eq!(sink.writes, 1);
         assert_eq!(sink.flushes, 1);
         assert!(sink.bytes.starts_with(SYNCHRONIZED_OUTPUT_BEGIN));
         assert!(sink.bytes.ends_with(SYNCHRONIZED_OUTPUT_END));
-        let synchronized = dec_mode(DecPrivateModeCode::SynchronizedOutput);
-        assert_eq!(String::from_utf8_lossy(SYNCHRONIZED_OUTPUT_BEGIN), Csi::Mode(Mode::SetDecPrivateMode(synchronized)).to_string());
-        assert_eq!(String::from_utf8_lossy(SYNCHRONIZED_OUTPUT_END), Csi::Mode(Mode::ResetDecPrivateMode(synchronized)).to_string());
+        assert_eq!(SYNCHRONIZED_OUTPUT_BEGIN, b"\x1b[?2026h");
+        assert_eq!(SYNCHRONIZED_OUTPUT_END, b"\x1b[?2026l");
     }
 
     #[test]
     fn osc52_copy_is_local_bounded_and_base64_encoded() {
         let mut output = Vec::new();
         {
-            let mut backend = TerminaBackend::new(&mut output, 80, 24).expect("backend");
+            let mut backend = TerminaBackend::new(&mut output);
             backend.copy_osc52(ClipboardSelection::Clipboard, "wren β").expect("clipboard copy");
         }
         assert_eq!(output, b"\x1b]52;c;d3JlbiDOsg==\x1b\\");
@@ -737,7 +595,7 @@ mod tests {
     fn osc52_primary_copy_targets_the_star_register_selection() {
         let mut output = Vec::new();
         {
-            let mut backend = TerminaBackend::new(&mut output, 80, 24).expect("backend");
+            let mut backend = TerminaBackend::new(&mut output);
             backend.copy_osc52(ClipboardSelection::Primary, "primary").expect("primary clipboard copy");
         }
         assert_eq!(output, b"\x1b]52;p;cHJpbWFyeQ==\x1b\\");
@@ -805,38 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn renderer_uses_typed_cursor_clear_and_visibility_sequences() {
+    fn renderer_uses_typed_clear_and_cursor_sequences() {
         let mut output = Vec::new();
-        render_patches(
-            &mut output,
-            &[TerminalPatch::Clear, TerminalPatch::MoveTo { column: 4, row: 2 }, TerminalPatch::ShowCursor(false), TerminalPatch::ShowCursor(true)],
-            &mut None,
-            &mut StyleCache::default(),
-        )
-        .expect("render");
-        assert_eq!(output, b"\x1b[m\x1b[2J\x1b[3;5H\x1b[?25l\x1b[?25h");
-    }
-
-    #[test]
-    fn renderer_transmits_and_deletes_kitty_rgb_overlays() {
-        let overlay = std::sync::Arc::new(wren_view::RasterOverlay {
-            frame_id: 1,
-            width: 2,
-            height: 1,
-            columns: 1,
-            rows: 1,
-            source: RasterSource::Rgb(std::sync::Arc::new(vec![1_u8, 2, 3, 4, 5, 6])),
-        });
-        let mut output = Vec::new();
-        let mut raster_rows = None;
-        render_patches(&mut output, &[TerminalPatch::SetRasterOverlay(Some(overlay))], &mut raster_rows, &mut StyleCache::default()).expect("render overlay");
-        assert_eq!(raster_rows, Some(1));
-        assert_eq!(output, b"\x1b[1;1H\x1b_Ga=T,f=24,s=2,v=1,i=1465009486,p=1,c=1,r=1,C=1,z=-1,q=2,m=0;AQIDBAUG\x1b\\");
-
-        output.clear();
-        render_patches(&mut output, &[TerminalPatch::SetRasterOverlay(None)], &mut raster_rows, &mut StyleCache::default()).expect("delete overlay");
-        assert_eq!(raster_rows, None);
-        assert_eq!(output, b"\x1b_Ga=d,d=I,i=1465009486,q=2\x1b\\");
+        render_update(&mut output, &TerminalUpdate { clear: true, cursor: (4, 2), ..TerminalUpdate::default() }, &mut None, &mut StyleCache::default())
+            .expect("render");
+        assert_eq!(output, b"\x1b[?25l\x1b[m\x1b[2J\x1b[3;5H\x1b[?25h");
     }
 
     #[test]
@@ -854,10 +685,12 @@ mod tests {
             height: 12,
             columns: 2,
             rows: 1,
-            source: RasterSource::Quads { background: wren_view::RgbColor::new(10, 20, 30), quads: std::sync::Arc::new(Vec::new()) },
+            background: wren_view::RgbColor::new(10, 20, 30),
+            quads: std::sync::Arc::new(Vec::new()),
         });
         let mut output = Vec::new();
-        render_patches(&mut output, &[TerminalPatch::SetRasterOverlay(Some(overlay))], &mut None, &mut StyleCache::default()).expect("render vector overlay");
+        render_update(&mut output, &TerminalUpdate { raster_overlay: Some(Some(overlay)), ..TerminalUpdate::default() }, &mut None, &mut StyleCache::default())
+            .expect("render vector overlay");
         assert!(output.windows(b"f=24,o=z,s=12,v=12".len()).any(|window| window == b"f=24,o=z,s=12,v=12"));
     }
 }

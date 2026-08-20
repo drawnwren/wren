@@ -12,13 +12,6 @@
 ; ((identifier)(selector (argument_part)) @function)
 ; NOTE: This query is a bit of a work around for the fact that the dart grammar doesn't
 ; specifically identify a node as a function call
-(((identifier) @function.call
-  (#lua-match? @function.call "^_?[%l]"))
-  .
-  (selector
-    .
-    (argument_part))) @function.call
-
 ; Annotations
 ; --------------------
 (annotation
@@ -66,13 +59,6 @@
   "/="
   "^="
   "~/="
-  (shift_operator)
-  (multiplicative_operator)
-  (increment_operator)
-  (is_operator)
-  (prefix_operator)
-  (equality_operator)
-  (additive_operator)
 ] @operator
 
 [
@@ -97,14 +83,8 @@
 
 ; Types
 ; --------------------
-(class_definition
-  name: (identifier) @type)
-
 (constructor_signature
   name: (identifier) @type)
-
-(scoped_identifier
-  scope: (identifier) @type)
 
 (function_signature
   name: (identifier) @function.method)
@@ -123,11 +103,6 @@
 
 (void_type) @type
 
-((scoped_identifier
-  scope: (identifier) @type
-  name: (identifier) @type)
-  (#lua-match? @type "^[%u%l]"))
-
 (type_identifier) @type
 
 (type_alias
@@ -141,22 +116,10 @@
 
 ; Variables
 ; --------------------
-; var keyword
-(inferred_type) @keyword
-
 ((identifier) @type
-  (#lua-match? @type "^_?[%u].*[%l]")) ; catch Classes or IClasses not CLASSES
+  (#match? @type "^_?[A-Z].*[a-z]")) ; catch Classes or IClasses not CLASSES
 
 "Function" @type
-
-; properties
-(unconditional_assignable_selector
-  (identifier) @property)
-
-(conditional_assignable_selector
-  (identifier) @property)
-
-(this) @variable.builtin
 
 ; Parameters
 ; --------------------
@@ -190,8 +153,6 @@
 
 (comment) @comment @spell
 
-(documentation_comment) @comment.documentation @spell
-
 ; Keywords
 ; --------------------
 [
@@ -212,7 +173,6 @@
   ; because the grammar selects the whole node or the content
   ; of the assertion not just the keyword
   ; assert
-  (case_builtin)
   "late"
   "required"
   "on"
@@ -257,8 +217,6 @@
 ] @keyword.coroutine
 
 [
-  (const_builtin)
-  (final_builtin)
   "abstract"
   "covariant"
   "external"

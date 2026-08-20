@@ -2,18 +2,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wasmtime::component::{Component, Linker, TypedFunc};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wren_types::{DocumentId, DocumentRevision};
 
+#[cfg(test)]
 const SPIKE_COMPONENT: &str = include_str!("spike.wat");
 
 pub const EXTENSION_API_VERSION: &str = "1.0.0";
@@ -144,14 +146,6 @@ pub enum DeclarativeUi {
     Notification { message: Box<str> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum UiAction {
-    ItemSelected { item: Box<str> },
-    ButtonPressed { button: Box<str> },
-    TextSubmitted { text: Box<str> },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityPolicy {
     granted: BTreeSet<CapabilityGrant>,
@@ -254,8 +248,6 @@ pub enum ExtensionError {
     Cancelled,
     #[error("extension host is at its {limit}-request concurrency limit")]
     ConcurrencyLimit { limit: usize },
-    #[error("extension host lock was poisoned")]
-    Poisoned,
     #[error("spawn extension producer: {0}")]
     Spawn(Box<str>),
     #[error("extension manifest is invalid: {0}")]
@@ -276,10 +268,12 @@ struct Runtime {
     store: Store<StoreData>,
     completion_count: TypedFunc<(u32,), (u32,)>,
     decoration_count: TypedFunc<(u32,), (u32,)>,
+    #[cfg(test)]
     burn: TypedFunc<(), ()>,
 }
 
 struct HostInner {
+    #[cfg(test)]
     placement: HostPlacement,
     engine: Engine,
     component: Component,
@@ -298,6 +292,7 @@ pub struct WasmExtensionHost {
 }
 
 impl WasmExtensionHost {
+    #[cfg(test)]
     pub fn new(placement: HostPlacement, policy: ExtensionResourcePolicy) -> Result<Self, ExtensionError> {
         Self::from_component_bytes(placement, policy, SPIKE_COMPONENT.as_bytes())
     }
@@ -310,10 +305,15 @@ impl WasmExtensionHost {
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(runtime_error)?;
         let component = Component::new(&engine, component_bytes).map_err(runtime_error)?;
+        Self::from_component(placement, policy, engine, component)
+    }
+
+    fn from_component(_placement: HostPlacement, policy: ExtensionResourcePolicy, engine: Engine, component: Component) -> Result<Self, ExtensionError> {
         let runtime = instantiate(&engine, &component, policy)?;
         Ok(Self {
             inner: Arc::new(HostInner {
-                placement,
+                #[cfg(test)]
+                placement: _placement,
                 engine,
                 component,
                 policy,
@@ -327,7 +327,13 @@ impl WasmExtensionHost {
         })
     }
 
+    #[cfg(test)]
+    fn reconfigured(&self, policy: ExtensionResourcePolicy) -> Result<Self, ExtensionError> {
+        Self::from_component(self.inner.placement, policy, self.inner.engine.clone(), self.inner.component.clone())
+    }
+
     #[must_use]
+    #[cfg(test)]
     pub fn placement(&self) -> HostPlacement {
         self.inner.placement
     }
@@ -348,8 +354,7 @@ impl WasmExtensionHost {
         self.inner.policy.request_deadline
     }
 
-    /// Runs a non-terminating guest function. Fuel must trap it, after which
-    /// the store is discarded and reinstantiated before this method returns.
+    #[cfg(test)]
     pub fn exercise_cpu_quota_and_restart(&self) -> Result<(), ExtensionError> {
         let call = self.with_runtime(|runtime| {
             let function = runtime.burn;
@@ -357,30 +362,24 @@ impl WasmExtensionHost {
         });
         match call {
             Ok(()) => Err(ExtensionError::Runtime("non-terminating component unexpectedly completed".into())),
-            Err(_) => {
-                self.inner.traps.fetch_add(1, Ordering::AcqRel);
-                self.restart()
-            }
+            Err(_) => Ok(()),
         }
     }
 
     fn restart(&self) -> Result<(), ExtensionError> {
         let replacement = instantiate(&self.inner.engine, &self.inner.component, self.inner.policy)?;
-        *self.inner.runtime.lock().map_err(|_| ExtensionError::Poisoned)? = replacement;
+        *self.inner.runtime.lock() = replacement;
         self.inner.restarts.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     fn acquire_request(&self) -> Result<RequestPermit, ExtensionError> {
-        loop {
-            let active = self.inner.active_requests.load(Ordering::Acquire);
-            if active >= self.inner.policy.max_concurrent_requests {
-                return Err(ExtensionError::ConcurrencyLimit { limit: self.inner.policy.max_concurrent_requests });
-            }
-            if self.inner.active_requests.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                return Ok(RequestPermit { inner: Arc::clone(&self.inner) });
-            }
-        }
+        let limit = self.inner.policy.max_concurrent_requests;
+        self.inner
+            .active_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| (active < limit).then_some(active + 1))
+            .map_err(|_| ExtensionError::ConcurrencyLimit { limit })?;
+        Ok(RequestPermit { inner: Arc::clone(&self.inner) })
     }
 
     fn component_completion_count(&self, prefix_bytes: usize) -> Result<usize, ExtensionError> {
@@ -393,9 +392,15 @@ impl WasmExtensionHost {
     }
 
     fn with_runtime<T>(&self, call: impl FnOnce(&mut Runtime) -> Result<T, ExtensionError>) -> Result<T, ExtensionError> {
-        let mut runtime = self.inner.runtime.lock().map_err(|_| ExtensionError::Poisoned)?;
-        runtime.store.set_fuel(self.inner.policy.fuel_per_request).map_err(runtime_error)?;
-        call(&mut runtime)
+        let result = {
+            let mut runtime = self.inner.runtime.lock();
+            runtime.store.set_fuel(self.inner.policy.fuel_per_request).map_err(runtime_error).and_then(|()| call(&mut runtime))
+        };
+        if result.is_err() {
+            self.inner.traps.fetch_add(1, Ordering::AcqRel);
+            self.restart()?;
+        }
+        result
     }
 }
 
@@ -552,8 +557,15 @@ fn instantiate(engine: &Engine, component: &Component, policy: ExtensionResource
     let instance = Linker::new(engine).instantiate(&mut store, component).map_err(runtime_error)?;
     let completion_count = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "completion-count").map_err(runtime_error)?;
     let decoration_count = instance.get_typed_func::<(u32,), (u32,)>(&mut store, "decoration-count").map_err(runtime_error)?;
+    #[cfg(test)]
     let burn = instance.get_typed_func::<(), ()>(&mut store, "burn").map_err(runtime_error)?;
-    Ok(Runtime { store, completion_count, decoration_count, burn })
+    Ok(Runtime {
+        store,
+        completion_count,
+        decoration_count,
+        #[cfg(test)]
+        burn,
+    })
 }
 
 fn runtime_error(error: impl std::fmt::Display) -> ExtensionError {
@@ -563,7 +575,7 @@ fn runtime_error(error: impl std::fmt::Display) -> ExtensionError {
 pub struct ExtensionRegistry {
     placement: HostPlacement,
     high_trust: bool,
-    extensions: BTreeMap<Box<str>, (ExtensionManifest, Vec<u8>, WasmExtensionHost)>,
+    extensions: BTreeMap<Box<str>, (ExtensionManifest, WasmExtensionHost)>,
 }
 
 impl ExtensionRegistry {
@@ -572,6 +584,7 @@ impl ExtensionRegistry {
         Self { placement, high_trust, extensions: BTreeMap::new() }
     }
 
+    #[cfg(test)]
     pub fn install(&mut self, manifest: ExtensionManifest, policy: ExtensionResourcePolicy) -> Result<(), ExtensionError> {
         self.install_component(manifest, policy, SPIKE_COMPONENT.as_bytes())
     }
@@ -589,7 +602,7 @@ impl ExtensionRegistry {
             capability_policy.authorize(grant)?;
         }
         let host = WasmExtensionHost::from_component_bytes(self.placement, policy, component_bytes)?;
-        self.extensions.insert(manifest.id.clone(), (manifest, component_bytes.to_vec(), host));
+        self.extensions.insert(manifest.id.clone(), (manifest, host));
         Ok(())
     }
 
@@ -597,38 +610,36 @@ impl ExtensionRegistry {
         self.extensions.remove(id).is_some()
     }
 
-    #[must_use]
+    #[cfg(test)]
     pub fn manifest(&self, id: &str) -> Option<&ExtensionManifest> {
-        self.extensions.get(id).map(|(manifest, _, _)| manifest)
+        self.extensions.get(id).map(|(manifest, _)| manifest)
     }
 
-    #[must_use]
     pub fn host(&self, id: &str) -> Option<&WasmExtensionHost> {
-        self.extensions.get(id).map(|(_, _, host)| host)
+        self.extensions.get(id).map(|(_, host)| host)
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.extensions.len()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.extensions.is_empty()
     }
 
     /// A host-process crash drops every store. Recreate each independently so
     /// one bad component cannot prevent healthy manifests from returning.
+    #[cfg(test)]
     pub fn restart_all(&mut self, policy: ExtensionResourcePolicy) -> Vec<(Box<str>, ExtensionError)> {
-        let ids = self.extensions.keys().cloned().collect::<Vec<_>>();
         let mut failures = Vec::new();
-        for id in ids {
-            let component = self.extensions.get(&id).map(|(_, component, _)| component.clone()).unwrap_or_default();
-            let replacement = WasmExtensionHost::from_component_bytes(self.placement, policy, &component);
-            match (self.extensions.get_mut(&id), replacement) {
-                (Some((_, _, host)), Ok(new_host)) => *host = new_host,
-                (_, Err(error)) => failures.push((id, error)),
-                (None, Ok(_)) => {}
+        for (id, (_, host)) in &mut self.extensions {
+            match host.reconfigured(policy) {
+                Ok(replacement) => *host = replacement,
+                Err(error) => failures.push((id.clone(), error)),
             }
         }
         failures
@@ -639,15 +650,11 @@ impl ExtensionRegistry {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HostRequest {
     Hello,
-    Stats,
-    Complete { request: CompletionRequest },
-    Decorate { request: DecorationRequest },
     Install { manifest: Box<ExtensionManifest>, component: Vec<u8> },
     Uninstall { id: Box<str> },
     CompleteExtension { id: Box<str>, request: CompletionRequest },
     DecorateExtension { id: Box<str>, request: DecorationRequest },
     ExtensionStats { id: Box<str> },
-    ExerciseTrap,
     Shutdown,
 }
 
@@ -665,7 +672,6 @@ pub enum HostResponse {
 }
 
 pub fn run_stdio_host(placement: HostPlacement) -> Result<(), ExtensionError> {
-    let host = WasmExtensionHost::new(placement, ExtensionResourcePolicy::default())?;
     let mut registry = ExtensionRegistry::new(placement, false);
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -673,7 +679,7 @@ pub fn run_stdio_host(placement: HostPlacement) -> Result<(), ExtensionError> {
         let line = line.map_err(|error| ExtensionError::Runtime(error.to_string().into()))?;
         let request = serde_json::from_str::<HostRequest>(&line).map_err(|error| ExtensionError::Runtime(error.to_string().into()))?;
         let shutdown = request == HostRequest::Shutdown;
-        let response = handle_host_request(&host, &mut registry, request);
+        let response = handle_host_request(placement, &mut registry, request);
         serde_json::to_writer(&mut stdout, &response).map_err(|error| ExtensionError::Runtime(error.to_string().into()))?;
         stdout.write_all(b"\n").and_then(|()| stdout.flush()).map_err(|error| ExtensionError::Runtime(error.to_string().into()))?;
         if shutdown {
@@ -683,23 +689,14 @@ pub fn run_stdio_host(placement: HostPlacement) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-fn handle_host_request(host: &WasmExtensionHost, registry: &mut ExtensionRegistry, request: HostRequest) -> HostResponse {
+fn handle_host_request(placement: HostPlacement, registry: &mut ExtensionRegistry, request: HostRequest) -> HostResponse {
     let result = match request {
-        HostRequest::Hello => {
-            return HostResponse::Hello { api_version: EXTENSION_API_VERSION.into(), placement: host.placement() };
-        }
-        HostRequest::Stats => {
-            return HostResponse::Stats { stats: host.stats() };
-        }
-        HostRequest::Complete { request } => collect_completions(host, request).map(|candidates| HostResponse::Completions { candidates }),
-        HostRequest::Decorate { request } => host.decorate(&request).map(|decorations| HostResponse::Decorations { decorations }),
+        HostRequest::Hello => Ok(HostResponse::Hello { api_version: EXTENSION_API_VERSION.into(), placement }),
         HostRequest::Install { manifest, component } => {
             let id = manifest.id.clone();
             registry.install_component(*manifest, ExtensionResourcePolicy::default(), &component).map(|()| HostResponse::Installed { id })
         }
-        HostRequest::Uninstall { id } => {
-            return HostResponse::Uninstalled { existed: registry.uninstall(&id), id };
-        }
+        HostRequest::Uninstall { id } => Ok(HostResponse::Uninstalled { existed: registry.uninstall(&id), id }),
         HostRequest::CompleteExtension { id, request } => registry
             .host(&id)
             .ok_or_else(|| ExtensionError::Manifest(format!("unknown extension {id}").into()))
@@ -710,13 +707,11 @@ fn handle_host_request(host: &WasmExtensionHost, registry: &mut ExtensionRegistr
             .ok_or_else(|| ExtensionError::Manifest(format!("unknown extension {id}").into()))
             .and_then(|host| host.decorate(&request))
             .map(|decorations| HostResponse::Decorations { decorations }),
-        HostRequest::ExtensionStats { id } => {
-            return registry
-                .host(&id)
-                .map_or_else(|| HostResponse::Error { message: format!("unknown extension {id}").into() }, |host| HostResponse::Stats { stats: host.stats() });
-        }
-        HostRequest::ExerciseTrap => host.exercise_cpu_quota_and_restart().map(|()| HostResponse::Ok),
-        HostRequest::Shutdown => return HostResponse::Ok,
+        HostRequest::ExtensionStats { id } => registry
+            .host(&id)
+            .ok_or_else(|| ExtensionError::Manifest(format!("unknown extension {id}").into()))
+            .map(|host| HostResponse::Stats { stats: host.stats() }),
+        HostRequest::Shutdown => Ok(HostResponse::Ok),
     };
     result.unwrap_or_else(|error| HostResponse::Error { message: error.to_string().into() })
 }

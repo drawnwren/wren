@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 use thiserror::Error;
 use wren_text::{DefaultText, TextStore};
+#[cfg(test)]
+use wren_types::StateCheckpoint;
 use wren_types::{
-    AcceptedDocument, ClientId, ClientMutation, ClientSequence, DocumentFrontier, DocumentId, DocumentMutation, DocumentRevision, EventOrigin, LeaseEpoch,
-    LeaseGrant, MutationId, MutationResult, MutationValidationError, OfflinePolicy, Resume, ResumeResult, SessionEpoch, SessionEvent, SessionEventPayload,
-    SessionId, SessionSequence, StateCheckpoint, StateDelta, Transaction, WorkspaceGeneration,
+    AcceptedDocument, ClientId, ClientMutation, ClientSequence, DocumentFrontier, DocumentId, DocumentRevision, EventOrigin, LeaseEpoch, LeaseGrant,
+    MutationId, MutationResult, MutationValidationError, OfflinePolicy, Resume, ResumeResult, SessionEpoch, SessionEvent, SessionEventPayload, SessionId,
+    SessionSequence, StateDelta, Transaction, WorkspaceGeneration,
 };
 
 use crate::journal::{JournalEntry, RegisteredDocument};
@@ -22,13 +24,6 @@ pub struct AuthorityDocument {
     // Session events may be compacted or invalidated by an epoch change, while
     // an online writer can still present an older document frontier.
     history: Vec<Transaction>,
-}
-
-#[derive(Clone)]
-struct StagedDocumentUpdate {
-    text: DefaultText,
-    revision: DocumentRevision,
-    transactions: Vec<Transaction>,
 }
 
 impl AuthorityDocument {
@@ -51,23 +46,24 @@ impl AuthorityDocument {
         }
         self.history.iter().filter(|transaction| transaction.base_revision() >= base).cloned().collect()
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MutationSubmission {
-    Accepted { received: MutationResult, durable: MutationResult },
-    Rejected(MutationResult),
-}
-
-impl MutationSubmission {
-    #[must_use]
-    pub fn durable(&self) -> Option<&MutationResult> {
-        match self {
-            Self::Accepted { durable, .. } => Some(durable),
-            Self::Rejected(_) => None,
+    fn apply(&mut self, transactions: &[Transaction]) -> Result<(), AuthorityError> {
+        for transaction in transactions {
+            transaction
+                .validate_boundaries(self.text.len_bytes(), |offset| self.text.is_char_boundary(offset))
+                .map_err(|error| AuthorityError::Replay(format!("transaction for {:?} could not apply: {error}", self.document_id)))?;
+            self.text.apply(transaction);
+            self.revision = self.revision.next().ok_or(AuthorityError::CounterOverflow)?;
+            self.history.push(transaction.clone());
         }
+        Ok(())
     }
 }
+
+/// A validated submission either reaches its durable result or returns the
+/// protocol-level rejection that prevented it. `Received` is a transport ack,
+/// so it is emitted by the connection rather than duplicated in this value.
+pub type MutationSubmission = Result<MutationResult, MutationResult>;
 
 #[derive(Debug, Error)]
 pub enum AuthorityError {
@@ -97,12 +93,6 @@ pub enum AuthorityError {
     CounterOverflow,
     #[error("serialize canonical mutation: {0}")]
     CanonicalSerialization(serde_json::Error),
-}
-
-pub trait MutationService {
-    fn submit_mutation(&mut self, mutation: ClientMutation) -> Result<MutationSubmission, AuthorityError>;
-
-    fn resume_session(&self, request: &Resume) -> ResumeResult;
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +166,7 @@ impl SessionAuthority {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -186,6 +177,7 @@ impl SessionAuthority {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn workspace_generation(&self) -> WorkspaceGeneration {
         self.workspace_generation
     }
@@ -195,7 +187,6 @@ impl SessionAuthority {
         self.session_sequence
     }
 
-    #[must_use]
     pub fn document(&self, document_id: DocumentId) -> Option<&AuthorityDocument> {
         self.documents.get(&document_id)
     }
@@ -213,11 +204,13 @@ impl SessionAuthority {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn retained_after(&self) -> SessionSequence {
         self.retained_after
     }
 
     #[must_use]
+    #[cfg(test)]
     pub const fn event_retention_limit(&self) -> usize {
         self.event_retention_limit
     }
@@ -227,12 +220,14 @@ impl SessionAuthority {
         self.events.iter().filter(|event| event.session_sequence > sequence).cloned().collect()
     }
 
+    #[cfg(test)]
     pub fn set_event_retention_limit(&mut self, limit: usize) -> Result<(), AuthorityError> {
         self.event_retention_limit = limit.max(1);
         self.enforce_event_retention()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn client_state(&self, client_id: ClientId) -> &[StateDelta] {
         self.state.get(&client_id).map_or(&[], Vec::as_slice)
     }
@@ -278,7 +273,7 @@ impl SessionAuthority {
             let mut staged_documents = match staged_authority.stage_documents(&mutation)? {
                 Ok(documents) => documents,
                 Err(rejection) => {
-                    submissions.push(MutationSubmission::Rejected(rejection));
+                    submissions.push(Err(rejection));
                     continue;
                 }
             };
@@ -288,11 +283,14 @@ impl SessionAuthority {
             journal_entries.push(JournalEntry::MutationCommitted { mutation: mutation.clone(), durable: durable.clone(), events: events.clone() });
             staged_authority.apply_staged_documents(&mut staged_documents);
             staged_authority.install_committed(&mutation, durable.clone(), events, mutation_hash)?;
-            if let Some(continuity) = staged_authority.staged_retention_boundary()? {
+            if let Some(continuity) = (staged_authority.events.len() > staged_authority.event_retention_limit)
+                .then(|| staged_authority.next_continuity().map(|(_, _, boundary)| boundary))
+                .transpose()?
+            {
                 staged_authority.replay(continuity.clone())?;
                 journal_entries.push(continuity);
             }
-            submissions.push(MutationSubmission::Accepted { received: MutationResult::Received { mutation_id: mutation.mutation_id }, durable });
+            submissions.push(Ok(durable));
         }
 
         // The O_DSYNC batch write is the durable frontier. Only after it
@@ -302,13 +300,6 @@ impl SessionAuthority {
         Ok(submissions)
     }
 
-    fn staged_retention_boundary(&self) -> Result<Option<JournalEntry>, AuthorityError> {
-        if self.events.len() <= self.event_retention_limit {
-            return Ok(None);
-        }
-        self.next_continuity().map(|(_, _, boundary)| Some(boundary))
-    }
-
     fn previous_submission(&self, mutation: &ClientMutation, mutation_hash: [u8; 32]) -> Result<Option<MutationSubmission>, AuthorityError> {
         let Some(existing) = self.dedup.get(&mutation.mutation_id) else {
             return Ok(None);
@@ -316,7 +307,7 @@ impl SessionAuthority {
         if existing.mutation_hash != mutation_hash {
             return Err(AuthorityError::MutationIdCollision { mutation_id: mutation.mutation_id });
         }
-        Ok(Some(MutationSubmission::Accepted { received: MutationResult::Received { mutation_id: mutation.mutation_id }, durable: existing.durable.clone() }))
+        Ok(Some(Ok(existing.durable.clone())))
     }
 
     fn validate_client_sequence(&self, mutation: &ClientMutation) -> Result<(), AuthorityError> {
@@ -328,7 +319,7 @@ impl SessionAuthority {
         Ok(())
     }
 
-    fn stage_documents(&self, mutation: &ClientMutation) -> Result<Result<BTreeMap<DocumentId, StagedDocumentUpdate>, MutationResult>, AuthorityError> {
+    fn stage_documents(&self, mutation: &ClientMutation) -> Result<Result<BTreeMap<DocumentId, AuthorityDocument>, MutationResult>, AuthorityError> {
         let mut staged = BTreeMap::new();
         for document_mutation in &mutation.documents {
             let Some(document) = self.documents.get(&document_mutation.document_id) else {
@@ -348,22 +339,18 @@ impl SessionAuthority {
                     delta_since_base: document.delta_since(document_mutation.base_revision),
                 }));
             }
-            let update = stage_document(document, document_mutation)?;
+            let mut update = document.clone();
+            update.apply(&document_mutation.transactions)?;
             staged.insert(document_mutation.document_id, update);
         }
         Ok(Ok(staged))
     }
 
-    fn apply_staged_documents(&mut self, staged_documents: &mut BTreeMap<DocumentId, StagedDocumentUpdate>) {
-        for document in self.documents.values_mut() {
-            if let Some(staged) = staged_documents.remove(&document.document_id) {
-                document.text = staged.text;
-                document.revision = staged.revision;
-                document.history.extend(staged.transactions);
-            }
-        }
+    fn apply_staged_documents(&mut self, staged_documents: &mut BTreeMap<DocumentId, AuthorityDocument>) {
+        self.documents.append(staged_documents);
     }
 
+    #[cfg(test)]
     pub fn grant_lease(&mut self, document_id: DocumentId, holder_id: ClientId, offline_policy: OfflinePolicy) -> Result<LeaseGrant, AuthorityError> {
         let current = self.documents.get(&document_id).ok_or(AuthorityError::UnknownDocument(document_id))?;
         let lease_epoch = current.lease.lease_epoch.get().checked_add(1).map(LeaseEpoch::new).ok_or(AuthorityError::CounterOverflow)?;
@@ -406,6 +393,7 @@ impl SessionAuthority {
         Ok((new_session_epoch, workspace_generation, boundary))
     }
 
+    #[cfg(test)]
     fn enforce_event_retention(&mut self) -> Result<(), AuthorityError> {
         if self.events.len() > self.event_retention_limit {
             self.break_event_continuity()?;
@@ -413,7 +401,8 @@ impl SessionAuthority {
         Ok(())
     }
 
-    pub fn checkpoint_state(&mut self, checkpoint: StateCheckpoint) -> Result<(), AuthorityError> {
+    #[cfg(test)]
+    pub fn checkpoint_state(&mut self, checkpoint: wren_types::StateCheckpoint) -> Result<(), AuthorityError> {
         let durable = self.highest_client_sequence.get(&checkpoint.client_id).copied().unwrap_or(ClientSequence::new(0));
         if checkpoint.through_client_sequence > durable {
             return Err(AuthorityError::CheckpointAhead { client_id: checkpoint.client_id, through: checkpoint.through_client_sequence, durable });
@@ -468,6 +457,7 @@ impl SessionAuthority {
         Ok((events, final_sequence))
     }
 
+    #[cfg(test)]
     fn next_sequence(&self) -> Result<SessionSequence, AuthorityError> {
         self.session_sequence.get().checked_add(1).map(SessionSequence::new).ok_or(AuthorityError::CounterOverflow)
     }
@@ -489,12 +479,7 @@ impl SessionAuthority {
                             document.document_id, document.revision, document_mutation.base_revision
                         )));
                     }
-                    for transaction in &document_mutation.transactions {
-                        validate_transaction_for_store(transaction, &document.text).map_err(|error| AuthorityError::Replay(error.to_string()))?;
-                        document.text.apply(transaction);
-                        document.revision = document.revision.next().ok_or(AuthorityError::CounterOverflow)?;
-                        document.history.push(transaction.clone());
-                    }
+                    document.apply(&document_mutation.transactions)?;
                 }
                 self.install_committed(&mutation, durable, events, mutation_hash)
             }
@@ -560,46 +545,8 @@ impl SessionAuthority {
     }
 }
 
-impl MutationService for SessionAuthority {
-    fn submit_mutation(&mut self, mutation: ClientMutation) -> Result<MutationSubmission, AuthorityError> {
-        self.submit(mutation)
-    }
-
-    fn resume_session(&self, request: &Resume) -> ResumeResult {
-        self.resume(request)
-    }
-}
-
-fn stage_document(document: &AuthorityDocument, mutation: &DocumentMutation) -> Result<StagedDocumentUpdate, AuthorityError> {
-    let mut text = document.text.clone();
-    let mut revision = document.revision;
-    let mut transactions = Vec::with_capacity(mutation.transactions.len());
-    for transaction in &mutation.transactions {
-        validate_transaction_for_store(transaction, &text)
-            .map_err(|error| AuthorityError::Replay(format!("transaction for {:?} could not apply: {error}", mutation.document_id)))?;
-        text.apply(transaction);
-        revision = revision.next().ok_or(AuthorityError::CounterOverflow)?;
-        transactions.push(transaction.clone());
-    }
-    Ok(StagedDocumentUpdate { text, revision, transactions })
-}
-
 fn text_store(text: String) -> DefaultText {
     DefaultText::from_string(text)
-}
-
-fn validate_transaction_for_store(transaction: &Transaction, text: &DefaultText) -> Result<(), wren_types::TransactionError> {
-    for edit in transaction.edits() {
-        for offset in [edit.range.start, edit.range.end] {
-            if offset > text.len_bytes() {
-                return Err(wren_types::TransactionError::OutOfBounds { offset, len: text.len_bytes() });
-            }
-            if !text.is_char_boundary(offset) {
-                return Err(wren_types::TransactionError::NotCharBoundary { offset });
-            }
-        }
-    }
-    Ok(())
 }
 
 fn durable_result(mutation: &ClientMutation, session_sequence: SessionSequence) -> Result<MutationResult, AuthorityError> {
@@ -666,14 +613,14 @@ mod tests {
         let mut first = authority_with_document(directory.path(), "base");
         let original = mutation(19, 1, 1, 0, "x");
         let submission = first.submit(original.clone()).expect("submit");
-        assert!(matches!(submission, MutationSubmission::Accepted { received: MutationResult::Received { .. }, durable: MutationResult::Durable { .. } }));
+        assert!(matches!(submission, Ok(MutationResult::Durable { .. })));
         assert_eq!(document_text(&first, 11), "xbase");
         drop(first);
 
         let mut recovered = open_authority(directory.path());
         assert_eq!(document_text(&recovered, 11), "xbase");
         let duplicate = recovered.submit(original).expect("retry after lost ack");
-        assert!(duplicate.durable().is_some());
+        assert!(duplicate.is_ok());
         assert_eq!(document_text(&recovered, 11), "xbase");
     }
 
@@ -684,7 +631,7 @@ mod tests {
         let mutations = (0..128_u64).map(|index| mutation(index + 1, index + 1, 1, index, "x")).collect::<Vec<_>>();
         let submissions = authority.submit_batch(mutations).expect("submit mutation batch");
         assert_eq!(submissions.len(), 128);
-        assert!(submissions.iter().all(|submission| matches!(submission, MutationSubmission::Accepted { durable: MutationResult::Durable { .. }, .. })));
+        assert!(submissions.iter().all(|submission| matches!(submission, Ok(MutationResult::Durable { .. }))));
         let expected = format!("{}base", "x".repeat(128));
         assert_eq!(document_text(&authority, 11), expected);
 
@@ -709,7 +656,7 @@ mod tests {
             undo_parent: None,
             transactions: vec![Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "y")]).expect("transaction")],
         });
-        assert!(matches!(authority.submit(proposed).expect("rejection"), MutationSubmission::Rejected(MutationResult::LeaseLost { .. })));
+        assert!(matches!(authority.submit(proposed).expect("rejection"), Err(MutationResult::LeaseLost { .. })));
         assert_eq!((document_text(&authority, 11), document_text(&authority, 12)), ("a".to_owned(), "b".to_owned()));
         assert_eq!(authority.session_sequence(), SessionSequence::new(0));
     }
@@ -718,10 +665,10 @@ mod tests {
     fn stale_revision_returns_delta_and_stale_lease_is_fenced() {
         let directory = tempdir().expect("temporary directory");
         let mut authority = authority_with_document(directory.path(), "a");
-        authority.submit(mutation(1, 1, 1, 0, "x")).expect("first mutation");
+        let _ = authority.submit(mutation(1, 1, 1, 0, "x")).expect("first mutation");
         assert!(matches!(
             authority.submit(mutation(2, 2, 1, 0, "y")).expect("rebase"),
-            MutationSubmission::Rejected(MutationResult::RebaseRequired {
+            Err(MutationResult::RebaseRequired {
                 authoritative_revision,
                 ref delta_since_base,
                 ..
@@ -730,7 +677,7 @@ mod tests {
         authority.grant_lease(DocumentId::new(11), ClientId::new(8), OfflinePolicy::LocalBranch).expect("move lease");
         assert!(matches!(
             authority.submit(mutation(3, 2, 1, 1, "z")).expect("fence"),
-            MutationSubmission::Rejected(MutationResult::LeaseLost {
+            Err(MutationResult::LeaseLost {
                 current_lease_epoch,
                 ..
             }) if current_lease_epoch == LeaseEpoch::new(2)
@@ -741,7 +688,7 @@ mod tests {
     fn resume_replays_contiguous_events_or_requires_a_snapshot_after_epoch_change() {
         let directory = tempdir().expect("temporary directory");
         let mut authority = authority_with_document(directory.path(), "a");
-        authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
+        let _ = authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
         let resume = Resume {
             session_id: SessionId::new(3),
             session_epoch: SessionEpoch::new(1),
@@ -767,7 +714,7 @@ mod tests {
             authority
                 .submit(mutation(2, 2, 1, 0, "y"))
                 .expect("rebase after event compaction"),
-            MutationSubmission::Rejected(MutationResult::RebaseRequired {
+            Err(MutationResult::RebaseRequired {
                 ref delta_since_base,
                 ..
             }) if delta_since_base.len() == 1
@@ -782,7 +729,7 @@ mod tests {
     fn client_state_checkpoint_is_durable_and_cannot_run_ahead_of_mutations() {
         let directory = tempdir().expect("temporary directory");
         let mut authority = authority_with_document(directory.path(), "a");
-        authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
+        let _ = authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
         let state = vec![StateDelta::SearchPattern("needle".into())];
         authority
             .checkpoint_state(StateCheckpoint { client_id: ClientId::new(7), through_client_sequence: ClientSequence::new(1), state: state.clone() })
@@ -800,7 +747,7 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let mut authority = authority_with_document(directory.path(), "a");
         authority.set_event_retention_limit(1).expect("retention policy");
-        authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
+        let _ = authority.submit(mutation(1, 1, 1, 0, "x")).expect("mutation");
         assert_eq!(authority.session_epoch(), SessionEpoch::new(2));
         assert_eq!(authority.retained_after(), SessionSequence::new(2));
         assert!(authority.events_after(SessionSequence::new(0)).is_empty());

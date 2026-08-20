@@ -4,18 +4,22 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "benchmarking"))]
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tempfile::NamedTempFile;
 use thiserror::Error;
+#[cfg(any(test, feature = "benchmarking"))]
 use wren_shmem::{SharedDocumentHeadReader, SharedHeadError};
-use wren_types::{
-    Anchor, ClientId, DocumentId, DurableJumpEntry, HeadValidation, PublishedViewportKey, ResumeViewState, SemanticGroupId, SessionEpoch, StateDelta,
-};
+use wren_types::{Anchor, ClientId, DocumentId, DurableJumpEntry, SemanticGroupId, StateDelta};
+#[cfg(any(test, feature = "benchmarking"))]
+use wren_types::{HeadValidation, PublishedViewportKey, ResumeViewState, SessionEpoch};
+#[cfg(any(test, feature = "benchmarking"))]
 use wren_view::DesiredGrid;
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedViewport {
     pub session_epoch: SessionEpoch,
@@ -24,6 +28,7 @@ pub struct PublishedViewport {
     pub grid: DesiredGrid,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewportRestore {
     Correct(Arc<DesiredGrid>),
@@ -142,6 +147,7 @@ pub enum ClientStateError {
     Checksum { path: PathBuf },
     #[error("client state serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[cfg(any(test, feature = "benchmarking"))]
     #[error(transparent)]
     SharedHead(#[from] SharedHeadError),
 }
@@ -170,6 +176,7 @@ impl ClientViewStateStore {
         Self { directory: directory.into() }
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn save_resume(&self, state: &ResumeViewState) -> Result<(), ClientStateError> {
         self.save(&self.resume_path(state.client_id.get()), state)
     }
@@ -182,14 +189,17 @@ impl ClientViewStateStore {
         self.load(&self.durable_path(client_id.get()))
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn load_resume(&self, client_id: wren_types::ClientId) -> Result<Option<ResumeViewState>, ClientStateError> {
         self.load(&self.resume_path(client_id.get()))
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn save_viewport(&self, viewport: &PublishedViewport) -> Result<(), ClientStateError> {
         self.save(&self.viewport_path(viewport.key.client_id.get(), viewport.key.view_id.get(), viewport.document_id.get()), viewport)
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn load_viewport(
         &self,
         client_id: wren_types::ClientId,
@@ -199,6 +209,7 @@ impl ClientViewStateStore {
         self.load(&self.viewport_path(client_id.get(), view_id.get(), document_id.get()))
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn restore_correct_viewport(
         &self,
         expected_key: &PublishedViewportKey,
@@ -250,6 +261,7 @@ impl ClientViewStateStore {
         Ok(Some(serde_json::from_str(stored.value.get())?))
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     fn resume_path(&self, client: u64) -> PathBuf {
         self.directory.join(format!("resume-{client}.json"))
     }
@@ -258,6 +270,7 @@ impl ClientViewStateStore {
         self.directory.join(format!("durable-{client}.json"))
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     fn viewport_path(&self, client: u64, view: u64, document: u64) -> PathBuf {
         self.directory.join(format!("viewport-{client}-{view}-{document}.json"))
     }

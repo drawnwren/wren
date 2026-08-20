@@ -8,50 +8,45 @@ pub(super) struct FormatterInvocation {
 
 const FILE_ARGUMENT: &str = "$file";
 
-#[derive(Clone, Copy)]
+#[derive(Deserialize)]
+pub(super) struct LanguageToolProfile {
+    languages: Vec<Box<str>>,
+    pub(super) server: Option<LanguageServerProfile>,
+    formatter: Option<ToolProfile>,
+    diagnostic: Option<ToolProfile>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct LanguageServerProfile {
+    pub(super) program: Box<str>,
+    #[serde(default)]
+    pub(super) arguments: Vec<Box<str>>,
+    pub(super) language_id: Option<Box<str>>,
+    #[serde(default)]
+    pub(super) initialization_options: serde_json::Value,
+    #[serde(default)]
+    pub(super) settings: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 struct ToolProfile {
-    languages: &'static [&'static str],
-    program: &'static str,
-    arguments: &'static str,
+    program: Box<str>,
+    #[serde(default)]
+    arguments: Vec<Box<str>>,
+    #[serde(default)]
     parent_directory: bool,
 }
 
-macro_rules! tool {
-    ($languages:expr, $program:literal, $arguments:literal, $parent:literal) => {
-        ToolProfile { languages: $languages, program: $program, arguments: $arguments, parent_directory: $parent }
-    };
+pub(super) fn language_tool_profile(language: &str) -> Option<&'static LanguageToolProfile> {
+    static PROFILES: std::sync::LazyLock<Vec<LanguageToolProfile>> =
+        std::sync::LazyLock::new(|| serde_json::from_str(include_str!("language-tools.json")).unwrap_or_default());
+    PROFILES.iter().find(|profile| profile.languages.iter().any(|candidate| candidate.as_ref() == language))
 }
 
-const FORMATTER_PROFILES: &[ToolProfile] = &[
-    tool!(&["rust"], "rustfmt", "--emit=stdout", false),
-    tool!(&["python"], "ruff", "format --stdin-filename $file -", false),
-    tool!(&["go"], "gofmt", "", false),
-    tool!(&["hcl"], "tofu", "fmt -", false),
-    tool!(&["nix"], "nixfmt", "", false),
-    tool!(&["haskell"], "fourmolu", "--stdin-input-file $file", false),
-];
-
-const DIAGNOSTIC_PROFILES: &[ToolProfile] = &[
-    tool!(&["rust"], "cargo", "clippy --quiet --message-format=short", false),
-    tool!(&["python"], "ruff", "check --output-format=concise $file", false),
-    tool!(&["javascript", "typescript", "tsx"], "pnpm", "exec tsc --noEmit --pretty false", false),
-    tool!(&["go"], "go", "vet ./...", false),
-    tool!(&["hcl"], "tofu", "validate -no-color", true),
-    tool!(&["nix"], "nix-instantiate", "--parse $file", false),
-    tool!(&["haskell"], "ghc", "-fno-code $file", false),
-    tool!(&["lua"], "luac", "-p $file", false),
-    tool!(&["bash"], "bash", "-n $file", false),
-    tool!(&["c", "cpp"], "clang++", "-fsyntax-only $file", false),
-];
-
 impl ToolProfile {
-    fn for_language(profiles: &'static [Self], language: &str) -> Option<&'static Self> {
-        profiles.iter().find(|profile| profile.languages.contains(&language))
-    }
-
     fn arguments(&self, path: &Path) -> Vec<String> {
         let file = path.to_string_lossy();
-        self.arguments.split_ascii_whitespace().map(|argument| if argument == FILE_ARGUMENT { file.as_ref() } else { argument }).map(str::to_owned).collect()
+        self.arguments.iter().map(|argument| if argument.as_ref() == FILE_ARGUMENT { file.as_ref() } else { argument }).map(str::to_owned).collect()
     }
 }
 
@@ -137,8 +132,8 @@ pub(super) fn formatter_invocation(path: &Path) -> Option<FormatterInvocation> {
         }
         return Some(FormatterInvocation { program: "astyle".to_owned(), arguments });
     }
-    let profile = ToolProfile::for_language(FORMATTER_PROFILES, language)?;
-    Some(FormatterInvocation { program: profile.program.to_owned(), arguments: profile.arguments(path) })
+    let profile = language_tool_profile(language)?.formatter.as_ref()?;
+    Some(FormatterInvocation { program: profile.program.to_string(), arguments: profile.arguments(path) })
 }
 
 pub(super) fn find_upward(path: &Path, name: &str) -> Option<PathBuf> {
@@ -169,12 +164,12 @@ pub(super) struct DiagnosticInvocation {
 
 pub(super) fn diagnostic_invocation(path: &Path, workspace_root: &Path) -> Option<DiagnosticInvocation> {
     let language = bundled_language_id(path)?;
-    let profile = ToolProfile::for_language(DIAGNOSTIC_PROFILES, language)?;
+    let profile = language_tool_profile(language)?.diagnostic.as_ref()?;
     let directory = profile.parent_directory.then(|| path.parent()).flatten().unwrap_or(workspace_root).to_path_buf();
-    Some(DiagnosticInvocation { program: profile.program.to_owned(), arguments: profile.arguments(path), directory })
+    Some(DiagnosticInvocation { program: profile.program.to_string(), arguments: profile.arguments(path), directory })
 }
 
-pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<DiagnosticEntry> {
+pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<QuickfixEntry> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -188,13 +183,13 @@ pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<Diag
     let path = if path.is_absolute() { path } else { directory.join(path) };
     let lowercase = message.to_ascii_lowercase();
     let severity = if lowercase.contains("error") {
-        DiagnosticSeverity::Error
+        Severity::Error
     } else if lowercase.contains("warning") || lowercase.contains("warn") {
-        DiagnosticSeverity::Warning
+        Severity::Warning
     } else if lowercase.contains("hint") {
-        DiagnosticSeverity::Hint
+        Severity::Hint
     } else {
-        DiagnosticSeverity::Information
+        Severity::Info
     };
-    Some(DiagnosticEntry { path, line: line_number.max(1), column: column.max(1), severity, message: message.to_owned() })
+    Some(QuickfixEntry::diagnostic(path, line_number.max(1), column.max(1), severity, message))
 }

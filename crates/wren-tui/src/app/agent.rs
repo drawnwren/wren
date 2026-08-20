@@ -2,11 +2,10 @@ use super::*;
 
 impl App {
     pub(super) fn toggle_agent_sidebar(&mut self) -> Result<()> {
-        if self.agent_sidebar.visible {
-            self.agent_sidebar.visible = false;
+        if self.agent_sidebar_visible {
+            self.agent_sidebar_visible = false;
             self.input_focus = InputFocus::Editor;
-            self.message = "Oh My Pi pane hidden".to_owned();
-            return Ok(());
+            return self.set_message("Oh My Pi pane hidden".to_owned());
         }
         self.open_agent_sidebar()
     }
@@ -17,18 +16,16 @@ impl App {
     }
 
     pub(super) fn open_agent_sidebar_in(&mut self, program: &str, arguments: &[&str]) -> Result<()> {
-        self.popup = None;
-        self.popup_deadline = None;
+        self.close_editor_popup();
         self.prompt = None;
         if self.agent_terminal.as_ref().is_none_or(|terminal| terminal.exit_code().is_some()) {
             let (rows, columns) = self.agent_terminal_dimensions();
             self.agent_terminal = Some(PtySession::spawn_in(program, arguments, rows, columns, &self.root_workspace)?);
         }
-        self.agent_sidebar.visible = true;
+        self.agent_sidebar_visible = true;
         self.input_focus = InputFocus::Agent(AgentInputPrefix::None);
         self.resize_agent_terminal();
-        self.message = "Oh My Pi · Ctrl-\\ Ctrl-N returns to editor".to_owned();
-        Ok(())
+        self.set_message("Oh My Pi · Ctrl-\\ Ctrl-N returns to editor".to_owned())
     }
 
     pub(super) fn start_ai_task(&mut self, prompt: &str) -> Result<()> {
@@ -44,11 +41,8 @@ impl App {
     }
 
     pub(super) fn poll_agent_terminal(&mut self) -> Result<bool> {
-        let Some(terminal) = &mut self.agent_terminal else {
-            return Ok(false);
-        };
-        let changed = terminal.poll()?;
-        if changed && let Some(code) = terminal.exit_code() {
+        let (changed, exit) = crate::app_terminal::poll_pty(&mut self.agent_terminal)?;
+        if let Some(code) = exit {
             self.input_focus = InputFocus::Editor;
             self.message = format!("Oh My Pi exited with status {code}");
         }
@@ -56,7 +50,7 @@ impl App {
     }
 
     pub(super) fn apply_agent_sidebar(&self, layout: &mut ViewportLayout, grid: DesiredGrid) -> DesiredGrid {
-        if !self.agent_sidebar.visible {
+        if !self.agent_sidebar_visible {
             return grid;
         }
         let Some(terminal) = &self.agent_terminal else {
@@ -81,11 +75,7 @@ impl App {
                 self.viewport_columns = columns.max(1);
                 self.resize_agent_terminal();
             }
-            TerminalInput::Paste(text) => {
-                if let Some(terminal) = &mut self.agent_terminal {
-                    terminal.send_input(text.as_bytes())?;
-                }
-            }
+            TerminalInput::Paste(text) => crate::app_terminal::send_pty(&mut self.agent_terminal, text.as_bytes())?,
             TerminalInput::Key(key) => self.handle_agent_key(key)?,
             event @ TerminalInput::Mouse { .. } => self.send_agent_mouse_input(&event)?,
             TerminalInput::Ignored => {}
@@ -94,17 +84,12 @@ impl App {
     }
 
     fn handle_agent_key(&mut self, key: TerminalKey) -> Result<()> {
-        let prefix = match self.input_focus {
-            InputFocus::Agent(prefix) => prefix,
-            _ => return Ok(()),
-        };
+        let InputFocus::Agent(prefix) = self.input_focus else { return Ok(()) };
         self.input_focus = InputFocus::Agent(AgentInputPrefix::None);
         match prefix {
             AgentInputPrefix::Window if self.handle_agent_window_key(key) => return Ok(()),
             AgentInputPrefix::Window => {
-                if let Some(terminal) = &mut self.agent_terminal {
-                    terminal.send_input(&[0x17])?;
-                }
+                crate::app_terminal::send_pty(&mut self.agent_terminal, &[0x17])?;
             }
             AgentInputPrefix::TerminalEscape if key.control() && matches!(key.code, TerminalKeyCode::Char('n' | 'N')) => {
                 self.input_focus = InputFocus::Editor;
@@ -112,9 +97,7 @@ impl App {
                 return Ok(());
             }
             AgentInputPrefix::TerminalEscape => {
-                if let Some(terminal) = &mut self.agent_terminal {
-                    terminal.send_input(&[0x1c])?;
-                }
+                crate::app_terminal::send_pty(&mut self.agent_terminal, &[0x1c])?;
             }
             AgentInputPrefix::None => {}
         }
@@ -124,13 +107,10 @@ impl App {
         }
         if key.control() && matches!(key.code, TerminalKeyCode::Char('w' | 'W')) {
             self.input_focus = InputFocus::Agent(AgentInputPrefix::Window);
-            self.message = "window: h editor · q hide harness".to_owned();
-            return Ok(());
+            return self.set_message("window: h editor · q hide harness".to_owned());
         }
-        if let Some(bytes) = terminal_key_bytes(key)
-            && let Some(terminal) = &mut self.agent_terminal
-        {
-            terminal.send_input(&bytes)?;
+        if let Some(bytes) = terminal_key_bytes(key) {
+            crate::app_terminal::send_pty(&mut self.agent_terminal, &bytes)?;
         }
         Ok(())
     }
@@ -142,7 +122,7 @@ impl App {
                 self.message = "editor window focused".to_owned();
             }
             TerminalKeyCode::Char('q' | 'Q' | 'c' | 'C') => {
-                self.agent_sidebar.visible = false;
+                self.agent_sidebar_visible = false;
                 self.input_focus = InputFocus::Editor;
                 self.message = "Oh My Pi pane hidden; session remains alive".to_owned();
             }
@@ -159,19 +139,13 @@ impl App {
         let Some(local_event) = self.agent_local_mouse_event(event) else {
             return Ok(());
         };
-        let Some(terminal) = &mut self.agent_terminal else {
-            return Ok(());
-        };
-        if terminal.surface().accepts_sgr_mouse() {
-            terminal.send_input(&terminal_mouse_bytes(&local_event))?;
-        }
-        Ok(())
+        crate::app_terminal::send_pty_mouse(&mut self.agent_terminal, &local_event)
     }
 
     pub(super) fn agent_local_mouse_event(&self, event: &TerminalInput) -> Option<TerminalInput> {
         let start = ViewportLayout::terminal_sidebar_column_for_size(self.viewport_columns, self.viewport_rows)?.saturating_add(1);
         match event {
-            TerminalInput::Mouse { action, column, row } => Some(TerminalInput::mouse(*action, column.saturating_sub(start), *row)),
+            TerminalInput::Mouse { action, column, row } => Some(TerminalInput::Mouse { action: *action, column: column.saturating_sub(start), row: *row }),
             TerminalInput::Key(_) | TerminalInput::Paste(_) | TerminalInput::Resized { .. } | TerminalInput::Ignored => None,
         }
     }

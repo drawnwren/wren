@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+pub use catppuccin::{ColorName as CatppuccinColor, FlavorName as CatppuccinFlavor};
+use compact_str::CompactString;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use wren_engine::{EngineFrame, FrameText, FrameTextChange};
 pub use wren_types::RgbColor;
-use wren_types::{Bias, BufferId, DocumentId, DocumentRevision, Edit, FloatingSurfaceId, TabId, Transaction, ViewId, WindowId, ranges_overlap};
+use wren_types::{Bias, BufferId, DocumentRevision, Edit, TabId, Transaction, WindowId, ranges_overlap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitAxis {
@@ -27,25 +29,16 @@ pub enum WindowDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SplitTree {
-    Window(WindowId),
-    Split { axis: SplitAxis, ratio_milli: u16, first: Box<SplitTree>, second: Box<SplitTree> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BufferView {
-    pub id: BufferId,
-    pub document_id: DocumentId,
-    pub name: Box<str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowView {
     pub id: WindowId,
-    pub view_id: ViewId,
     pub buffer_id: BufferId,
-    pub cursor_byte: usize,
     pub top_line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitTree {
+    Window(WindowView),
+    Split { axis: SplitAxis, ratio_milli: u16, first: Box<SplitTree>, second: Box<SplitTree> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,96 +56,16 @@ pub struct TabView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FloatingSurface {
-    pub id: FloatingSurfaceId,
-    pub owner: WindowId,
-    pub kind: Box<str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Extmark {
-    pub document_id: DocumentId,
-    pub range: Range<usize>,
-    pub kind: Box<str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromptSurface {
-    pub id: FloatingSurfaceId,
-    pub owner: WindowId,
-    pub prefix: char,
-    pub input: Box<str>,
-    pub cursor_byte: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CommandLineState {
-    pub prompt: Option<PromptSurface>,
-    pub history_index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MessageSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-impl MessageSeverity {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Info => "INFO",
-            Self::Warning => "WARN",
-            Self::Error => "ERROR",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageEntry {
-    pub sequence: u64,
-    pub severity: MessageSeverity,
-    pub text: Box<str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct MessageLog {
-    pub entries: Vec<MessageEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalSurface {
-    pub buffer_id: BufferId,
-    pub rows: u16,
-    pub columns: u16,
-    pub cursor: (u16, u16),
-    pub contents: Box<str>,
-    pub running: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientViewModel {
-    pub buffers: Vec<BufferView>,
-    pub windows: Vec<WindowView>,
     pub tabs: Vec<TabView>,
     pub active_tab: TabId,
-    pub floating: Vec<FloatingSurface>,
-    pub extmarks: Vec<Extmark>,
-    pub command_line: CommandLineState,
-    pub messages: MessageLog,
-    pub terminals: Vec<TerminalSurface>,
     next_id: u64,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ViewModelError {
-    #[error("unknown buffer {0:?}")]
-    UnknownBuffer(BufferId),
     #[error("unknown window {0:?}")]
     UnknownWindow(WindowId),
-    #[error("unknown tab {0:?}")]
-    UnknownTab(TabId),
     #[error("cannot close the final window")]
     FinalWindow,
     #[error("cannot close the final tab")]
@@ -161,40 +74,32 @@ pub enum ViewModelError {
 
 impl ClientViewModel {
     #[must_use]
-    pub fn new(document_id: DocumentId, name: impl Into<Box<str>>) -> Self {
+    pub fn initial() -> Self {
         let buffer_id = BufferId::new(1);
         let window_id = WindowId::new(2);
         let tab_id = TabId::new(4);
         Self {
-            buffers: vec![BufferView { id: buffer_id, document_id, name: name.into() }],
-            windows: vec![WindowView { id: window_id, view_id: ViewId::new(3), buffer_id, cursor_byte: 0, top_line: 0 }],
-            tabs: vec![TabView { id: tab_id, root: SplitTree::Window(window_id), active_window: window_id }],
+            tabs: vec![TabView { id: tab_id, root: SplitTree::Window(WindowView { id: window_id, buffer_id, top_line: 0 }), active_window: window_id }],
             active_tab: tab_id,
-            floating: Vec::new(),
-            extmarks: Vec::new(),
-            command_line: CommandLineState::default(),
-            messages: MessageLog::default(),
-            terminals: Vec::new(),
             next_id: 5,
         }
     }
 
     #[must_use]
     pub fn active_tab(&self) -> &TabView {
-        // The constructor and all mutators preserve this invariant.
-        &self.tabs[self.active_tab_index().unwrap_or_default()]
+        &self.tabs[self.active_tab_index()]
     }
 
     #[must_use]
     pub fn active_window(&self) -> &WindowView {
-        let id = self.active_tab().active_window;
-        self.windows.iter().find(|window| window.id == id).unwrap_or_else(|| &self.windows[0])
+        let tab = self.active_tab();
+        find_window(&tab.root, tab.active_window).unwrap_or_else(|| first_window(&tab.root))
     }
 
     pub fn active_window_mut(&mut self) -> &mut WindowView {
-        let id = self.active_tab().active_window;
-        let index = self.window_index(id).unwrap_or_default();
-        &mut self.windows[index]
+        let index = self.active_tab_index();
+        let id = self.tabs[index].active_window;
+        selected_window_mut(&mut self.tabs[index].root, id)
     }
 
     #[must_use]
@@ -202,79 +107,62 @@ impl ClientViewModel {
         self.active_window().buffer_id
     }
 
-    pub fn add_buffer(&mut self, document_id: DocumentId, name: impl Into<Box<str>>) -> BufferId {
-        let id = BufferId::new(self.allocate());
-        self.buffers.push(BufferView { id, document_id, name: name.into() });
-        id
+    pub fn add_buffer(&mut self) -> BufferId {
+        BufferId::new(self.allocate())
     }
 
-    pub fn set_active_buffer(&mut self, buffer_id: BufferId) -> Result<(), ViewModelError> {
-        if !self.has_buffer(buffer_id) {
-            return Err(ViewModelError::UnknownBuffer(buffer_id));
-        }
-        let window_id = self.active_tab().active_window;
-        let window_index = self.window_index(window_id)?;
-        self.windows[window_index].buffer_id = buffer_id;
-        Ok(())
+    pub fn set_active_buffer(&mut self, buffer_id: BufferId) {
+        self.active_window_mut().buffer_id = buffer_id;
     }
 
-    pub fn remove_buffer(&mut self, buffer_id: BufferId, replacement: BufferId) -> Result<(), ViewModelError> {
-        if !self.has_buffer(replacement) {
-            return Err(ViewModelError::UnknownBuffer(replacement));
+    pub fn remove_buffer(&mut self, buffer_id: BufferId, replacement: BufferId) {
+        for tab in &mut self.tabs {
+            visit_windows_mut(&mut tab.root, &mut |window| {
+                if window.buffer_id == buffer_id {
+                    window.buffer_id = replacement;
+                }
+            });
         }
-        if !self.has_buffer(buffer_id) {
-            return Err(ViewModelError::UnknownBuffer(buffer_id));
-        }
-        for window in &mut self.windows {
-            if window.buffer_id == buffer_id {
-                window.buffer_id = replacement;
-            }
-        }
-        self.buffers.retain(|buffer| buffer.id != buffer_id);
-        Ok(())
     }
 
     pub fn split_active(&mut self, axis: SplitAxis) -> Result<WindowId, ViewModelError> {
         let active = self.active_tab().active_window;
         let buffer_id = self.active_window().buffer_id;
-        let window_id = self.add_window(buffer_id);
-        let tab_index = self.active_tab_index()?;
+        let window_id = WindowId::new(self.allocate());
+        let window = WindowView { id: window_id, buffer_id, top_line: 0 };
+        let tab_index = self.active_tab_index();
         let tab = &mut self.tabs[tab_index];
-        replace_window_with_split(&mut tab.root, active, window_id, axis)?;
+        replace_window_with_split(&mut tab.root, active, &window, axis)?;
         tab.active_window = window_id;
         Ok(window_id)
     }
 
     pub fn close_active_window(&mut self) -> Result<(), ViewModelError> {
         let active = self.active_tab().active_window;
-        let tab_index = self.active_tab_index()?;
+        let tab_index = self.active_tab_index();
         let tab = &mut self.tabs[tab_index];
         let replacement = remove_window(&mut tab.root, active).ok_or(ViewModelError::FinalWindow)?;
         tab.active_window = replacement;
-        self.windows.retain(|window| window.id != active);
         Ok(())
     }
 
-    pub fn new_tab(&mut self, buffer_id: BufferId) -> Result<TabId, ViewModelError> {
-        if !self.has_buffer(buffer_id) {
-            return Err(ViewModelError::UnknownBuffer(buffer_id));
-        }
-        let window_id = self.add_window(buffer_id);
+    pub fn new_tab(&mut self, buffer_id: BufferId) -> TabId {
+        let window_id = WindowId::new(self.allocate());
         let tab_id = TabId::new(self.allocate());
-        self.tabs.push(TabView { id: tab_id, root: SplitTree::Window(window_id), active_window: window_id });
+        self.tabs.push(TabView { id: tab_id, root: SplitTree::Window(WindowView { id: window_id, buffer_id, top_line: 0 }), active_window: window_id });
         self.active_tab = tab_id;
-        Ok(tab_id)
+        tab_id
     }
 
     pub fn cycle_tab(&mut self, delta: isize) {
-        let current = self.active_tab_index().unwrap_or_default();
+        let current = self.active_tab_index();
         let len = self.tabs.len();
         let next = current.wrapping_add_signed(delta).rem_euclid(len);
         self.active_tab = self.tabs[next].id;
     }
 
     pub fn focus_window(&mut self, direction: WindowDirection) -> Result<(), ViewModelError> {
-        let tab_index = self.active_tab_index()?;
+        let tab_index = self.active_tab_index();
         let active = self.tabs[tab_index].active_window;
         let mut panes = Vec::new();
         split_rectangles(&self.tabs[tab_index].root, Rect { column: 0, row: 0, width: 1_000_000, height: 1_000_000 }, &mut panes);
@@ -315,50 +203,57 @@ impl ClientViewModel {
     }
 
     pub fn focus_window_id(&mut self, window_id: WindowId) -> Result<(), ViewModelError> {
-        let tab_index = self.active_tab_index()?;
+        let tab_index = self.active_tab_index();
         let tab = &mut self.tabs[tab_index];
-        if !window_ids(&tab.root).contains(&window_id) {
+        if !has_window(&tab.root, window_id) {
             return Err(ViewModelError::UnknownWindow(window_id));
         }
         tab.active_window = window_id;
         Ok(())
     }
 
-    pub fn cycle_window(&mut self, delta: isize) -> Result<(), ViewModelError> {
-        let tab_index = self.active_tab_index()?;
+    pub fn cycle_window(&mut self, delta: isize) {
+        let tab_index = self.active_tab_index();
         let ids = window_ids(&self.tabs[tab_index].root);
-        let current =
-            ids.iter().position(|id| *id == self.tabs[tab_index].active_window).ok_or(ViewModelError::UnknownWindow(self.tabs[tab_index].active_window))?;
+        let current = ids.iter().position(|id| *id == self.tabs[tab_index].active_window).unwrap_or_default();
         let next = current.wrapping_add_signed(delta).rem_euclid(ids.len());
         self.tabs[tab_index].active_window = ids[next];
-        Ok(())
     }
 
-    pub fn only_active_window(&mut self) -> Result<(), ViewModelError> {
-        let tab_index = self.active_tab_index()?;
-        let active = self.tabs[tab_index].active_window;
-        let removed = window_ids(&self.tabs[tab_index].root).into_iter().filter(|window| *window != active).collect::<Vec<_>>();
-        self.tabs[tab_index].root = SplitTree::Window(active);
-        self.windows.retain(|window| !removed.contains(&window.id));
-        Ok(())
+    pub fn only_active_window(&mut self) {
+        let tab_index = self.active_tab_index();
+        let window = self.active_window().clone();
+        self.tabs[tab_index].root = SplitTree::Window(window);
     }
 
-    pub fn equalize_windows(&mut self) -> Result<(), ViewModelError> {
-        let tab_index = self.active_tab_index()?;
+    pub fn equalize_windows(&mut self) {
+        let tab_index = self.active_tab_index();
         equalize_split_tree(&mut self.tabs[tab_index].root);
-        Ok(())
     }
 
     pub fn close_active_tab(&mut self) -> Result<(), ViewModelError> {
         if self.tabs.len() == 1 {
             return Err(ViewModelError::FinalTab);
         }
-        let current = self.active_tab_index()?;
-        let removed = self.tabs.remove(current);
-        let removed_windows = window_ids(&removed.root);
-        self.windows.retain(|window| !removed_windows.contains(&window.id));
+        let current = self.active_tab_index();
+        self.tabs.remove(current);
         self.active_tab = self.tabs[current.min(self.tabs.len() - 1)].id;
         Ok(())
+    }
+
+    #[must_use]
+    pub fn window_count(&self) -> usize {
+        self.tabs.iter().map(|tab| count_windows(&tab.root)).sum()
+    }
+
+    pub fn visit_windows(&self, mut visit: impl FnMut(&WindowView)) {
+        for tab in &self.tabs {
+            visit_windows(&tab.root, &mut visit);
+        }
+    }
+
+    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut WindowView> {
+        self.tabs.iter_mut().find_map(|tab| find_window_mut(&mut tab.root, id))
     }
 
     fn allocate(&mut self) -> u64 {
@@ -367,30 +262,20 @@ impl ClientViewModel {
         id
     }
 
-    fn active_tab_index(&self) -> Result<usize, ViewModelError> {
-        self.tabs.iter().position(|tab| tab.id == self.active_tab).ok_or(ViewModelError::UnknownTab(self.active_tab))
-    }
-
-    fn window_index(&self, id: WindowId) -> Result<usize, ViewModelError> {
-        self.windows.iter().position(|window| window.id == id).ok_or(ViewModelError::UnknownWindow(id))
-    }
-
-    fn has_buffer(&self, id: BufferId) -> bool {
-        self.buffers.iter().any(|buffer| buffer.id == id)
-    }
-
-    fn add_window(&mut self, buffer_id: BufferId) -> WindowId {
-        let id = WindowId::new(self.allocate());
-        let view_id = ViewId::new(self.allocate());
-        self.windows.push(WindowView { id, view_id, buffer_id, cursor_byte: 0, top_line: 0 });
-        id
+    fn active_tab_index(&self) -> usize {
+        self.tabs.iter().position(|tab| tab.id == self.active_tab).unwrap_or_default()
     }
 }
 
-fn replace_window_with_split(tree: &mut SplitTree, target: WindowId, new: WindowId, axis: SplitAxis) -> Result<(), ViewModelError> {
+fn replace_window_with_split(tree: &mut SplitTree, target: WindowId, new: &WindowView, axis: SplitAxis) -> Result<(), ViewModelError> {
     match tree {
-        SplitTree::Window(id) if *id == target => {
-            *tree = SplitTree::Split { axis, ratio_milli: 500, first: Box::new(SplitTree::Window(target)), second: Box::new(SplitTree::Window(new)) };
+        SplitTree::Window(window) if window.id == target => {
+            *tree = SplitTree::Split {
+                axis,
+                ratio_milli: 500,
+                first: Box::new(SplitTree::Window(window.clone())),
+                second: Box::new(SplitTree::Window(new.clone())),
+            };
             Ok(())
         }
         SplitTree::Window(_) => Err(ViewModelError::UnknownWindow(target)),
@@ -404,31 +289,84 @@ fn remove_window(tree: &mut SplitTree, target: WindowId) -> Option<WindowId> {
     let SplitTree::Split { first, second, .. } = tree else {
         return None;
     };
-    if matches!(first.as_ref(), SplitTree::Window(id) if *id == target) {
-        let sibling = std::mem::replace(second, Box::new(SplitTree::Window(target)));
-        let next = first_window(&sibling);
+    if matches!(first.as_ref(), SplitTree::Window(window) if window.id == target) {
+        let sibling = std::mem::replace(second, Box::new((**first).clone()));
+        let next = first_window(&sibling).id;
         *tree = *sibling;
         return Some(next);
     }
-    if matches!(second.as_ref(), SplitTree::Window(id) if *id == target) {
-        let sibling = std::mem::replace(first, Box::new(SplitTree::Window(target)));
-        let next = first_window(&sibling);
+    if matches!(second.as_ref(), SplitTree::Window(window) if window.id == target) {
+        let sibling = std::mem::replace(first, Box::new((**second).clone()));
+        let next = first_window(&sibling).id;
         *tree = *sibling;
         return Some(next);
     }
     remove_window(first, target).or_else(|| remove_window(second, target))
 }
 
-fn first_window(tree: &SplitTree) -> WindowId {
+fn first_window(tree: &SplitTree) -> &WindowView {
     match tree {
-        SplitTree::Window(id) => *id,
+        SplitTree::Window(window) => window,
         SplitTree::Split { first, .. } => first_window(first),
+    }
+}
+
+fn find_window(tree: &SplitTree, id: WindowId) -> Option<&WindowView> {
+    match tree {
+        SplitTree::Window(window) => (window.id == id).then_some(window),
+        SplitTree::Split { first, second, .. } => find_window(first, id).or_else(|| find_window(second, id)),
+    }
+}
+
+fn find_window_mut(tree: &mut SplitTree, id: WindowId) -> Option<&mut WindowView> {
+    match tree {
+        SplitTree::Window(window) => (window.id == id).then_some(window),
+        SplitTree::Split { first, second, .. } => find_window_mut(first, id).or_else(|| find_window_mut(second, id)),
+    }
+}
+
+fn selected_window_mut(tree: &mut SplitTree, id: WindowId) -> &mut WindowView {
+    match tree {
+        SplitTree::Window(window) => window,
+        SplitTree::Split { first, second, .. } if has_window(first, id) => selected_window_mut(first, id),
+        SplitTree::Split { second, .. } => selected_window_mut(second, id),
+    }
+}
+
+fn has_window(tree: &SplitTree, id: WindowId) -> bool {
+    find_window(tree, id).is_some()
+}
+
+fn count_windows(tree: &SplitTree) -> usize {
+    match tree {
+        SplitTree::Window(_) => 1,
+        SplitTree::Split { first, second, .. } => count_windows(first) + count_windows(second),
+    }
+}
+
+fn visit_windows(tree: &SplitTree, visit: &mut impl FnMut(&WindowView)) {
+    match tree {
+        SplitTree::Window(window) => visit(window),
+        SplitTree::Split { first, second, .. } => {
+            visit_windows(first, visit);
+            visit_windows(second, visit);
+        }
+    }
+}
+
+fn visit_windows_mut(tree: &mut SplitTree, visit: &mut impl FnMut(&mut WindowView)) {
+    match tree {
+        SplitTree::Window(window) => visit(window),
+        SplitTree::Split { first, second, .. } => {
+            visit_windows_mut(first, visit);
+            visit_windows_mut(second, visit);
+        }
     }
 }
 
 fn window_ids(tree: &SplitTree) -> Vec<WindowId> {
     match tree {
-        SplitTree::Window(id) => vec![*id],
+        SplitTree::Window(window) => vec![window.id],
         SplitTree::Split { first, second, .. } => {
             let mut ids = window_ids(first);
             ids.extend(window_ids(second));
@@ -459,128 +397,49 @@ impl CellColor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CatppuccinFlavor {
-    Latte,
-    Frappe,
-    Macchiato,
-    Mocha,
-}
-
-impl CatppuccinFlavor {
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "latte" | "catppuccin-latte" => Some(Self::Latte),
-            "frappe" | "frappé" | "catppuccin-frappe" => Some(Self::Frappe),
-            "macchiato" | "catppuccin-macchiato" => Some(Self::Macchiato),
-            "mocha" | "catppuccin" | "catppuccin-mocha" => Some(Self::Mocha),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Latte => "latte",
-            Self::Frappe => "frappe",
-            Self::Macchiato => "macchiato",
-            Self::Mocha => "mocha",
-        }
-    }
-}
-
-macro_rules! rgb {
-    ($value:literal) => {{
-        let value: u32 = $value;
-        RgbColor::new(((value >> 16) & 0xff) as u8, ((value >> 8) & 0xff) as u8, (value & 0xff) as u8)
-    }};
-}
-
-macro_rules! catppuccin_palette {
-    ($($slot:ident: [$latte:literal, $frappe:literal, $macchiato:literal, $mocha:literal]),+ $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-        pub struct CatppuccinPalette {
-            $(pub $slot: RgbColor),+
-        }
-
-        impl CatppuccinPalette {
-            #[must_use]
-            pub fn set(&mut self, name: &str, color: RgbColor) -> bool {
-                let slot = match name {
-                    $(stringify!($slot) => &mut self.$slot,)+
-                    _ => return false,
-                };
-                *slot = color;
-                true
-            }
-
-            fn slots(self) -> [RgbColor; 26] {
-                [$(self.$slot),+]
-            }
-
-            pub const LATTE: Self = Self { $($slot: rgb!($latte)),+ };
-            pub const FRAPPE: Self = Self { $($slot: rgb!($frappe)),+ };
-            pub const MACCHIATO: Self = Self { $($slot: rgb!($macchiato)),+ };
-            pub const MOCHA: Self = Self { $($slot: rgb!($mocha)),+ };
-        }
-    };
-}
-
-catppuccin_palette! {
-    rosewater: [0xdc8a78, 0xf2d5cf, 0xf4dbd6, 0xf5e0dc],
-    flamingo: [0xdd7878, 0xeebebe, 0xf0c6c6, 0xf2cdcd],
-    pink: [0xea76cb, 0xf4b8e4, 0xf5bde6, 0xf5c2e7],
-    mauve: [0x8839ef, 0xca9ee6, 0xc6a0f6, 0xcba6f7],
-    red: [0xd20f39, 0xe78284, 0xed8796, 0xf38ba8],
-    maroon: [0xe64553, 0xea999c, 0xee99a0, 0xeba0ac],
-    peach: [0xfe640b, 0xef9f76, 0xf5a97f, 0xfab387],
-    yellow: [0xdf8e1d, 0xe5c890, 0xeed49f, 0xf9e2af],
-    green: [0x40a02b, 0xa6d189, 0xa6da95, 0xa6e3a1],
-    teal: [0x179299, 0x81c8be, 0x8bd5ca, 0x94e2d5],
-    sky: [0x04a5e5, 0x99d1db, 0x91d7e3, 0x89dceb],
-    sapphire: [0x209fb5, 0x85c1dc, 0x7dc4e4, 0x74c7ec],
-    blue: [0x1e66f5, 0x8caaee, 0x8aadf4, 0x89b4fa],
-    lavender: [0x7287fd, 0xbabbf1, 0xb7bdf8, 0xb4befe],
-    text: [0x4c4f69, 0xc6d0f5, 0xcad3f5, 0xcdd6f4],
-    subtext1: [0x5c5f77, 0xb5bfe2, 0xb8c0e0, 0xbac2de],
-    subtext0: [0x6c6f85, 0xa5adce, 0xa5adcb, 0xa6adc8],
-    overlay2: [0x7c7f93, 0x949cbb, 0x939ab7, 0x9399b2],
-    overlay1: [0x8c8fa1, 0x838ba7, 0x8087a2, 0x7f849c],
-    overlay0: [0x9ca0b0, 0x737994, 0x6e738d, 0x6c7086],
-    surface2: [0xacb0be, 0x626880, 0x5b6078, 0x585b70],
-    surface1: [0xbcc0cc, 0x51576d, 0x494d64, 0x45475a],
-    surface0: [0xccd0da, 0x414559, 0x363a4f, 0x313244],
-    base: [0xeff1f5, 0x303446, 0x24273a, 0x1e1e2e],
-    mantle: [0xe6e9ef, 0x292c3c, 0x1e2030, 0x181825],
-    crust: [0xdce0e8, 0x232634, 0x181926, 0x11111b],
+pub struct CatppuccinPalette {
+    slots: [RgbColor; 26],
 }
 
 impl CatppuccinPalette {
     #[must_use]
-    pub const fn for_flavor(flavor: CatppuccinFlavor) -> Self {
-        match flavor {
-            CatppuccinFlavor::Latte => Self::LATTE,
-            CatppuccinFlavor::Frappe => Self::FRAPPE,
-            CatppuccinFlavor::Macchiato => Self::MACCHIATO,
-            CatppuccinFlavor::Mocha => Self::MOCHA,
+    pub fn for_flavor(flavor: CatppuccinFlavor) -> Self {
+        let colors = &catppuccin::PALETTE[flavor].colors;
+        let mut slots = [RgbColor::new(0, 0, 0); 26];
+        for color in colors {
+            slots[color.order as usize] = RgbColor::new(color.rgb.r, color.rgb.g, color.rgb.b);
         }
+        Self { slots }
+    }
+
+    #[must_use]
+    pub fn color(self, name: CatppuccinColor) -> RgbColor {
+        self.slots[catppuccin::PALETTE.mocha.colors[name].order as usize]
+    }
+
+    pub fn set(&mut self, name: &str, color: RgbColor) -> bool {
+        let Ok(name) = name.parse::<CatppuccinColor>() else { return false };
+        self.slots[catppuccin::PALETTE.mocha.colors[name].order as usize] = color;
+        true
     }
 
     fn remap_from_mocha(self, color: CellColor) -> CellColor {
         let CellColor::Rgb(rgb) = color else {
             return color;
         };
-        Self::MOCHA.slots().into_iter().zip(self.slots()).find_map(|(source, target)| (source == rgb).then_some(CellColor::Rgb(target))).unwrap_or(color)
+        Self::for_flavor(CatppuccinFlavor::Mocha)
+            .slots
+            .into_iter()
+            .zip(self.slots)
+            .find_map(|(source, target)| (source == rgb).then_some(CellColor::Rgb(target)))
+            .unwrap_or(color)
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellStyle {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub strikethrough: bool,
-    pub reverse: bool,
+    pub attributes: u8,
     /// True color is preferred; palette indexes remain available for terminal-native colors.
     pub foreground: Option<CellColor>,
     pub background: Option<CellColor>,
@@ -589,74 +448,83 @@ pub struct CellStyle {
 impl Default for CellStyle {
     fn default() -> Self {
         Self {
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            reverse: false,
-            foreground: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.text)),
-            background: Some(CellColor::Rgb(CatppuccinPalette::MOCHA.base)),
+            attributes: 0,
+            foreground: Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Text))),
+            background: Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Base))),
         }
     }
-}
-
-macro_rules! style_methods {
-    (value: $($method:ident($field:ident): $ty:ty => $value:expr),+; flag: $($flag:ident($flag_field:ident) => $flag_value:expr),+) => {
-        $(
-            #[must_use]
-            pub const fn $method(mut self, value: $ty) -> Self {
-                self.$field = $value(value);
-                self
-            }
-        )+
-        $(
-            #[must_use]
-            pub const fn $flag(mut self) -> Self {
-                self.$flag_field = $flag_value;
-                self
-            }
-        )+
-    };
 }
 
 impl CellStyle {
-    #[must_use]
     pub const fn rgb(foreground: RgbColor, background: RgbColor) -> Self {
-        Self {
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            reverse: false,
-            foreground: Some(CellColor::Rgb(foreground)),
-            background: Some(CellColor::Rgb(background)),
-        }
+        Self { attributes: 0, foreground: Some(CellColor::Rgb(foreground)), background: Some(CellColor::Rgb(background)) }
     }
 
-    style_methods! {
-        value: with_foreground(foreground): CellColor => Some,
-               with_background(background): CellColor => Some;
-        flag: without_foreground(foreground) => None,
-              without_background(background) => None,
-              with_bold(bold) => true,
-              with_italic(italic) => true,
-              with_underline(underline) => true,
-              with_strikethrough(strikethrough) => true,
-              with_reverse(reverse) => true
+    pub const fn with_foreground(mut self, color: CellColor) -> Self {
+        self.foreground = Some(color);
+        self
+    }
+
+    pub const fn with_background(mut self, color: CellColor) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    pub const fn without_foreground(mut self) -> Self {
+        self.foreground = None;
+        self
+    }
+
+    #[cfg(test)]
+    pub const fn without_background(mut self) -> Self {
+        self.background = None;
+        self
+    }
+
+    pub const fn with_bold(mut self) -> Self {
+        self.attributes |= 1;
+        self
+    }
+
+    pub const fn with_underline(mut self) -> Self {
+        self.attributes |= 4;
+        self
+    }
+
+    pub const fn with_reverse(mut self) -> Self {
+        self.attributes |= 16;
+        self
+    }
+
+    pub const fn bold(self) -> bool {
+        self.attributes & 1 != 0
+    }
+    pub const fn italic(self) -> bool {
+        self.attributes & 2 != 0
+    }
+    pub const fn underline(self) -> bool {
+        self.attributes & 4 != 0
+    }
+    pub const fn strikethrough(self) -> bool {
+        self.attributes & 8 != 0
+    }
+    pub const fn reverse(self) -> bool {
+        self.attributes & 16 != 0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PickerOverlayRow {
+pub struct MenuOverlayRow {
     pub label: Box<str>,
     pub detail: Box<str>,
+    pub source: Option<Box<str>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PickerOverlay {
     pub title: Box<str>,
     pub prompt: Box<str>,
-    pub rows: Vec<PickerOverlayRow>,
+    pub rows: Vec<MenuOverlayRow>,
     pub selected: usize,
     pub preview_title: Box<str>,
     pub preview: Box<str>,
@@ -667,34 +535,14 @@ pub struct PickerOverlay {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletionOverlayRow {
-    pub label: Box<str>,
-    pub detail: Box<str>,
-    pub source: Box<str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionOverlay {
-    pub rows: Vec<CompletionOverlayRow>,
+    pub rows: Vec<MenuOverlayRow>,
     pub selected: Option<usize>,
     pub documentation: Box<str>,
     pub documentation_scroll: usize,
 }
 
-#[derive(Clone, Copy)]
-struct CompletionMenu {
-    rectangle: Rect,
-    visible_rows: usize,
-    start: usize,
-}
-
-#[derive(Clone, Copy)]
-struct CompletionStyles {
-    base: CellStyle,
-    border: CellStyle,
-    selected: CellStyle,
-}
-
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPopup {
     pub title: Box<str>,
@@ -719,18 +567,16 @@ pub struct TerminalSidebar<'a> {
 }
 
 impl TextPopup {
-    #[must_use]
     pub fn new(title: impl Into<Box<str>>, text: impl Into<Box<str>>) -> Self {
         Self { title: title.into(), text: text.into(), scroll: 0, cursor: None, decorations: Vec::new() }
     }
 
-    #[must_use]
+    #[cfg(test)]
     pub fn with_cursor(mut self, cursor: (usize, usize)) -> Self {
         self.cursor = Some(cursor);
         self
     }
 
-    #[must_use]
     pub fn with_decorations(mut self, decorations: Vec<DecorationSpan>) -> Self {
         self.decorations = decorations;
         self
@@ -751,21 +597,6 @@ pub struct AceJumpTarget {
     pub label: Box<str>,
 }
 
-#[derive(Clone, Copy)]
-struct AceJumpPane {
-    rectangle: Rect,
-    gutter: usize,
-    content_width: usize,
-    start_byte: usize,
-    end_byte: usize,
-}
-
-struct AceJumpPosition<'a> {
-    row: usize,
-    column: usize,
-    label: &'a str,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AceJumpOverlay {
     pub targets: Vec<AceJumpTarget>,
@@ -773,12 +604,13 @@ pub struct AceJumpOverlay {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugOverlay {
-    pub scopes: Box<str>,
-    pub breakpoints: Box<str>,
-    pub stacks: Box<str>,
-    pub watches: Box<str>,
-    pub repl: Box<str>,
-    pub console: Box<str>,
+    pub panels: [DebugPanel; 6],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugPanel {
+    pub title: &'static str,
+    pub text: Box<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -827,71 +659,8 @@ pub struct Cell {
     pub style: CellStyle,
 }
 
-// A single Unicode scalar occupies at most four UTF-8 bytes. Longer grapheme
-// clusters remain lossless in the heap variant, while ordinary editor cells
-// stay compact enough to build and copy a viewport cheaply.
-const INLINE_GRAPHEME_BYTES: usize = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CellGrapheme {
-    Inline { len: u8, bytes: [u8; INLINE_GRAPHEME_BYTES] },
-    Heap(Box<str>),
-}
-
-impl From<&str> for CellGrapheme {
-    fn from(grapheme: &str) -> Self {
-        if grapheme.len() <= INLINE_GRAPHEME_BYTES {
-            let mut bytes = [0; INLINE_GRAPHEME_BYTES];
-            bytes[..grapheme.len()].copy_from_slice(grapheme.as_bytes());
-            return Self::Inline { len: u8::try_from(grapheme.len()).unwrap_or(0), bytes };
-        }
-        Self::Heap(Box::from(grapheme))
-    }
-}
-
-impl From<String> for CellGrapheme {
-    fn from(grapheme: String) -> Self {
-        if grapheme.len() <= INLINE_GRAPHEME_BYTES {
-            return Self::from(grapheme.as_str());
-        }
-        Self::Heap(grapheme.into_boxed_str())
-    }
-}
-
-impl AsRef<str> for CellGrapheme {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::Inline { len, bytes } => std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default(),
-            Self::Heap(grapheme) => grapheme,
-        }
-    }
-}
-
-impl std::ops::Deref for CellGrapheme {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_ref()
-    }
-}
-
-impl Serialize for CellGrapheme {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for CellGrapheme {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(Self::from)
-    }
-}
+/// Retains ordinary graphemes inline while preserving arbitrary clusters.
+pub type CellGrapheme = CompactString;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CellRow {
@@ -900,11 +669,13 @@ pub struct CellRow {
 
 impl CellRow {
     #[must_use]
+    #[cfg(test)]
     pub fn text(&self) -> String {
-        self.cells.iter().map(|cell| cell.grapheme.as_ref()).collect()
+        self.cells.iter().map(|cell| cell.grapheme.as_str()).collect()
     }
 }
 
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredGrid {
     pub epoch: u64,
@@ -918,6 +689,7 @@ pub struct DesiredGrid {
 
 impl DesiredGrid {
     #[must_use]
+    #[cfg(test)]
     pub fn text(&self) -> String {
         self.rows.iter().map(|row| row.text()).collect::<Vec<_>>().join("\n")
     }
@@ -932,13 +704,8 @@ pub struct RasterOverlay {
     pub height: usize,
     pub columns: usize,
     pub rows: usize,
-    pub source: RasterSource,
-}
-
-#[derive(Debug, Clone)]
-pub enum RasterSource {
-    Rgb(Arc<Vec<u8>>),
-    Quads { background: RgbColor, quads: Arc<Vec<RasterQuad>> },
+    pub background: RgbColor,
+    pub quads: Arc<Vec<RasterQuad>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -982,7 +749,7 @@ struct EditorRenderSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedLogicalRow {
-    row: Arc<CellRow>,
+    rows: Vec<Arc<CellRow>>,
     decorations: Vec<DecorationSpan>,
 }
 
@@ -1021,6 +788,23 @@ struct EditorRenderRequest<'a> {
     shared: Option<&'a SharedDecorations>,
 }
 
+impl CachedEditorRender {
+    fn matches_context(&self, request: EditorRenderRequest<'_>, top_line: usize, settings: EditorRenderSettings, relative_cursor_line: Option<usize>) -> bool {
+        self.top_line == top_line
+            && self.settings == settings
+            && self.status.as_ref() == request.status
+            && self.prompt.as_deref() == request.prompt
+            && self.line_decorations == request.line_decorations
+            && self.relative_cursor_line == relative_cursor_line
+    }
+
+    fn matches_frame(&self, request: EditorRenderRequest<'_>, top_line: usize, settings: EditorRenderSettings, relative_cursor_line: Option<usize>) -> bool {
+        self.text.same_snapshot(&request.frame.text)
+            && self.decorations.as_ref() == request.decorations
+            && self.matches_context(request, top_line, settings, relative_cursor_line)
+    }
+}
+
 struct WorkspacePaneSource<'a> {
     window: &'a WindowView,
     frame: &'a EngineFrame,
@@ -1028,29 +812,12 @@ struct WorkspacePaneSource<'a> {
     line_decorations: &'a [LineDecoration],
 }
 
-struct ViewportShift {
-    moving_down: bool,
-    line_delta: usize,
-    content_height: usize,
-    introduced_start: usize,
-    introduced_end: usize,
-    start_byte: usize,
-    end_byte: usize,
-    cursor_line: usize,
-    cached_row_lines: Vec<Option<usize>>,
-    cached_decorations: SharedDecorations,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TerminalPatch {
-    Clear,
-    ClearToEndOfLine(CellStyle),
-    MoveTo { column: usize, row: usize },
-    SetStyle(CellStyle),
-    Put(Cell),
-    PutRow(Arc<CellRow>),
-    SetRasterOverlay(Option<Arc<RasterOverlay>>),
-    ShowCursor(bool),
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TerminalUpdate {
+    pub clear: bool,
+    pub rows: Vec<(usize, Arc<CellRow>)>,
+    pub raster_overlay: Option<Option<Arc<RasterOverlay>>>,
+    pub cursor: (usize, usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1067,7 +834,7 @@ pub struct ViewportLayout {
     theme: CatppuccinPalette,
     epoch: u64,
     cached_rows: Vec<Arc<CellRow>>,
-    cached_logical_rows: BTreeMap<usize, CachedLogicalRow>,
+    cached_logical_rows: BTreeMap<(usize, Option<usize>), CachedLogicalRow>,
     cached_editor_render: Option<CachedEditorRender>,
     cached_editor_viewports: Vec<CachedEditorViewport>,
     cached_decoration_compositions: Vec<CachedDecorationComposition>,
@@ -1079,7 +846,7 @@ pub struct ViewportLayout {
 
 impl ViewportLayout {
     #[must_use]
-    pub const fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize) -> Self {
         Self {
             width,
             height,
@@ -1090,7 +857,7 @@ impl ViewportLayout {
             relative_numbers: false,
             number_width: 0,
             color_column: None,
-            theme: CatppuccinPalette::MOCHA,
+            theme: CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha),
             epoch: 0,
             cached_rows: Vec::new(),
             cached_logical_rows: BTreeMap::new(),
@@ -1110,11 +877,6 @@ impl ViewportLayout {
             self.clear_cached_rendering();
             self.epoch = self.epoch.saturating_add(1);
         }
-    }
-
-    #[must_use]
-    pub const fn theme(&self) -> CatppuccinPalette {
-        self.theme
     }
 
     pub fn configure_dotfile_profile(&mut self) {
@@ -1199,7 +961,6 @@ impl ViewportLayout {
 
     /// Maps a terminal cell back through the same pane, gutter, tab, Unicode,
     /// and soft-wrap geometry used to render the workspace.
-    #[must_use]
     pub fn hit_test_workspace(
         &self,
         model: &ClientViewModel,
@@ -1225,7 +986,7 @@ impl ViewportLayout {
                 && row >= rectangle.row
                 && row < rectangle.row.saturating_add(rectangle.height)
         })?;
-        let window = model.windows.iter().find(|window| window.id == window_id)?;
+        let window = find_window(&model.active_tab().root, window_id)?;
         let (_, frame) = frames.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id)?;
         let mut pane = Self::new(rectangle.width.max(1), rectangle.height.max(1));
         pane.top_line = window.top_line;
@@ -1260,17 +1021,15 @@ impl ViewportLayout {
         }
     }
 
-    #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn desired_grid(&mut self, frame: &EngineFrame) -> DesiredGrid {
         self.desired_editor_grid_with_line_decorations(frame, "", None, &[], &[])
     }
 
-    #[must_use]
     pub fn desired_editor_grid(&mut self, frame: &EngineFrame, status: &str, prompt: Option<&str>) -> DesiredGrid {
         self.desired_editor_grid_with_line_decorations(frame, status, prompt, &[], &[])
     }
 
-    #[must_use]
     pub fn desired_editor_grid_with_line_decorations(
         &mut self,
         frame: &EngineFrame,
@@ -1282,7 +1041,6 @@ impl ViewportLayout {
         self.desired_editor_grid_retaining_decorations(frame, status, prompt, decorations, line_decorations, None)
     }
 
-    #[must_use]
     pub fn desired_editor_grid_with_shared_decorations(
         &mut self,
         frame: &EngineFrame,
@@ -1304,56 +1062,129 @@ impl ViewportLayout {
         shared: Option<&SharedDecorations>,
     ) -> DesiredGrid {
         let request = EditorRenderRequest { frame, status, prompt, decorations, line_decorations, shared };
-        if let Some(grid) = self.reuse_cached_editor_grid(request) {
+        let cached = self.cached_rows.len() == self.height
+            && self.cached_editor_render.as_ref().is_some_and(|cached| {
+                cached.matches_frame(
+                    request,
+                    self.top_line,
+                    self.editor_render_settings(),
+                    self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)),
+                )
+            });
+        if cached {
+            return self.reuse_editor_render(frame, status, prompt);
+        }
+        if let Some(grid) = self.repaint_cached_editor_line(request) {
             return grid;
         }
-        self.render_editor_grid(request)
-    }
-
-    fn reuse_cached_editor_grid(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        // Text changes and presentation-only changes have disjoint reuse
-        // strategies. Classify that state once so an edit does not walk every
-        // viewport, decoration, and cursor-only cache before reaching the
-        // incremental line renderer.
-        if self.cached_editor_render.as_ref().is_some_and(|cached| !cached.text.same_snapshot(&request.frame.text)) {
-            return self.update_cached_editor_line(request);
+        if self.reuse_recent_editor_viewport(request) {
+            return self.reuse_editor_render(frame, status, prompt);
         }
-        if self.editor_render_is_cached(request) {
-            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
+        if let Some(grid) = self.reconcile_cached_editor(request) {
+            return grid;
         }
-        if let Some(grid) = self.reuse_recent_editor_viewport(request) {
-            return Some(grid);
-        }
-        self.stash_current_editor_viewport(request.frame);
-        for reuse in [
-            Self::update_cached_editor_distant_viewport,
-            Self::update_cached_editor_viewport,
-            Self::update_cached_editor_decorations,
-            Self::update_cached_editor_relative_numbers,
-        ] {
-            if let Some(grid) = reuse(self, request) {
-                return Some(grid);
-            }
-        }
-        None
-    }
-
-    fn render_editor_grid(&mut self, request: EditorRenderRequest<'_>) -> DesiredGrid {
-        let preserve_logical_rows = self
-            .cached_editor_render
-            .as_ref()
-            .is_some_and(|cached| cached.text.same_snapshot(&request.frame.text) && self.editor_render_static_structure_is_cached(request));
+        let preserve_logical_rows =
+            self.cached_editor_render.as_ref().is_some_and(|cached| cached.text.same_snapshot(&frame.text) && self.editor_cache_is_compatible(request));
         if !preserve_logical_rows {
             self.cached_logical_rows.clear();
         }
-        let layout = self.editor_grid_layout(request.status, request.prompt);
-        let mut content = self.render_editor_content(request.frame, request.decorations, request.line_decorations, layout);
-        self.append_editor_footer(&mut content.rows, &mut content.cursor, layout.content_height, request.status, request.prompt);
-        self.finish_editor_grid(request, content)
+        let layout = EditorGridLayout { content_height: self.editor_content_height(status, prompt), gutter: self.editor_gutter(self.width) };
+        let mut content = self.render_editor_content(frame, decorations, line_decorations, layout);
+        if let Some((row, prompt_cursor)) = self.editor_footer(status, prompt) {
+            content.rows.resize_with(layout.content_height, CellRow::default);
+            content.rows.push(row);
+            if let Some(prompt_cursor) = prompt_cursor {
+                content.cursor = prompt_cursor;
+            }
+        }
+        let cursor = content.cursor;
+        let grid = self.finish_rows(content.rows, cursor);
+        self.cache_editor_render(request, content.row_lines, self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)));
+        self.stash_current_viewport_rows();
+        grid
     }
 
-    fn editor_grid_layout(&self, status: &str, prompt: Option<&str>) -> EditorGridLayout {
-        EditorGridLayout { content_height: self.editor_content_height(status, prompt), gutter: self.editor_gutter(self.width) }
+    fn repaint_cached_editor_line(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        let cached = self.cached_editor_render.as_ref()?;
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
+        if cached.text.same_snapshot(&request.frame.text)
+            || !cached.matches_context(request, self.top_line, self.editor_render_settings(), self.relative_numbers.then_some(cursor_line))
+            || !self.editor_cache_is_compatible(request)
+        {
+            return None;
+        }
+        let change = single_line_change(&cached.text, &request.frame.text)?;
+        let content_height = self.editor_content_height(request.status, request.prompt);
+        let old_visible = cached.text.byte_of_line(self.top_line)..cached.text.byte_of_line(self.top_line.saturating_add(content_height));
+        let new_visible = request.frame.text.byte_of_line(self.top_line)..request.frame.text.byte_of_line(self.top_line.saturating_add(content_height));
+        let affected = decoration_change_range(&cached.decorations, request.decorations, change, old_visible, new_visible.clone());
+        let start = affected.start.max(new_visible.start);
+        let end = affected.end.min(new_visible.end);
+        let mut repaints = Vec::new();
+        if start < end {
+            let first = request.frame.text.line_of_byte(start);
+            let last = request.frame.text.line_of_byte(end.saturating_sub(1));
+            if last.saturating_sub(first) >= 4 {
+                return None;
+            }
+            for line in first..=last {
+                let Some(screen_row) = cached.content_row_lines.iter().position(|row_line| *row_line == Some(line)) else {
+                    continue;
+                };
+                let old_rows = cached.content_row_lines[screen_row..].iter().take_while(|row_line| **row_line == Some(line)).count();
+                let line_range = logical_line_range(&request.frame.text, line);
+                let rendered = self.render_editor_line(
+                    &request.frame.text,
+                    line,
+                    cursor_line,
+                    line_range.start,
+                    line_range.end,
+                    old_rows,
+                    request.decorations,
+                    request.line_decorations,
+                );
+                if rendered.len() != old_rows {
+                    return None;
+                }
+                repaints.push((line, screen_row, rendered));
+            }
+        }
+        for (line, screen_row, rendered) in repaints {
+            self.remove_cached_logical_line(line);
+            for (target, row) in self.cached_rows[screen_row..].iter_mut().zip(rendered) {
+                *target = Arc::new(row);
+            }
+        }
+        let cached = self.cached_editor_render.as_mut()?;
+        cached.text.clone_from(&request.frame.text);
+        cached.decorations = retain_decorations(request.decorations, request.shared);
+        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
+    }
+
+    fn reuse_recent_editor_viewport(&mut self, request: EditorRenderRequest<'_>) -> bool {
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
+        let settings = self.editor_render_settings();
+        let Some(index) = self.cached_editor_viewports.iter().position(|viewport| {
+            viewport.rows.len() == self.height && viewport.render.matches_frame(request, self.top_line, settings, self.relative_numbers.then_some(cursor_line))
+        }) else {
+            return false;
+        };
+        let viewport = self.cached_editor_viewports.swap_remove(index);
+        if let Some(render) = self.cached_editor_render.replace(viewport.render) {
+            let rows = std::mem::replace(&mut self.cached_rows, viewport.rows);
+            self.cached_editor_viewports.push(CachedEditorViewport { render, rows });
+        } else {
+            self.cached_rows = viewport.rows;
+        }
+        self.prune_recent_editor_viewports();
+        true
+    }
+
+    fn prune_recent_editor_viewports(&mut self) {
+        const CAPACITY: usize = 8;
+        if self.cached_editor_viewports.len() > CAPACITY {
+            self.cached_editor_viewports.drain(..self.cached_editor_viewports.len() - CAPACITY);
+        }
     }
 
     fn editor_content_height(&self, status: &str, prompt: Option<&str>) -> usize {
@@ -1400,48 +1231,28 @@ impl ViewportLayout {
             cursor.0 = cursor.0.saturating_add(layout.gutter);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(&mut rows, layout.gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.mantle);
+            mark_color_column(&mut rows, layout.gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.color(CatppuccinColor::Mantle));
         }
         RenderedEditorContent { rows, row_lines, cursor }
     }
 
-    fn append_editor_footer(&self, rows: &mut Vec<CellRow>, cursor: &mut (usize, usize), content_height: usize, status: &str, prompt: Option<&str>) {
-        let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
-            return;
-        };
-        let style = prompt_style(prompt.is_some());
-        rows.resize_with(content_height, CellRow::default);
-        rows.push(row_from_text(label, self.width, style, self.tab_width));
-        if prompt.is_some() {
-            *cursor = self.prompt_cursor(label);
-        }
+    fn editor_footer(&self, status: &str, prompt: Option<&str>) -> Option<(CellRow, Option<(usize, usize)>)> {
+        let label = prompt.or((!status.is_empty()).then_some(status))?;
+        Some((row_from_text(label, self.width, prompt_style(prompt.is_some()), self.tab_width), prompt.map(|_| self.prompt_cursor(label))))
     }
 
-    fn finish_editor_grid(&mut self, request: EditorRenderRequest<'_>, mut content: RenderedEditorContent) -> DesiredGrid {
-        content.rows.resize_with(self.height, CellRow::default);
-        content.rows.truncate(self.height);
-        ensure_row_backgrounds(&mut content.rows);
-        apply_theme_to_rows(&mut content.rows, self.theme);
-        let rows: Vec<_> = content
-            .rows
-            .into_iter()
-            .enumerate()
-            .map(|(index, row)| self.cached_rows.get(index).filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)))
-            .collect();
-        self.cached_rows.clone_from(&rows);
+    fn cache_editor_render(&mut self, request: EditorRenderRequest<'_>, content_row_lines: Vec<Option<usize>>, relative_cursor_line: Option<usize>) {
         self.cached_editor_render = Some(CachedEditorRender {
             text: request.frame.text.clone(),
-            content_row_lines: content.row_lines,
+            content_row_lines,
             top_line: self.top_line,
             settings: self.editor_render_settings(),
             status: request.status.into(),
             prompt: request.prompt.map(Into::into),
             decorations: retain_decorations(request.decorations, request.shared),
             line_decorations: request.line_decorations.to_vec(),
-            relative_cursor_line: self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)),
+            relative_cursor_line,
         });
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor: content.cursor, raster_overlay: None }
     }
 
     fn prompt_cursor(&self, label: &str) -> (usize, usize) {
@@ -1449,489 +1260,179 @@ impl ViewportLayout {
         (display_width(input, self.tab_width).min(self.width.saturating_sub(1)), self.height.saturating_sub(1))
     }
 
-    fn editor_render_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
+    fn editor_cache_is_compatible(&self, request: EditorRenderRequest<'_>) -> bool {
         let Some(cached) = &self.cached_editor_render else {
             return false;
         };
-        cached.text.same_snapshot(&request.frame.text) && self.editor_render_context_is_cached(request)
+        self.cached_rows.len() == self.height && cached.settings == self.editor_render_settings() && cached.line_decorations == request.line_decorations
     }
 
-    fn reuse_recent_editor_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        self.cached_editor_viewports.retain(|viewport| viewport.render.text.same_snapshot(&request.frame.text));
-        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        let index = self.cached_editor_viewports.iter().position(|viewport| {
-            let cached = &viewport.render;
-            viewport.rows.len() == self.height
-                && cached.top_line == self.top_line
-                && cached.text.same_snapshot(&request.frame.text)
-                && cached.settings == self.editor_render_settings()
-                && cached.status.as_ref() == request.status
-                && cached.prompt.as_deref() == request.prompt
-                && cached.decorations.as_ref() == request.decorations
-                && cached.line_decorations == request.line_decorations
-                && cached.relative_cursor_line == self.relative_numbers.then_some(cursor_line)
-        })?;
-        let viewport = self.cached_editor_viewports.swap_remove(index);
-        if let Some(render) = self.cached_editor_render.take()
-            && self.cached_rows.len() == self.height
-            && render.text.same_snapshot(&request.frame.text)
-        {
-            self.cached_editor_viewports.push(CachedEditorViewport { render, rows: std::mem::take(&mut self.cached_rows) });
-        }
-        self.cached_editor_render = Some(viewport.render);
-        self.cached_rows = viewport.rows;
-        self.prune_recent_editor_viewports();
-        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
-    }
-
-    fn stash_current_editor_viewport(&mut self, frame: &EngineFrame) {
-        let Some(cached) = self.cached_editor_render.as_ref() else {
-            return;
-        };
-        if self.cached_rows.len() != self.height || !cached.text.same_snapshot(&frame.text) {
-            self.cached_editor_viewports.retain(|viewport| viewport.render.text.same_snapshot(&frame.text));
-            return;
-        }
-        let duplicate = self.cached_editor_viewports.iter().any(|viewport| {
-            viewport.render.top_line == cached.top_line
-                && viewport.render.relative_cursor_line == cached.relative_cursor_line
-                && viewport.render.decorations == cached.decorations
-                && viewport.render.line_decorations == cached.line_decorations
-                && viewport.render.status == cached.status
-                && viewport.render.prompt == cached.prompt
-        });
-        if !duplicate {
-            self.cached_editor_viewports.push(CachedEditorViewport { render: cached.clone(), rows: self.cached_rows.clone() });
-            self.prune_recent_editor_viewports();
-        }
-    }
-
-    fn prune_recent_editor_viewports(&mut self) {
-        const RECENT_VIEWPORT_CAPACITY: usize = 8;
-        if self.cached_editor_viewports.len() > RECENT_VIEWPORT_CAPACITY {
-            self.cached_editor_viewports.drain(..self.cached_editor_viewports.len() - RECENT_VIEWPORT_CAPACITY);
-        }
-    }
-
-    fn editor_render_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        let Some(cached) = &self.cached_editor_render else {
-            return false;
-        };
-        self.cached_rows.len() == self.height && cached.top_line == self.top_line && self.editor_render_stable_context_is_cached(request)
-    }
-
-    fn editor_render_stable_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        let Some(cached) = &self.cached_editor_render else {
-            return false;
-        };
-        self.editor_render_structure_is_cached(request) && cached.decorations.as_ref() == request.decorations
-    }
-
-    fn editor_render_structure_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        self.editor_render_static_structure_is_cached(request)
-            && self
-                .cached_editor_render
-                .as_ref()
-                .is_some_and(|cached| cached.relative_cursor_line == self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte)))
-    }
-
-    fn editor_render_static_structure_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        self.editor_render_shape_is_cached(request) && self.cached_editor_render.as_ref().is_some_and(|cached| cached.status.as_ref() == request.status)
-    }
-
-    fn editor_render_shape_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        let Some(cached) = &self.cached_editor_render else {
-            return false;
-        };
-        self.cached_rows.len() == self.height
-            && cached.settings == self.editor_render_settings()
-            && cached.prompt.as_deref() == request.prompt
-            && cached.line_decorations == request.line_decorations
-    }
-
-    fn editor_line_update_context_is_cached(&self, request: EditorRenderRequest<'_>) -> bool {
-        let Some(cached) = &self.cached_editor_render else {
-            return false;
-        };
-        self.editor_render_shape_is_cached(request)
-            && cached.top_line == self.top_line
-            && cached.status.is_empty() == request.status.is_empty()
-            && cached.relative_cursor_line == self.relative_numbers.then(|| request.frame.text.line_of_byte(request.frame.cursor_byte))
-    }
-
-    fn update_cached_editor_decorations(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        let cached = self.cached_editor_render.as_ref()?;
-        if !cached.text.same_snapshot(&request.frame.text)
-            || cached.top_line != self.top_line
-            || cached.decorations.as_ref() == request.decorations
-            || !self.editor_render_structure_is_cached(request)
-        {
+    fn reconcile_cached_editor(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
+        if !self.editor_cache_is_compatible(request) {
             return None;
         }
-        let prefix = cached.decorations.iter().zip(request.decorations).take_while(|(old, new)| old == new).count();
-        let suffix = cached.decorations[prefix..]
-            .iter()
-            .rev()
-            .zip(request.decorations[prefix.min(request.decorations.len())..].iter().rev())
-            .take_while(|(old, new)| old == new)
-            .count();
-        let old_end = cached.decorations.len().saturating_sub(suffix);
-        let new_end = request.decorations.len().saturating_sub(suffix);
-        let changed = cached.decorations[prefix.min(old_end)..old_end].iter().chain(request.decorations[prefix.min(new_end)..new_end].iter());
-        let affected = changed.fold(None::<Range<usize>>, |affected, span| {
-            Some(affected.map_or_else(|| span.range.clone(), |affected| affected.start.min(span.range.start)..affected.end.max(span.range.end)))
-        })?;
-        let logical_line = request.frame.text.line_of_byte(affected.start);
-        if request.frame.text.line_of_byte(affected.end.saturating_sub(1).max(affected.start)) != logical_line {
-            return None;
+        let same_text = self.cached_editor_render.as_ref()?.text.same_snapshot(&request.frame.text);
+        let changed_line = if same_text { None } else { Some(single_line_change(&self.cached_editor_render.as_ref()?.text, &request.frame.text)?) };
+        let trust = self.logical_row_trust(request, changed_line);
+        if let Some(changed_line) = changed_line {
+            self.remove_cached_logical_line(changed_line.line);
         }
-        self.cached_logical_rows.remove(&logical_line);
-        let Some(screen_row) = cached.content_row_lines.iter().position(|line| *line == Some(logical_line)) else {
-            self.cached_editor_render.as_mut()?.decorations = retain_decorations(request.decorations, request.shared);
-            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
-        };
-        let visible_rows = cached.content_row_lines[screen_row..].iter().take_while(|line| **line == Some(logical_line)).count().max(1);
-        let start = request.frame.text.byte_of_line(logical_line);
-        let mut end = request.frame.text.byte_of_line(logical_line.saturating_add(1));
-        if end > start && request.frame.text.slice(end - 1..end).as_ref() == "\n" {
-            end -= 1;
-        }
-        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        let rendered =
-            self.render_editor_line(&request.frame.text, logical_line, cursor_line, start, end, visible_rows, request.decorations, request.line_decorations);
-        if rendered.len() != visible_rows {
-            return None;
-        }
-        for (offset, row) in rendered.into_iter().enumerate() {
-            self.cached_rows[screen_row + offset] = Arc::new(row);
-        }
-        self.cached_editor_render.as_mut()?.decorations = retain_decorations(request.decorations, request.shared);
-        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
-    }
 
-    fn update_cached_editor_relative_numbers(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        let cached = self.cached_editor_render.as_ref()?;
-        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        if !self.relative_numbers
-            || !cached.text.same_snapshot(&request.frame.text)
-            || cached.top_line != self.top_line
-            || cached.decorations.as_ref() != request.decorations
-            || cached.relative_cursor_line == Some(cursor_line)
-            || !self.editor_render_static_structure_is_cached(request)
-        {
-            return None;
-        }
-        let content_row_lines = cached.content_row_lines.clone();
-        for (row, logical_line) in self.cached_rows.iter_mut().zip(content_row_lines) {
-            let Some(logical_line) = logical_line else {
-                continue;
-            };
-            replace_line_number(Arc::make_mut(row), logical_line, cursor_line, self.number_width, true, request.line_decorations);
-        }
-        self.cached_editor_render.as_mut()?.relative_cursor_line = Some(cursor_line);
-        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
-    }
-
-    fn update_cached_editor_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        let shift = self.viewport_shift(request)?;
-        let introduced = self.shift_introduced_rows(request.frame, request.decorations, request.line_decorations, &shift);
-        if introduced.len() != shift.line_delta {
-            return None;
-        }
-        self.stash_shift_displaced_rows(request.frame, &shift);
-        self.install_shift_rows(&shift, introduced);
-        self.commit_viewport_shift(&shift, request.decorations, request.line_decorations, request.shared)?;
-        self.prune_cached_logical_rows(shift.content_height);
-        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
-    }
-
-    fn viewport_shift(&self, request: EditorRenderRequest<'_>) -> Option<ViewportShift> {
-        let cached = self.cached_editor_render.as_ref()?;
-        let cached_top_line = cached.top_line;
-        let moving_down = self.top_line >= cached_top_line;
-        let line_delta = self.top_line.abs_diff(cached_top_line);
-        if !cached.text.same_snapshot(&request.frame.text) || line_delta == 0 || !self.editor_render_static_structure_is_cached(request) {
-            return None;
-        }
         let content_height = self.editor_content_height(request.status, request.prompt);
-        if line_delta >= content_height
-            || cached.content_row_lines.len() != content_height
-            || !cached.content_row_lines.iter().enumerate().all(|(offset, line)| *line == Some(cached_top_line.saturating_add(offset)))
-        {
-            return None;
-        }
-        let cached_content_row_lines = cached.content_row_lines.clone();
-        let cached_decorations = cached.decorations.clone();
-        let overlap_start_line = self.top_line.max(cached_top_line);
-        let overlap_end_line = self.top_line.saturating_add(content_height).min(cached_top_line.saturating_add(content_height));
-        let overlap = request.frame.text.byte_of_line(overlap_start_line)..request.frame.text.byte_of_line(overlap_end_line);
-        if !decorations_match_range(&cached_decorations, request.decorations, &overlap) {
-            return None;
-        }
         let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        let introduced_start = if moving_down { self.top_line.saturating_add(content_height.saturating_sub(line_delta)) } else { self.top_line };
-        let introduced_end = introduced_start.saturating_add(line_delta);
-        let start = request.frame.text.byte_of_line(introduced_start);
-        let end = request.frame.text.byte_of_line(introduced_end).min(request.frame.text.len());
-        let text = request.frame.text.slice(start..end);
-        let content_width = self.width.saturating_sub(self.editor_grid_layout(request.status, request.prompt).gutter).max(1);
-        if text.split_terminator('\n').any(|line| visual_line_rows(line, content_width, self.tab_width) != 1) {
-            return None;
+        let last_line = request.frame.text.line_of_byte(request.frame.text.len());
+        let mut decorations = DecorationResolver::new_at(request.decorations, request.frame.text.byte_of_line(self.top_line));
+        let mut rows = Vec::with_capacity(self.height);
+        let mut row_lines = Vec::with_capacity(content_height);
+        let mut logical_line = self.top_line;
+        while rows.len() < content_height && logical_line <= last_line {
+            let remaining = content_height - rows.len();
+            let trusted = trust.as_ref().is_some_and(|range| range.contains(&logical_line)) && self.has_cached_logical_line(logical_line);
+            let line_range = logical_line_range(&request.frame.text, logical_line);
+            let indices = decorations.overlapping_indices(line_range);
+            let mut line_rows = self.cached_line_rows(request, logical_line, remaining, (!trusted).then_some(indices));
+            row_lines.push(Some(logical_line));
+            row_lines.resize(row_lines.len().saturating_add(line_rows.len().saturating_sub(1)), None);
+            rows.append(&mut line_rows);
+            logical_line += 1;
         }
-        Some(ViewportShift {
-            moving_down,
-            line_delta,
-            content_height,
-            introduced_start,
-            introduced_end,
-            start_byte: start,
-            end_byte: end,
-            cursor_line,
-            cached_row_lines: cached_content_row_lines,
-            cached_decorations,
-        })
-    }
-
-    fn shift_introduced_rows(
-        &mut self,
-        frame: &EngineFrame,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shift: &ViewportShift,
-    ) -> Vec<Arc<CellRow>> {
-        (shift.introduced_start..shift.introduced_end)
-            .map(|line| {
-                let range = frame.text.byte_of_line(line)..frame.text.byte_of_line(line.saturating_add(1));
-                let cached = self.cached_logical_rows.remove(&line)?;
-                decorations_match_range(&cached.decorations, decorations, &range).then_some(cached.row)
-            })
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_else(|| {
-                self.render_editor_line(
-                    &frame.text,
-                    shift.introduced_start,
-                    shift.cursor_line,
-                    shift.start_byte,
-                    shift.end_byte,
-                    shift.line_delta,
-                    decorations,
-                    line_decorations,
-                )
-                .into_iter()
-                .map(Arc::new)
-                .collect()
-            })
-    }
-
-    fn stash_shift_displaced_rows(&mut self, frame: &EngineFrame, shift: &ViewportShift) {
-        let displaced = if shift.moving_down { 0..shift.line_delta } else { shift.content_height.saturating_sub(shift.line_delta)..shift.content_height };
-        for index in displaced {
-            if let (Some(Some(line)), Some(row)) = (shift.cached_row_lines.get(index), self.cached_rows.get(index)) {
-                let range = frame.text.byte_of_line(*line)..frame.text.byte_of_line(line.saturating_add(1));
-                self.cached_logical_rows.insert(
-                    *line,
-                    CachedLogicalRow {
-                        row: Arc::clone(row),
-                        decorations: shift
-                            .cached_decorations
-                            .iter()
-                            .filter(|span| span.range.start < range.end && range.start < span.range.end)
-                            .cloned()
-                            .collect(),
-                    },
-                );
+        if rows.len() < content_height {
+            for index in rows.len()..content_height {
+                let cached_blank = self
+                    .cached_editor_render
+                    .as_ref()
+                    .and_then(|cached| cached.content_row_lines.get(index))
+                    .is_some_and(Option::is_none)
+                    .then(|| self.cached_rows.get(index).cloned())
+                    .flatten();
+                rows.push(cached_blank.unwrap_or_else(|| {
+                    let mut blank = CellRow::default();
+                    ensure_row_backgrounds(std::slice::from_mut(&mut blank));
+                    apply_theme_to_rows(std::slice::from_mut(&mut blank), self.theme);
+                    Arc::new(blank)
+                }));
             }
+            row_lines.resize(content_height, None);
         }
-    }
-
-    fn install_shift_rows(&mut self, shift: &ViewportShift, introduced: Vec<Arc<CellRow>>) {
-        if shift.moving_down {
-            self.cached_rows[..shift.content_height].rotate_left(shift.line_delta);
-            for (offset, row) in introduced.into_iter().enumerate() {
-                self.cached_rows[shift.content_height - shift.line_delta + offset] = row;
-            }
-        } else {
-            self.cached_rows[..shift.content_height].rotate_right(shift.line_delta);
-            for (offset, row) in introduced.into_iter().enumerate() {
-                self.cached_rows[offset] = row;
-            }
+        if let Some((mut footer, _)) = self.editor_footer(request.status, request.prompt) {
+            ensure_row_backgrounds(std::slice::from_mut(&mut footer));
+            apply_theme_to_rows(std::slice::from_mut(&mut footer), self.theme);
+            rows.push(Arc::new(footer));
         }
-    }
-
-    fn commit_viewport_shift(
-        &mut self,
-        shift: &ViewportShift,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-        shared: Option<&SharedDecorations>,
-    ) -> Option<()> {
-        let cached = self.cached_editor_render.as_mut()?;
-        cached.top_line = self.top_line;
-        for (offset, line) in cached.content_row_lines.iter_mut().enumerate() {
-            *line = Some(self.top_line.saturating_add(offset));
-        }
-        cached.relative_cursor_line = self.relative_numbers.then_some(shift.cursor_line);
-        cached.decorations = retain_decorations(decorations, shared);
-        if self.relative_numbers {
-            for (row, logical_line) in self.cached_rows.iter_mut().zip(cached.content_row_lines.iter().copied()) {
-                let Some(logical_line) = logical_line else {
-                    continue;
-                };
-                replace_line_number(Arc::make_mut(row), logical_line, shift.cursor_line, self.number_width, true, line_decorations);
-            }
-        }
-        Some(())
-    }
-
-    fn update_cached_editor_distant_viewport(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        let content_height = self.distant_viewport_height(request)?;
-        self.stash_current_viewport_rows(request.frame);
-        let target_rows = self.cached_viewport_rows(request.frame, request.decorations, content_height)?;
-        for (target, row) in self.cached_rows[..content_height].iter_mut().zip(target_rows) {
-            *target = row;
-        }
-        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        if self.relative_numbers {
-            for (offset, row) in self.cached_rows[..content_height].iter_mut().enumerate() {
-                replace_line_number(Arc::make_mut(row), self.top_line.saturating_add(offset), cursor_line, self.number_width, true, request.line_decorations);
-            }
-        }
-        let cached = self.cached_editor_render.as_mut()?;
-        cached.top_line = self.top_line;
-        for (offset, line) in cached.content_row_lines.iter_mut().enumerate() {
-            *line = Some(self.top_line.saturating_add(offset));
-        }
-        cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
-        cached.decorations = retain_decorations(request.decorations, request.shared);
+        rows.resize_with(self.height, || Arc::new(CellRow::default()));
+        rows.truncate(self.height);
+        self.cached_rows = rows;
+        self.cache_editor_render(request, row_lines, self.relative_numbers.then_some(cursor_line));
         self.prune_cached_logical_rows(content_height);
         Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
     }
 
-    fn distant_viewport_height(&self, request: EditorRenderRequest<'_>) -> Option<usize> {
-        let cached = self.cached_editor_render.as_ref()?;
-        let content_height = self.editor_content_height(request.status, request.prompt);
-        if !(self.top_line.abs_diff(cached.top_line) >= content_height
-            && cached.text.same_snapshot(&request.frame.text)
-            && cached.content_row_lines.len() == content_height
-            && self.editor_render_static_structure_is_cached(request)
-            && cached.content_row_lines.iter().enumerate().all(|(offset, line)| *line == Some(cached.top_line.saturating_add(offset))))
-        {
+    fn logical_row_trust(&self, request: EditorRenderRequest<'_>, change: Option<FrameTextChange>) -> Option<Range<usize>> {
+        let Some(cached) = &self.cached_editor_render else {
+            return None;
+        };
+        if change.is_some() {
             return None;
         }
-        (self.top_line..self.top_line.saturating_add(content_height)).all(|line| self.cached_logical_rows.contains_key(&line)).then_some(content_height)
+        if request.shared.is_some_and(|decorations| Arc::ptr_eq(decorations, &cached.decorations)) {
+            return Some(0..usize::MAX);
+        }
+        let old_start = cached.content_row_lines.iter().flatten().copied().min().unwrap_or(cached.top_line);
+        let old_end = cached.content_row_lines.iter().flatten().copied().max().unwrap_or(old_start).saturating_add(1);
+        let new_end = self.top_line.saturating_add(self.editor_content_height(request.status, request.prompt));
+        let start = old_start.max(self.top_line);
+        let end = old_end.min(new_end);
+        let bytes = request.frame.text.byte_of_line(start)..request.frame.text.byte_of_line(end);
+        (start < end && decorations_match_range(&cached.decorations, request.decorations, &bytes)).then_some(start..end)
     }
 
-    fn stash_current_viewport_rows(&mut self, frame: &EngineFrame) {
+    fn cached_line_rows(&mut self, request: EditorRenderRequest<'_>, line: usize, remaining: usize, decoration_indices: Option<&[usize]>) -> Vec<Arc<CellRow>> {
+        let Range { start, end } = logical_line_range(&request.frame.text, line);
+        let content_width = self.width.saturating_sub(self.editor_gutter(self.width)).max(1);
+        let visible = request.frame.text.slice(start..end);
+        let row_count = visual_line_rows_bounded(&visible, content_width, self.tab_width, remaining);
+        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
+        let key = (line, self.relative_numbers.then_some(cursor_line));
+        let exact = self.cached_logical_rows.get(&key);
+        let cached = exact.or_else(|| self.cached_logical_row(line)).filter(|cached| {
+            decoration_indices.is_none_or(|indices| relative_decorations_equal(request.decorations, indices, start..end, &cached.decorations))
+        });
+        let (mut rows, stored_decorations, exact) = cached.map_or_else(
+            || {
+                let indices = decoration_indices.unwrap_or_default();
+                let absolute = indices.iter().map(|index| request.decorations[*index].clone()).collect::<Vec<_>>();
+                let relative = relative_decorations_from_indices(request.decorations, indices, start..end);
+                let rows = self
+                    .render_editor_line(&request.frame.text, line, cursor_line, start, end, row_count.min(remaining), &absolute, request.line_decorations)
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect();
+                (rows, relative, false)
+            },
+            |cached| {
+                let decorations = if exact.is_some() { Vec::new() } else { cached.decorations.clone() };
+                (cached.rows.clone(), decorations, exact.is_some())
+            },
+        );
+        if self.relative_numbers && !exact {
+            for row in &mut rows {
+                replace_line_number(Arc::make_mut(row), line, cursor_line, self.number_width, true, request.line_decorations);
+            }
+        }
+        if row_count <= remaining && !exact {
+            self.cached_logical_rows.insert(key, CachedLogicalRow { rows: rows.clone(), decorations: stored_decorations });
+        }
+        rows.truncate(remaining);
+        rows
+    }
+
+    fn stash_current_viewport_rows(&mut self) {
         let Some(cached) = &self.cached_editor_render else {
             return;
         };
-        for (index, logical_line) in cached.content_row_lines.iter().copied().enumerate() {
-            let (Some(logical_line), Some(row)) = (logical_line, self.cached_rows.get(index)) else {
-                continue;
-            };
-            let range = frame.text.byte_of_line(logical_line)..frame.text.byte_of_line(logical_line.saturating_add(1));
-            self.cached_logical_rows.insert(
-                logical_line,
-                CachedLogicalRow {
-                    row: Arc::clone(row),
-                    decorations: cached.decorations.iter().filter(|span| span.range.start < range.end && range.start < span.range.end).cloned().collect(),
-                },
-            );
+        let mut decorations = DecorationResolver::new_at(&cached.decorations, cached.text.byte_of_line(cached.top_line));
+        let mut index = 0;
+        while let Some(Some(line)) = cached.content_row_lines.get(index) {
+            let end = cached.content_row_lines[index + 1..].iter().position(Option::is_some).map_or(cached.content_row_lines.len(), |next| index + next + 1);
+            let Range { start, end: line_end } = logical_line_range(&cached.text, *line);
+            let range = start..line_end;
+            let indices = decorations.overlapping_indices(range.clone());
+            let width = self.width.saturating_sub(self.editor_gutter(self.width)).max(1);
+            if visual_line_rows_bounded(&cached.text.slice(start..line_end), width, self.tab_width, end - index) <= end - index {
+                self.cached_logical_rows.insert(
+                    (*line, cached.relative_cursor_line),
+                    CachedLogicalRow {
+                        rows: self.cached_rows[index..end].to_vec(),
+                        decorations: relative_decorations_from_indices(&cached.decorations, indices, range),
+                    },
+                );
+            }
+            index = end;
         }
-    }
-
-    fn cached_viewport_rows(&self, frame: &EngineFrame, decorations: &[DecorationSpan], content_height: usize) -> Option<Vec<Arc<CellRow>>> {
-        (self.top_line..self.top_line.saturating_add(content_height))
-            .map(|logical_line| {
-                let range = frame.text.byte_of_line(logical_line)..frame.text.byte_of_line(logical_line.saturating_add(1));
-                let row = self.cached_logical_rows.get(&logical_line)?;
-                decorations_match_range(&row.decorations, decorations, &range).then(|| Arc::clone(&row.row))
-            })
-            .collect()
     }
 
     fn prune_cached_logical_rows(&mut self, content_height: usize) {
         let capacity = content_height.saturating_mul(8).max(content_height);
         while self.cached_logical_rows.len() > capacity {
-            let Some(farthest) = self.cached_logical_rows.keys().max_by_key(|line| line.abs_diff(self.top_line)).copied() else {
+            let Some(farthest) = self.cached_logical_rows.keys().max_by_key(|(line, _)| line.abs_diff(self.top_line)).copied() else {
                 break;
             };
             self.cached_logical_rows.remove(&farthest);
         }
     }
 
-    fn update_cached_editor_line(&mut self, request: EditorRenderRequest<'_>) -> Option<DesiredGrid> {
-        if !self.editor_line_update_context_is_cached(request) {
-            return None;
-        }
-        let cached = self.cached_editor_render.as_ref()?;
-        let change = single_line_change(&cached.text, &request.frame.text)?;
-        let decoration_start = matching_decorations_outside_change(&cached.decorations, request.decorations, change)?;
-        self.cached_logical_rows.remove(&change.line);
-        let content_height = self.editor_content_height(request.status, request.prompt);
-        if change.line < self.top_line || change.line >= self.top_line.saturating_add(content_height) {
-            self.cached_editor_render.as_mut()?.text.clone_from(&request.frame.text);
-            return Some(self.reuse_editor_render(request.frame, request.status, request.prompt));
-        }
-        let gutter = self.editor_gutter(self.width);
-        let content_width = self.width.saturating_sub(gutter).max(1);
-        let screen_row = cached.content_row_lines.iter().position(|line| *line == Some(change.line))?;
-        let old_rows = visual_line_rows(&cached.text.slice(change.old_start..change.old_end), content_width, self.tab_width);
-        let new_rows = visual_line_rows(&request.frame.text.slice(change.new_start..change.new_end), content_width, self.tab_width);
-        if old_rows != new_rows {
-            return None;
-        }
-        let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
-        self.repaint_cached_editor_line(
-            request.frame,
-            LineRepaint { change, cursor_line, screen_row, content_height, new_rows },
-            &request.decorations[decoration_start..],
-            request.line_decorations,
-        )?;
-        let cached = self.cached_editor_render.as_mut()?;
-        cached.text.clone_from(&request.frame.text);
-        cached.status = request.status.into();
-        cached.decorations = retain_decorations(request.decorations, request.shared);
-        cached.relative_cursor_line = self.relative_numbers.then_some(cursor_line);
-        self.update_cached_editor_footer(request.status, request.prompt);
-        Some(self.reuse_editor_render(request.frame, request.status, request.prompt))
+    fn cached_logical_row(&self, line: usize) -> Option<&CachedLogicalRow> {
+        self.cached_logical_rows.range((line, None)..=(line, Some(usize::MAX))).next().map(|(_, row)| row)
     }
 
-    fn repaint_cached_editor_line(
-        &mut self,
-        frame: &EngineFrame,
-        repaint: LineRepaint,
-        decorations: &[DecorationSpan],
-        line_decorations: &[LineDecoration],
-    ) -> Option<()> {
-        if repaint.screen_row >= repaint.content_height {
-            return Some(());
-        }
-        let visible_rows = repaint.content_height.saturating_sub(repaint.screen_row).min(repaint.new_rows);
-        let rendered = self.render_editor_line(
-            &frame.text,
-            repaint.change.line,
-            repaint.cursor_line,
-            repaint.change.new_start,
-            repaint.change.new_end,
-            visible_rows,
-            decorations,
-            line_decorations,
-        );
-        if rendered.len() != visible_rows {
-            return None;
-        }
-        for (offset, row) in rendered.into_iter().enumerate() {
-            self.cached_rows[repaint.screen_row + offset] = Arc::new(row);
-        }
-        Some(())
+    fn has_cached_logical_line(&self, line: usize) -> bool {
+        self.cached_logical_row(line).is_some()
     }
 
-    fn update_cached_editor_footer(&mut self, status: &str, prompt: Option<&str>) {
-        let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
-            return;
-        };
-        self.cached_rows[self.height.saturating_sub(1)] = Arc::new(row_from_text(label, self.width, prompt_style(prompt.is_some()), self.tab_width));
+    fn remove_cached_logical_line(&mut self, line: usize) {
+        while let Some(key) = self.cached_logical_rows.range((line, None)..=(line, Some(usize::MAX))).next().map(|(key, _)| *key) {
+            self.cached_logical_rows.remove(&key);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1955,7 +1456,7 @@ impl ViewportLayout {
             prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, gutter, self.relative_numbers, line_decorations);
         }
         if let Some(column) = self.color_column {
-            mark_color_column(&mut rows, gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.mantle);
+            mark_color_column(&mut rows, gutter.saturating_add(column.saturating_sub(1)), self.width, self.theme.color(CatppuccinColor::Mantle));
         }
         ensure_row_backgrounds(&mut rows);
         apply_theme_to_rows(&mut rows, self.theme);
@@ -1982,12 +1483,12 @@ impl ViewportLayout {
         DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows: self.cached_rows.clone(), cursor, raster_overlay: None }
     }
 
-    #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn desired_workspace_grid(&mut self, model: &ClientViewModel, frames: &[(BufferId, EngineFrame)], status: &str, prompt: Option<&str>) -> DesiredGrid {
         self.desired_workspace_grid_with_shared_decorations(model, frames, &[], &[], status, prompt)
     }
 
-    #[must_use]
+    #[cfg(test)]
     pub fn desired_workspace_grid_with_decorations(
         &mut self,
         model: &ClientViewModel,
@@ -2000,7 +1501,6 @@ impl ViewportLayout {
         self.desired_workspace_grid_with_shared_decorations(model, frames, &decorations, &[], status, prompt)
     }
 
-    #[must_use]
     pub fn desired_workspace_grid_with_shared_decorations(
         &mut self,
         model: &ClientViewModel,
@@ -2012,18 +1512,47 @@ impl ViewportLayout {
     ) -> DesiredGrid {
         let content_height = self.editor_content_height(status, prompt);
         let tab = model.active_tab();
-        let panes = self.workspace_panes(&tab.root, content_height);
-        if let Some((window_id, rectangle)) = self.full_workspace_pane(&panes, content_height)
-            && let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, window_id)
+        let mut panes = Vec::new();
+        split_rectangles(&tab.root, Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height }, &mut panes);
+        self.pane_layouts.retain(|window_id, _| panes.iter().any(|(visible, _)| visible == window_id));
+        if let [(window_id, rectangle)] = panes.as_slice()
+            && *rectangle == (Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height })
+            && let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, *window_id)
         {
-            let grid = self.render_workspace_pane(window_id, rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
-            return self.finish_single_pane_workspace(grid, status, prompt);
+            let grid = self.render_workspace_pane(*window_id, *rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
+            let mut rows = grid.rows;
+            let mut cursor = grid.cursor;
+            if let Some((mut row, prompt_cursor)) = self.editor_footer(status, prompt) {
+                ensure_row_backgrounds(std::slice::from_mut(&mut row));
+                apply_theme_to_rows(std::slice::from_mut(&mut row), self.theme);
+                rows.push(self.cached_rows.last().filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)));
+                if let Some(prompt_cursor) = prompt_cursor {
+                    cursor = prompt_cursor;
+                }
+            }
+            return self.finish_shared_rows(rows, cursor);
         }
 
-        let (mut rows, mut cursor) = self.compose_workspace_panes(model, frames, decorations, line_decorations, &panes, tab.active_window);
+        let mut rows = vec![CellRow::default(); self.height];
+        let mut cursor = (0, 0);
+        for &(window_id, rectangle) in &panes {
+            let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, window_id) else {
+                continue;
+            };
+            let grid = self.render_workspace_pane(window_id, rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
+            merge_pane_rows(&mut rows, rectangle, &grid.rows);
+            if window_id == tab.active_window {
+                cursor = (rectangle.column + grid.cursor.0, rectangle.row + grid.cursor.1);
+            }
+        }
         draw_split_borders(&tab.root, 0, 0, self.workspace_width(), content_height, &mut rows);
-        self.paint_workspace_footer(&mut rows, &mut cursor, status, prompt);
-        self.finish_workspace_grid(rows, cursor)
+        if let Some((row, prompt_cursor)) = self.editor_footer(status, prompt) {
+            rows[self.height.saturating_sub(1)] = row;
+            if let Some(prompt_cursor) = prompt_cursor {
+                cursor = prompt_cursor;
+            }
+        }
+        self.finish_rows(rows, cursor)
     }
 
     /// Prepare a likely distant navigation target without replacing the
@@ -2079,7 +1608,7 @@ impl ViewportLayout {
                 .collect::<Vec<_>>();
             let mut preview = self.clone();
             let grid = preview.desired_editor_grid_with_line_decorations(&EngineFrame::new(text, byte.saturating_add(1)), "", None, &mapped, line_decorations);
-            std::hint::black_box(grid);
+            let _ = std::hint::black_box(grid);
         }
 
         let amount = self.height.saturating_sub(1).checked_div(2).unwrap_or(1);
@@ -2089,10 +1618,10 @@ impl ViewportLayout {
             preview.top_line = preview.top_line.saturating_add(amount);
             let moved = EngineFrame::new(frame.text.clone(), frame.text.byte_of_line(target_line));
             let grid = preview.desired_editor_grid_with_line_decorations(&moved, "", None, decorations, line_decorations);
-            std::hint::black_box(grid);
+            let _ = std::hint::black_box(grid);
             preview.top_line = self.top_line;
             let grid = preview.desired_editor_grid_with_line_decorations(frame, "", None, decorations, line_decorations);
-            std::hint::black_box(grid);
+            let _ = std::hint::black_box(grid);
         }
     }
 
@@ -2114,64 +1643,15 @@ impl ViewportLayout {
         preview.ensure_cursor_visible(frame, 0);
         let _ = preview.desired_editor_grid_with_line_decorations(frame, "", None, decorations, line_decorations);
         preview.prepare_editor_realtime_updates(frame, decorations, line_decorations);
-        if let Some(render) = preview.cached_editor_render
-            && preview.cached_rows.len() == self.height
-        {
+        if let Some(render) = preview.cached_editor_render {
             self.cached_editor_viewports.push(CachedEditorViewport { render, rows: preview.cached_rows });
             self.prune_recent_editor_viewports();
         }
     }
 
-    fn workspace_panes(&mut self, root: &SplitTree, content_height: usize) -> Vec<(WindowId, Rect)> {
-        let mut panes = Vec::new();
-        split_rectangles(root, Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height }, &mut panes);
-        self.pane_layouts.retain(|window_id, _| panes.iter().any(|(visible, _)| visible == window_id));
-        panes
-    }
-
-    fn full_workspace_pane(&self, panes: &[(WindowId, Rect)], content_height: usize) -> Option<(WindowId, Rect)> {
-        let [pane] = panes else {
-            return None;
-        };
-        (pane.1 == Rect { column: 0, row: 0, width: self.workspace_width(), height: content_height }).then_some(*pane)
-    }
-
-    fn compose_workspace_panes(
-        &mut self,
-        model: &ClientViewModel,
-        frames: &[(BufferId, EngineFrame)],
-        decorations: &[(BufferId, SharedDecorations)],
-        line_decorations: &[(BufferId, Vec<LineDecoration>)],
-        panes: &[(WindowId, Rect)],
-        active_window: WindowId,
-    ) -> (Vec<CellRow>, (usize, usize)) {
-        let mut rows = vec![CellRow::default(); self.height];
-        let mut cursor = (0, 0);
-        for &(window_id, rectangle) in panes {
-            let Some(source) = workspace_pane_source(model, frames, decorations, line_decorations, window_id) else {
-                continue;
-            };
-            let grid = self.render_workspace_pane(window_id, rectangle, source.window.top_line, source.frame, source.decorations, source.line_decorations);
-            merge_pane_rows(&mut rows, rectangle, &grid.rows);
-            if window_id == active_window {
-                cursor = (rectangle.column + grid.cursor.0, rectangle.row + grid.cursor.1);
-            }
-        }
-        (rows, cursor)
-    }
-
-    fn paint_workspace_footer(&self, rows: &mut [CellRow], cursor: &mut (usize, usize), status: &str, prompt: Option<&str>) {
-        let Some(label) = prompt.or((!status.is_empty()).then_some(status)) else {
-            return;
-        };
-        let status_row = self.height.saturating_sub(1);
-        rows[status_row] = row_from_text(label, self.width, prompt_style(prompt.is_some()), self.tab_width);
-        if prompt.is_some() {
-            *cursor = self.prompt_cursor(label);
-        }
-    }
-
-    fn finish_workspace_grid(&mut self, mut rows: Vec<CellRow>, cursor: (usize, usize)) -> DesiredGrid {
+    fn finish_rows(&mut self, mut rows: Vec<CellRow>, cursor: (usize, usize)) -> DesiredGrid {
+        rows.resize_with(self.height, CellRow::default);
+        rows.truncate(self.height);
         ensure_row_backgrounds(&mut rows);
         apply_theme_to_rows(&mut rows, self.theme);
         let rows: Vec<_> = rows
@@ -2179,6 +1659,12 @@ impl ViewportLayout {
             .enumerate()
             .map(|(index, row)| self.cached_rows.get(index).filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)))
             .collect();
+        self.finish_shared_rows(rows, cursor)
+    }
+
+    fn finish_shared_rows(&mut self, mut rows: Vec<Arc<CellRow>>, cursor: (usize, usize)) -> DesiredGrid {
+        rows.resize_with(self.height, || Arc::new(CellRow::default()));
+        rows.truncate(self.height);
         self.cached_rows.clone_from(&rows);
         self.epoch = self.epoch.saturating_add(1);
         DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor, raster_overlay: None }
@@ -2211,43 +1697,70 @@ impl ViewportLayout {
         pane.desired_editor_grid_with_shared_decorations(frame, "", None, decorations, line_decorations)
     }
 
-    fn finish_single_pane_workspace(&mut self, grid: DesiredGrid, status: &str, prompt: Option<&str>) -> DesiredGrid {
-        let mut rows = grid.rows;
-        let mut cursor = grid.cursor;
-        if !status.is_empty() || prompt.is_some() {
-            let label = prompt.unwrap_or(status);
-            let style = if prompt.is_some() { CellStyle::default() } else { CellStyle::default().with_bold().with_reverse() };
-            let mut status_rows = vec![row_from_text(label, self.width, style, self.tab_width)];
-            ensure_row_backgrounds(&mut status_rows);
-            apply_theme_to_rows(&mut status_rows, self.theme);
-            let row = status_rows.pop().unwrap_or_default();
-            rows.push(self.cached_rows.last().filter(|cached| cached.as_ref() == &row).cloned().unwrap_or_else(|| Arc::new(row)));
-            if prompt.is_some() {
-                let input = label.split("  │  ").next().unwrap_or(label);
-                cursor = (display_width(input, self.tab_width).min(self.width.saturating_sub(1)), self.height.saturating_sub(1));
-            }
-        }
-        rows.resize_with(self.height, || Arc::new(CellRow::default()));
-        rows.truncate(self.height);
-        self.cached_rows.clone_from(&rows);
-        self.epoch = self.epoch.saturating_add(1);
-        DesiredGrid { epoch: self.epoch, width: self.width, height: self.height, rows, cursor, raster_overlay: None }
-    }
-
     /// Draws Telescope's horizontal results/preview layout as a floating surface.
     /// The overlay deliberately lives above the editor grid so picker interaction
     /// never mutates buffer or split state.
-    #[must_use]
     pub fn apply_picker_overlay(&mut self, grid: DesiredGrid, picker: &PickerOverlay) -> DesiredGrid {
         if self.width < 20 || self.height < 8 {
             return grid;
         }
         let mut rows = overlay_rows(&grid);
         let geometry = self.picker_geometry();
-        let styles = self.picker_styles();
-        self.draw_picker_shell(&mut rows, picker, geometry, styles);
-        self.draw_picker_results(&mut rows, picker, geometry, styles);
-        self.draw_picker_preview(&mut rows, picker, geometry, styles);
+        let base = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Mantle));
+        let border = CellStyle::rgb(self.theme.color(CatppuccinColor::Blue), self.theme.color(CatppuccinColor::Mantle)).with_bold();
+        let title = CellStyle::rgb(self.theme.color(CatppuccinColor::Lavender), self.theme.color(CatppuccinColor::Mantle)).with_bold();
+        let selected_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Surface2)).with_bold();
+        draw_popup_frame(&mut rows, geometry.rectangle(), base, border, "");
+        let heading = format!(" {} ({}) ", picker.title, picker.rows.len());
+        paint_text(&mut rows[geometry.row], geometry.column + 2, heading.len().min(geometry.width.saturating_sub(4)), &heading, title);
+        paint_text(
+            &mut rows[geometry.prompt_row],
+            geometry.column + 1,
+            geometry.inner_width,
+            &format!("❯ {}", picker.prompt),
+            CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Surface0)),
+        );
+        let footer_width = display_width(&picker.footer, 1).min(geometry.result_width.saturating_sub(2));
+        if footer_width > 0 {
+            let detail = CellStyle::rgb(self.theme.color(CatppuccinColor::Subtext0), self.theme.color(CatppuccinColor::Mantle));
+            paint_text(&mut rows[geometry.row + 1], geometry.column + 2, footer_width, &picker.footer, detail);
+        }
+        let selected = picker.selected.min(picker.rows.len().saturating_sub(1));
+        let result_start =
+            selected.saturating_sub(geometry.content_height.saturating_sub(1) / 2).min(picker.rows.len().saturating_sub(geometry.content_height));
+        for (screen_index, item) in picker.rows.iter().skip(result_start).take(geometry.content_height).enumerate() {
+            let item_index = result_start + screen_index;
+            let marker = if item_index == selected { "❯ " } else { "  " };
+            let label = if item.detail.is_empty() { format!("{marker}{}", item.label) } else { format!("{marker}{}  {}", item.label, item.detail) };
+            paint_text(
+                &mut rows[geometry.content_start + screen_index],
+                geometry.column + 1,
+                geometry.result_width,
+                &label,
+                if item_index == selected { selected_style } else { base },
+            );
+        }
+        if geometry.preview_visible {
+            let divider_column = geometry.column + 1 + geometry.result_width;
+            for target in rows.iter_mut().take(geometry.prompt_row).skip(geometry.row + 1) {
+                paint_text(target, divider_column, 1, "│", border);
+            }
+            let preview_column = divider_column + 1;
+            paint_text(&mut rows[geometry.row + 1], preview_column, geometry.preview_width, &format!(" {} ", picker.preview_title), title);
+            let preview_lines = wrap_popup_text(&picker.preview, geometry.preview_width, self.tab_width);
+            for (line_offset, line) in preview_lines.iter().filter(|line| line.source_line >= picker.preview_scroll).take(geometry.content_height).enumerate() {
+                let style = if picker.preview_highlight_line == Some(line.source_line) { selected_style } else { base };
+                paint_text(&mut rows[geometry.content_start + line_offset], preview_column, geometry.preview_width, &line.text, style);
+                paint_decorated_popup_text(
+                    &mut rows[geometry.content_start + line_offset],
+                    preview_column,
+                    line,
+                    &picker.preview_decorations,
+                    style,
+                    self.tab_width,
+                );
+            }
+        }
         self.finish_overlay(
             grid,
             rows,
@@ -2283,95 +1796,24 @@ impl ViewportLayout {
         }
     }
 
-    fn picker_styles(&self) -> PickerStyles {
-        PickerStyles {
-            base: CellStyle::rgb(self.theme.text, self.theme.mantle),
-            border: CellStyle::rgb(self.theme.blue, self.theme.mantle).with_bold(),
-            title: CellStyle::rgb(self.theme.lavender, self.theme.mantle).with_bold(),
-            selected: CellStyle::rgb(self.theme.text, self.theme.surface2).with_bold(),
-            detail: CellStyle::rgb(self.theme.subtext0, self.theme.mantle),
-        }
-    }
-
-    fn draw_picker_shell(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
-        draw_popup_frame(rows, geometry.column, geometry.row, geometry.width, geometry.height, styles.base, styles.border, "");
-        let title = format!(" {} ({}) ", picker.title, picker.rows.len());
-        paint_text(&mut rows[geometry.row], geometry.column + 2, title.len().min(geometry.width.saturating_sub(4)), &title, styles.title);
-        let prompt = format!("❯ {}", picker.prompt);
-        paint_text(&mut rows[geometry.prompt_row], geometry.column + 1, geometry.inner_width, &prompt, CellStyle::rgb(self.theme.text, self.theme.surface0));
-        let footer_width = display_width(&picker.footer, 1).min(geometry.result_width.saturating_sub(2));
-        if footer_width > 0 {
-            paint_text(&mut rows[geometry.row + 1], geometry.column + 2, footer_width, &picker.footer, styles.detail);
-        }
-    }
-
-    fn draw_picker_results(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
-        let selected = picker.selected.min(picker.rows.len().saturating_sub(1));
-        let result_start =
-            selected.saturating_sub(geometry.content_height.saturating_sub(1) / 2).min(picker.rows.len().saturating_sub(geometry.content_height));
-        for (screen_index, item) in picker.rows.iter().skip(result_start).take(geometry.content_height).enumerate() {
-            let item_index = result_start + screen_index;
-            let marker = if item_index == selected { "❯ " } else { "  " };
-            let label = if item.detail.is_empty() { format!("{marker}{}", item.label) } else { format!("{marker}{}  {}", item.label, item.detail) };
-            paint_text(
-                &mut rows[geometry.content_start + screen_index],
-                geometry.column + 1,
-                geometry.result_width,
-                &label,
-                if item_index == selected { styles.selected } else { styles.base },
-            );
-        }
-    }
-
-    fn draw_picker_preview(&self, rows: &mut [CellRow], picker: &PickerOverlay, geometry: PickerGeometry, styles: PickerStyles) {
-        if !geometry.preview_visible {
-            return;
-        }
-        let divider_column = geometry.column + 1 + geometry.result_width;
-        for target in rows.iter_mut().take(geometry.prompt_row).skip(geometry.row + 1) {
-            paint_text(target, divider_column, 1, "│", styles.border);
-        }
-        let preview_column = divider_column + 1;
-        paint_text(&mut rows[geometry.row + 1], preview_column, geometry.preview_width, &format!(" {} ", picker.preview_title), styles.title);
-        let preview_lines = wrap_popup_text(&picker.preview, geometry.preview_width, self.tab_width);
-        for (line_offset, line) in preview_lines.iter().filter(|line| line.source_line >= picker.preview_scroll).take(geometry.content_height).enumerate() {
-            let style = if picker.preview_highlight_line == Some(line.source_line) { styles.selected } else { styles.base };
-            paint_text(&mut rows[geometry.content_start + line_offset], preview_column, geometry.preview_width, &line.text, style);
-            paint_decorated_popup_text(
-                &mut rows[geometry.content_start + line_offset],
-                preview_column,
-                line,
-                &picker.preview_decorations,
-                style,
-                self.tab_width,
-            );
-        }
-    }
-
     /// Draws an nvim-cmp compatible popup menu at the active cursor and a
     /// documentation window alongside it when the selected item has docs.
-    #[must_use]
     pub fn apply_completion_overlay(&mut self, grid: DesiredGrid, completion: &CompletionOverlay) -> DesiredGrid {
         if completion.rows.is_empty() || self.width < 12 || self.height < 4 {
             return grid;
         }
         let cursor = grid.cursor;
         let mut rows = overlay_rows(&grid);
-        let menu = self.completion_menu(cursor, completion);
-        let styles = self.completion_styles();
-        self.draw_completion_menu(&mut rows, completion, menu, styles);
-        self.draw_completion_documentation(&mut rows, completion, menu.rectangle, styles.base, styles.border);
-        self.finish_overlay(grid, rows, cursor)
-    }
-
-    fn completion_menu(&self, cursor: (usize, usize), completion: &CompletionOverlay) -> CompletionMenu {
         let visible_rows = completion.rows.len().min(10);
         let menu_height = visible_rows + 2;
         let longest = completion
             .rows
             .iter()
             .map(|row| {
-                display_width(&row.label, 1).saturating_add(display_width(&row.detail, 1)).saturating_add(display_width(&row.source, 1)).saturating_add(7)
+                display_width(&row.label, 1)
+                    .saturating_add(display_width(&row.detail, 1))
+                    .saturating_add(display_width(row.source.as_deref().unwrap_or_default(), 1))
+                    .saturating_add(7)
             })
             .max()
             .unwrap_or(20);
@@ -2380,63 +1822,53 @@ impl ViewportLayout {
         let menu_row = if cursor.1 + menu_height + 1 < self.height { cursor.1 + 1 } else { cursor.1.saturating_sub(menu_height) };
         let selected = completion.selected.unwrap_or(0).min(completion.rows.len().saturating_sub(1));
         let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2).min(completion.rows.len().saturating_sub(visible_rows));
-        CompletionMenu { rectangle: Rect { column: menu_column, row: menu_row, width: menu_width, height: menu_height }, visible_rows, start }
-    }
-
-    fn completion_styles(&self) -> CompletionStyles {
-        CompletionStyles {
-            base: CellStyle::rgb(self.theme.text, self.theme.surface0),
-            border: CellStyle::rgb(self.theme.blue, self.theme.base),
-            selected: CellStyle::rgb(self.theme.text, self.theme.surface2).with_bold(),
-        }
-    }
-
-    fn draw_completion_menu(&self, rows: &mut [CellRow], completion: &CompletionOverlay, menu: CompletionMenu, styles: CompletionStyles) {
-        draw_popup_frame(
-            rows,
-            menu.rectangle.column,
-            menu.rectangle.row,
-            menu.rectangle.width,
-            menu.rectangle.height,
-            styles.base,
-            styles.border,
-            "completion",
-        );
-        for (offset, item) in completion.rows.iter().skip(menu.start).take(menu.visible_rows).enumerate() {
-            let item_index = menu.start + offset;
+        let menu = Rect { column: menu_column, row: menu_row, width: menu_width, height: menu_height };
+        let base = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Surface0));
+        let border = CellStyle::rgb(self.theme.color(CatppuccinColor::Blue), self.theme.color(CatppuccinColor::Base));
+        let selected_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Surface2)).with_bold();
+        draw_popup_frame(&mut rows, menu, base, border, "completion");
+        for (offset, item) in completion.rows.iter().skip(start).take(visible_rows).enumerate() {
+            let item_index = start + offset;
             let is_selected = completion.selected == Some(item_index);
             paint_text(
-                &mut rows[menu.rectangle.row + 1 + offset],
-                menu.rectangle.column + 1,
-                menu.rectangle.width.saturating_sub(2),
-                &completion_label(item, is_selected),
-                if is_selected { styles.selected } else { styles.base },
+                &mut rows[menu.row + 1 + offset],
+                menu.column + 1,
+                menu.width.saturating_sub(2),
+                &format!(
+                    "{} {}{} [{}]",
+                    if is_selected { "❯" } else { " " },
+                    item.label,
+                    if item.detail.is_empty() { String::new() } else { format!(" · {}", item.detail) },
+                    item.source.as_deref().unwrap_or_default()
+                ),
+                if is_selected { selected_style } else { base },
             );
         }
-    }
-
-    fn draw_completion_documentation(&self, rows: &mut [CellRow], completion: &CompletionOverlay, menu: Rect, base_style: CellStyle, border_style: CellStyle) {
-        if completion.documentation.is_empty() || self.width < 48 {
-            return;
+        if !completion.documentation.is_empty() && self.width >= 48 {
+            let available_right = self.width.saturating_sub(menu.column + menu.width + 1);
+            let docs_width = 50.min(self.width.saturating_sub(2)).min(if available_right >= 24 { available_right } else { menu.column.saturating_sub(1) });
+            if docs_width >= 20 {
+                let docs_column = if available_right >= docs_width { menu.column + menu.width + 1 } else { menu.column.saturating_sub(docs_width + 1) };
+                let docs_height = (completion.documentation.lines().skip(completion.documentation_scroll).count().min(12) + 2)
+                    .clamp(4, self.height.saturating_sub(menu.row).max(4));
+                let docs_style = base.with_background(CellColor::Rgb(self.theme.color(CatppuccinColor::Mantle)));
+                draw_popup_frame(
+                    &mut rows,
+                    Rect { column: docs_column, row: menu.row, width: docs_width, height: docs_height },
+                    docs_style,
+                    border,
+                    "documentation",
+                );
+                for (offset, line) in completion.documentation.lines().skip(completion.documentation_scroll).take(docs_height.saturating_sub(2)).enumerate() {
+                    paint_text(&mut rows[menu.row + 1 + offset], docs_column + 1, docs_width.saturating_sub(2), line, docs_style);
+                }
+            }
         }
-        let available_right = self.width.saturating_sub(menu.column + menu.width + 1);
-        let docs_width = 50.min(self.width.saturating_sub(2)).min(if available_right >= 24 { available_right } else { menu.column.saturating_sub(1) });
-        if docs_width < 20 {
-            return;
-        }
-        let docs_column = if available_right >= docs_width { menu.column + menu.width + 1 } else { menu.column.saturating_sub(docs_width + 1) };
-        let docs_height =
-            (completion.documentation.lines().skip(completion.documentation_scroll).count().min(12) + 2).clamp(4, self.height.saturating_sub(menu.row).max(4));
-        let docs_style = base_style.with_background(CellColor::Rgb(self.theme.mantle));
-        draw_popup_frame(rows, docs_column, menu.row, docs_width, docs_height, docs_style, border_style, "documentation");
-        for (offset, line) in completion.documentation.lines().skip(completion.documentation_scroll).take(docs_height.saturating_sub(2)).enumerate() {
-            paint_text(&mut rows[menu.row + 1 + offset], docs_column + 1, docs_width.saturating_sub(2), line, docs_style);
-        }
+        self.finish_overlay(grid, rows, cursor)
     }
 
     /// Rounded context float used by LSP hover/signature help, diagnostics,
     /// Git previews and other `open_floating_preview` surfaces.
-    #[must_use]
     pub fn apply_text_popup(&mut self, grid: DesiredGrid, popup: &TextPopup) -> DesiredGrid {
         if popup.text.is_empty() || self.width < 8 || self.height < 4 {
             return grid;
@@ -2465,8 +1897,8 @@ impl ViewportLayout {
         let column = placement.column;
         let row = placement.row;
         let mut rows = overlay_rows(&grid);
-        let base_style = CellStyle::rgb(self.theme.text, self.theme.mantle);
-        let border_style = CellStyle::rgb(self.theme.blue, self.theme.base);
+        let base_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Mantle));
+        let border_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Blue), self.theme.color(CatppuccinColor::Base));
         // A popup can extend past the final explicit cell in a short editor
         // row. Preserve that row's implicit tail before painting the float;
         // otherwise the terminal diff uses the popup border as the style for
@@ -2474,7 +1906,7 @@ impl ViewportLayout {
         for target in rows.iter_mut().skip(row).take(height) {
             materialize_row_tail(target, grid.width);
         }
-        draw_popup_frame(&mut rows, column, row, width, height, base_style, border_style, &popup.title);
+        draw_popup_frame(&mut rows, Rect { column, row, width, height }, base_style, border_style, &popup.title);
         for (offset, line) in lines.iter().skip(scroll).take(visible_lines).enumerate() {
             paint_text(&mut rows[row + 1 + offset], column + 1, inner_width, &line.text, base_style);
             paint_decorated_popup_text(&mut rows[row + 1 + offset], column + 1, line, &popup.decorations, base_style, self.tab_width);
@@ -2486,7 +1918,6 @@ impl ViewportLayout {
     }
 
     /// Composites a terminal-emulator surface into the docked right pane.
-    #[must_use]
     pub fn apply_terminal_sidebar(&mut self, grid: DesiredGrid, sidebar: TerminalSidebar<'_>) -> DesiredGrid {
         let Some(column) = self.terminal_sidebar_column() else {
             return grid;
@@ -2496,11 +1927,17 @@ impl ViewportLayout {
         for row in &mut rows {
             materialize_row_tail(row, column);
         }
-        let border = CellStyle::rgb(self.theme.blue, self.theme.base);
-        let terminal_base = CellStyle::rgb(self.theme.text, self.theme.base);
+        let border = CellStyle::rgb(self.theme.color(CatppuccinColor::Blue), self.theme.color(CatppuccinColor::Base));
+        let terminal_base = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Base));
         for (row_index, row) in rows.iter_mut().enumerate() {
             paint_text(row, column, 1, "│", border);
-            paint_cells(row, column.saturating_add(1), inner_width, sidebar.rows.get(row_index).map_or(&[], |source| source.cells.as_slice()), terminal_base);
+            replace_cells(
+                row,
+                column.saturating_add(1),
+                inner_width,
+                sidebar.rows.get(row_index).map_or(&[] as &[Cell], |source| source.cells.as_slice()).iter().cloned(),
+                terminal_base,
+            );
         }
         let cursor = if sidebar.focused {
             (column.saturating_add(1).saturating_add(sidebar.cursor.0.min(inner_width.saturating_sub(1))), sidebar.cursor.1.min(self.height.saturating_sub(1)))
@@ -2511,12 +1948,10 @@ impl ViewportLayout {
     }
 
     /// Starting column of the docked terminal surface for this terminal size.
-    #[must_use]
     pub fn terminal_sidebar_column(&self) -> Option<usize> {
         Self::terminal_sidebar_column_for_size(self.width, self.height)
     }
 
-    #[must_use]
     pub fn terminal_sidebar_column_for_size(width: usize, height: usize) -> Option<usize> {
         if width < 36 || height < 6 {
             return None;
@@ -2528,7 +1963,6 @@ impl ViewportLayout {
 
     /// The default nvim-dap-ui layout: scopes/breakpoints/stacks/watches on
     /// the left and REPL/console panels across the bottom.
-    #[must_use]
     pub fn apply_debug_overlay(&mut self, grid: DesiredGrid, debug: &DebugOverlay) -> DesiredGrid {
         if self.width < 30 || self.height < 12 {
             return grid;
@@ -2549,109 +1983,71 @@ impl ViewportLayout {
         if cursor.1 < upper_height {
             cursor.0 = cursor.0.saturating_add(left_width).min(self.width - 1);
         }
-        let base_style = CellStyle::rgb(self.theme.text, self.theme.mantle);
-        let border_style = CellStyle::rgb(self.theme.blue, self.theme.base);
+        let base_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Mantle));
+        let border_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Blue), self.theme.color(CatppuccinColor::Base));
         let panel_height = (upper_height / 4).max(3);
-        for (index, (title, text)) in [
-            ("Scopes", debug.scopes.as_ref()),
-            ("Breakpoints", debug.breakpoints.as_ref()),
-            ("Stacks", debug.stacks.as_ref()),
-            ("Watches", debug.watches.as_ref()),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, panel) in debug.panels[..4].iter().enumerate() {
             let row = index.saturating_mul(panel_height);
             let height = if index == 3 { upper_height.saturating_sub(row).max(3) } else { panel_height };
-            draw_text_panel(&mut rows, 0, row, left_width, height, title, text, base_style, border_style);
+            draw_text_panel(&mut rows, Rect { column: 0, row, width: left_width, height }, panel.title, &panel.text, base_style, border_style);
         }
         let right_width = self.width.saturating_sub(left_width);
-        let repl_width = right_width / 2;
-        draw_text_panel(&mut rows, left_width, upper_height, repl_width, bottom_height, "REPL", &debug.repl, base_style, border_style);
-        draw_text_panel(
-            &mut rows,
-            left_width + repl_width,
-            upper_height,
-            right_width.saturating_sub(repl_width),
-            bottom_height,
-            "Console",
-            &debug.console,
-            base_style,
-            border_style,
-        );
+        let panel_width = right_width / 2;
+        for (index, panel) in debug.panels[4..].iter().enumerate() {
+            let column = left_width + index * panel_width;
+            let width = if index == 1 { self.width.saturating_sub(column) } else { panel_width };
+            draw_text_panel(&mut rows, Rect { column, row: upper_height, width, height: bottom_height }, panel.title, &panel.text, base_style, border_style);
+        }
         self.finish_overlay(grid, rows, cursor)
     }
 
     /// Paints AceJump-style labels directly over visible matches in the active
     /// pane using the same split, gutter, tab, and wrap geometry as the buffer.
-    #[must_use]
     pub fn apply_ace_jump_overlay(&mut self, grid: DesiredGrid, model: &ClientViewModel, frame: &EngineFrame, overlay: &AceJumpOverlay) -> DesiredGrid {
         if overlay.targets.is_empty() {
             return grid;
         }
-        let Some(pane) = self.ace_jump_pane(model, frame) else {
-            return grid;
-        };
-        let positions = self.ace_jump_positions(frame, overlay, pane);
-        let mut rows = overlay_rows(&grid);
-        self.paint_ace_jump_positions(&mut rows, pane, &positions);
-        let cursor = grid.cursor;
-        self.finish_overlay(grid, rows, cursor)
-    }
-
-    fn ace_jump_pane(&self, model: &ClientViewModel, frame: &EngineFrame) -> Option<AceJumpPane> {
         let tab = model.active_tab();
         let mut panes = Vec::new();
         split_rectangles(&tab.root, Rect { column: 0, row: 0, width: self.workspace_width(), height: self.height.saturating_sub(1).max(1) }, &mut panes);
-        let (_, rectangle) = panes.into_iter().find(|(window_id, _)| *window_id == tab.active_window)?;
-        let window = model.windows.iter().find(|window| window.id == tab.active_window)?;
+        let Some((_, rectangle)) = panes.into_iter().find(|(window_id, _)| *window_id == tab.active_window) else {
+            return grid;
+        };
+        let Some(window) = find_window(&tab.root, tab.active_window) else {
+            return grid;
+        };
         let gutter = self.editor_gutter(rectangle.width);
         let content_width = rectangle.width.saturating_sub(gutter).max(1);
         let start_byte = frame.text.byte_of_line(window.top_line);
         let end_byte = frame.text.byte_of_line(window.top_line.saturating_add(rectangle.height.max(1)));
-        Some(AceJumpPane { rectangle, gutter, content_width, start_byte, end_byte })
-    }
-
-    fn ace_jump_positions<'a>(&self, frame: &EngineFrame, overlay: &'a AceJumpOverlay, pane: AceJumpPane) -> Vec<AceJumpPosition<'a>> {
-        let wanted = overlay
-            .targets
-            .iter()
-            .filter(|target| target.byte >= pane.start_byte)
-            .map(|target| (target.byte, target.label.as_ref()))
-            .collect::<BTreeMap<_, _>>();
-        let mut positions = Vec::new();
-        let mut byte = pane.start_byte;
+        let mut rows = overlay_rows(&grid);
+        let wanted =
+            overlay.targets.iter().filter(|target| target.byte >= start_byte).map(|target| (target.byte, target.label.as_ref())).collect::<BTreeMap<_, _>>();
+        let style = CellStyle::rgb(self.theme.color(CatppuccinColor::Base), self.theme.color(CatppuccinColor::Peach)).with_bold();
+        let mut byte = start_byte;
         let mut screen_row = 0_usize;
         let mut screen_column = 0_usize;
-        let visible = frame.text.slice(pane.start_byte..pane.end_byte);
-        for grapheme in visible.graphemes(true) {
+        for grapheme in frame.text.slice(start_byte..end_byte).graphemes(true) {
             if let Some(label) = wanted.get(&byte)
-                && screen_row < pane.rectangle.height
+                && screen_row < rectangle.height
             {
-                positions.push(AceJumpPosition { row: screen_row, column: screen_column, label });
+                let row = rectangle.row.saturating_add(screen_row);
+                let column = rectangle.column.saturating_add(gutter).saturating_add(screen_column);
+                let available = rectangle.column.saturating_add(rectangle.width).saturating_sub(column);
+                if let Some(target) = rows.get_mut(row) {
+                    paint_text(target, column, display_width(label, self.tab_width).min(available), label, style);
+                }
             }
-            advance_visual_position(grapheme, pane.content_width, self.tab_width, &mut screen_row, &mut screen_column);
+            advance_visual_grapheme(&mut screen_row, &mut screen_column, content_width, self.tab_width, grapheme);
             byte = byte.saturating_add(grapheme.len());
-            if screen_row >= pane.rectangle.height {
+            if screen_row >= rectangle.height {
                 break;
             }
         }
-        positions
+        let cursor = grid.cursor;
+        self.finish_overlay(grid, rows, cursor)
     }
 
-    fn paint_ace_jump_positions(&self, rows: &mut [CellRow], pane: AceJumpPane, positions: &[AceJumpPosition<'_>]) {
-        let style = CellStyle::rgb(self.theme.base, self.theme.peach).with_bold();
-        for position in positions {
-            let row = pane.rectangle.row.saturating_add(position.row);
-            let column = pane.rectangle.column.saturating_add(pane.gutter).saturating_add(position.column);
-            let available = pane.rectangle.column.saturating_add(pane.rectangle.width).saturating_sub(column);
-            if let Some(target) = rows.get_mut(row) {
-                paint_text(target, column, display_width(position.label, self.tab_width).min(available), position.label, style);
-            }
-        }
-    }
-
-    #[must_use]
     pub fn apply_status_overlay(&mut self, grid: DesiredGrid, status: &StatusOverlay) -> DesiredGrid {
         if self.height == 0 {
             return grid;
@@ -2663,7 +2059,7 @@ impl ViewportLayout {
         let mut rows = grid.rows;
         let row_index = self.height - 1;
         let row = self.cached_status_rows.iter().rev().find(|(cached, _)| cached == status).map(|(_, row)| Arc::clone(row)).unwrap_or_else(|| {
-            let base_style = CellStyle::rgb(self.theme.subtext1, self.theme.mantle);
+            let base_style = CellStyle::rgb(self.theme.color(CatppuccinColor::Subtext1), self.theme.color(CatppuccinColor::Mantle));
             let mut row = CellRow { cells: Vec::with_capacity(self.width) };
             let mut left_column = 0;
             for segment in &status.left {
@@ -2728,13 +2124,10 @@ struct PickerGeometry {
     content_height: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PickerStyles {
-    base: CellStyle,
-    border: CellStyle,
-    title: CellStyle,
-    selected: CellStyle,
-    detail: CellStyle,
+impl PickerGeometry {
+    const fn rectangle(self) -> Rect {
+        Rect { column: self.column, row: self.row, width: self.width, height: self.height }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2786,7 +2179,7 @@ fn workspace_pane_source<'a>(
     line_decorations: &'a [(BufferId, Vec<LineDecoration>)],
     window_id: WindowId,
 ) -> Option<WorkspacePaneSource<'a>> {
-    let window = model.windows.iter().find(|window| window.id == window_id)?;
+    let window = find_window(&model.active_tab().root, window_id)?;
     let frame = frames.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id).map(|(_, frame)| frame)?;
     static EMPTY_DECORATIONS: std::sync::LazyLock<SharedDecorations> = std::sync::LazyLock::new(|| Arc::new(Vec::new()));
     let decorations = decorations.iter().find(|(buffer_id, _)| *buffer_id == window.buffer_id).map_or(&*EMPTY_DECORATIONS, |(_, spans)| spans);
@@ -2840,20 +2233,20 @@ fn text_popup_placement(grid: &DesiredGrid, width: usize, height: usize) -> Popu
         .chain(cursor_local_candidates)
         .enumerate()
         .min_by_key(|(preference, placement)| {
-            (occupied_cells_under_popup(grid, *placement, width, height), popup_contains_cursor(*placement, width, height, grid.cursor), *preference)
+            (
+                occupied_cells_under_popup(grid, *placement, width, height),
+                grid.cursor.0 >= placement.column
+                    && grid.cursor.0 < placement.column.saturating_add(width)
+                    && grid.cursor.1 >= placement.row
+                    && grid.cursor.1 < placement.row.saturating_add(height),
+                *preference,
+            )
         })
         .map_or(PopupPlacement { column: 0, row: 0 }, |(_, placement)| placement)
 }
 
 fn popup_max_inner_width(terminal_width: usize) -> usize {
     terminal_width.saturating_sub(4).clamp(4, 80)
-}
-
-fn popup_contains_cursor(placement: PopupPlacement, width: usize, height: usize, cursor: (usize, usize)) -> bool {
-    cursor.0 >= placement.column
-        && cursor.0 < placement.column.saturating_add(width)
-        && cursor.1 >= placement.row
-        && cursor.1 < placement.row.saturating_add(height)
 }
 
 fn occupied_cells_under_popup(grid: &DesiredGrid, placement: PopupPlacement, width: usize, height: usize) -> usize {
@@ -2882,7 +2275,7 @@ fn occupied_cells_under_popup(grid: &DesiredGrid, placement: PopupPlacement, wid
 }
 
 fn apply_theme_to_rows(rows: &mut [CellRow], theme: CatppuccinPalette) {
-    if theme == CatppuccinPalette::MOCHA {
+    if theme == CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha) {
         return;
     }
     for cell in rows.iter_mut().flat_map(|row| &mut row.cells) {
@@ -2901,10 +2294,6 @@ fn ensure_row_backgrounds(rows: &mut [CellRow]) {
 
 fn paint_text(row: &mut CellRow, column: usize, width: usize, text: &str, style: CellStyle) {
     replace_cells(row, column, width, row_from_text(text, width, style, 1).cells, style);
-}
-
-fn paint_cells(row: &mut CellRow, column: usize, width: usize, cells: &[Cell], fill_style: CellStyle) {
-    replace_cells(row, column, width, cells.iter().cloned(), fill_style);
 }
 
 fn replace_cells(row: &mut CellRow, column: usize, width: usize, replacement: impl IntoIterator<Item = Cell>, fill_style: CellStyle) {
@@ -2958,8 +2347,8 @@ fn truncate_row(row: &mut CellRow, width: usize) {
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_popup_frame(rows: &mut [CellRow], column: usize, row: usize, width: usize, height: usize, base_style: CellStyle, border_style: CellStyle, title: &str) {
+fn draw_popup_frame(rows: &mut [CellRow], rectangle: Rect, base_style: CellStyle, border_style: CellStyle, title: &str) {
+    let Rect { column, row, width, height } = rectangle;
     if width < 2 || height < 2 || row.saturating_add(height) > rows.len() {
         return;
     }
@@ -2978,22 +2367,12 @@ fn draw_popup_frame(rows: &mut [CellRow], column: usize, row: usize, width: usiz
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_text_panel(
-    rows: &mut [CellRow],
-    column: usize,
-    row: usize,
-    width: usize,
-    height: usize,
-    title: &str,
-    text: &str,
-    base_style: CellStyle,
-    border_style: CellStyle,
-) {
+fn draw_text_panel(rows: &mut [CellRow], rectangle: Rect, title: &str, text: &str, base_style: CellStyle, border_style: CellStyle) {
+    let Rect { column, row, width, height } = rectangle;
     if width < 4 || height < 3 {
         return;
     }
-    draw_popup_frame(rows, column, row, width, height, base_style, border_style, title);
+    draw_popup_frame(rows, rectangle, base_style, border_style, title);
     for (offset, line) in text.lines().take(height.saturating_sub(2)).enumerate() {
         paint_text(&mut rows[row + 1 + offset], column + 1, width.saturating_sub(2), line, base_style);
     }
@@ -3055,15 +2434,11 @@ fn popup_wrap_boundary(source: &str, start: usize, width: usize, tab_width: usiz
             break;
         }
     }
-    let end = if end == start { first_grapheme_end(source, start) } else { end };
+    let end = if end == start { source[start..].graphemes(true).next().map_or(source.len(), |grapheme| start + grapheme.len()) } else { end };
     match whitespace {
         Some((space_start, space_end)) if space_start > start && end < source.len() => (space_start, space_end),
         _ => (end, end),
     }
-}
-
-fn first_grapheme_end(source: &str, start: usize) -> usize {
-    source[start..].graphemes(true).next().map_or(source.len(), |grapheme| start + grapheme.len())
 }
 
 fn skip_grapheme_whitespace(source: &str, mut start: usize) -> usize {
@@ -3110,11 +2485,7 @@ fn apply_style_to_columns(row: &mut CellRow, start: usize, end: usize, style: Ce
 
 const fn merge_styles(base: CellStyle, overlay: CellStyle) -> CellStyle {
     CellStyle {
-        bold: base.bold || overlay.bold,
-        italic: base.italic || overlay.italic,
-        underline: base.underline || overlay.underline,
-        strikethrough: base.strikethrough || overlay.strikethrough,
-        reverse: base.reverse || overlay.reverse,
+        attributes: base.attributes | overlay.attributes,
         foreground: if overlay.foreground.is_some() { overlay.foreground } else { base.foreground },
         background: if overlay.background.is_some() { overlay.background } else { base.background },
     }
@@ -3122,7 +2493,7 @@ const fn merge_styles(base: CellStyle, overlay: CellStyle) -> CellStyle {
 
 fn split_rectangles(tree: &SplitTree, rectangle: Rect, panes: &mut Vec<(WindowId, Rect)>) {
     match tree {
-        SplitTree::Window(window) => panes.push((*window, rectangle)),
+        SplitTree::Window(window) => panes.push((window.id, rectangle)),
         SplitTree::Split { axis, ratio_milli, first, second } => {
             let split = rectangle.split(*axis, *ratio_milli);
             split_rectangles(first, split.first, panes);
@@ -3246,23 +2617,6 @@ fn byte_at_visual_cell(text: &FrameText, document_start: usize, width: usize, ta
         }
     }
     (row <= target_row).then_some(last_grapheme_on_row.unwrap_or(absolute_byte))
-}
-
-fn advance_visual_position(grapheme: &str, width: usize, tab_width: usize, row: &mut usize, column: &mut usize) {
-    if grapheme == "\n" {
-        *row = row.saturating_add(1);
-        *column = 0;
-        return;
-    }
-    let cells = if grapheme == "\t" { vec![" ".to_owned(); tab_width - (*column % tab_width)] } else { escape_grapheme(grapheme) };
-    for cell in cells {
-        let cell_width = UnicodeWidthStr::width(cell.as_str()).max(1);
-        if column.saturating_add(cell_width) > width && *column > 0 {
-            *row = row.saturating_add(1);
-            *column = 0;
-        }
-        *column = column.saturating_add(cell_width);
-    }
 }
 
 struct GridBuilder {
@@ -3459,13 +2813,7 @@ impl<'a> DecorationResolver<'a> {
         if range.end <= self.valid_until {
             return self.cached_style;
         }
-        self.active.retain(|index| self.decorations[*index].range.end > range.start);
-        while let Some(index) = self.next_decoration()
-            && self.decorations[index].range.start < range.end
-        {
-            self.active.push(index);
-            self.next += 1;
-        }
+        self.advance(&range);
         self.cached_style = decoration_style_from_indices(self.decorations, self.active.iter().copied(), range.clone());
         let next_start = self.next_decoration().map_or(usize::MAX, |index| self.decorations[index].range.start);
         let active_end = self.active.iter().map(|index| self.decorations[*index].range.end).min().unwrap_or(usize::MAX);
@@ -3475,6 +2823,21 @@ impl<'a> DecorationResolver<'a> {
 
     fn style_or_default(&mut self, range: Range<usize>) -> CellStyle {
         if self.decorations.is_empty() { CellStyle::default() } else { self.style(range) }
+    }
+
+    fn overlapping_indices(&mut self, range: Range<usize>) -> &[usize] {
+        self.advance(&range);
+        &self.active
+    }
+
+    fn advance(&mut self, range: &Range<usize>) {
+        self.active.retain(|index| self.decorations[*index].range.end > range.start);
+        while let Some(index) = self.next_decoration()
+            && self.decorations[index].range.start < range.end
+        {
+            self.active.push(index);
+            self.next += 1;
+        }
     }
 
     fn next_decoration(&self) -> Option<usize> {
@@ -3507,9 +2870,10 @@ fn replace_line_number(row: &mut CellRow, logical_line: usize, cursor_line: usiz
 }
 
 fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) -> CellRow {
-    let style = logical_line
-        .and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line))
-        .map_or(CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.overlay1)), |decoration| decoration.style);
+    let style = logical_line.and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line)).map_or(
+        CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Overlay1))),
+        |decoration| decoration.style,
+    );
     let mut cells = vec![Cell { grapheme: single_byte_grapheme(b' '), width: 1, style }; width];
     if let Some(line) = logical_line {
         let mut number = if relative && line != cursor_line { line.abs_diff(cursor_line) } else { line.saturating_add(1) };
@@ -3534,10 +2898,15 @@ fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: us
     CellRow { cells }
 }
 
+fn logical_line_range(text: &FrameText, line: usize) -> Range<usize> {
+    let start = text.byte_of_line(line);
+    let end = text.byte_of_line(line.saturating_add(1));
+    start..end.saturating_sub(usize::from(end > start && text.slice(end - 1..end).as_ref() == "\n"))
+}
+
 fn single_byte_grapheme(byte: u8) -> CellGrapheme {
-    let mut bytes = [0; INLINE_GRAPHEME_BYTES];
-    bytes[0] = byte;
-    CellGrapheme::Inline { len: 1, bytes }
+    let mut encoded = [0; 4];
+    CellGrapheme::new(char::from(byte).encode_utf8(&mut encoded))
 }
 
 #[cfg(test)]
@@ -3569,11 +2938,7 @@ fn resolve_decoration_style(
             continue;
         }
         overlaps = true;
-        style.bold |= decoration.style.bold;
-        style.italic |= decoration.style.italic;
-        style.underline |= decoration.style.underline;
-        style.strikethrough |= decoration.style.strikethrough;
-        style.reverse |= decoration.style.reverse;
+        style.attributes |= decoration.style.attributes;
         let precedence = (decoration.priority, order);
         if let Some(foreground) = decoration.style.foreground
             && foreground_priority.is_none_or(|current| precedence >= current)
@@ -3592,7 +2957,7 @@ fn resolve_decoration_style(
 }
 
 const fn transparent_cell_style() -> CellStyle {
-    CellStyle { bold: false, italic: false, underline: false, strikethrough: false, reverse: false, foreground: None, background: None }
+    CellStyle { attributes: 0, foreground: None, background: None }
 }
 
 fn escape_grapheme(grapheme: &str) -> Vec<String> {
@@ -3621,12 +2986,6 @@ fn prompt_style(is_prompt: bool) -> CellStyle {
         return CellStyle::default();
     }
     CellStyle::default().with_bold().with_reverse()
-}
-
-fn completion_label(item: &CompletionOverlayRow, selected: bool) -> String {
-    let marker = if selected { "❯" } else { " " };
-    let detail = if item.detail.is_empty() { String::new() } else { format!(" · {}", item.detail) };
-    format!("{marker} {}{detail} [{}]", item.label, item.source)
 }
 
 fn row_from_text(text: &str, width: usize, style: CellStyle, tab_width: usize) -> CellRow {
@@ -3673,13 +3032,92 @@ fn display_width(text: &str, tab_width: usize) -> usize {
     width
 }
 
-#[derive(Clone, Copy)]
-struct LineRepaint {
+fn relative_decorations_from_indices(decorations: &[DecorationSpan], indices: &[usize], range: Range<usize>) -> Vec<DecorationSpan> {
+    indices
+        .iter()
+        .map(|index| {
+            let span = &decorations[*index];
+            DecorationSpan::new(span.range.start.max(range.start) - range.start..span.range.end.min(range.end) - range.start, span.style, span.priority)
+        })
+        .collect()
+}
+
+fn relative_decorations_equal(decorations: &[DecorationSpan], indices: &[usize], range: Range<usize>, expected: &[DecorationSpan]) -> bool {
+    indices.len() == expected.len()
+        && indices.iter().zip(expected).all(|(index, expected)| {
+            let span = &decorations[*index];
+            span.style == expected.style
+                && span.priority == expected.priority
+                && span.range.start.max(range.start) - range.start == expected.range.start
+                && span.range.end.min(range.end) - range.start == expected.range.end
+        })
+}
+
+fn decoration_change_range(
+    old: &[DecorationSpan],
+    new: &[DecorationSpan],
     change: FrameTextChange,
-    cursor_line: usize,
-    screen_row: usize,
-    content_height: usize,
-    new_rows: usize,
+    old_visible: Range<usize>,
+    new_visible: Range<usize>,
+) -> Range<usize> {
+    let overlaps = |span: &&DecorationSpan, visible: &Range<usize>| span.range.start < visible.end && visible.start < span.range.end;
+    let inside_old = |span: &&DecorationSpan| span.range.start < change.old_end && change.old_start < span.range.end;
+    let inside_new = |span: &&DecorationSpan| span.range.start < change.new_end && change.new_start < span.range.end;
+    let shift = |offset: usize| {
+        if change.new_end >= change.old_end { offset.checked_add(change.new_end - change.old_end) } else { offset.checked_sub(change.old_end - change.new_end) }
+    };
+    let mut affected = change.new_start..change.new_end.max(change.new_start.saturating_add(1));
+    let mut include = |span: Option<DecorationSpan>| {
+        if let Some(span) = span {
+            affected.start = affected.start.min(span.range.start);
+            affected.end = affected.end.max(span.range.end);
+        }
+    };
+    for span in old.iter().filter(|span| overlaps(span, &old_visible) && inside_old(span)) {
+        let start = if span.range.start < change.old_start { span.range.start } else { change.new_start };
+        let end = if span.range.end > change.old_end { shift(span.range.end).unwrap_or(change.new_end) } else { change.new_end };
+        include(Some(DecorationSpan::new(start..end, span.style, span.priority)));
+    }
+    for span in new.iter().filter(|span| overlaps(span, &new_visible) && inside_new(span)) {
+        include(Some((*span).clone()));
+    }
+    let mut old = old.iter().filter(|span| overlaps(span, &old_visible) && !inside_old(span)).filter_map(|span| {
+        let mut mapped = span.clone();
+        if mapped.range.start >= change.old_end {
+            mapped.range = shift(mapped.range.start)?..shift(mapped.range.end)?;
+        }
+        Some(mapped)
+    });
+    let mut new = new.iter().filter(|span| overlaps(span, &new_visible) && !inside_new(span)).cloned();
+    loop {
+        match (old.next(), new.next()) {
+            (None, None) => return affected,
+            (Some(old), Some(new)) if old == new => {}
+            (old, new) => {
+                include(old);
+                include(new);
+                break;
+            }
+        }
+    }
+    loop {
+        match (old.next_back(), new.next_back()) {
+            (None, None) => return affected,
+            (Some(old), Some(new)) if old == new => {}
+            (old_span, new_span) => {
+                include(old_span);
+                include(new_span);
+                old.for_each(|span| include(Some(span)));
+                new.for_each(|span| include(Some(span)));
+                return affected;
+            }
+        }
+    }
+}
+
+fn decorations_match_range(left: &[DecorationSpan], right: &[DecorationSpan], range: &Range<usize>) -> bool {
+    let overlaps = |span: &&DecorationSpan| span.range.start < range.end && range.start < span.range.end;
+    left.iter().filter(overlaps).eq(right.iter().filter(overlaps))
 }
 
 fn single_line_change(old: &FrameText, new: &FrameText) -> Option<FrameTextChange> {
@@ -3701,72 +3139,6 @@ fn single_line_change(old: &FrameText, new: &FrameText) -> Option<FrameTextChang
         return None;
     }
     Some(FrameTextChange { line: old.line_of_byte(old_start), old_start, old_end, new_start, new_end })
-}
-
-fn matching_decorations_outside_change(old: &[DecorationSpan], new: &[DecorationSpan], change: FrameTextChange) -> Option<usize> {
-    let old_prefix = old.partition_point(|span| span.range.start < change.old_start);
-    let new_prefix = new.partition_point(|span| span.range.start < change.new_start);
-    let (mut old_index, mut new_index) = if old_prefix == new_prefix && old[..old_prefix] == new[..new_prefix] {
-        (old_prefix, new_prefix)
-    } else {
-        let mut old_index = 0;
-        let mut new_index = 0;
-        while old_index < old.len() && new_index < new.len() {
-            let old_span = &old[old_index];
-            let new_span = &new[new_index];
-            if old_span.range.end > change.old_start || new_span.range.end > change.new_start {
-                break;
-            }
-            if old_span != new_span {
-                return None;
-            }
-            old_index += 1;
-            new_index += 1;
-        }
-        (old_index, new_index)
-    };
-    if old.get(old_index).is_some_and(|span| span.range.end <= change.old_start) || new.get(new_index).is_some_and(|span| span.range.end <= change.new_start) {
-        return None;
-    }
-    let repaint_start = new_index;
-
-    let skip_changed = |spans: &[DecorationSpan], index: &mut usize, start, end| {
-        while *index < spans.len() && spans[*index].range.start < end {
-            let span = &spans[*index];
-            if span.range.start < start || span.range.end > end {
-                return false;
-            }
-            *index += 1;
-        }
-        true
-    };
-    if !skip_changed(old, &mut old_index, change.old_start, change.old_end)
-        || !skip_changed(new, &mut new_index, change.new_start, change.new_end)
-        || old.len().saturating_sub(old_index) != new.len().saturating_sub(new_index)
-    {
-        return None;
-    }
-
-    let old = &old[old_index..];
-    let new = &new[new_index..];
-    if change.new_end >= change.old_end {
-        let delta = change.new_end - change.old_end;
-        old.iter().zip(new).all(|(old, new)| {
-            old.style == new.style
-                && old.priority == new.priority
-                && old.range.start.checked_add(delta) == Some(new.range.start)
-                && old.range.end.checked_add(delta) == Some(new.range.end)
-        })
-    } else {
-        let delta = change.old_end - change.new_end;
-        old.iter().zip(new).all(|(old, new)| {
-            old.style == new.style
-                && old.priority == new.priority
-                && old.range.start.checked_sub(delta) == Some(new.range.start)
-                && old.range.end.checked_sub(delta) == Some(new.range.end)
-        })
-    }
-    .then_some(repaint_start)
 }
 
 fn retain_decorations(decorations: &[DecorationSpan], shared: Option<&SharedDecorations>) -> SharedDecorations {
@@ -3793,16 +3165,14 @@ fn merge_shared_decoration_layers(layers: &[SharedDecorations]) -> Vec<Decoratio
     merged
 }
 
-fn decorations_match_range(left: &[DecorationSpan], right: &[DecorationSpan], range: &Range<usize>) -> bool {
-    let overlaps = |span: &&DecorationSpan| span.range.start < range.end && range.start < span.range.end;
-    left.iter().filter(overlaps).eq(right.iter().filter(overlaps))
-}
-
-fn visual_line_rows(text: &str, width: usize, tab_width: usize) -> usize {
+fn visual_line_rows_bounded(text: &str, width: usize, tab_width: usize, limit: usize) -> usize {
     let mut row = 0;
     let mut column = 0;
     for grapheme in text.graphemes(true) {
         advance_visual_grapheme(&mut row, &mut column, width, tab_width, grapheme);
+        if row >= limit {
+            return limit.saturating_add(1);
+        }
     }
     row.saturating_add(1)
 }
@@ -3851,55 +3221,42 @@ fn advance_visual_cell(row: &mut usize, column: &mut usize, width: usize, cell_w
 }
 
 #[must_use]
-pub fn diff(previous: Option<&DesiredGrid>, desired: &DesiredGrid) -> Vec<TerminalPatch> {
-    let mut patches = Vec::with_capacity(desired.height.saturating_mul(3).saturating_add(4));
-    diff_into(previous, desired, &mut patches);
-    patches
+#[cfg(any(test, feature = "test-support"))]
+pub fn diff(previous: Option<&DesiredGrid>, desired: &DesiredGrid) -> TerminalUpdate {
+    let mut update = TerminalUpdate::default();
+    diff_into(previous, desired, &mut update);
+    update
 }
 
-/// Reuses caller-owned patch storage for successive terminal frames.
-pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, patches: &mut Vec<TerminalPatch>) {
-    patches.clear();
-    let required_capacity = desired.height.saturating_mul(3).saturating_add(4);
-    if patches.capacity() < required_capacity {
-        patches.reserve(required_capacity);
+/// Reuses caller-owned row storage for successive terminal frames.
+pub fn diff_into(previous: Option<&DesiredGrid>, desired: &DesiredGrid, update: &mut TerminalUpdate) {
+    update.clear = false;
+    update.rows.clear();
+    if update.rows.capacity() < desired.height {
+        update.rows.reserve(desired.height - update.rows.capacity());
     }
-    patches.push(TerminalPatch::ShowCursor(false));
     let full_refresh = previous.is_none_or(|old| old.width != desired.width || old.height != desired.height);
     let raster_rows = desired.raster_overlay.as_ref().map_or(0, |overlay| overlay.rows.min(desired.height));
     if full_refresh {
-        patches.push(TerminalPatch::Clear);
+        update.clear = true;
         let present_rows = desired.rows.len().min(desired.height);
         for (row_index, row) in desired.rows.iter().take(present_rows).enumerate().skip(raster_rows) {
-            append_row_patches(patches, row_index, Arc::clone(row));
+            update.rows.push((row_index, Arc::clone(row)));
         }
         for row_index in present_rows.max(raster_rows)..desired.height {
-            append_row_patches(patches, row_index, Arc::default());
+            update.rows.push((row_index, Arc::default()));
         }
     } else if let Some(previous) = previous {
         for row_index in 0..desired.height {
             let row = desired.rows.get(row_index).cloned().unwrap_or_default();
             if previous.rows.get(row_index) != Some(&row) {
-                append_row_patches(patches, row_index, row);
+                update.rows.push((row_index, row));
             }
         }
     }
     let previous_overlay = previous.and_then(|grid| grid.raster_overlay.as_ref());
-    if previous_overlay != desired.raster_overlay.as_ref() {
-        patches.push(TerminalPatch::SetRasterOverlay(desired.raster_overlay.clone()));
-    }
-    patches.push(TerminalPatch::MoveTo {
-        column: desired.cursor.0.min(desired.width.saturating_sub(1)),
-        row: desired.cursor.1.min(desired.height.saturating_sub(1)),
-    });
-    patches.push(TerminalPatch::ShowCursor(true));
-}
-
-fn append_row_patches(patches: &mut Vec<TerminalPatch>, row_index: usize, row: Arc<CellRow>) {
-    let clear_style = row.cells.last().map_or_else(CellStyle::default, |cell| cell.style);
-    patches.push(TerminalPatch::MoveTo { column: 0, row: row_index });
-    patches.push(TerminalPatch::PutRow(row));
-    patches.push(TerminalPatch::ClearToEndOfLine(clear_style));
+    update.raster_overlay = (previous_overlay != desired.raster_overlay.as_ref()).then(|| desired.raster_overlay.clone());
+    update.cursor = (desired.cursor.0.min(desired.width.saturating_sub(1)), desired.cursor.1.min(desired.height.saturating_sub(1)));
 }
 
 #[cfg(test)]
@@ -3908,15 +3265,15 @@ mod tests {
 
     #[test]
     fn view_model_tracks_buffers_splits_and_tabs() {
-        let mut model = ClientViewModel::new(DocumentId::new(10), "one");
-        let second = model.add_buffer(DocumentId::new(11), "two");
-        model.set_active_buffer(second).expect("select buffer");
+        let mut model = ClientViewModel::initial();
+        let second = model.add_buffer();
+        model.set_active_buffer(second);
         assert_eq!(model.active_buffer(), second);
 
         let first_window = model.active_window().id;
         let split = model.split_active(SplitAxis::Vertical).expect("split");
         assert_ne!(split, first_window);
-        assert_eq!(model.windows.len(), 2);
+        assert_eq!(model.window_count(), 2);
         model.focus_window(WindowDirection::Left).expect("focus left");
         assert_eq!(model.active_window().id, first_window);
         let lower = model.split_active(SplitAxis::Horizontal).expect("lower split");
@@ -3931,7 +3288,7 @@ mod tests {
         assert_eq!(model.active_window().id, first_window);
 
         let first_tab = model.active_tab;
-        model.new_tab(second).expect("new tab");
+        model.new_tab(second);
         assert_ne!(model.active_tab, first_tab);
         model.cycle_tab(-1);
         assert_eq!(model.active_tab, first_tab);
@@ -3942,11 +3299,11 @@ mod tests {
 
     #[test]
     fn workspace_grid_renders_split_panes_and_active_cursor() {
-        let mut model = ClientViewModel::new(DocumentId::new(10), "one");
-        let second = model.add_buffer(DocumentId::new(11), "two");
+        let mut model = ClientViewModel::initial();
+        let first = model.active_buffer();
+        let second = model.add_buffer();
         model.split_active(SplitAxis::Vertical).expect("split");
-        model.set_active_buffer(second).expect("second pane");
-        let first = model.buffers[0].id;
+        model.set_active_buffer(second);
         let grid = ViewportLayout::new(15, 4).desired_workspace_grid(
             &model,
             &[(first, EngineFrame::new("left", 0)), (second, EngineFrame::new("right", 5))],
@@ -3962,7 +3319,7 @@ mod tests {
 
     #[test]
     fn terminal_sidebar_preserves_harness_cells_and_owns_focused_cursor() {
-        let model = ClientViewModel::new(DocumentId::new(1), "terminal harness");
+        let model = ClientViewModel::initial();
         let buffer_id = model.active_buffer();
         let frame = EngineFrame::new("editor contents", 0);
         let mut layout = ViewportLayout::new(80, 10);
@@ -3982,7 +3339,7 @@ mod tests {
                 found
             })
             .expect("harness cell");
-        assert_eq!(harness_cell.grapheme.as_ref(), "界");
+        assert_eq!(harness_cell.grapheme.as_str(), "界");
         assert_eq!(harness_cell.width, 2);
         assert_eq!(harness_cell.style, harness_style);
         assert_eq!(grid.cursor, (column + 3, 0));
@@ -3991,12 +3348,12 @@ mod tests {
 
     #[test]
     fn workspace_hit_testing_matches_gutters_tabs_unicode_wraps_splits_and_status() {
-        let mut model = ClientViewModel::new(DocumentId::new(10), "one");
-        let first = model.buffers[0].id;
+        let mut model = ClientViewModel::initial();
+        let first = model.active_buffer();
         let first_window = model.active_window().id;
-        let second = model.add_buffer(DocumentId::new(11), "two");
+        let second = model.add_buffer();
         let second_window = model.split_active(SplitAxis::Vertical).expect("split");
-        model.set_active_buffer(second).expect("second pane");
+        model.set_active_buffer(second);
         let frames = [(first, EngineFrame::new("ab界cdef\n\txy\nlast", 0)), (second, EngineFrame::new("right pane", 0))];
         let mut layout = ViewportLayout::new(21, 7);
         layout.configure_dotfile_profile();
@@ -4034,20 +3391,22 @@ mod tests {
                 title: "Find Files".into(),
                 prompt: "main".into(),
                 rows: vec![
-                    PickerOverlayRow { label: "README.md".into(), detail: "".into() },
-                    PickerOverlayRow { label: "src/main.rs".into(), detail: "Rust".into() },
+                    MenuOverlayRow { label: "README.md".into(), detail: "".into(), source: None },
+                    MenuOverlayRow { label: "src/main.rs".into(), detail: "Rust".into(), source: None },
                 ],
                 selected: 1,
                 preview_title: "src/main.rs".into(),
                 preview: "fn main() {\n    println!(\"wren\");\n}".into(),
-                preview_scroll: 0,
                 preview_highlight_line: Some(1),
                 preview_decorations: vec![DecorationSpan::new(
                     0..2,
-                    CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)).with_bold(),
+                    CellStyle::default()
+                        .with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mauve)))
+                        .with_bold(),
                     100,
                 )],
                 footer: "↑/↓ select  ⏎ open".into(),
+                ..PickerOverlay::default()
             },
         );
         let rendered = grid.text();
@@ -4060,33 +3419,22 @@ mod tests {
 
     #[test]
     fn picker_overlay_preserves_the_already_themed_editor_background() {
-        let mut theme = CatppuccinPalette::LATTE;
+        let mut theme = CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte);
         // Deliberately overlap a customized slot with a Mocha source color.
         // Applying the theme a second time would reinterpret this background
         // as `surface0` and visibly recolor the editor behind the picker.
-        theme.base = CatppuccinPalette::MOCHA.surface0;
+        assert!(theme.set("base", CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Surface0)));
         let mut layout = ViewportLayout::new(80, 24);
         layout.set_theme(theme);
         let base = layout.desired_editor_grid(&EngineFrame::new("editor background", 0), "NORMAL", None);
         let outside = base.rows[0].cells[0].style;
         let grid = layout.apply_picker_overlay(
             base,
-            &PickerOverlay {
-                title: "Find Files".into(),
-                prompt: "".into(),
-                rows: Vec::new(),
-                selected: 0,
-                preview_title: "No preview".into(),
-                preview: "".into(),
-                preview_scroll: 0,
-                preview_highlight_line: None,
-                preview_decorations: Vec::new(),
-                footer: "Esc close".into(),
-            },
+            &PickerOverlay { title: "Find Files".into(), preview_title: "No preview".into(), footer: "Esc close".into(), ..PickerOverlay::default() },
         );
 
         assert_eq!(grid.rows[0].cells[0].style, outside);
-        assert_eq!(grid.rows[0].cells[0].style.background, Some(CellColor::Rgb(theme.base)));
+        assert_eq!(grid.rows[0].cells[0].style.background, Some(CellColor::Rgb(theme.color(CatppuccinColor::Base))));
     }
 
     #[test]
@@ -4098,28 +3446,28 @@ mod tests {
             grid,
             &PickerOverlay {
                 title: "Find Files".into(),
-                prompt: "".into(),
-                rows: vec![PickerOverlayRow { label: "src/main.rs".into(), detail: "".into() }],
-                selected: 0,
+                rows: vec![MenuOverlayRow { label: "src/main.rs".into(), detail: "".into(), source: None }],
                 preview_title: "src/main.rs".into(),
                 preview: preview.clone().into(),
-                preview_scroll: 0,
                 preview_highlight_line: Some(0),
                 preview_decorations: vec![DecorationSpan::new(
                     0..preview.len(),
-                    CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).with_bold(),
+                    CellStyle::default()
+                        .with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Green)))
+                        .with_bold(),
                     100,
                 )],
                 footer: "enter open".into(),
+                ..PickerOverlay::default()
             },
         );
 
         // At this terminal size the floating picker's right border is column
         // 97 and its preview begins at 41. All 140 cells wrap inside it.
         for row in 5..25 {
-            assert_eq!(grid.rows[row].cells[97].grapheme.as_ref(), "│");
+            assert_eq!(grid.rows[row].cells[97].grapheme.as_str(), "│");
         }
-        let rendered_x = grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.grapheme.as_ref() == "x").count();
+        let rendered_x = grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.grapheme.as_str() == "x").count();
         assert_eq!(rendered_x, preview.len());
         assert!(grid.rows.iter().all(|row| { row.cells.iter().map(|cell| usize::from(cell.width)).sum::<usize>() <= 100 }));
     }
@@ -4130,22 +3478,27 @@ mod tests {
         let base = layout.desired_editor_grid(&EngineFrame::new("underlying editor", 0), "NORMAL", None);
         let picker = PickerOverlay {
             title: "Jumplist".into(),
-            prompt: "".into(),
-            rows: vec![PickerOverlayRow { label: "src/main.rs:1:7".into(), detail: "language-server location".into() }],
-            selected: 0,
+            rows: vec![MenuOverlayRow { label: "src/main.rs:1:7".into(), detail: "language-server location".into(), source: None }],
             preview_title: "src/main.rs".into(),
             preview: "alpha target omega".into(),
-            preview_scroll: 0,
-            preview_highlight_line: None,
             preview_decorations: vec![
-                DecorationSpan::new(0..5, CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).without_background(), 100),
+                DecorationSpan::new(
+                    0..5,
+                    CellStyle::default()
+                        .with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Green)))
+                        .without_background(),
+                    100,
+                ),
                 DecorationSpan::new(
                     6..12,
-                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0)),
+                    CellStyle::default()
+                        .without_foreground()
+                        .with_background(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Surface0))),
                     u32::MAX,
                 ),
             ],
             footer: "enter open".into(),
+            ..PickerOverlay::default()
         };
         let geometry = layout.picker_geometry();
         let preview_column = geometry.column + 2 + geometry.result_width;
@@ -4153,12 +3506,21 @@ mod tests {
         let grid = layout.apply_picker_overlay(base, &picker);
         let row = &grid.rows[geometry.content_start];
 
-        assert_eq!(row.cells[preview_column].style.foreground, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.green)));
-        assert_eq!(row.cells[preview_column].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
+        assert_eq!(
+            row.cells[preview_column].style.foreground,
+            Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Green)))
+        );
+        assert_eq!(
+            row.cells[preview_column].style.background,
+            Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle)))
+        );
         for cell in &row.cells[preview_column + 6..preview_column + 12] {
-            assert_eq!(cell.style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.surface0)));
+            assert_eq!(cell.style.background, Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Surface0))));
         }
-        assert_eq!(row.cells[preview_column + 12].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
+        assert_eq!(
+            row.cells[preview_column + 12].style.background,
+            Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle)))
+        );
     }
 
     #[test]
@@ -4168,12 +3530,14 @@ mod tests {
         let grid = layout.apply_debug_overlay(
             grid,
             &DebugOverlay {
-                scopes: "▸ Locals".into(),
-                breakpoints: "● main.rs:1".into(),
-                stacks: "▾ current thread".into(),
-                watches: "watch value".into(),
-                repl: "(lldb)".into(),
-                console: "stopped".into(),
+                panels: [
+                    DebugPanel { title: "Scopes", text: "▸ Locals".into() },
+                    DebugPanel { title: "Breakpoints", text: "● main.rs:1".into() },
+                    DebugPanel { title: "Stacks", text: "▾ current thread".into() },
+                    DebugPanel { title: "Watches", text: "watch value".into() },
+                    DebugPanel { title: "REPL", text: "(lldb)".into() },
+                    DebugPanel { title: "Console", text: "stopped".into() },
+                ],
             },
         );
         let rendered = grid.text();
@@ -4185,37 +3549,39 @@ mod tests {
 
     #[test]
     fn catppuccin_flavors_are_exact_truecolor_and_overridable() {
-        assert_eq!(CatppuccinPalette::MOCHA.base, RgbColor::new(0x1e, 0x1e, 0x2e));
-        assert_eq!(CatppuccinPalette::MOCHA.text, RgbColor::new(0xcd, 0xd6, 0xf4));
-        assert_eq!(CatppuccinPalette::LATTE.base, RgbColor::new(0xef, 0xf1, 0xf5));
+        assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Base), RgbColor::new(0x1e, 0x1e, 0x2e));
+        assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Text), RgbColor::new(0xcd, 0xd6, 0xf4));
+        assert_eq!(CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte).color(CatppuccinColor::Base), RgbColor::new(0xef, 0xf1, 0xf5));
         let mut palette = CatppuccinPalette::for_flavor(CatppuccinFlavor::Macchiato);
         assert!(palette.set("mauve", RgbColor::new(1, 2, 3)));
-        assert_eq!(palette.mauve, RgbColor::new(1, 2, 3));
+        assert_eq!(palette.color(CatppuccinColor::Mauve), RgbColor::new(1, 2, 3));
         assert!(!palette.set("not-a-slot", RgbColor::new(1, 2, 3)));
 
         let mut layout = ViewportLayout::new(20, 2);
-        layout.set_theme(CatppuccinPalette::LATTE);
+        layout.set_theme(CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte));
         let grid = layout.desired_editor_grid(&EngineFrame::new("x", 0), "", None);
-        assert_eq!(grid.rows[0].cells[0].style, CellStyle::rgb(CatppuccinPalette::LATTE.text, CatppuccinPalette::LATTE.base));
+        assert_eq!(
+            grid.rows[0].cells[0].style,
+            CellStyle::rgb(
+                CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte).color(CatppuccinColor::Text),
+                CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte).color(CatppuccinColor::Base)
+            )
+        );
     }
 
     #[test]
     fn every_terminal_row_erases_with_the_active_theme_background() {
         let mut layout = ViewportLayout::new(120, 40);
-        layout.set_theme(CatppuccinPalette::MACCHIATO);
+        layout.set_theme(CatppuccinPalette::for_flavor(CatppuccinFlavor::Macchiato));
         let grid = layout.desired_editor_grid(&EngineFrame::new("one short line", 0), "NORMAL", None);
         assert_eq!(grid.rows.len(), 40);
         assert!(grid.rows.iter().all(|row| !row.cells.is_empty()));
         let patches = diff(None, &grid);
-        let clears = patches
-            .iter()
-            .filter_map(|patch| match patch {
-                TerminalPatch::ClearToEndOfLine(style) => Some(style),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let clears = patches.rows.iter().filter_map(|(_, cells)| cells.cells.last().map(|cell| &cell.style)).collect::<Vec<_>>();
         assert_eq!(clears.len(), 40);
-        assert!(clears.iter().all(|style| { style.background == Some(CellColor::Rgb(CatppuccinPalette::MACCHIATO.base)) }));
+        assert!(clears.iter().all(|style| {
+            style.background == Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Macchiato).color(CatppuccinColor::Base)))
+        }));
     }
 
     #[test]
@@ -4227,20 +3593,21 @@ mod tests {
             height: 2,
             columns: 2,
             rows: 1,
-            source: RasterSource::Rgb(Arc::new(vec![0; 12])),
+            background: RgbColor::new(0, 0, 0),
+            quads: Arc::new(Vec::new()),
         }));
-        assert!(diff(None, &with_overlay).iter().any(|patch| matches!(patch, TerminalPatch::SetRasterOverlay(Some(_)))));
+        assert!(matches!(diff(None, &with_overlay).raster_overlay, Some(Some(_))));
 
         let mut without_overlay = with_overlay.clone();
         without_overlay.raster_overlay = None;
-        assert!(diff(Some(&with_overlay), &without_overlay).iter().any(|patch| { matches!(patch, TerminalPatch::SetRasterOverlay(None)) }));
+        assert_eq!(diff(Some(&with_overlay), &without_overlay).raster_overlay, Some(None));
     }
 
     #[test]
     fn wraps_graphemes_without_splitting_them() {
         let frame = EngineFrame::new("ab界c", "ab界".len());
         let grid = ViewportLayout::new(3, 3).desired_grid(&frame);
-        assert_eq!(grid.rows[1].cells[0].grapheme.as_ref(), "界");
+        assert_eq!(grid.rows[1].cells[0].grapheme.as_str(), "界");
         assert_eq!(grid.cursor, (2, 1));
     }
 
@@ -4260,9 +3627,9 @@ mod tests {
         wide.configure_dotfile_profile();
         let wide_grid = wide.desired_grid(&EngineFrame::new("short\n", 0));
         let color_column = &wide_grid.rows[0].cells[82];
-        assert_eq!(color_column.grapheme.as_ref(), " ");
-        assert_eq!(color_column.style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
-        assert!(!color_column.style.reverse);
+        assert_eq!(color_column.grapheme.as_str(), " ");
+        assert_eq!(color_column.style.background, Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle))));
+        assert!(!color_column.style.reverse());
     }
 
     #[test]
@@ -4272,12 +3639,21 @@ mod tests {
         let grid = layout.desired_grid(&EngineFrame::new("x".repeat(180), 0));
 
         for row in grid.rows.iter().take(2) {
-            assert_eq!(row.cells[81].grapheme.as_ref(), "x");
-            assert_eq!(row.cells[81].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.base)));
-            assert_eq!(row.cells[82].grapheme.as_ref(), "x");
-            assert_eq!(row.cells[82].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
-            assert_eq!(row.cells[83].grapheme.as_ref(), "x");
-            assert_eq!(row.cells[83].style.background, Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)));
+            assert_eq!(row.cells[81].grapheme.as_str(), "x");
+            assert_eq!(
+                row.cells[81].style.background,
+                Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Base)))
+            );
+            assert_eq!(row.cells[82].grapheme.as_str(), "x");
+            assert_eq!(
+                row.cells[82].style.background,
+                Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle)))
+            );
+            assert_eq!(row.cells[83].grapheme.as_str(), "x");
+            assert_eq!(
+                row.cells[83].style.background,
+                Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle)))
+            );
         }
     }
 
@@ -4294,12 +3670,12 @@ mod tests {
 
         assert_eq!(
             interior.cells[82].style.background,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)),
+            Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle))),
             "popup must repaint the color-column cell with its own surface"
         );
         assert_eq!(
             interior.cells[100].style.background,
-            Some(CellColor::Rgb(CatppuccinPalette::MOCHA.mantle)),
+            Some(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mantle))),
             "the terminal tail beyond the popup must retain the editor overflow background"
         );
     }
@@ -4319,10 +3695,10 @@ mod tests {
 
         assert_eq!(first_placement, PopupPlacement { column: 84, row: 0 });
         assert_eq!(second_placement, first_placement);
-        assert_eq!(first_grid.rows[0].cells[84].grapheme.as_ref(), "╭");
-        assert_eq!(second_grid.rows[0].cells[84].grapheme.as_ref(), "╭");
-        assert_eq!(first_grid.rows[0].cells[98].grapheme.as_ref(), "╮");
-        assert_ne!(first_grid.rows[0].cells[99].grapheme.as_ref(), "╮");
+        assert_eq!(first_grid.rows[0].cells[84].grapheme.as_str(), "╭");
+        assert_eq!(second_grid.rows[0].cells[84].grapheme.as_str(), "╭");
+        assert_eq!(first_grid.rows[0].cells[98].grapheme.as_str(), "╮");
+        assert_ne!(first_grid.rows[0].cells[99].grapheme.as_str(), "╮");
     }
 
     #[test]
@@ -4335,9 +3711,9 @@ mod tests {
         let grid = layout.apply_text_popup(base, &popup);
 
         assert_eq!(placement.column, 1);
-        assert_eq!(grid.rows[placement.row].cells[1].grapheme.as_ref(), "╭");
-        assert_eq!(grid.rows[placement.row].cells[38].grapheme.as_ref(), "╮");
-        assert_ne!(grid.rows[placement.row].cells[39].grapheme.as_ref(), "╮");
+        assert_eq!(grid.rows[placement.row].cells[1].grapheme.as_str(), "╭");
+        assert_eq!(grid.rows[placement.row].cells[38].grapheme.as_str(), "╮");
+        assert_ne!(grid.rows[placement.row].cells[39].grapheme.as_str(), "╮");
     }
 
     #[test]
@@ -4364,7 +3740,7 @@ mod tests {
     fn one_cell_terminal_renders_status_without_indexing_past_the_grid() {
         let mut layout = ViewportLayout::new(1, 1);
         layout.configure_dotfile_profile();
-        let model = ClientViewModel::new(DocumentId::new(1), "tiny");
+        let model = ClientViewModel::initial();
         let frame = EngineFrame::new("x", 0);
         let grid = layout.desired_workspace_grid(&model, &[(BufferId::new(1), frame)], "NORMAL", None);
         assert_eq!(grid.rows.len(), 1);
@@ -4381,11 +3757,11 @@ mod tests {
 
     #[test]
     fn decorations_follow_byte_ranges_through_unicode_tabs_and_splits() {
-        let mut model = ClientViewModel::new(DocumentId::new(10), "one");
-        let second = model.add_buffer(DocumentId::new(11), "two");
+        let mut model = ClientViewModel::initial();
+        let first = model.active_buffer();
+        let second = model.add_buffer();
         model.split_active(SplitAxis::Vertical).expect("split");
-        model.set_active_buffer(second).expect("second pane");
-        let first = model.buffers[0].id;
+        model.set_active_buffer(second);
         let keyword = CellStyle::default().with_foreground(CellColor::Palette(12)).with_bold();
         let grid = ViewportLayout::new(20, 3).desired_workspace_grid_with_decorations(
             &model,
@@ -4395,14 +3771,18 @@ mod tests {
             None,
         );
         let styled: String =
-            grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.style == keyword).map(|cell| cell.grapheme.as_ref()).collect();
+            grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.style == keyword).map(|cell| cell.grapheme.as_str()).collect();
         assert_eq!(styled, "fnlet");
     }
 
     #[test]
     fn signcolumn_number_decorations_do_not_overwrite_syntax_tokens() {
-        let syntax = CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.mauve)).with_bold();
-        let git_sign = CellStyle::default().with_foreground(CellColor::Rgb(CatppuccinPalette::MOCHA.green)).with_bold();
+        let syntax = CellStyle::default()
+            .with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Mauve)))
+            .with_bold();
+        let git_sign = CellStyle::default()
+            .with_foreground(CellColor::Rgb(CatppuccinPalette::for_flavor(CatppuccinFlavor::Mocha).color(CatppuccinColor::Green)))
+            .with_bold();
         let mut layout = ViewportLayout::new(20, 2);
         layout.configure_dotfile_profile();
         let grid = layout.desired_editor_grid_with_line_decorations(
@@ -4414,9 +3794,9 @@ mod tests {
         );
 
         assert!(grid.rows[0].cells[..3].iter().all(|cell| cell.style.foreground == git_sign.foreground));
-        assert_eq!(grid.rows[0].cells[3].grapheme.as_ref(), "f");
+        assert_eq!(grid.rows[0].cells[3].grapheme.as_str(), "f");
         assert_eq!(grid.rows[0].cells[3].style.foreground, syntax.foreground);
-        assert_eq!(grid.rows[0].cells[4].grapheme.as_ref(), "n");
+        assert_eq!(grid.rows[0].cells[4].grapheme.as_str(), "n");
         assert_eq!(grid.rows[0].cells[4].style.foreground, syntax.foreground);
     }
 
@@ -4431,10 +3811,10 @@ mod tests {
     }
 
     #[test]
-    fn shrinking_rows_emits_clear_to_end() {
+    fn shrinking_rows_replaces_the_terminal_row() {
         let old = ViewportLayout::new(20, 2).desired_grid(&EngineFrame::new("long line", 0));
         let new = ViewportLayout::new(20, 2).desired_grid(&EngineFrame::new("x", 0));
-        assert!(diff(Some(&old), &new).iter().any(|patch| matches!(patch, TerminalPatch::ClearToEndOfLine(_))));
+        assert!(!diff(Some(&old), &new).rows.is_empty());
     }
 
     #[test]
@@ -4526,7 +3906,7 @@ mod tests {
         let first = layout.desired_editor_grid(&EngineFrame::new(text.clone(), 0), "", None);
         layout.top_line = 4;
         let down = layout.desired_editor_grid(&EngineFrame::new(text.clone(), text.byte_of_line(4)), "", None);
-        assert!(layout.cached_logical_rows.keys().all(|line| *line < 4));
+        assert!((0..4).all(|line| layout.has_cached_logical_line(line)));
         assert!(row_text(&down.rows[0]).starts_with(" 5 line 04"));
 
         layout.top_line = 0;
@@ -4562,7 +3942,7 @@ mod tests {
 
     #[test]
     fn production_workspace_retains_unchanged_pane_rows() {
-        let model = ClientViewModel::new(DocumentId::new(10), "main.rs");
+        let model = ClientViewModel::initial();
         let buffer_id = model.active_buffer();
         let window_id = model.active_window().id;
         let mut layout = ViewportLayout::new(30, 4);

@@ -11,5 +11,8 @@ unicode-width.workspace = true
 wren-text = { version = "0.1.0", path = "../wren-text" }
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
+[dev-dependencies]
+wren-types = { version = "0.1.0", path = "../wren-types", features = ["test-support"] }
+
 [lints]
 workspace = true

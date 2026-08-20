@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 blake3.workspace = true
 filetime.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -20,6 +21,7 @@ nix.workspace = true
 
 [dev-dependencies]
 loom = "0.7"
+wren-types = { version = "0.1.0", path = "../wren-types", features = ["test-support"] }
 
 [lints]
 workspace = true

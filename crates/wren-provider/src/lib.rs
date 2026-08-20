@@ -1,6 +1,5 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-#[cfg(feature = "gpu")]
 mod gpu;
 
 use std::collections::BTreeMap;
@@ -8,26 +7,48 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Pattern};
-use regex::Regex;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tree_sitter::{Query, QueryCursor, QueryMatch, QueryPredicateArg, StreamingIterator};
+#[cfg(test)]
+use wren_types::Bias;
 use wren_types::{
-    Bias, DocumentId, DocumentRevision, Edit, Freshness, FreshnessKey, LanguageBundle, ProviderDemand, ProviderGeneration, Transaction, floor_char_boundary,
-    merge_ranges,
+    DocumentId, DocumentRevision, Edit, Freshness, FreshnessKey, LanguageBundle, ProviderDemand, ProviderGeneration, Transaction, floor_char_boundary,
+    identifier_prefix_start, merge_ranges,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "kebab-case")]
 pub enum ProviderRequest {
-    Hello { protocol: u32 },
-    UpdateDocument { document_id: DocumentId, revision: DocumentRevision, text: Box<str>, bundle: LanguageBundle },
-    AdvanceDocumentRevision { document_id: DocumentId, from_revision: DocumentRevision, revision: DocumentRevision, generation: ProviderGeneration },
-    Demand { document_id: DocumentId, demand: ProviderDemand },
-    Complete { document_id: DocumentId, revision: DocumentRevision, byte: usize },
+    Hello {
+        protocol: u32,
+    },
+    UpdateDocument {
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        text: Box<str>,
+        bundle: LanguageBundle,
+    },
+    AdvanceDocumentRevision {
+        document_id: DocumentId,
+        from_revision: DocumentRevision,
+        revision: DocumentRevision,
+        generation: ProviderGeneration,
+    },
+    Demand {
+        document_id: DocumentId,
+        demand: ProviderDemand,
+    },
+    Complete {
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        byte: usize,
+    },
+    #[cfg(any(test, debug_assertions))]
     CrashForTest,
     Shutdown,
 }
@@ -128,6 +149,7 @@ pub enum GrammarBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "benchmarking"))]
 pub enum AccelerationBackend {
     Pending,
     Gpu,
@@ -147,15 +169,14 @@ struct LexicalSourceKey {
     range: Range<usize>,
 }
 
+#[derive(Default)]
 enum LexicalAccelerator {
     Cpu,
-    #[cfg(feature = "gpu")]
+    #[default]
     Pending,
-    #[cfg(feature = "gpu")]
     Gpu(Box<GpuAccelerator>),
 }
 
-#[cfg(feature = "gpu")]
 struct GpuAccelerator {
     classifier: gpu::GpuLexical,
     resident_source: Option<LexicalSourceKey>,
@@ -163,28 +184,20 @@ struct GpuAccelerator {
 
 impl std::fmt::Debug for LexicalAccelerator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("LexicalAccelerator").field(&self.backend()).finish()
+        formatter.write_str(match self {
+            Self::Cpu => "Cpu",
+            Self::Pending => "Pending",
+            Self::Gpu(_) => "Gpu",
+        })
     }
 }
 
 impl LexicalAccelerator {
-    fn prefer_gpu() -> Self {
-        #[cfg(feature = "gpu")]
-        {
-            Self::Pending
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            Self::Cpu
-        }
-    }
-
+    #[cfg(any(test, feature = "benchmarking"))]
     const fn backend(&self) -> AccelerationBackend {
         match self {
             Self::Cpu => AccelerationBackend::Cpu,
-            #[cfg(feature = "gpu")]
             Self::Pending => AccelerationBackend::Pending,
-            #[cfg(feature = "gpu")]
             Self::Gpu(_) => AccelerationBackend::Gpu,
         }
     }
@@ -193,28 +206,19 @@ impl LexicalAccelerator {
         if text.len() < MIN_GPU_CLASSIFICATION_BYTES || !text.is_ascii() {
             return None;
         }
-        #[cfg(not(feature = "gpu"))]
-        {
-            let _ = (source, text);
-            None
+        if matches!(self, Self::Pending) {
+            *self = Self::initialize_gpu();
         }
-        #[cfg(feature = "gpu")]
-        {
-            if matches!(self, Self::Pending) {
-                *self = Self::initialize_gpu();
-            }
-            let Self::Gpu(gpu) = self else { return None };
-            match gpu.classify(source, text) {
-                Ok(ranges) => ranges,
-                Err(()) => {
-                    *self = Self::Cpu;
-                    None
-                }
+        let Self::Gpu(gpu) = self else { return None };
+        match gpu.classify(source, text) {
+            Ok(ranges) => ranges,
+            Err(()) => {
+                *self = Self::Cpu;
+                None
             }
         }
     }
 
-    #[cfg(feature = "gpu")]
     fn initialize_gpu() -> Self {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(gpu::GpuLexical::new))
             .ok()
@@ -225,7 +229,6 @@ impl LexicalAccelerator {
     }
 }
 
-#[cfg(feature = "gpu")]
 impl GpuAccelerator {
     fn classify(&mut self, source: LexicalSourceKey, text: &str) -> Result<Option<Vec<Range<usize>>>, ()> {
         if !self.classifier.supports(text.len()) {
@@ -239,18 +242,13 @@ impl GpuAccelerator {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ProviderActor {
     documents: BTreeMap<DocumentId, ProviderDocument>,
     lexical_accelerator: LexicalAccelerator,
 }
 
-impl Default for ProviderActor {
-    fn default() -> Self {
-        Self { documents: BTreeMap::new(), lexical_accelerator: LexicalAccelerator::prefer_gpu() }
-    }
-}
-
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone)]
 pub struct QueuedDemand {
     pub document_id: DocumentId,
@@ -260,6 +258,7 @@ pub struct QueuedDemand {
 
 /// Bounded latest-wins scheduler. A document can occupy only one queue slot;
 /// newer revisions replace obsolete work before it reaches the provider.
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug)]
 pub struct LatestDemandQueue {
     capacity: usize,
@@ -268,6 +267,7 @@ pub struct LatestDemandQueue {
     pending: BTreeMap<DocumentId, QueuedDemand>,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl LatestDemandQueue {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
@@ -294,11 +294,13 @@ impl LatestDemandQueue {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn depth(&self) -> usize {
         self.pending.len()
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -306,11 +308,13 @@ impl LatestDemandQueue {
 
 impl ProviderActor {
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn cpu_only() -> Self {
         Self { documents: BTreeMap::new(), lexical_accelerator: LexicalAccelerator::Cpu }
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub const fn acceleration_backend(&self) -> AccelerationBackend {
         self.lexical_accelerator.backend()
     }
@@ -320,7 +324,7 @@ impl ProviderActor {
             ProviderRequest::Hello { protocol } => Ok(ProviderResponse::Hello { protocol }),
             ProviderRequest::UpdateDocument { document_id, revision, text, bundle } => {
                 let generation = bundle.provider_generation();
-                let (grammar_backend, mut syntax_spans) = native_tree_sitter_spans(&text, &bundle.language_id)
+                let (grammar_backend, mut syntax_spans) = query_tree_sitter_spans(&text, &bundle.language_id)
                     .map_or_else(|| (GrammarBackend::DynamicWasmFallback, Vec::new()), |spans| (GrammarBackend::BundledNative, spans));
                 syntax_spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
                 let mut maximum_end = 0;
@@ -344,6 +348,7 @@ impl ProviderActor {
             }
             ProviderRequest::Demand { document_id, demand } => self.highlight(document_id, demand).map(ProviderResponse::Highlight),
             ProviderRequest::Complete { document_id, revision, byte } => self.complete(document_id, revision, byte).map(ProviderResponse::Completion),
+            #[cfg(any(test, debug_assertions))]
             ProviderRequest::CrashForTest => panic!("injected provider process crash"),
             ProviderRequest::Shutdown => Ok(ProviderResponse::Bye),
         }
@@ -362,7 +367,7 @@ impl ProviderActor {
             let last = document.syntax_spans.partition_point(|span| span.range.start < range.end);
             spans.extend(document.syntax_spans[first..last].iter().filter(|span| span.range.start < range.end && range.start < span.range.end).cloned());
         }
-        if document.grammar_backend == GrammarBackend::DynamicWasmFallback || (document.grammar_backend == GrammarBackend::BundledNative && spans.is_empty()) {
+        if document.grammar_backend == GrammarBackend::DynamicWasmFallback || spans.is_empty() {
             for range in &requested_ranges {
                 let source = &document.text[range.clone()];
                 let source_key = LexicalSourceKey { document_id, revision: document.revision, generation: document.generation, range: range.clone() };
@@ -381,12 +386,7 @@ impl ProviderActor {
     fn complete(&self, document_id: DocumentId, requested_revision: DocumentRevision, byte: usize) -> Result<CompletionResult, ProviderError> {
         let document = self.documents.get(&document_id).ok_or(ProviderError::UnknownDocument(document_id))?;
         let byte = floor_char_boundary(&document.text, byte);
-        let start = document.text[..byte]
-            .char_indices()
-            .rev()
-            .take_while(|(_, character)| character.is_alphanumeric() || *character == '_')
-            .last()
-            .map_or(byte, |(offset, _)| offset);
+        let start = identifier_prefix_start(&document.text, byte);
         let prefix = &document.text[start..byte];
         let mut words: Vec<_> = document
             .text
@@ -398,7 +398,7 @@ impl ProviderActor {
         let candidates = fuzzy_rank(prefix, words.into_iter())
             .into_iter()
             .take(64)
-            .map(|word| CompletionCandidate {
+            .map(|(_, word)| CompletionCandidate {
                 label: word.into(),
                 insert: word.into(),
                 source: "word".into(),
@@ -415,10 +415,6 @@ impl ProviderActor {
             candidates,
         })
     }
-}
-
-fn native_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
-    query_tree_sitter_spans(text, language_id)
 }
 
 fn query_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
@@ -494,10 +490,9 @@ fn collect_query_spans(
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(range);
     let mut matches = cursor.matches(query, root, text.as_bytes());
-    let mut lua_patterns = BTreeMap::<Box<str>, Regex>::new();
     let mut spans = Vec::new();
     while let Some(query_match) = matches.next() {
-        if !satisfies_neovim_predicates(query, query_match, text, &mut lua_patterns) {
+        if !satisfies_neovim_predicates(query, query_match, text) {
             continue;
         }
         let priority = pattern_priorities.get(query_match.pattern_index).copied().unwrap_or(u32::MAX);
@@ -596,165 +591,77 @@ fn cached_highlight_query(language_id: &str, language: &tree_sitter::Language) -
 
     let (canonical_id, source) = highlight_query_source(language_id)?;
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(queries) = cache.lock()
-        && let Some(query) = queries.get(canonical_id)
-    {
+    if let Some(query) = cache.lock().get(canonical_id) {
         return Some(Arc::clone(query));
     }
-    let query = Arc::new(compile_compatible_query(language, source).ok()?);
-    if let Ok(mut queries) = cache.lock() {
-        queries.insert(canonical_id, Arc::clone(&query));
-    }
+    let query = Arc::new(Query::new(language, source).ok()?);
+    cache.lock().insert(canonical_id, Arc::clone(&query));
     Some(query)
 }
 
-fn compile_compatible_query(language: &tree_sitter::Language, source: &str) -> Result<Query, tree_sitter::QueryError> {
-    let mut compatible = source.to_owned();
-    loop {
-        match Query::new(language, &compatible) {
-            Ok(query) => return Ok(query),
-            Err(error) => {
-                let Some(range) = query_pattern_range(&compatible, error.offset) else {
-                    return Err(error);
-                };
-                compatible.replace_range(range, "");
-            }
-        }
-    }
+struct BundledLanguage {
+    language: ast_grep_language::SupportLang,
+    id: &'static str,
+    query: &'static str,
 }
 
-/// Find the complete top-level query pattern containing an incompatibility.
-/// Neovim's query pack tracks newer parsers closely; when a bundled grammar is
-/// one release behind, omitting only the unknown pattern preserves the rest of
-/// the same language query instead of discarding highlighting for the file.
-fn query_pattern_range(source: &str, error_offset: usize) -> Option<Range<usize>> {
-    let mut lexical = QueryLexicalState::Code;
-    let mut pattern = QueryPatternBounds::new(error_offset);
-    for (index, byte) in source.bytes().enumerate() {
-        lexical = match (lexical, byte) {
-            (QueryLexicalState::Comment, b'\n') | (QueryLexicalState::String, b'"') => QueryLexicalState::Code,
-            (QueryLexicalState::Comment, _) | (QueryLexicalState::Code, b';') => QueryLexicalState::Comment,
-            (QueryLexicalState::String, b'\\') => QueryLexicalState::EscapedString,
-            (QueryLexicalState::String | QueryLexicalState::EscapedString, _) | (QueryLexicalState::Code, b'"') => QueryLexicalState::String,
-            (QueryLexicalState::Code, b'(' | b'[') => {
-                pattern.open(source, index);
-                QueryLexicalState::Code
-            }
-            (QueryLexicalState::Code, b')' | b']') => {
-                if let Some(range) = pattern.close(source, index) {
-                    return Some(range);
-                }
-                QueryLexicalState::Code
-            }
-            (QueryLexicalState::Code, _) => QueryLexicalState::Code,
-        };
-    }
-    None
+const CPP_QUERY: &str = concat!(include_str!("../queries/c.scm"), "\n", include_str!("../queries/cpp.scm"));
+const HTML_QUERY: &str = concat!(include_str!("../queries/html_tags.scm"), "\n", include_str!("../queries/html.scm"));
+const JAVASCRIPT_QUERY: &str =
+    concat!(include_str!("../queries/ecma.scm"), "\n", include_str!("../queries/jsx.scm"), "\n", include_str!("../queries/javascript.scm"));
+const PHP_QUERY: &str = concat!(include_str!("../queries/php_only.scm"), "\n", include_str!("../queries/php.scm"));
+const TSX_QUERY: &str = concat!(
+    include_str!("../queries/ecma.scm"),
+    "\n",
+    include_str!("../queries/typescript.scm"),
+    "\n",
+    include_str!("../queries/jsx.scm"),
+    "\n",
+    include_str!("../queries/tsx.scm")
+);
+const TYPESCRIPT_QUERY: &str = concat!(include_str!("../queries/ecma.scm"), "\n", include_str!("../queries/typescript.scm"));
+
+const BUNDLED_LANGUAGES: &[BundledLanguage] = &[
+    BundledLanguage { language: ast_grep_language::SupportLang::Bash, id: "bash", query: include_str!("../queries/bash.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::C, id: "c", query: include_str!("../queries/c.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Cpp, id: "cpp", query: CPP_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::CSharp, id: "csharp", query: include_str!("../queries/c_sharp.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Css, id: "css", query: include_str!("../queries/css.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Dart, id: "dart", query: include_str!("../queries/dart.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Elixir, id: "elixir", query: include_str!("../queries/elixir.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Go, id: "go", query: include_str!("../queries/go.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Haskell, id: "haskell", query: include_str!("../queries/haskell.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Hcl, id: "hcl", query: include_str!("../queries/hcl.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Html, id: "html", query: HTML_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::Java, id: "java", query: include_str!("../queries/java.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::JavaScript, id: "javascript", query: JAVASCRIPT_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::Json, id: "json", query: include_str!("../queries/json.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Kotlin, id: "kotlin", query: include_str!("../queries/kotlin.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Lua, id: "lua", query: include_str!("../queries/lua.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Markdown, id: "markdown", query: include_str!("../queries/markdown.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Nix, id: "nix", query: include_str!("../queries/nix.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Php, id: "php", query: PHP_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::Python, id: "python", query: include_str!("../queries/python.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Ruby, id: "ruby", query: include_str!("../queries/ruby.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Rust, id: "rust", query: include_str!("../queries/rust.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Scala, id: "scala", query: include_str!("../queries/scala.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Solidity, id: "solidity", query: include_str!("../queries/solidity.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Swift, id: "swift", query: include_str!("../queries/swift.scm") },
+    BundledLanguage { language: ast_grep_language::SupportLang::Tsx, id: "tsx", query: TSX_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::TypeScript, id: "typescript", query: TYPESCRIPT_QUERY },
+    BundledLanguage { language: ast_grep_language::SupportLang::Yaml, id: "yaml", query: include_str!("../queries/yaml.scm") },
+];
+
+fn highlight_query_source(language_id: &str) -> Option<(&'static str, &'static str)> {
+    BUNDLED_LANGUAGES.iter().find(|language| language.id == language_id).map(|language| (language.id, language.query))
 }
 
-#[derive(Clone, Copy)]
-enum QueryLexicalState {
-    Code,
-    Comment,
-    String,
-    EscapedString,
+fn support_language_id(language: ast_grep_language::SupportLang) -> &'static str {
+    BUNDLED_LANGUAGES.iter().find(|bundled| bundled.language == language).map_or("text", |bundled| bundled.id)
 }
 
-struct QueryPatternBounds {
-    depth: usize,
-    start: Option<usize>,
-    error_offset: usize,
-}
-
-impl QueryPatternBounds {
-    fn new(error_offset: usize) -> Self {
-        Self { depth: 0, start: None, error_offset }
-    }
-
-    fn open(&mut self, source: &str, index: usize) {
-        if self.depth == 0 {
-            self.start = Some(source[..index].rfind('\n').map_or(0, |line| line + 1));
-        }
-        self.depth = self.depth.saturating_add(1);
-    }
-
-    fn close(&mut self, source: &str, index: usize) -> Option<Range<usize>> {
-        self.depth = self.depth.saturating_sub(1);
-        if self.depth != 0 || index < self.error_offset {
-            return None;
-        }
-        let start = self.start?;
-        let end = source[index..].find('\n').map_or(source.len(), |line| index + line + 1);
-        Some(start..end)
-    }
-}
-
-macro_rules! bundled_languages {
-    ($($variant:ident => $id:literal: $query:expr),+ $(,)?) => {
-        fn highlight_query_source(language_id: &str) -> Option<(&'static str, &'static str)> {
-            Some(match language_id {
-                $($id => ($id, $query),)+
-                _ => return None,
-            })
-        }
-
-        fn support_language_id(language: ast_grep_language::SupportLang) -> &'static str {
-            match language {
-                $(ast_grep_language::SupportLang::$variant => $id,)+
-            }
-        }
-    };
-}
-
-bundled_languages! {
-    Bash => "bash": include_str!("../queries/bash.scm"),
-    C => "c": include_str!("../queries/c.scm"),
-    Cpp => "cpp": concat!(include_str!("../queries/c.scm"), "\n", include_str!("../queries/cpp.scm")),
-    CSharp => "csharp": include_str!("../queries/c_sharp.scm"),
-    Css => "css": include_str!("../queries/css.scm"),
-    Dart => "dart": include_str!("../queries/dart.scm"),
-    Elixir => "elixir": include_str!("../queries/elixir.scm"),
-    Go => "go": include_str!("../queries/go.scm"),
-    Haskell => "haskell": include_str!("../queries/haskell.scm"),
-    Hcl => "hcl": include_str!("../queries/hcl.scm"),
-    Html => "html": concat!(include_str!("../queries/html_tags.scm"), "\n", include_str!("../queries/html.scm")),
-    Java => "java": include_str!("../queries/java.scm"),
-    JavaScript => "javascript": concat!(include_str!("../queries/ecma.scm"), "\n", include_str!("../queries/jsx.scm"), "\n", include_str!("../queries/javascript.scm")),
-    Json => "json": include_str!("../queries/json.scm"),
-    Kotlin => "kotlin": include_str!("../queries/kotlin.scm"),
-    Lua => "lua": include_str!("../queries/lua.scm"),
-    Markdown => "markdown": include_str!("../queries/markdown.scm"),
-    Nix => "nix": include_str!("../queries/nix.scm"),
-    Php => "php": concat!(include_str!("../queries/php_only.scm"), "\n", include_str!("../queries/php.scm")),
-    Python => "python": include_str!("../queries/python.scm"),
-    Ruby => "ruby": include_str!("../queries/ruby.scm"),
-    Rust => "rust": include_str!("../queries/rust.scm"),
-    Scala => "scala": include_str!("../queries/scala.scm"),
-    Solidity => "solidity": include_str!("../queries/solidity.scm"),
-    Swift => "swift": include_str!("../queries/swift.scm"),
-    Tsx => "tsx": concat!(include_str!("../queries/ecma.scm"), "\n", include_str!("../queries/typescript.scm"), "\n", include_str!("../queries/jsx.scm"), "\n", include_str!("../queries/tsx.scm")),
-    TypeScript => "typescript": concat!(include_str!("../queries/ecma.scm"), "\n", include_str!("../queries/typescript.scm")),
-    Yaml => "yaml": include_str!("../queries/yaml.scm"),
-}
-
-fn satisfies_neovim_predicates(query: &Query, query_match: &QueryMatch<'_, '_>, text: &str, lua_patterns: &mut BTreeMap<Box<str>, Regex>) -> bool {
+fn satisfies_neovim_predicates(query: &Query, query_match: &QueryMatch<'_, '_>, text: &str) -> bool {
     query.general_predicates(query_match.pattern_index).iter().all(|predicate| match predicate.operator.as_ref() {
-        "lua-match?" | "not-lua-match?" => {
-            let Some((QueryPredicateArg::Capture(capture), QueryPredicateArg::String(pattern))) = predicate.args.first().zip(predicate.args.get(1)) else {
-                return false;
-            };
-            let regex = if let Some(regex) = lua_patterns.get(pattern.as_ref()) {
-                regex
-            } else {
-                let Ok(regex) = lua_pattern_regex(pattern) else {
-                    return false;
-                };
-                lua_patterns.insert(pattern.clone(), regex);
-                lua_patterns.get(pattern.as_ref()).unwrap_or_else(|| unreachable!())
-            };
-            let matched = query_match.nodes_for_capture_index(*capture).all(|node| text.get(node.byte_range()).is_some_and(|source| regex.is_match(source)));
-            matched == (predicate.operator.as_ref() == "lua-match?")
-        }
         "has-ancestor?" | "not-has-ancestor?" => {
             neovim_ancestor_predicate(query_match, &predicate.args, false) == (predicate.operator.as_ref() == "has-ancestor?")
         }
@@ -771,15 +678,10 @@ fn neovim_ancestor_predicate(query_match: &QueryMatch<'_, '_>, args: &[QueryPred
     let Some(QueryPredicateArg::Capture(capture)) = args.first() else {
         return false;
     };
-    let kinds = args.iter().skip(1).filter_map(|arg| match arg {
-        QueryPredicateArg::String(kind) => Some(kind.as_ref()),
-        QueryPredicateArg::Capture(_) => None,
-    });
-    let kinds = kinds.collect::<Vec<_>>();
     query_match.nodes_for_capture_index(*capture).all(|node| {
         let mut ancestor = node.parent();
         while let Some(current) = ancestor {
-            if kinds.iter().any(|kind| *kind == current.kind()) {
+            if args.iter().skip(1).any(|arg| matches!(arg, QueryPredicateArg::String(kind) if kind.as_ref() == current.kind())) {
                 return true;
             }
             if parent_only {
@@ -795,14 +697,10 @@ fn neovim_contains_predicate(query_match: &QueryMatch<'_, '_>, args: &[QueryPred
     let Some(QueryPredicateArg::Capture(capture)) = args.first() else {
         return false;
     };
-    let needles = args.iter().skip(1).filter_map(|arg| match arg {
-        QueryPredicateArg::String(needle) => Some(needle.as_ref()),
-        QueryPredicateArg::Capture(_) => None,
-    });
-    let needles = needles.collect::<Vec<_>>();
-    query_match
-        .nodes_for_capture_index(*capture)
-        .all(|node| text.get(node.byte_range()).is_some_and(|source| needles.iter().any(|needle| source.contains(needle))))
+    query_match.nodes_for_capture_index(*capture).all(|node| {
+        text.get(node.byte_range())
+            .is_some_and(|source| args.iter().skip(1).any(|arg| matches!(arg, QueryPredicateArg::String(needle) if source.contains(needle.as_ref()))))
+    })
 }
 
 fn offset_capture_range(text: &str, node: tree_sitter::Node<'_>, [start_row, start_column, end_row, end_column]: [isize; 4]) -> Range<usize> {
@@ -819,60 +717,9 @@ fn offset_byte(text: &str, row: usize, column: usize, row_delta: isize, column_d
     floor_char_boundary(text, line_start.saturating_add(target_column).min(line_end))
 }
 
-fn lua_pattern_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    let mut regex = String::with_capacity(pattern.len().saturating_add(8));
-    let mut characters = pattern.chars().peekable();
-    let mut in_class = false;
-    while let Some(character) = characters.next() {
-        match character {
-            '[' => {
-                in_class = true;
-                regex.push(character);
-            }
-            ']' => {
-                in_class = false;
-                regex.push(character);
-            }
-            '%' => {
-                let Some(escaped) = characters.next() else {
-                    regex.push('%');
-                    break;
-                };
-                let class = match escaped {
-                    'a' => Some("A-Za-z"),
-                    'd' => Some("0-9"),
-                    'l' => Some("a-z"),
-                    's' => Some("\\s"),
-                    'u' => Some("A-Z"),
-                    'w' => Some("A-Za-z0-9"),
-                    'x' => Some("A-Fa-f0-9"),
-                    'z' => Some("\\x00"),
-                    _ => None,
-                };
-                if let Some(class) = class {
-                    if in_class || class.starts_with('\\') {
-                        regex.push_str(class);
-                    } else {
-                        regex.push('[');
-                        regex.push_str(class);
-                        regex.push(']');
-                    }
-                } else {
-                    regex.push_str(&regex::escape(&escaped.to_string()));
-                }
-            }
-            '-' if !in_class => regex.push_str("*?"),
-            '\\' => regex.push_str("\\\\"),
-            _ => regex.push(character),
-        }
-    }
-    Regex::new(&regex)
-}
-
 /// Resolves every grammar bundled by `ast-grep-language` from its complete
 /// extension table. Keeping this next to the parser prevents the client from
 /// maintaining a smaller, drifting copy of the supported language list.
-#[must_use]
 pub fn bundled_language_id(path: &Path) -> Option<&'static str> {
     use ast_grep_core::Language as _;
     use ast_grep_language::SupportLang;
@@ -896,7 +743,7 @@ pub fn bundled_language_id(path: &Path) -> Option<&'static str> {
 /// the same native Tree-sitter backend as editor buffers.
 #[must_use]
 pub fn highlight_text(text: &str, language_id: &str) -> Vec<HighlightSpan> {
-    native_tree_sitter_spans(text, language_id).unwrap_or_else(|| {
+    query_tree_sitter_spans(text, language_id).unwrap_or_else(|| {
         let mut spans = Vec::new();
         lexical_spans(text, 0, &mut spans);
         spans
@@ -912,6 +759,7 @@ pub fn lexical_highlight_text(text: &str) -> Vec<HighlightSpan> {
     spans
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecorationSet {
     pub key: FreshnessKey,
@@ -919,6 +767,7 @@ pub struct DecorationSet {
     pub spans: Vec<HighlightSpan>,
 }
 
+#[cfg(test)]
 impl DecorationSet {
     pub fn map_through(&mut self, transaction: &Transaction) {
         let mut mapped = Vec::with_capacity(self.spans.len());
@@ -983,10 +832,6 @@ pub struct ProviderProcess {
 }
 
 impl ProviderProcess {
-    pub fn spawn(program: impl AsRef<Path>) -> Result<Self, ProviderError> {
-        Self::spawn_with_args(program, std::iter::empty::<&str>())
-    }
-
     pub fn spawn_with_args(program: impl AsRef<Path>, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> Result<Self, ProviderError> {
         let program = program.as_ref();
         if !program.exists() {
@@ -1022,42 +867,30 @@ pub struct ProviderSupervisor {
     args: Vec<std::ffi::OsString>,
     process: ProviderProcess,
     open_documents: BTreeMap<DocumentId, ProviderRequest>,
-    restart_count: u64,
 }
 
 impl ProviderSupervisor {
-    pub fn spawn(program: impl AsRef<Path>) -> Result<Self, ProviderError> {
-        Self::spawn_with_args(program, std::iter::empty::<&str>())
-    }
-
     pub fn spawn_with_args(program: impl AsRef<Path>, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> Result<Self, ProviderError> {
         let program = program.as_ref().to_path_buf();
         let args = args.into_iter().map(|arg| arg.as_ref().to_owned()).collect::<Vec<_>>();
         let process = ProviderProcess::spawn_with_args(&program, &args)?;
-        Ok(Self { program, args, process, open_documents: BTreeMap::new(), restart_count: 0 })
-    }
-
-    #[must_use]
-    pub const fn restart_count(&self) -> u64 {
-        self.restart_count
+        Ok(Self { program, args, process, open_documents: BTreeMap::new() })
     }
 
     pub fn request(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        match self.process.request(request) {
-            Ok(response) => {
-                self.remember(request);
-                Ok(response)
-            }
-            Err(error) => {
+        let response = match self.process.request(request) {
+            Ok(response) => response,
+            Err(_error) => {
                 self.restart()?;
+                #[cfg(any(test, debug_assertions))]
                 if matches!(request, ProviderRequest::CrashForTest) {
-                    return Err(error);
+                    return Err(_error);
                 }
-                let response = self.process.request(request)?;
-                self.remember(request);
-                Ok(response)
+                self.process.request(request)?
             }
-        }
+        };
+        self.remember(request);
+        Ok(response)
     }
 
     fn remember(&mut self, request: &ProviderRequest) {
@@ -1079,7 +912,6 @@ impl ProviderSupervisor {
 
     fn restart(&mut self) -> Result<(), ProviderError> {
         self.process = ProviderProcess::spawn_with_args(&self.program, &self.args)?;
-        self.restart_count = self.restart_count.saturating_add(1);
         for update in self.open_documents.values() {
             match self.process.request(update)? {
                 ProviderResponse::Updated { .. } => {}
@@ -1148,18 +980,19 @@ fn keyword_span(range: Range<usize>) -> HighlightSpan {
     HighlightSpan::new(range, Arc::clone(KEYWORD.get_or_init(|| "keyword".into())), default_highlight_priority())
 }
 
-pub fn fuzzy_rank<'a>(needle: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+pub fn fuzzy_rank<'a>(needle: &str, candidates: impl Iterator<Item = &'a str>) -> Vec<(usize, &'a str)> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(needle, nucleo_matcher::pattern::CaseMatching::Smart, nucleo_matcher::pattern::Normalization::Smart);
     let mut scored: Vec<_> = candidates
-        .filter_map(|candidate| {
+        .enumerate()
+        .filter_map(|(index, candidate)| {
             let mut buffer = Vec::new();
             let haystack = Utf32Str::new(candidate, &mut buffer);
-            pattern.score(haystack, &mut matcher).map(|score| (score, candidate))
+            pattern.score(haystack, &mut matcher).map(|score| (score, index, candidate))
         })
         .collect();
-    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
-    scored.into_iter().map(|(_, candidate)| candidate).collect()
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(right.2)).then_with(|| left.1.cmp(&right.1)));
+    scored.into_iter().map(|(_, index, candidate)| (index, candidate)).collect()
 }
 
 #[cfg(test)]
@@ -1209,7 +1042,7 @@ mod tests {
     }
 
     fn assert_highlights(source: &str, language: &str, expected: &[(&str, &str)]) {
-        let spans = native_tree_sitter_spans(source, language).expect("bundled grammar");
+        let spans = query_tree_sitter_spans(source, language).expect("bundled grammar");
         for (needle, kind) in expected {
             let start = source.find(needle).expect("sample token");
             assert!(
@@ -1423,7 +1256,6 @@ mod tests {
         assert_eq!(result.spans, lexical_highlight_text(source));
     }
 
-    #[cfg(feature = "gpu")]
     #[test]
     fn gpu_lexical_classifier_matches_cpu_when_an_adapter_is_available() {
         let Ok(mut gpu) = gpu::GpuLexical::new() else {

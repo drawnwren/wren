@@ -4,25 +4,18 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+#[cfg(any(test, feature = "benchmarking"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use mmap_io::{MemoryMappedFile, MmapMode};
-#[cfg(unix)]
-use nix::{
-    fcntl::OFlag,
-    sys::{
-        mman::{shm_open, shm_unlink},
-        stat::Mode,
-    },
-};
+use parking_lot::Mutex;
 
 use thiserror::Error;
-use wren_types::{DocumentHead, DocumentId, DocumentRevision, HeadValidation, ResumeViewState, SessionEpoch};
+use wren_types::DocumentHead;
+#[cfg(any(test, feature = "benchmarking"))]
+use wren_types::{DocumentId, DocumentRevision, HeadValidation, ResumeViewState, SessionEpoch};
 
 const MAGIC: u64 = u64::from_le_bytes(*b"WRENHEAD");
 const VERSION: u64 = 2;
@@ -44,8 +37,6 @@ pub enum SharedHeadError {
     InvalidCapacity { actual: usize, max: usize },
     #[error("{actual} document heads exceed shared table capacity {capacity}")]
     Capacity { actual: usize, capacity: usize },
-    #[error("shared head table writer lock was poisoned")]
-    Poisoned,
     #[error("shared head table generation overflow")]
     GenerationOverflow,
     #[error("shared head table {path} is still owned by a live session")]
@@ -57,10 +48,9 @@ pub struct SharedDocumentHeadWriter {
     capacity: usize,
     state: Mutex<WriterState>,
     owner: File,
-    #[cfg(unix)]
-    shared_memory_name: Box<str>,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 pub struct SharedDocumentHeadReader {
     path: PathBuf,
     capacity: usize,
@@ -78,6 +68,7 @@ impl fmt::Debug for SharedDocumentHeadWriter {
     }
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl fmt::Debug for SharedDocumentHeadReader {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("SharedDocumentHeadReader").field("path", &self.path).field("capacity", &self.capacity).finish_non_exhaustive()
@@ -100,24 +91,19 @@ impl SharedDocumentHeadWriter {
         let path = path.to_path_buf();
         create_parent(&path)?;
         let owner = acquire_owner(&path)?;
-        let (table, shared_memory_name) = create_backing(&path, fail_if_exists, capacity)?;
-        write_snapshot(&table, &path, &encode_snapshot(capacity, 2, &[]))?;
-        Ok(Self {
-            path,
-            capacity,
-            state: Mutex::new(WriterState { generation: 2, table }),
-            owner,
-            #[cfg(unix)]
-            shared_memory_name,
-        })
+        let table = create_backing(&path, fail_if_exists, capacity)?;
+        write_snapshot(&table, &path, capacity, 1, 2, &[])?;
+        Ok(Self { path, capacity, state: Mutex::new(WriterState { generation: 2, table }), owner })
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub const fn capacity(&self) -> usize {
         self.capacity
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -126,10 +112,10 @@ impl SharedDocumentHeadWriter {
         if heads.len() > self.capacity {
             return Err(SharedHeadError::Capacity { actual: heads.len(), capacity: self.capacity });
         }
-        let mut state = self.state.lock().map_err(|_| SharedHeadError::Poisoned)?;
+        let mut state = self.state.lock();
         let writing = state.generation.checked_add(1).ok_or(SharedHeadError::GenerationOverflow)?;
         let complete = state.generation.checked_add(2).ok_or(SharedHeadError::GenerationOverflow)?;
-        write_published_snapshot(&state.table, &self.path, &encode_snapshot(self.capacity, writing, heads), complete)?;
+        write_snapshot(&state.table, &self.path, self.capacity, writing, complete, heads)?;
         state.generation = complete;
         Ok(complete)
     }
@@ -137,18 +123,18 @@ impl SharedDocumentHeadWriter {
 
 impl Drop for SharedDocumentHeadWriter {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let _ = shm_unlink(self.shared_memory_name.as_ref());
+        let _ = fs::remove_file(&self.path);
         let _ = self.owner.unlock();
     }
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 impl SharedDocumentHeadReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SharedHeadError> {
         let path = path.as_ref().to_path_buf();
         let table = open_backing(&path)?;
-        let bytes = read_snapshot(&table, &path)?;
-        let capacity = decode_header(&bytes, &path)?.capacity;
+        let (header, _) = read_snapshot(&table, &path)?;
+        let capacity = header.capacity;
         Ok(Self { path, capacity, table })
     }
 
@@ -158,22 +144,9 @@ impl SharedDocumentHeadReader {
     }
 
     pub fn snapshot(&self) -> Result<(u64, Vec<DocumentHead>), SharedHeadError> {
-        let bytes = read_snapshot(&self.table, &self.path)?;
-        let header = decode_header(&bytes, &self.path)?;
+        let (header, heads) = read_snapshot(&self.table, &self.path)?;
         if header.capacity != self.capacity {
             return Err(SharedHeadError::InvalidFormat { path: self.path.clone() });
-        }
-        let mut heads = Vec::with_capacity(header.count);
-        for index in 0..header.count {
-            let offset = entry_offset(index);
-            if word_at(&bytes, offset + 3).is_none_or(|occupied| occupied == 0) {
-                continue;
-            }
-            heads.push(DocumentHead {
-                session_epoch: SessionEpoch::new(required_word(&bytes, offset, &self.path)?),
-                document_id: DocumentId::new(required_word(&bytes, offset + 1, &self.path)?),
-                authoritative_revision: DocumentRevision::new(required_word(&bytes, offset + 2, &self.path)?),
-            });
         }
         Ok((header.generation, heads))
     }
@@ -208,6 +181,7 @@ fn pack_version_capacity(capacity: usize) -> u64 {
     VERSION | ((capacity as u64) << 32)
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 fn unpack_version_capacity(word: u64) -> (u64, usize) {
     (word & u64::from(u32::MAX), (word >> 32) as usize)
 }
@@ -216,6 +190,7 @@ fn validate_capacity(capacity: usize) -> Result<(), SharedHeadError> {
     if capacity == 0 || capacity > MAX_CAPACITY { Err(SharedHeadError::InvalidCapacity { actual: capacity, max: MAX_CAPACITY }) } else { Ok(()) }
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, Copy)]
 struct SnapshotHeader {
     capacity: usize,
@@ -223,138 +198,61 @@ struct SnapshotHeader {
     count: usize,
 }
 
-fn encode_snapshot(capacity: usize, generation: u64, heads: &[DocumentHead]) -> Vec<u8> {
-    debug_assert!(capacity <= MAX_CAPACITY);
-    debug_assert!(heads.len() <= capacity);
-    let word_count = HEADER_WORDS + capacity * ENTRY_WORDS;
-    let mut words = vec![0_u64; word_count];
-    words[MAGIC_WORD] = MAGIC;
-    words[VERSION_CAPACITY_WORD] = pack_version_capacity(capacity);
-    words[GENERATION_WORD] = generation;
-    words[COUNT_WORD] = heads.len() as u64;
-    for (index, head) in heads.iter().enumerate() {
-        let offset = entry_offset(index);
-        words[offset] = head.session_epoch.get();
-        words[offset + 1] = head.document_id.get();
-        words[offset + 2] = head.authoritative_revision.get();
-        words[offset + 3] = 1;
-    }
-    let byte_count = snapshot_bytes(capacity);
-    let mut bytes = Vec::with_capacity(byte_count);
-    for word in words {
-        bytes.extend_from_slice(&word.to_le_bytes());
-    }
-    bytes
-}
-
-fn decode_header(bytes: &[u8], path: &Path) -> Result<SnapshotHeader, SharedHeadError> {
-    if word_at(bytes, MAGIC_WORD) != Some(MAGIC) {
+#[cfg(any(test, feature = "benchmarking"))]
+fn decode_header(words: &[AtomicU64], path: &Path, generation: u64) -> Result<SnapshotHeader, SharedHeadError> {
+    if words[MAGIC_WORD].load(Ordering::Relaxed) != MAGIC {
         return Err(invalid_format(path));
     }
-    let packed = required_word(bytes, VERSION_CAPACITY_WORD, path)?;
+    let packed = words[VERSION_CAPACITY_WORD].load(Ordering::Relaxed);
     let (version, capacity) = unpack_version_capacity(packed);
     if version != VERSION || validate_capacity(capacity).is_err() {
         return Err(invalid_format(path));
     }
-    let generation = required_word(bytes, GENERATION_WORD, path)?;
-    if !generation.is_multiple_of(2) {
-        return Err(invalid_format(path));
-    }
-    let count = usize::try_from(required_word(bytes, COUNT_WORD, path)?).map_err(|_| invalid_format(path))?;
-    if count > capacity {
-        return Err(invalid_format(path));
-    }
-    if snapshot_bytes(capacity) != bytes.len() {
+    let count = usize::try_from(words[COUNT_WORD].load(Ordering::Relaxed)).map_err(|_| invalid_format(path))?;
+    if count > capacity || snapshot_bytes(capacity) != words.len() * size_of::<u64>() {
         return Err(invalid_format(path));
     }
     Ok(SnapshotHeader { capacity, generation, count })
 }
 
-fn word_at(bytes: &[u8], index: usize) -> Option<u64> {
-    let start = index.checked_mul(size_of::<u64>())?;
-    let end = start.checked_add(size_of::<u64>())?;
-    let word: [u8; 8] = bytes.get(start..end)?.try_into().ok()?;
-    Some(u64::from_le_bytes(word))
-}
-
-fn required_word(bytes: &[u8], index: usize, path: &Path) -> Result<u64, SharedHeadError> {
-    word_at(bytes, index).ok_or_else(|| invalid_format(path))
-}
-
-fn read_snapshot(file: &MemoryMappedFile, path: &Path) -> Result<Vec<u8>, SharedHeadError> {
+#[cfg(any(test, feature = "benchmarking"))]
+fn read_snapshot(file: &MemoryMappedFile, path: &Path) -> Result<(SnapshotHeader, Vec<DocumentHead>), SharedHeadError> {
     let file_length = file.len();
-    if file_length < snapshot_bytes(1) as u64 {
+    if file_length < snapshot_bytes(1) as u64 || !file_length.is_multiple_of(size_of::<u64>() as u64) {
         return Err(invalid_format(path));
     }
-    let generation_offset = (GENERATION_WORD * size_of::<u64>()) as u64;
+    let word_count = usize::try_from(file_length / size_of::<u64>() as u64).map_err(|_| invalid_format(path))?;
+    let words = file.atomic_u64_slice(0, word_count).map_err(|error| storage_error(path, error))?;
     for _ in 0..1_024 {
-        let before = file.atomic_u64(generation_offset).map_err(|error| storage_error(path, error))?.load(Ordering::Acquire);
+        let before = words[GENERATION_WORD].load(Ordering::Acquire);
         if !before.is_multiple_of(2) {
             std::thread::yield_now();
             continue;
         }
-        let header = file.as_slice(0, (HEADER_WORDS * size_of::<u64>()) as u64).map_err(|error| storage_error(path, error))?;
-        if word_at(&header, MAGIC_WORD) != Some(MAGIC) {
-            return Err(invalid_format(path));
-        }
-        let packed = word_at(&header, VERSION_CAPACITY_WORD).ok_or_else(|| invalid_format(path))?;
-        let (version, capacity) = unpack_version_capacity(packed);
-        if version != VERSION || validate_capacity(capacity).is_err() {
-            return Err(invalid_format(path));
-        }
-        let snapshot_length = snapshot_bytes(capacity) as u64;
-        if snapshot_length > file_length {
-            return Err(invalid_format(path));
-        }
-        let bytes = file.as_slice(0, snapshot_length).map_err(|error| storage_error(path, error))?.to_vec();
-        let after = file.atomic_u64(generation_offset).map_err(|error| storage_error(path, error))?.load(Ordering::Acquire);
+        let header = decode_header(&words, path, before)?;
+        let heads = (0..header.count)
+            .map(|index| {
+                let offset = entry_offset(index);
+                if words[offset + 3].load(Ordering::Relaxed) == 0 {
+                    return Err(invalid_format(path));
+                }
+                Ok(DocumentHead {
+                    session_epoch: SessionEpoch::new(words[offset].load(Ordering::Relaxed)),
+                    document_id: DocumentId::new(words[offset + 1].load(Ordering::Relaxed)),
+                    authoritative_revision: DocumentRevision::new(words[offset + 2].load(Ordering::Relaxed)),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let after = words[GENERATION_WORD].load(Ordering::Acquire);
         if before == after && after.is_multiple_of(2) {
-            return Ok(bytes);
+            return Ok((header, heads));
         }
         std::thread::yield_now();
     }
     Err(storage_error(path, "shared-memory seqlock did not stabilize"))
 }
 
-#[cfg(unix)]
-fn create_backing(path: &Path, create_new_locator: bool, capacity: usize) -> Result<(MemoryMappedFile, Box<str>), SharedHeadError> {
-    static NEXT_NAME: AtomicU64 = AtomicU64::new(1);
-    let mut last_error = None;
-    for _ in 0..128 {
-        let serial = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
-        let name = format!("/wren-heads-{}-{serial}", std::process::id());
-        match shm_open(name.as_str(), OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR, Mode::S_IRUSR | Mode::S_IWUSR) {
-            Ok(descriptor) => {
-                let file = File::from(descriptor);
-                file.set_len(snapshot_bytes(capacity) as u64).map_err(|error| storage_error(path, error))?;
-                let mut locator = OpenOptions::new();
-                locator.write(true);
-                if create_new_locator {
-                    locator.create_new(true);
-                } else {
-                    locator.create(true).truncate(true);
-                }
-                let write_locator = (|| {
-                    let mut locator = locator.open(path).map_err(|error| storage_error(path, error))?;
-                    restrict_permissions(path)?;
-                    locator.write_all(name.as_bytes()).map_err(|error| storage_error(path, error))?;
-                    locator.sync_all().map_err(|error| storage_error(path, error))
-                })();
-                if let Err(error) = write_locator {
-                    let _ = shm_unlink(name.as_str());
-                    return Err(error);
-                }
-                let mapping = MemoryMappedFile::from_file(file, MmapMode::ReadWrite, path).map_err(|error| storage_error(path, error))?;
-                return Ok((mapping, name.into_boxed_str()));
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(storage_error(path, last_error.map_or_else(|| "no shared-memory name available".to_owned(), |error| error.to_string())))
-}
-
-#[cfg(not(unix))]
-fn create_backing(path: &Path, create_new: bool, capacity: usize) -> Result<(MemoryMappedFile, ()), SharedHeadError> {
+fn create_backing(path: &Path, create_new: bool, capacity: usize) -> Result<MemoryMappedFile, SharedHeadError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     if create_new {
@@ -362,40 +260,37 @@ fn create_backing(path: &Path, create_new: bool, capacity: usize) -> Result<(Mem
     } else {
         options.create(true).truncate(true);
     }
-    let table = options.open(path).map_err(|error| storage_error(path, error))?;
-    table.set_len(snapshot_bytes(capacity) as u64).map_err(|error| storage_error(path, error))?;
+    let file = options.open(path).map_err(|error| storage_error(path, error))?;
+    file.set_len(snapshot_bytes(capacity) as u64).map_err(|error| storage_error(path, error))?;
     restrict_permissions(path)?;
-    let mapping = MemoryMappedFile::from_file(table, MmapMode::ReadWrite, path).map_err(|error| storage_error(path, error))?;
-    Ok((mapping, ()))
+    MemoryMappedFile::from_file(file, MmapMode::ReadWrite, path).map_err(|error| storage_error(path, error))
 }
 
-#[cfg(unix)]
+#[cfg(any(test, feature = "benchmarking"))]
 fn open_backing(path: &Path) -> Result<MemoryMappedFile, SharedHeadError> {
-    let name = fs::read_to_string(path).map_err(|error| storage_error(path, error))?;
-    if name.is_empty() || !name.starts_with('/') || name.contains('\n') || name.contains('\0') {
-        return Err(invalid_format(path));
+    MemoryMappedFile::builder(path).mode(MmapMode::ReadOnly).open().map_err(|error| storage_error(path, error))
+}
+
+fn write_snapshot(
+    file: &MemoryMappedFile,
+    path: &Path,
+    capacity: usize,
+    writing_generation: u64,
+    complete_generation: u64,
+    heads: &[DocumentHead],
+) -> Result<(), SharedHeadError> {
+    let words = file.atomic_u64_slice(0, HEADER_WORDS + capacity * ENTRY_WORDS).map_err(|error| storage_error(path, error))?;
+    words[GENERATION_WORD].store(writing_generation, Ordering::Release);
+    words[MAGIC_WORD].store(MAGIC, Ordering::Relaxed);
+    words[VERSION_CAPACITY_WORD].store(pack_version_capacity(capacity), Ordering::Relaxed);
+    for (index, head) in heads.iter().enumerate() {
+        let offset = entry_offset(index);
+        for (word, value) in [head.session_epoch.get(), head.document_id.get(), head.authoritative_revision.get(), 1].into_iter().enumerate() {
+            words[offset + word].store(value, Ordering::Relaxed);
+        }
     }
-    let descriptor = shm_open(name.as_str(), OFlag::O_RDONLY, Mode::empty()).map_err(|error| storage_error(path, error))?;
-    MemoryMappedFile::from_file(File::from(descriptor), MmapMode::ReadOnly, path).map_err(|error| storage_error(path, error))
-}
-
-#[cfg(not(unix))]
-fn open_backing(path: &Path) -> Result<MemoryMappedFile, SharedHeadError> {
-    MemoryMappedFile::open_ro(path).map_err(|error| storage_error(path, error))
-}
-
-fn write_snapshot(file: &MemoryMappedFile, path: &Path, bytes: &[u8]) -> Result<(), SharedHeadError> {
-    file.update_region(0, bytes).map_err(|error| storage_error(path, error))
-}
-
-fn write_published_snapshot(file: &MemoryMappedFile, path: &Path, writing_bytes: &[u8], complete_generation: u64) -> Result<(), SharedHeadError> {
-    let start = GENERATION_WORD * size_of::<u64>();
-    file.atomic_u64(start as u64)
-        .map_err(|error| storage_error(path, error))?
-        .store(word_at(writing_bytes, GENERATION_WORD).ok_or_else(|| invalid_format(path))?, Ordering::Release);
-    file.update_region(0, &writing_bytes[..start]).map_err(|error| storage_error(path, error))?;
-    file.update_region((start + size_of::<u64>()) as u64, &writing_bytes[start + size_of::<u64>()..]).map_err(|error| storage_error(path, error))?;
-    file.atomic_u64(start as u64).map_err(|error| storage_error(path, error))?.store(complete_generation, Ordering::Release);
+    words[COUNT_WORD].store(heads.len() as u64, Ordering::Relaxed);
+    words[GENERATION_WORD].store(complete_generation, Ordering::Release);
     Ok(())
 }
 
@@ -423,6 +318,7 @@ fn acquire_owner(path: &Path) -> Result<File, SharedHeadError> {
     }
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 fn invalid_format(path: &Path) -> SharedHeadError {
     SharedHeadError::InvalidFormat { path: path.to_path_buf() }
 }
@@ -431,15 +327,9 @@ fn storage_error(path: &Path, error: impl std::fmt::Display) -> SharedHeadError 
     SharedHeadError::Io { path: path.to_path_buf(), message: error.to_string().into() }
 }
 
-#[cfg(unix)]
 fn restrict_permissions(path: &Path) -> Result<(), SharedHeadError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| storage_error(path, error))
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), SharedHeadError> {
-    Ok(())
 }
 
 #[cfg(test)]

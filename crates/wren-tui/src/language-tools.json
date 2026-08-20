@@ -1,0 +1,85 @@
+[
+  {
+    "languages": ["rust"],
+    "server": {"program": "rust-analyzer", "settings": {"rust-analyzer": {"check": {"command": "clippy"}}}},
+    "formatter": {"program": "rustfmt", "arguments": ["--emit=stdout"]},
+    "diagnostic": {"program": "cargo", "arguments": ["clippy", "--quiet", "--message-format=short"]}
+  },
+  {
+    "languages": ["javascript", "typescript", "tsx"],
+    "server": {
+      "program": "pnpm",
+      "arguments": ["exec", "typescript-language-server", "--stdio"],
+      "initialization_options": {"jsx": {"enabled": true}},
+      "settings": {
+        "typescript": {"suggestionActions": {"enabled": true}, "updateImportsOnFileMove": {"enabled": "always"}},
+        "javascript": {"updateImportsOnFileMove": {"enabled": "always"}}
+      }
+    },
+    "diagnostic": {"program": "pnpm", "arguments": ["exec", "tsc", "--noEmit", "--pretty", "false"]}
+  },
+  {
+    "languages": ["python"],
+    "server": {
+      "program": "basedpyright-langserver",
+      "arguments": ["--stdio"],
+      "settings": {
+        "python": {"pythonPath": null},
+        "basedpyright": {"analysis": {
+          "autoSearchPaths": true,
+          "useLibraryCodeForTypes": true,
+          "diagnosticMode": "workspace",
+          "inlayHints": {"variableTypes": true, "callArgumentNames": true, "functionReturnTypes": true, "parameterNames": true}
+        }}
+      }
+    },
+    "formatter": {"program": "ruff", "arguments": ["format", "--stdin-filename", "$file", "-"]},
+    "diagnostic": {"program": "ruff", "arguments": ["check", "--output-format=concise", "$file"]}
+  },
+  {
+    "languages": ["go"],
+    "server": {"program": "gopls"},
+    "formatter": {"program": "gofmt"},
+    "diagnostic": {"program": "go", "arguments": ["vet", "./..."]}
+  },
+  {
+    "languages": ["hcl"],
+    "server": {"program": "terraform-ls", "arguments": ["serve"], "language_id": "terraform"},
+    "formatter": {"program": "tofu", "arguments": ["fmt", "-"]},
+    "diagnostic": {"program": "tofu", "arguments": ["validate", "-no-color"], "parent_directory": true}
+  },
+  {
+    "languages": ["nix"],
+    "server": {"program": "nixd", "settings": {"nixd": {"nixpkgs": {"expr": null}, "formatting": {"command": ["nixfmt"]}}}},
+    "formatter": {"program": "nixfmt"},
+    "diagnostic": {"program": "nix-instantiate", "arguments": ["--parse", "$file"]}
+  },
+  {
+    "languages": ["haskell"],
+    "server": {
+      "program": "haskell-language-server-wrapper",
+      "arguments": ["--lsp"],
+      "settings": {"haskell": {
+        "plugin": {"hlint": {"diagnosticsOn": true, "codeActionsOn": true}, "fourmolu": {"config": {"external": true}}},
+        "formattingProvider": "fourmolu"
+      }}
+    },
+    "formatter": {"program": "fourmolu", "arguments": ["--stdin-input-file", "$file"]},
+    "diagnostic": {"program": "ghc", "arguments": ["-fno-code", "$file"]}
+  },
+  {
+    "languages": ["lua"],
+    "server": {"program": "lua-language-server", "settings": {"Lua": {"runtime": {"version": "LuaJIT"}, "workspace": {"checkThirdParty": false}}}},
+    "diagnostic": {"program": "luac", "arguments": ["-p", "$file"]}
+  },
+  {
+    "languages": ["bash"],
+    "server": {"program": "bash-language-server", "arguments": ["start"], "language_id": "shellscript"},
+    "diagnostic": {"program": "bash", "arguments": ["-n", "$file"]}
+  },
+  {
+    "languages": ["c", "cpp"],
+    "server": {"program": "clangd"},
+    "diagnostic": {"program": "clang++", "arguments": ["-fsyntax-only", "$file"]}
+  }
+]

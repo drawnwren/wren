@@ -34,38 +34,8 @@ pub(super) fn spawn_lsp_client(
         16 * 1024 * 1024,
     );
     let mut client = LspClient::spawn(&spec, true, 16 * 1024 * 1024)?;
-    let initialize = client.initialize_with_options(
-        &file_uri(root),
-        serde_json::json!({
-            "workspace": {"workspaceFolders": true},
-            "textDocument": {
-                "hover": {"contentFormat": ["markdown", "plaintext"]},
-                "signatureHelp": {"signatureInformation": {"documentationFormat": ["markdown", "plaintext"]}},
-                "completion": {"completionItem": {"snippetSupport": true, "documentationFormat": ["markdown", "plaintext"]}},
-                "publishDiagnostics": {"relatedInformation": true},
-                "codeAction": {"dynamicRegistration": true},
-                "rename": {"prepareSupport": true},
-                "semanticTokens": {
-                    "dynamicRegistration": true,
-                    "requests": {"range": false, "full": true},
-                    "tokenTypes": [
-                        "namespace", "type", "class", "enum", "interface", "struct",
-                        "typeParameter", "parameter", "variable", "property", "enumMember",
-                        "event", "function", "method", "macro", "keyword", "modifier",
-                        "comment", "string", "number", "regexp", "operator", "decorator"
-                    ],
-                    "tokenModifiers": [
-                        "declaration", "definition", "readonly", "static", "deprecated",
-                        "abstract", "async", "modification", "documentation", "defaultLibrary"
-                    ],
-                    "formats": ["relative"],
-                    "overlappingTokenSupport": false,
-                    "multilineTokenSupport": false
-                }
-            }
-        }),
-        server.initialization_options.clone(),
-    )?;
+    let capabilities = serde_json::from_str(include_str!("lsp-capabilities.json"))?;
+    let initialize = client.initialize_with_options(&file_uri(root), capabilities, server.initialization_options.clone())?;
     if !server.settings.is_null() {
         client.notify("workspace/didChangeConfiguration", serde_json::json!({"settings": server.settings}))?;
     }
@@ -190,106 +160,32 @@ fn lsp_position_byte_indexed(text: &str, line_starts: &[usize], line: u32, chara
 
 pub(super) fn language_server_invocation(path: Option<&Path>) -> Option<LanguageServerInvocation> {
     let path = path?;
+    let language = bundled_language_id(path)?;
+    let profile = language_tool_profile(language)?.server.as_ref()?;
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let (program, arguments, language_id, initialization_options, settings) = match bundled_language_id(path)? {
-        "rust" => ("rust-analyzer", &[][..], "rust", serde_json::Value::Null, serde_json::json!({"rust-analyzer": {"check": {"command": "clippy"}}})),
-        "javascript" | "typescript" | "tsx" => (
-            "pnpm",
-            &["exec", "typescript-language-server", "--stdio"][..],
-            match extension.as_str() {
-                "ts" | "mts" | "cts" => "typescript",
-                "tsx" => "typescriptreact",
-                "jsx" => "javascriptreact",
-                _ => "javascript",
-            },
-            serde_json::json!({"jsx": {"enabled": true}}),
-            serde_json::json!({
-                "typescript": {
-                    "suggestionActions": {"enabled": true},
-                    "updateImportsOnFileMove": {"enabled": "always"}
-                },
-                "javascript": {"updateImportsOnFileMove": {"enabled": "always"}}
-            }),
-        ),
-        "python" => (
-            "basedpyright-langserver",
-            &["--stdio"][..],
-            "python",
-            serde_json::Value::Null,
-            serde_json::json!({
-                "python": {"pythonPath": python_interpreter(path)},
-                "basedpyright": {"analysis": {
-                    "autoSearchPaths": true,
-                    "useLibraryCodeForTypes": true,
-                    "diagnosticMode": "workspace",
-                    "inlayHints": {
-                        "variableTypes": true,
-                        "callArgumentNames": true,
-                        "functionReturnTypes": true,
-                        "parameterNames": true
-                    }
-                }}
-            }),
-        ),
-        "go" => ("gopls", &[][..], "go", serde_json::Value::Null, serde_json::json!({})),
-        "hcl" => ("terraform-ls", &["serve"][..], "terraform", serde_json::Value::Null, serde_json::json!({})),
-        "nix" => (
-            "nixd",
-            &[][..],
-            "nix",
-            serde_json::Value::Null,
-            serde_json::json!({"nixd": {
-                "nixpkgs": {"expr": nixd_nixpkgs_expression(
-                    nixd_expression_path().as_deref(),
-                    &env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned())
-                )},
-                "formatting": {"command": ["nixfmt"]}
-            }}),
-        ),
-        "haskell" => (
-            "haskell-language-server-wrapper",
-            &["--lsp"][..],
-            "haskell",
-            serde_json::Value::Null,
-            serde_json::json!({"haskell": {
-                "plugin": {
-                    "hlint": {"diagnosticsOn": true, "codeActionsOn": true},
-                    "fourmolu": {"config": {"external": true}}
-                },
-                "formattingProvider": "fourmolu"
-            }}),
-        ),
-        "lua" => (
-            "lua-language-server",
-            &[][..],
-            "lua",
-            serde_json::Value::Null,
-            serde_json::json!({"Lua": {
-                "runtime": {"version": "LuaJIT"},
-                "workspace": {"checkThirdParty": false}
-            }}),
-        ),
-        "bash" => ("bash-language-server", &["start"][..], "shellscript", serde_json::Value::Null, serde_json::json!({})),
-        "c" | "cpp" => ("clangd", &[][..], bundled_language_id(path)?, serde_json::Value::Null, serde_json::json!({})),
-        _ => return None,
+    let language_id = match extension.as_str() {
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "typescriptreact",
+        "jsx" => "javascriptreact",
+        _ => profile.language_id.as_deref().unwrap_or(language),
     };
-    Some(language_server(program, arguments, language_id, initialization_options, settings))
-}
-
-fn language_server(
-    program: &str,
-    arguments: &[&str],
-    language_id: &str,
-    initialization_options: serde_json::Value,
-    settings: serde_json::Value,
-) -> LanguageServerInvocation {
+    let mut settings = profile.settings.clone();
+    if language == "python" {
+        settings["python"]["pythonPath"] = python_interpreter(path).map_or(serde_json::Value::Null, serde_json::Value::String);
+    } else if language == "nix" {
+        settings["nixd"]["nixpkgs"]["expr"] = serde_json::Value::String(nixd_nixpkgs_expression(
+            nixd_expression_path().as_deref(),
+            &env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned()),
+        ));
+    }
     LanguageServerInvocation {
-        program: program.to_owned(),
-        arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
+        program: profile.program.to_string(),
+        arguments: profile.arguments.iter().map(ToString::to_string).collect(),
         language_id: language_id.to_owned(),
-        initialization_options,
+        initialization_options: profile.initialization_options.clone(),
         settings,
     }
+    .into()
 }
 
 pub(super) fn nixd_nixpkgs_expression(config: Option<&Path>, input: &str) -> String {

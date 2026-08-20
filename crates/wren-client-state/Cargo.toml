@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = ["wren-shmem/benchmarking", "wren-types/benchmarking", "wren-view/benchmarking"]
+
 [dependencies]
 blake3.workspace = true
 serde.workspace = true
@@ -13,6 +16,11 @@ thiserror.workspace = true
 wren-shmem = { version = "0.1.0", path = "../wren-shmem" }
 wren-types = { version = "0.1.0", path = "../wren-types" }
 wren-view = { version = "0.1.0", path = "../wren-view" }
+
+[dev-dependencies]
+wren-shmem = { version = "0.1.0", path = "../wren-shmem", features = ["benchmarking"] }
+wren-types = { version = "0.1.0", path = "../wren-types", features = ["benchmarking"] }
+wren-view = { version = "0.1.0", path = "../wren-view", features = ["benchmarking"] }
 
 [lints]
 workspace = true

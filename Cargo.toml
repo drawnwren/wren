@@ -12,9 +12,11 @@ repository = "https://example.invalid/wren"
 ropey = "1"
 crop = "0.4"
 imara-diff = "0.2"
+merge3 = { version = "0.2.1", default-features = false }
 ls-types = "0.0.6"
-logos = "0.16"
 mmap-io = { version = "1", features = ["atomic"] }
+parking_lot = "0.12"
+rayon = "1"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSThread", "NSObjCRuntime"] }
 ast-grep-core = "0.45"
 ast-grep-language = "0.45"
@@ -26,6 +28,7 @@ vt100 = "0.16.2"
 nix = { version = "0.28", features = ["fs", "mman", "process", "resource", "signal"] }
 xattr = "1"
 filetime = "0.2"
+fastcdc = "4.0.1"
 nucleo-matcher = "0.3"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -37,8 +40,12 @@ serde = { version = "1", features = ["derive", "rc"] }
 anyhow = "1"
 base64 = "0.22"
 flate2 = "1"
+glam = "0.30"
 bitflags = { version = "2", features = ["serde"] }
 blake3 = "1"
+compact_str = { version = "0.10", features = ["serde"] }
+catppuccin = "2.8"
+cel-interpreter = { version = "0.10", default-features = false }
 core_affinity = "0.8"
 dhat = "0.3"
 rmpv = { version = "1", features = ["with-serde"] }

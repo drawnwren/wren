@@ -12,8 +12,7 @@ use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use wren_benchmark_support::{
-    ArgumentCursor, CommonArguments, bare_metal_declared, elapsed_nanos, emit_report, histogram, percentiles, pin_requested_cpu, require_bare_metal_cpu,
-    ten_percent_cut,
+    CommonArguments, bare_metal_declared, elapsed_nanos, emit_report, histogram, percentiles, pin_requested_cpu, require_bare_metal_cpu, ten_percent_cut,
 };
 use wren_client_state::{ClientViewStateStore, PublishedViewport};
 use wren_engine::EngineFrame;
@@ -67,20 +66,16 @@ impl Timings {
 }
 
 fn arguments() -> Result<Arguments> {
-    let mut arguments = Arguments { common: CommonArguments::new(1_000), b3_path: None, probe_file: None };
-    let mut cursor = ArgumentCursor::from_env();
-    while let Some(argument) = cursor.next() {
-        if arguments.common.consume(&argument, &mut cursor)? {
-            continue;
+    let (mut b3_path, mut probe_file) = (None, None);
+    let common = CommonArguments::parse_with(1_000, |argument, cursor| {
+        match argument {
+            "--b3-path" => b3_path = Some(cursor.path(argument)?),
+            "--probe-file" => probe_file = Some(cursor.path(argument)?),
+            _ => return Ok(false),
         }
-        match argument.as_str() {
-            "--b3-path" => arguments.b3_path = Some(cursor.path(&argument)?),
-            "--probe-file" => arguments.probe_file = Some(cursor.path(&argument)?),
-            argument => anyhow::bail!("unknown argument: {argument}"),
-        }
-    }
-    arguments.common.validate()?;
-    Ok(arguments)
+        Ok(true)
+    })?;
+    Ok(Arguments { common, b3_path, probe_file })
 }
 
 fn validate_gate_environment(arguments: &Arguments, pinned: bool) -> Result<()> {
@@ -272,32 +267,10 @@ fn probe(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn read_at(file: &File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     let mut bytes = vec![0; length];
     let count = file.read_at(&mut bytes, offset)?;
-    bytes.truncate(count);
-    Ok(bytes)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::{Seek, SeekFrom};
-
-    use std::os::windows::fs::FileExt;
-    let mut bytes = vec![0; length];
-    let count = file.seek_read(&mut bytes, offset)?;
-    bytes.truncate(count);
-    Ok(bytes)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn read_at(file: &File, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
-    let mut file = file.try_clone()?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut bytes = vec![0; length];
-    let count = file.read(&mut bytes)?;
     bytes.truncate(count);
     Ok(bytes)
 }

@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -33,28 +34,28 @@ struct OutboxState {
     durable_records_since_compaction: usize,
 }
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct MutationOutbox {
-    path: PathBuf,
+    records: crate::record::RecordStore,
     state: Arc<Mutex<OutboxState>>,
 }
 
 impl MutationOutbox {
-    #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), state: Arc::new(Mutex::new(OutboxState::default())) }
+        Self { records: crate::record::RecordStore::new("client outbox", path, MAGIC), state: Arc::new(Mutex::new(OutboxState::default())) }
     }
 
-    #[must_use]
     pub fn in_directory(directory: impl AsRef<Path>) -> Self {
         Self::new(directory.as_ref().join("mutations.wal"))
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.records.path()
     }
 
+    #[cfg(test)]
     pub fn append(&self, mutation: &ClientMutation) -> Result<(), OutboxError> {
         self.append_many(std::slice::from_ref(mutation)).map(|_| ())
     }
@@ -62,7 +63,7 @@ impl MutationOutbox {
     /// Crash-safely records a group of mutations with one durability sync.
     /// Every mutation remains an independently checksummed WAL record.
     pub fn append_many(&self, mutations: &[ClientMutation]) -> Result<usize, OutboxError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         self.load_state(&mut state)?;
         let outstanding = &mut state.outstanding;
         let mut known = outstanding.iter().map(|mutation| (mutation.mutation_id, mutation)).collect::<HashMap<_, _>>();
@@ -95,7 +96,7 @@ impl MutationOutbox {
     /// Crash-safely records all known durable acknowledgements with one sync.
     /// Unknown, duplicate, received, and rejected results are ignored.
     pub fn observe_results(&self, results: &[MutationResult]) -> Result<usize, OutboxError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         self.load_state(&mut state)?;
         let outstanding = &state.outstanding;
         let mut known = outstanding.iter().map(|mutation| mutation.mutation_id).collect::<HashSet<_>>();
@@ -118,13 +119,13 @@ impl MutationOutbox {
     }
 
     pub fn outstanding(&self) -> Result<Vec<ClientMutation>, OutboxError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock();
         self.load_state(&mut state)?;
         Ok(state.outstanding.clone())
     }
 
     fn recover_outstanding(&self) -> Result<Vec<ClientMutation>, OutboxError> {
-        let records = self.recover_records()?;
+        let records: Vec<OutboxRecord> = self.records.recover()?;
         let mut positions: HashMap<MutationId, usize> = HashMap::new();
         let mut mutations: Vec<Option<ClientMutation>> = Vec::new();
         for record in records {
@@ -150,29 +151,17 @@ impl MutationOutbox {
         Ok(mutations.into_iter().flatten().collect())
     }
 
-    pub fn compact(&self) -> Result<(), OutboxError> {
-        let mut state = self.lock_state()?;
-        self.load_state(&mut state)?;
-        self.compact_outstanding(&state.outstanding)?;
-        state.durable_records_since_compaction = 0;
-        Ok(())
-    }
-
     fn compact_outstanding(&self, outstanding: &[ClientMutation]) -> Result<(), OutboxError> {
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|source| self.io(source))?;
-        let mut temporary = NamedTempFile::new_in(parent).map_err(|source| self.io(source))?;
-        for mutation in outstanding {
-            self.records().write(temporary.as_file_mut(), &OutboxRecord::Mutation(mutation.clone()))?;
-        }
-        temporary.as_file_mut().flush().and_then(|()| temporary.as_file().sync_all()).map_err(|source| self.io(source))?;
-        temporary.persist(&self.path).map_err(|error| self.io(error.error))?;
-        File::open(parent).and_then(|directory| directory.sync_all()).map_err(|source| self.io(source))?;
+        let parent = self.path().parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| self.records.error(source))?;
+        let mut temporary = NamedTempFile::new_in(parent).map_err(|source| self.records.error(source))?;
+        let records = outstanding.iter().cloned().map(OutboxRecord::Mutation).collect::<Vec<_>>();
+        self.records.write_many(temporary.as_file_mut(), &records)?;
+        temporary.as_file_mut().flush().and_then(|()| temporary.as_file().sync_all()).map_err(|source| self.records.error(source))?;
+        self.records.reset_writer();
+        temporary.persist(self.path()).map_err(|error| self.records.error(error.error))?;
+        File::open(parent).and_then(|directory| directory.sync_all()).map_err(|source| self.records.error(source))?;
         Ok(())
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OutboxState>, OutboxError> {
-        self.state.lock().map_err(|_| self.io(io::Error::other("mutation outbox state lock poisoned")))
     }
 
     fn load_state(&self, state: &mut OutboxState) -> Result<(), OutboxError> {
@@ -184,19 +173,7 @@ impl MutationOutbox {
     }
 
     fn append_records(&self, records: &[OutboxRecord]) -> Result<(), OutboxError> {
-        self.records().append_many(records).map_err(Into::into)
-    }
-
-    fn recover_records(&self) -> Result<Vec<OutboxRecord>, OutboxError> {
-        self.records().recover().map_err(Into::into)
-    }
-
-    fn io(&self, source: io::Error) -> OutboxError {
-        self.records().error(source).into()
-    }
-
-    fn records(&self) -> crate::record::RecordStore<'_> {
-        crate::record::RecordStore::new("client outbox", &self.path, MAGIC)
+        self.records.append_many(records).map_err(Into::into)
     }
 }
 
@@ -211,7 +188,7 @@ mod tests {
         SessionId, SessionSequence, StateDelta, Transaction,
     };
 
-    use crate::{MutationSubmission, SessionAuthority, SessionJournal};
+    use crate::{SessionAuthority, SessionJournal};
 
     use super::*;
 
@@ -340,7 +317,7 @@ mod tests {
         let pending = mutation();
         outbox.append(&pending).expect("client durable");
         let first = authority.submit(pending.clone()).expect("remote durable");
-        assert!(matches!(first, MutationSubmission::Accepted { .. }));
+        assert!(first.is_ok());
 
         // Simulate both processes dying before the client records the ack.
         drop(authority);
@@ -348,7 +325,7 @@ mod tests {
         let replayed = outbox.outstanding().expect("client recovery");
         assert_eq!(replayed, vec![pending.clone()]);
         let retry = authority.submit(pending).expect("deduplicated retry");
-        let durable = retry.durable().expect("durable result");
+        let durable = retry.as_ref().expect("durable result");
         outbox.observe_result(durable).expect("compact on durable");
         assert!(outbox.outstanding().expect("empty outbox").is_empty());
         assert_eq!(authority.document(DocumentId::new(4)).expect("document").text(), "ext");

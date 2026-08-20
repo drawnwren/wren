@@ -4,11 +4,13 @@ use std::env;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -39,6 +41,20 @@ impl CommonArguments {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.iterations > 0, "--iterations must be positive");
         Ok(())
+    }
+
+    pub fn parse(default_iterations: u64) -> Result<Self> {
+        Self::parse_with(default_iterations, |_, _| Ok(false))
+    }
+
+    pub fn parse_with(default_iterations: u64, mut consume_custom: impl FnMut(&str, &mut ArgumentCursor) -> Result<bool>) -> Result<Self> {
+        let mut parsed = Self::new(default_iterations);
+        let mut cursor = ArgumentCursor::from_env();
+        while let Some(argument) = cursor.next() {
+            anyhow::ensure!(parsed.consume(&argument, &mut cursor)? || consume_custom(&argument, &mut cursor)?, "unknown argument: {argument}");
+        }
+        parsed.validate()?;
+        Ok(parsed)
     }
 }
 
@@ -173,6 +189,22 @@ pub fn emit_report(report: &Value, output: Option<&Path>) -> Result<()> {
     }
     println!("{rendered}");
     Ok(())
+}
+
+pub fn isolated_child_report<T: DeserializeOwned>(flag: &str, iterations: u64, description: &str) -> Result<T> {
+    let isolated = tempfile::tempdir().with_context(|| format!("create isolated {description} home"))?;
+    let output = Command::new(env::current_exe().with_context(|| format!("locate {description} executable"))?)
+        .arg(flag)
+        .arg(iterations.to_string())
+        .current_dir(isolated.path())
+        .env("HOME", isolated.path())
+        .env("XDG_STATE_HOME", isolated.path().join("state"))
+        .env("XDG_DATA_HOME", isolated.path().join("data"))
+        .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+        .output()
+        .with_context(|| format!("run isolated {description}"))?;
+    anyhow::ensure!(output.status.success(), "{description} failed: {}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).with_context(|| format!("decode {description} report"))
 }
 
 /// Materializes the deterministic, real-looking Rust document used by text

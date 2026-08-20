@@ -1,11 +1,15 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use thiserror::Error;
-use wren_grammar::{ExpressionContext, Value, evaluate_expression};
-use wren_types::{CommandArgumentType, CommandInvocation, CommandSchema, CommandValue, LanguageBundle};
+use wren_grammar::{ExpressionContext, evaluate_expression};
+#[cfg(test)]
+use wren_types::LanguageBundle;
+use wren_types::{CommandArgumentType, CommandInvocation, CommandSchema, CommandValue};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct Config {
@@ -59,6 +63,7 @@ fn prompt_save() -> String {
     "prompt".to_owned()
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigBundle {
     pub config_toml: Box<str>,
@@ -68,6 +73,7 @@ pub struct ConfigBundle {
     pub content_hash: [u8; 32],
 }
 
+#[cfg(test)]
 impl ConfigBundle {
     #[must_use]
     pub fn new(
@@ -215,6 +221,7 @@ pub fn executable_hash(config: &Config) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(test)]
 #[must_use]
 pub fn sanitized_environment(inherited: impl IntoIterator<Item = (String, String)>) -> BTreeMap<String, String> {
     let exact: BTreeSet<&str> = ["HOME", "PATH", "LANG", "TERM", "TMPDIR", "USER", "SHELL"].into_iter().collect();
@@ -227,13 +234,13 @@ fn has_executable_contributions(config: &Config) -> bool {
 
 fn validation_context() -> ExpressionContext {
     ExpressionContext::new()
-        .with("language", Value::String("rust".to_owned()))
-        .with("remote", Value::Bool(false))
-        .with("os", Value::String("linux".to_owned()))
-        .with("selection.nonempty", Value::Bool(false))
-        .with("lsp.available", Value::Bool(false))
-        .with("document.class", Value::String("normal".to_owned()))
-        .with("workspace.trusted", Value::Bool(false))
+        .with("language", "rust")
+        .with("remote", false)
+        .with("os", "macos")
+        .with("selection.nonempty", false)
+        .with("lsp.available", false)
+        .with("document.class", "normal")
+        .with("workspace.trusted", false)
 }
 
 fn command_value(value: &toml::Value, expected: &CommandArgumentType) -> Option<CommandValue> {

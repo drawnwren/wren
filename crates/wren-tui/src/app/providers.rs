@@ -29,7 +29,6 @@ impl App {
         if transaction.is_empty() {
             return;
         }
-        let mapping = transaction.offset_mapping();
         let frame = self.active.editor.frame();
         let language_id = language_bundle(self.active.document.presentation_path()).language_id;
         let (mut targets, replacement) = changed_syntax(&frame.text, transaction, &language_id, self.theme);
@@ -38,7 +37,7 @@ impl App {
         }
         targets.sort_by_key(|target| target.start);
         let pending = self.provider_refresh_ranges.entry(self.active.document_id).or_default();
-        *pending = std::mem::take(pending).into_iter().filter_map(|range| map_range_with(range, &mapping)).chain(targets.iter().cloned()).collect();
+        *pending = std::mem::take(pending).into_iter().filter_map(|range| map_range(range, transaction)).chain(targets.iter().cloned()).collect();
         merge_ranges(pending);
         let revision = self.active.editor.revision();
         let state = self.decorations.entry(self.active.buffer_id).or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
@@ -57,7 +56,7 @@ impl App {
     pub(super) fn prepare_realtime_decoration_updates(&self) {
         if self.realtime_decorations_prepared.get()
             || self.active.editor.mode() != Mode::Normal
-            || self.views.windows.len() != 1
+            || self.views.window_count() != 1
             || !self.active.class.policy().whole_document_syntax
         {
             return;
@@ -107,15 +106,16 @@ impl App {
     pub(super) fn schedule_provider_refreshes(&mut self, viewport_height: usize) {
         let viewport_height = viewport_height.max(1);
         let mut line_ranges: BTreeMap<BufferId, (usize, usize)> = BTreeMap::new();
-        let windows = self.views.windows.iter().enumerate().map(|(index, window)| (index, window.buffer_id, window.top_line)).collect::<Vec<_>>();
-        for (window_index, buffer_id, top_line) in windows {
+        let mut windows = Vec::with_capacity(self.views.window_count());
+        self.views.visit_windows(|window| windows.push((window.id, window.buffer_id, window.top_line)));
+        for (window_id, buffer_id, top_line) in windows {
             let Some(buffer) = self.buffer(buffer_id) else {
                 continue;
             };
             let cursor_line = buffer.editor.cursor_line_column().0;
             let margin = 3.min(viewport_height.saturating_sub(1) / 2);
             let effective_top = viewport_top_with_margin(top_line, cursor_line, viewport_height, margin);
-            if let Some(window) = self.views.windows.get_mut(window_index) {
+            if let Some(window) = self.views.window_mut(window_id) {
                 window.top_line = effective_top;
             }
             let range = line_ranges.entry(buffer_id).or_insert((effective_top, effective_top + viewport_height));
@@ -173,7 +173,7 @@ impl App {
         self.provider_refresh_due.remove(&refresh.document_id);
     }
 
-    pub(super) fn poll_provider_results(&mut self) -> Result<bool> {
+    pub(super) fn poll_provider_results(&mut self) -> bool {
         let mut changed = false;
         while let Some(result) = self.provider.try_result() {
             match result {
@@ -185,19 +185,13 @@ impl App {
                     let spans = spans.into_iter().map(|span| provider_decoration(span, self.theme)).collect::<Vec<_>>();
                     let state = self.decorations.entry(buffer_id).or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
                     if state.revision == revision {
-                        state.replace_current_ranges(&ranges, spans);
+                        state.state.replace_ranges(&ranges, spans);
                     } else {
                         *state = BufferDecorations::new(revision, spans);
                     }
                     self.provider_refresh_ranges.entry(document_id).or_insert_with(|| Vec::with_capacity(4)).clear();
                     changed = true;
-                    self.provider_submitted.entry(document_id).or_insert(ProviderDemandKey {
-                        revision,
-                        visible_start: 0,
-                        visible_end: 0,
-                        near_start: 0,
-                        near_end: 0,
-                    });
+                    self.provider_submitted.entry(document_id).or_insert(ProviderDemandKey { revision, visible: 0..0, near_viewport: 0..0 });
                 }
                 ProviderWorkerResult::Failed { document_id, message } => {
                     self.provider_submitted.remove(&document_id);
@@ -221,10 +215,10 @@ impl App {
                 }
             }
         }
-        Ok(changed)
+        changed
     }
 
-    pub(super) fn poll_git_hunk_results(&mut self) -> Result<bool> {
+    pub(super) fn poll_git_hunk_results(&mut self) -> bool {
         self.flush_due_git_hunk_refreshes();
         let mut changed = false;
         while let Some(result) = self.git_worker.try_result() {
@@ -241,7 +235,7 @@ impl App {
                 changed = true;
             }
         }
-        Ok(changed)
+        changed
     }
 
     pub(super) fn schedule_git_hunk_refresh(&mut self, request: GitHunkRequest) {
@@ -299,12 +293,7 @@ impl App {
     pub(super) fn local_completion_candidates(&self) -> (Range<usize>, Vec<CompletionCandidate>) {
         let text = self.active.editor.contents();
         let cursor = self.active.editor.primary_cursor().min(text.len());
-        let word_start = text[..cursor]
-            .char_indices()
-            .rev()
-            .take_while(|(_, character)| character.is_alphanumeric() || *character == '_')
-            .last()
-            .map_or(cursor, |(byte, _)| byte);
+        let word_start = identifier_prefix_start(&text, cursor);
         let mut candidates = self.path_completion_candidates(&text, cursor);
         candidates.extend(self.vsnip_completion_candidates(&text[word_start..cursor], word_start..cursor));
         (word_start..cursor, candidates)
@@ -321,13 +310,13 @@ impl App {
             return Vec::new();
         }
         let (typed_directory, name_prefix) = token.rsplit_once('/').map_or(("", token), |(directory, name)| (&token[..directory.len() + 1], name));
-        let expanded_directory = if let Some(relative) = typed_directory.strip_prefix("~/") {
-            env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(relative)
-        } else if Path::new(typed_directory).is_absolute() {
-            PathBuf::from(typed_directory)
-        } else {
-            env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(typed_directory)
-        };
+        let expanded_directory = typed_directory.strip_prefix("~/").map_or_else(
+            || {
+                let directory = Path::new(typed_directory);
+                if directory.is_absolute() { directory.to_path_buf() } else { env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(directory) }
+            },
+            |relative| env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join(relative),
+        );
         let Ok(entries) = std::fs::read_dir(&expanded_directory) else {
             return Vec::new();
         };
@@ -419,19 +408,12 @@ impl App {
             rows: session
                 .candidates
                 .iter()
-                .map(|candidate| CompletionOverlayRow { label: candidate.label.clone(), detail: candidate.detail.clone(), source: candidate.source.clone() })
+                .map(|candidate| MenuOverlayRow { label: candidate.label.clone(), detail: candidate.detail.clone(), source: Some(candidate.source.clone()) })
                 .collect(),
             selected,
             documentation: documentation.into(),
             documentation_scroll: self.completion_documentation_scroll,
         })
-    }
-
-    pub(super) fn completion_documentation_lines(&self) -> usize {
-        self.completion
-            .as_ref()
-            .and_then(|session| session.candidates.get(self.completion_index))
-            .map_or(0, |candidate| candidate.documentation.lines().count())
     }
 
     pub(super) fn move_completion(&mut self, direction: isize) {
@@ -517,14 +499,13 @@ impl App {
 }
 
 fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str, theme: CatppuccinPalette) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
-    let mapping = transaction.offset_mapping();
     let text_len = text.len();
     let mut targets = transaction
         .edits()
         .iter()
         .filter_map(|edit| {
-            let start = mapping.map_offset(edit.range.start, Bias::Left).ok()?;
-            let end = mapping.map_offset(edit.range.end, Bias::Right).ok()?;
+            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
+            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
             let start_line = text.line_of_byte(start.min(text_len));
             let end_line = text.line_of_byte(end.min(text_len));
             let target_start_line = start_line.saturating_sub(1);
@@ -538,19 +519,14 @@ fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str
         .flat_map(|target| {
             let slice = text.slice(target.clone());
             let spans = if language_id == "markdown" {
-                // Markdown prose has no code keywords. Structural and inline
-                // Markdown styling is painted by `markdown_decorations`, while
-                // the provider refresh supplies fenced-language captures.
-                // Keeping this parser-free also preserves the realtime edit
-                // path's latency contract.
-                Vec::new()
+                provider_decorations(highlight_text(slice.as_ref(), language_id), theme)
             } else {
-                lexical_highlight_text(slice.as_ref())
+                provider_decorations(lexical_highlight_text(slice.as_ref()), theme)
             };
             spans.into_iter().map(|mut span| {
                 span.range.start = span.range.start.saturating_add(target.start);
                 span.range.end = span.range.end.saturating_add(target.start);
-                provider_decoration(span, theme)
+                span
             })
         })
         .collect();

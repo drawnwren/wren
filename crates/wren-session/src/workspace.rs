@@ -135,7 +135,6 @@ impl WorkspaceExecutor {
         self.documents.get(&document_id).ok_or(WorkspaceError::UnknownDocument(document_id))
     }
 
-    #[must_use]
     pub fn document(&self, document_id: DocumentId) -> Option<&WorkspaceDocument> {
         self.documents.get(&document_id)
     }
@@ -224,7 +223,6 @@ impl WorkspaceExecutor {
         self.batches.get(&batch_id).map(PersistBatch::report).ok_or(WorkspaceError::UnknownBatch(batch_id))
     }
 
-    #[must_use]
     pub fn batch(&self, batch_id: PersistBatchId) -> Option<PersistBatchReport> {
         self.batches.get(&batch_id).map(PersistBatch::report)
     }
@@ -406,17 +404,9 @@ fn identity_if_exists(path: &Path) -> Result<Option<FileIdentity>, WorkspaceErro
     }
 }
 
-#[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
     FileIdentity { device: metadata.dev(), file: metadata.ino(), generation: 0 }
-}
-
-#[cfg(not(unix))]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    use std::time::UNIX_EPOCH;
-    let generation = metadata.modified().ok().and_then(|time| time.duration_since(UNIX_EPOCH).ok()).map_or(0, |duration| duration.as_nanos() as u64);
-    FileIdentity { device: 0, file: metadata.len(), generation }
 }
 
 fn sync_parent(path: &Path) -> Result<(), WorkspaceError> {

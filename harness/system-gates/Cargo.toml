@@ -12,9 +12,9 @@ nix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 wren-benchmark-support = { version = "0.1.0", path = "../benchmark-support" }
-wren-provider = { version = "0.1.0", path = "../../crates/wren-provider" }
-wren-remote = { version = "0.1.0", path = "../../crates/wren-remote" }
-wren-text = { version = "0.1.0", path = "../../crates/wren-text" }
+wren-provider = { version = "0.1.0", path = "../../crates/wren-provider", features = ["benchmarking"] }
+wren-remote = { version = "0.1.0", path = "../../crates/wren-remote", features = ["benchmarking"] }
+wren-text = { version = "0.1.0", path = "../../crates/wren-text", features = ["benchmarking"] }
 wren-types = { version = "0.1.0", path = "../../crates/wren-types" }
 
 [lints]

@@ -3,21 +3,13 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProviderDemandKey {
     pub(super) revision: DocumentRevision,
-    pub(super) visible_start: usize,
-    pub(super) visible_end: usize,
-    pub(super) near_start: usize,
-    pub(super) near_end: usize,
+    pub(super) visible: Range<usize>,
+    pub(super) near_viewport: Range<usize>,
 }
 
 impl From<&ProviderRefresh> for ProviderDemandKey {
     fn from(refresh: &ProviderRefresh) -> Self {
-        Self {
-            revision: refresh.revision,
-            visible_start: refresh.visible.start,
-            visible_end: refresh.visible.end,
-            near_start: refresh.near_viewport.start,
-            near_end: refresh.near_viewport.end,
-        }
+        Self { revision: refresh.revision, visible: refresh.visible.clone(), near_viewport: refresh.near_viewport.clone() }
     }
 }
 
@@ -59,16 +51,7 @@ pub(super) struct LspOpenDocument {
     pub(super) revision: DocumentRevision,
 }
 
-pub(super) enum LspBackgroundOutcome {
-    Location { method: String, response: Result<serde_json::Value, String> },
-    Hover { method: String, document_id: DocumentId, revision: DocumentRevision, response: Result<serde_json::Value, String> },
-    Semantic { buffer_id: BufferId, revision: DocumentRevision, decorations: Result<BufferDecorations, String> },
-}
-
-pub(super) struct LspBackgroundResult {
-    pub(super) lsp: PersistentLsp,
-    pub(super) outcome: LspBackgroundOutcome,
-}
+pub(super) type LspCompletion = Box<dyn FnOnce(&mut App) + Send>;
 
 pub(super) enum ProviderWorkerMessage {
     Refresh(Box<ProviderRefresh>),
@@ -117,33 +100,21 @@ pub(super) struct GitHunkResult {
     pub(super) hunks: Vec<GitHunk>,
 }
 
-pub(super) enum GitHunkMessage {
-    Refresh(GitHunkRequest),
-    Stop,
-}
-
 pub(super) struct GitHunkWorker {
-    sender: mpsc::Sender<GitHunkMessage>,
+    sender: mpsc::Sender<GitHunkRequest>,
     results: mpsc::Receiver<GitHunkResult>,
-    join: Option<JoinHandle<()>>,
 }
 
 impl GitHunkWorker {
     pub(super) fn start() -> Result<Self> {
         let (sender, requests) = mpsc::channel();
         let (results, receiver) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name("wren-git-hunks".to_owned())
-            .spawn(move || {
-                wren_scheduling::mark_background();
-                git_hunk_loop(requests, results);
-            })
-            .context("spawn Git hunk worker")?;
-        Ok(Self { sender, results: receiver, join: Some(join) })
+        wren_scheduling::spawn_background("wren-git-hunks", move || git_hunk_loop(requests, results)).context("spawn Git hunk worker")?;
+        Ok(Self { sender, results: receiver })
     }
 
     pub(super) fn refresh(&self, request: GitHunkRequest) {
-        let _ = self.sender.send(GitHunkMessage::Refresh(request));
+        let _ = self.sender.send(request);
     }
 
     pub(super) fn try_result(&self) -> Option<GitHunkResult> {
@@ -151,18 +122,8 @@ impl GitHunkWorker {
     }
 }
 
-impl Drop for GitHunkWorker {
-    fn drop(&mut self) {
-        let _ = self.sender.send(GitHunkMessage::Stop);
-        join_worker_thread(&mut self.join);
-    }
-}
-
-fn git_hunk_loop(requests: mpsc::Receiver<GitHunkMessage>, results: mpsc::Sender<GitHunkResult>) {
-    while let Ok(message) = requests.recv() {
-        let GitHunkMessage::Refresh(request) = message else {
-            return;
-        };
+fn git_hunk_loop(requests: mpsc::Receiver<GitHunkRequest>, results: mpsc::Sender<GitHunkResult>) {
+    while let Ok(request) = requests.recv() {
         let after = request.after.shared();
         let hunks = git_hunks(&request.before, &after);
         if results.send(GitHunkResult { buffer_id: request.buffer_id, revision: request.revision, hunks }).is_err() {
@@ -184,16 +145,13 @@ impl ProviderWorker {
         let (results, receiver) = mpsc::channel();
         #[cfg(not(test))]
         let executable = env::current_exe().context("locate provider executable")?;
-        let join = thread::Builder::new()
-            .name("wren-provider-supervisor".to_owned())
-            .spawn(move || {
-                wren_scheduling::mark_background();
-                #[cfg(test)]
-                provider_actor_loop(requests, immediate_requests, results);
-                #[cfg(not(test))]
-                provider_process_loop(executable, requests, immediate_requests, results);
-            })
-            .context("spawn provider supervisor")?;
+        let join = wren_scheduling::spawn_background("wren-provider-supervisor", move || {
+            #[cfg(test)]
+            provider_actor_loop(requests, immediate_requests, results);
+            #[cfg(not(test))]
+            provider_process_loop(executable, requests, immediate_requests, results);
+        })
+        .context("spawn provider supervisor")?;
         Ok(Self { sender, immediate_sender, results: receiver, join: Some(join) })
     }
 
@@ -248,13 +206,13 @@ fn provider_process_loop(
     let mut supervisor = match supervisor {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            provider_failures_until_stop(&requests, &immediate_requests, &results, error.to_string());
-            return;
+            let message = error.to_string();
+            return provider_loop(requests, immediate_requests, results, move |_| Err(provider_error(&message)));
         }
     };
     if let Err(error) = supervisor.request(&ProviderRequest::Hello { protocol: 1 }) {
-        provider_failures_until_stop(&requests, &immediate_requests, &results, error.to_string());
-        return;
+        let message = error.to_string();
+        return provider_loop(requests, immediate_requests, results, move |_| Err(provider_error(&message)));
     }
     provider_loop(requests, immediate_requests, results, |request| supervisor.request(request));
 }
@@ -284,25 +242,21 @@ pub(super) fn provider_loop(
         let Some(message) = next_provider_message(&requests, &immediate_requests, &mut pending) else {
             return;
         };
-        match message {
+        let result = match message {
             ProviderWorkerMessage::Refresh(refresh) => {
                 let refresh = coalesce_provider_refresh(*refresh, &requests, &mut pending);
-                let result = refresh_provider(refresh, &mut uploaded, &mut request);
-                if results.send(result).is_err() {
-                    return;
-                }
+                Some(refresh_provider(refresh, &mut uploaded, &mut request))
             }
-            ProviderWorkerMessage::Complete(completion) => {
-                let result = complete_provider(*completion, &mut uploaded, &mut request);
-                if results.send(result).is_err() {
-                    return;
-                }
-            }
+            ProviderWorkerMessage::Complete(completion) => Some(complete_provider(*completion, &mut uploaded, &mut request)),
             ProviderWorkerMessage::HighlightNow(highlight) => {
                 highlight_immediately(*highlight, &mut uploaded, &mut request);
+                None
             }
-            ProviderWorkerMessage::Wake => {}
+            ProviderWorkerMessage::Wake => None,
             ProviderWorkerMessage::Stop => return,
+        };
+        if result.is_some_and(|result| results.send(result).is_err()) {
+            return;
         }
     }
 }
@@ -353,7 +307,11 @@ fn coalesce_provider_refresh(
 }
 
 fn unexpected_provider_response(context: &str, response: ProviderResponse) -> wren_provider::ProviderError {
-    wren_provider::ProviderError::Json(serde_json::Error::io(std::io::Error::other(format!("unexpected {context} response {response:?}"))))
+    provider_error(&format!("unexpected {context} response {response:?}"))
+}
+
+fn provider_error(message: &str) -> wren_provider::ProviderError {
+    wren_provider::ProviderError::Json(serde_json::Error::io(std::io::Error::other(message.to_owned())))
 }
 
 fn ensure_provider_document(
@@ -368,25 +326,20 @@ fn ensure_provider_document(
     if uploaded.get(&document_id).is_some_and(|document| document.revision == revision && document.generation == generation) {
         return Ok(());
     }
-    if let Some(document) = uploaded.get(&document_id)
+    let (context, update) = if let Some(document) = uploaded.get(&document_id)
         && document.generation == generation
         && document.text.as_ref() == text.as_ref()
     {
-        let from_revision = document.revision;
-        return match request(&ProviderRequest::AdvanceDocumentRevision { document_id, from_revision, revision, generation })? {
-            ProviderResponse::Updated { .. } => {
-                uploaded.insert(document_id, UploadedProviderDocument { revision, generation, text });
-                Ok(())
-            }
-            response => Err(unexpected_provider_response("document revision advance", response)),
-        };
-    }
-    match request(&ProviderRequest::UpdateDocument { document_id, revision, text: text.as_ref().into(), bundle })? {
+        ("document revision advance", ProviderRequest::AdvanceDocumentRevision { document_id, from_revision: document.revision, revision, generation })
+    } else {
+        ("document update", ProviderRequest::UpdateDocument { document_id, revision, text: text.as_ref().into(), bundle })
+    };
+    match request(&update)? {
         ProviderResponse::Updated { .. } => {
             uploaded.insert(document_id, UploadedProviderDocument { revision, generation, text });
             Ok(())
         }
-        response => Err(unexpected_provider_response("document update", response)),
+        response => Err(unexpected_provider_response(context, response)),
     }
 }
 
@@ -476,38 +429,4 @@ fn checked_provider_response<T>(
         uploaded.remove(&document_id);
     }
     result
-}
-
-#[cfg(not(test))]
-fn provider_failures_until_stop(
-    requests: &mpsc::Receiver<ProviderWorkerMessage>,
-    immediate_requests: &mpsc::Receiver<ProviderWorkerMessage>,
-    results: &mpsc::Sender<ProviderWorkerResult>,
-    message: String,
-) {
-    loop {
-        let request = match immediate_requests.try_recv() {
-            Ok(request) => request,
-            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-                let Ok(request) = requests.recv() else {
-                    return;
-                };
-                request
-            }
-        };
-        match request {
-            ProviderWorkerMessage::Refresh(refresh) => {
-                let _ = results.send(ProviderWorkerResult::Failed { document_id: refresh.document_id, message: message.clone() });
-            }
-            ProviderWorkerMessage::Complete(completion) => {
-                let _ = results.send(ProviderWorkerResult::Failed { document_id: completion.document_id, message: message.clone() });
-            }
-            ProviderWorkerMessage::HighlightNow(highlight) => {
-                let ImmediateHighlight { document_id, reply, .. } = *highlight;
-                let _ = reply.send(Err(format!("document {document_id:?}: {message}")));
-            }
-            ProviderWorkerMessage::Wake => {}
-            ProviderWorkerMessage::Stop => break,
-        }
-    }
 }

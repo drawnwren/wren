@@ -1,17 +1,18 @@
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use wren_presenter::{PresentationObserver, Presenter};
 use wren_term::{TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode};
 use wren_types::Modifiers;
-use wren_view::{CellColor, DesiredGrid, TerminalPatch, ViewportLayout, diff_into};
+use wren_view::{CatppuccinColor, CellColor, DesiredGrid, TerminalUpdate, ViewportLayout, diff_into};
 
-use super::{App, BufferDecorations, DiagnosticEntry, DiagnosticSeverity, SearchDirection, StartupScreen, desired_frame, poll_app_work};
+use super::{App, BufferDecorations, QuickfixEntry, SearchDirection, Severity, StartupScreen, desired_frame, poll_app_work};
 
 const WIDTH: usize = 120;
 const HEIGHT: usize = 40;
@@ -98,16 +99,20 @@ struct MeasuringBackend {
 
 impl MeasuringBackend {
     fn new() -> Result<Self> {
-        Ok(Self { terminal: TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)? })
+        Ok(Self { terminal: TerminaBackend::new(CountingWriter::default()) })
     }
 }
 
 impl TerminalBackend for MeasuringBackend {
     type Error = TerminalError;
 
-    fn submit(&mut self, patches: &[TerminalPatch]) -> Result<(), Self::Error> {
-        self.terminal.submit(patches)
+    fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
+        self.terminal.submit(update)
     }
+}
+
+fn terminal_update_operations(update: &TerminalUpdate) -> usize {
+    2 + update.rows.len() + usize::from(update.clear) + usize::from(update.raster_overlay.is_some())
 }
 
 #[derive(Clone, Default)]
@@ -135,7 +140,7 @@ struct TilingProbe {
     presented: mpsc::Receiver<u64>,
     presenter_bytes: Arc<AtomicU64>,
     previous: Option<Arc<DesiredGrid>>,
-    diagnostic_patches: Vec<TerminalPatch>,
+    diagnostic_update: TerminalUpdate,
     setup_presentations: u64,
     samples: Vec<TilingPerformanceSample>,
 }
@@ -150,10 +155,10 @@ impl TilingProbe {
         let mut layout = ViewportLayout::new(WIDTH, HEIGHT);
         layout.configure_dotfile_profile();
         app.resize_terminal(HEIGHT, WIDTH);
-        let diagnostic_terminal = TerminaBackend::new(CountingWriter::default(), WIDTH, HEIGHT)?;
+        let diagnostic_terminal = TerminaBackend::new(CountingWriter::default());
         let presenter_writer = SharedCountingWriter::default();
         let presenter_bytes = Arc::clone(&presenter_writer.bytes);
-        let backend = Arc::new(Mutex::new(TerminaBackend::new(presenter_writer, WIDTH, HEIGHT)?));
+        let backend = Arc::new(Mutex::new(TerminaBackend::new(presenter_writer)));
         let (presented_sender, presented) = mpsc::sync_channel(1);
         let observer: PresentationObserver = Arc::new(move |epoch| {
             let _ = presented_sender.send(epoch);
@@ -167,7 +172,7 @@ impl TilingProbe {
             presented,
             presenter_bytes,
             previous: None,
-            diagnostic_patches: Vec::new(),
+            diagnostic_update: TerminalUpdate::default(),
             setup_presentations: 0,
             samples: Vec::new(),
         })
@@ -177,7 +182,6 @@ impl TilingProbe {
         self.layout.resize(width, height);
         self.layout.configure_dotfile_profile();
         self.app.resize_terminal(height, width);
-        self.diagnostic_terminal.resize(width, height);
     }
 
     fn set_animation_time(&mut self, elapsed: Duration) {
@@ -195,8 +199,8 @@ impl TilingProbe {
         self.presenter.publish(Arc::clone(&frame))?;
         let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("tiling performance setup presentation timed out")?;
         anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
-        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_patches);
-        self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
+        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_update);
+        self.diagnostic_terminal.submit(&self.diagnostic_update)?;
         self.previous = Some(frame);
         self.setup_presentations = self.setup_presentations.saturating_add(1);
         Ok(())
@@ -224,12 +228,12 @@ impl TilingProbe {
         // Drop the preceding diagnostic patch contents before the component
         // clock, matching the allocation-returning `diff` baseline whose
         // result was dropped after its measured interval.
-        self.diagnostic_patches.clear();
+        self.diagnostic_update.rows.clear();
         let diff_started = Instant::now();
-        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_patches);
+        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_update);
         let diff_nanos = elapsed_nanos(diff_started);
         let terminal_started = Instant::now();
-        self.diagnostic_terminal.submit(&self.diagnostic_patches)?;
+        self.diagnostic_terminal.submit(&self.diagnostic_update)?;
         let terminal_write_nanos = elapsed_nanos(terminal_started);
         anyhow::ensure!(frame.raster_overlay.is_some(), "tiling performance sample did not render the startup tiling");
         self.samples.push(TilingPerformanceSample {
@@ -240,7 +244,7 @@ impl TilingProbe {
             diff_nanos,
             terminal_write_nanos,
             full_render_nanos,
-            terminal_patches: self.diagnostic_patches.len(),
+            terminal_patches: terminal_update_operations(&self.diagnostic_update),
             terminal_bytes,
         });
         self.previous = Some(frame);
@@ -446,7 +450,7 @@ fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<Prepa
                 .cloned()
                 .map(|mut span| {
                     span.priority = 2_000_000;
-                    span.style = span.style.with_foreground(CellColor::Rgb(app.theme.lavender));
+                    span.style = span.style.with_foreground(CellColor::Rgb(app.theme.color(CatppuccinColor::Lavender)));
                     span
                 })
                 .collect::<Vec<_>>()
@@ -457,20 +461,8 @@ fn prepare_app(mut app: App, source_path: &Path, source: String) -> Result<Prepa
     app.active.editor.search("value_", SearchDirection::Forward).context("prepare production search highlight")?;
     app.search_highlight = true;
     app.diagnostics.extend([
-        DiagnosticEntry {
-            path: source_path.to_path_buf(),
-            line: 1,
-            column: 1,
-            severity: DiagnosticSeverity::Warning,
-            message: "deterministic benchmark warning".to_owned(),
-        },
-        DiagnosticEntry {
-            path: source_path.to_path_buf(),
-            line: LARGE_RUST_LINES,
-            column: 1,
-            severity: DiagnosticSeverity::Error,
-            message: "deterministic benchmark error".to_owned(),
-        },
+        QuickfixEntry::diagnostic(source_path, 1, 1, Severity::Warning, "deterministic benchmark warning"),
+        QuickfixEntry::diagnostic(source_path, LARGE_RUST_LINES, 1, Severity::Error, "deterministic benchmark error"),
     ]);
     Ok(PreparedApp { app, syntax_spans, semantic_spans: semantic_spans_count })
 }

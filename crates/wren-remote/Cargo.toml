@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = ["dep:fastcdc", "wren-types/test-support"]
+client = []
+
 [dependencies]
 blake3.workspace = true
+fastcdc = { workspace = true, optional = true }
 filetime.workspace = true
-imara-diff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -15,7 +19,10 @@ wren-proto = { version = "0.1.0", path = "../wren-proto" }
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
 [dev-dependencies]
+fastcdc.workspace = true
+merge3.workspace = true
 tempfile.workspace = true
+wren-types = { version = "0.1.0", path = "../wren-types", features = ["test-support"] }
 
 [lints]
 workspace = true

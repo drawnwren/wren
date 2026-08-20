@@ -5,25 +5,18 @@ const GREP_PICKER_RESULT_LIMIT: usize = 10_000;
 fn launch_grep_picker_task(request: GrepPickerRequest) -> Result<GrepPickerTask> {
     let generation = request.generation;
     let query = request.query.clone();
-    let child = Arc::new(Mutex::new(None));
+    let child = Arc::new(LocalMutex::new(None));
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_child = Arc::clone(&child);
     let worker_cancelled = Arc::clone(&cancelled);
-    let (sender, receiver) = mpsc::channel();
-    thread::Builder::new()
-        .name("wren-live-grep".to_owned())
-        .spawn(move || {
-            wren_scheduling::mark_background();
-            let result = run_grep_picker_search(request, &worker_child, &worker_cancelled);
-            let _ = sender.send(result);
-        })
+    let receiver = wren_scheduling::spawn_background_result("wren-live-grep", move || run_grep_picker_search(request, &worker_child, &worker_cancelled))
         .context("start repository search worker")?;
     Ok(GrepPickerTask { generation, query, child, cancelled, receiver })
 }
 
 fn run_grep_picker_search(
     request: GrepPickerRequest,
-    child_slot: &Mutex<Option<std::process::Child>>,
+    child_slot: &LocalMutex<Option<std::process::Child>>,
     cancelled: &AtomicBool,
 ) -> std::result::Result<Vec<QuickfixEntry>, String> {
     let root = git_root_for(&request.root).unwrap_or(request.root);
@@ -41,7 +34,7 @@ fn run_grep_picker_search(
         .map_err(|error| format!("start rg: {error}"))?;
     let stdout = child.stdout.take().ok_or_else(|| "rg stdout was not captured".to_owned())?;
     {
-        let mut slot = child_slot.lock().map_err(|_| "repository search child lock is poisoned".to_owned())?;
+        let mut slot = child_slot.lock();
         if cancelled.load(Ordering::Acquire) {
             let _ = child.kill();
             return Err("cancelled".to_owned());
@@ -70,11 +63,7 @@ fn run_grep_picker_search(
             }
         }
     }
-    let mut child = child_slot
-        .lock()
-        .map_err(|_| "repository search child lock is poisoned".to_owned())?
-        .take()
-        .ok_or_else(|| "repository search child vanished".to_owned())?;
+    let mut child = child_slot.lock().take().ok_or_else(|| "repository search child vanished".to_owned())?;
     let limited = entries.len() == GREP_PICKER_RESULT_LIMIT;
     if limited || cancelled.load(Ordering::Acquire) {
         let _ = child.kill();
@@ -94,20 +83,18 @@ fn run_grep_picker_search(
 
 impl App {
     pub(super) fn start_file_picker(&mut self, query: &str) -> Result<()> {
-        self.picker_directory = None;
         let output = Command::new("rg").args(["--files", "--null"]).output().context("enumerate workspace files with rg")?;
         if !output.status.success() {
             bail!("file enumeration failed: {}", String::from_utf8_lossy(&output.stderr).trim());
         }
-        self.picker_files = output
+        let candidates = output
             .stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
             .take(100_000)
-            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .map(|path| PickerItem::Path(String::from_utf8_lossy(path).into_owned().into()))
             .collect();
-        self.last_picker_source = Some(PickerSource::Files);
-        self.begin_path_picker(PickerSource::Files, query);
+        self.begin_picker(PickerSource::Files, query, candidates, None);
         Ok(())
     }
 
@@ -125,50 +112,38 @@ impl App {
             PickerSource::Jumps => "Jumplist".to_owned(),
             PickerSource::Diagnostics => "Diagnostics".to_owned(),
         };
-        let rows = match source.family() {
-            PickerFamily::Path => {
-                let workspace_root = self.workspace_root();
-                self.picker_matches
-                    .iter()
-                    .map(|path| {
-                        let is_directory = path.is_dir();
-                        let label = if source == PickerSource::Browser {
-                            path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
-                        } else if let Ok(relative) = path.strip_prefix(&workspace_root) {
-                            relative.display().to_string()
-                        } else if path.is_absolute() {
-                            path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
-                        } else {
-                            path.display().to_string()
-                        };
-                        let detail = if is_directory {
-                            "directory".to_owned()
-                        } else if path.is_absolute() && !path.starts_with(&workspace_root) {
-                            path.parent().map_or_else(String::new, |parent| parent.display().to_string())
-                        } else {
-                            String::new()
-                        };
-                        PickerOverlayRow { label: format!("{label}{}", if is_directory { "/" } else { "" }).into(), detail: detail.into() }
-                    })
-                    .collect()
-            }
-            PickerFamily::Grep => self
-                .quickfix
-                .iter()
-                .map(|entry| PickerOverlayRow {
+        let workspace_root = self.workspace_root();
+        let rows = self
+            .picker_items
+            .iter()
+            .map(|item| match item {
+                PickerItem::Path(path) => {
+                    let is_directory = path.is_dir();
+                    let label = if source == PickerSource::Browser {
+                        path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+                    } else if let Ok(relative) = path.strip_prefix(&workspace_root) {
+                        relative.display().to_string()
+                    } else if path.is_absolute() {
+                        path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+                    } else {
+                        path.display().to_string()
+                    };
+                    let detail = if is_directory {
+                        "directory".to_owned()
+                    } else if path.is_absolute() && !path.starts_with(&workspace_root) {
+                        path.parent().map_or_else(String::new, |parent| parent.display().to_string())
+                    } else {
+                        String::new()
+                    };
+                    MenuOverlayRow { label: format!("{label}{}", if is_directory { "/" } else { "" }).into(), detail: detail.into(), source: None }
+                }
+                PickerItem::Location(entry) => MenuOverlayRow {
                     label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column).into(),
                     detail: compact(&entry.text, 80).into(),
-                })
-                .collect(),
-            PickerFamily::Location => self
-                .filtered_locations(&prompt.buffer)
-                .into_iter()
-                .map(|entry| PickerOverlayRow {
-                    label: format!("{}:{}:{}", entry.path.display(), entry.line, entry.column).into(),
-                    detail: compact(&entry.text, 80).into(),
-                })
-                .collect(),
-        };
+                    source: None,
+                },
+            })
+            .collect();
         Some(PickerOverlay {
             title: title.into(),
             prompt: prompt.buffer.as_str().into(),
@@ -184,20 +159,8 @@ impl App {
     }
 
     fn selected_picker_target(&self) -> Option<(PathBuf, Option<QuickfixEntry>)> {
-        let prompt = self.prompt.as_ref()?;
-        match prompt.kind.picker_source()?.family() {
-            PickerFamily::Path => self.picker_matches.get(self.picker_index).cloned().map(|path| (path, None)),
-            PickerFamily::Grep | PickerFamily::Location => self.selected_picker_entry().map(|entry| (entry.path.clone(), Some(entry))),
-        }
-    }
-
-    fn selected_picker_entry(&self) -> Option<QuickfixEntry> {
-        let prompt = self.prompt.as_ref()?;
-        match prompt.kind.picker_source()?.family() {
-            PickerFamily::Grep => self.quickfix.get(self.picker_index).cloned(),
-            PickerFamily::Location => self.filtered_locations(&prompt.buffer).get(self.picker_index).cloned(),
-            PickerFamily::Path => None,
-        }
+        let item = self.picker_items.get(self.picker_index)?;
+        Some((item.path().to_path_buf(), item.location().cloned()))
     }
 
     pub(super) fn refresh_picker_preview(&mut self) {
@@ -264,7 +227,7 @@ impl App {
             if let Some(range) = entry.selection_byte_range(&self.picker_preview) {
                 self.picker_preview_decorations.push(DecorationSpan::new(
                     range,
-                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(self.theme.surface0)),
+                    CellStyle::default().without_foreground().with_background(CellColor::Rgb(self.theme.color(CatppuccinColor::Surface0))),
                     u32::MAX,
                 ));
             } else {
@@ -286,11 +249,7 @@ impl App {
             .map(|entry| entry.path())
             .collect::<Vec<_>>();
         entries.sort_by_key(|path| (!path.is_dir(), path.file_name().map(ToOwned::to_owned)));
-        self.picker_files = entries.iter().map(|path| path.to_string_lossy().into_owned()).collect();
-        self.picker_directory = Some(directory);
-        self.last_picker_source = Some(PickerSource::Browser);
-        self.prompt = Some(Prompt::new(PromptKind::Picker(PickerSource::Browser)));
-        self.update_file_picker();
+        self.begin_picker(PickerSource::Browser, "", entries.into_iter().map(PickerItem::Path).collect(), Some(directory));
         Ok(())
     }
 
@@ -304,36 +263,31 @@ impl App {
 
     pub(super) fn start_buffer_picker(&mut self) -> Result<()> {
         self.picker_directory = None;
-        self.picker_files = std::iter::once(&self.active)
+        let candidates = std::iter::once(&self.active)
             .chain(self.inactive.iter())
             .filter_map(|buffer| buffer.document.presentation_path())
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect();
-        if self.picker_files.is_empty() {
-            self.message = "no named buffers".to_owned();
-            return Ok(());
+            .map(|path| PickerItem::Path(path.to_path_buf()))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return self.set_message("no named buffers".to_owned());
         }
-        self.last_picker_source = Some(PickerSource::Buffers);
-        self.begin_path_picker(PickerSource::Buffers, "");
+        self.begin_picker(PickerSource::Buffers, "", candidates, None);
         Ok(())
     }
 
     pub(super) fn start_recent_picker(&mut self) -> Result<()> {
-        self.picker_files = self.recent_files.iter().filter(|path| path.exists()).map(|path| path.to_string_lossy().into_owned()).collect();
-        if self.picker_files.is_empty() {
-            self.message = "oldfiles is empty".to_owned();
-            return Ok(());
+        let candidates = self.recent_files.iter().filter(|path| path.exists()).cloned().map(PickerItem::Path).collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return self.set_message("oldfiles is empty".to_owned());
         }
-        self.last_picker_source = Some(PickerSource::Recent);
-        self.begin_path_picker(PickerSource::Recent, "");
+        self.begin_picker(PickerSource::Recent, "", candidates, None);
         Ok(())
     }
 
     pub(super) fn start_jumplist_picker(&mut self) -> Result<()> {
         self.quickfix = if self.jump_history.is_empty() {
             let Some(path) = self.active.document.presentation_path().map(Path::to_path_buf) else {
-                self.message = "jumplist has no named locations".to_owned();
-                return Ok(());
+                return self.set_message("jumplist has no named locations".to_owned());
             };
             self.active
                 .editor
@@ -350,14 +304,15 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, jump)| {
-                    let buffer = if self.active.document.presentation_path().is_some_and(|path| same_path(path, &jump.path)) {
+                    let path = Path::new(jump.path_hint.as_deref()?);
+                    let buffer = if self.active.document.presentation_path().is_some_and(|active| same_path(active, path)) {
                         Some(&self.active)
                     } else {
-                        self.inactive.iter().find(|buffer| buffer.document.presentation_path().is_some_and(|path| same_path(path, &jump.path)))
+                        self.inactive.iter().find(|buffer| buffer.document.presentation_path().is_some_and(|active| same_path(active, path)))
                     }?;
-                    let line = buffer.editor.text().line_of_byte(jump.byte);
+                    let line = buffer.editor.text().line_of_byte(jump.anchor.byte);
                     let line_start = buffer.editor.text().byte_of_line(line);
-                    Some(QuickfixEntry::new(jump.path.clone(), line + 1, jump.byte.saturating_sub(line_start) + 1, format!("jump {}", index + 1)))
+                    Some(QuickfixEntry::new(path, line + 1, jump.anchor.byte.saturating_sub(line_start) + 1, format!("jump {}", index + 1)))
                 })
                 .collect()
         };
@@ -366,7 +321,7 @@ impl App {
 
     pub(super) fn start_diagnostic_picker(&mut self) -> Result<()> {
         self.refresh_diagnostics()?;
-        self.quickfix = self.diagnostics.iter().map(DiagnosticEntry::quickfix).collect();
+        self.quickfix.clone_from(&self.diagnostics);
         self.start_location_picker(PickerSource::Diagnostics, "")
     }
 
@@ -379,40 +334,34 @@ impl App {
             };
             return Ok(());
         }
+        self.begin_picker(source, query, self.quickfix.iter().cloned().map(PickerItem::Location).collect(), None);
+        Ok(())
+    }
+
+    fn begin_picker(&mut self, source: PickerSource, query: &str, candidates: Vec<PickerItem>, directory: Option<PathBuf>) {
+        self.picker_candidates = candidates;
+        self.picker_directory = directory;
         self.last_picker_source = Some(source);
         self.last_picker_query = query.to_owned();
         self.picker_index = 0;
         self.prompt = Some(Prompt { kind: PromptKind::Picker(source), buffer: query.to_owned(), history_index: None });
-        self.update_location_picker();
-        Ok(())
-    }
-
-    pub(super) fn begin_path_picker(&mut self, source: PickerSource, query: &str) {
-        self.picker_directory = None;
-        self.prompt = Some(Prompt { kind: PromptKind::Picker(source), buffer: query.to_owned(), history_index: None });
-        self.update_file_picker();
+        if source == PickerSource::Grep { self.update_grep_picker() } else { self.update_picker() }
     }
 
     pub(super) fn start_grep_picker(&mut self, query: &str) -> Result<()> {
-        self.last_picker_source = Some(PickerSource::Grep);
-        self.prompt = Some(Prompt { kind: PromptKind::Picker(PickerSource::Grep), buffer: query.to_owned(), history_index: None });
-        self.picker_index = 0;
-        self.update_grep_picker();
+        self.begin_picker(PickerSource::Grep, query, Vec::new(), None);
         Ok(())
     }
 
     pub(super) fn update_prompt_picker(&mut self) -> Result<()> {
         match self.prompt.as_ref().map(|prompt| prompt.kind) {
-            Some(PromptKind::Picker(PickerSource::Files | PickerSource::Browser | PickerSource::Buffers | PickerSource::Recent)) => {
-                self.update_file_picker();
+            Some(PromptKind::Picker(PickerSource::Files | PickerSource::Browser | PickerSource::Buffers | PickerSource::Recent))
+            | Some(PromptKind::Picker(PickerSource::Jumps | PickerSource::Diagnostics)) => {
+                self.update_picker();
                 Ok(())
             }
             Some(PromptKind::Picker(PickerSource::Grep)) => {
                 self.update_grep_picker();
-                Ok(())
-            }
-            Some(PromptKind::Picker(PickerSource::Jumps | PickerSource::Diagnostics)) => {
-                self.update_location_picker();
                 Ok(())
             }
             Some(PromptKind::Command) => {
@@ -446,12 +395,12 @@ impl App {
             return;
         };
         let text = self.active.editor.contents();
-        let Ok(pattern) = self.active.editor.compile_search_pattern(&substitute.needle, substitute.case_override) else {
+        let Ok(pattern) = self.active.editor.compile_search_pattern(&substitute.needle, substitute_case_override(substitute.flags)) else {
             self.message = "inccommand: invalid pattern".to_owned();
             return;
         };
         let replacement = VimReplacement::new(substitute.replacement);
-        let Ok(edits) = plan_substitution_edits(&text, &pattern, &replacement, &substitute.ranges, substitute.global, || Ok(())) else {
+        let Ok(edits) = plan_substitution_edits(&text, &pattern, &replacement, &substitute.ranges, substitute.flags.global, || Ok(())) else {
             self.message.clear();
             return;
         };
@@ -466,15 +415,16 @@ impl App {
         self.message = format!("inccommand: {}", substitution_message(transaction.edit_count(), true, &text, &transaction));
     }
 
-    pub(super) fn update_file_picker(&mut self) {
-        let Some(prompt) = self.prompt.as_ref().filter(|prompt| prompt.kind.picker_source().map(PickerSource::family) == Some(PickerFamily::Path)) else {
+    pub(super) fn update_picker(&mut self) {
+        let Some(query) = self.prompt.as_ref().filter(|prompt| prompt.kind.is_picker()).map(|prompt| prompt.buffer.clone()) else {
             return;
         };
-        let query = prompt.buffer.clone();
         self.last_picker_query.clone_from(&query);
-        self.picker_matches = fuzzy_rank(&query, self.picker_files.iter().map(String::as_str)).into_iter().take(128).map(PathBuf::from).collect();
-        self.picker_index = 0;
-        self.update_file_picker_message();
+        let labels = self.picker_candidates.iter().map(PickerItem::search_text).collect::<Vec<_>>();
+        self.picker_items =
+            fuzzy_rank(&query, labels.iter().map(String::as_str)).into_iter().take(128).map(|(index, _)| self.picker_candidates[index].clone()).collect();
+        self.picker_index = self.picker_index.min(self.picker_items.len().saturating_sub(1));
+        self.update_picker_message();
         self.refresh_picker_preview();
     }
 
@@ -492,12 +442,14 @@ impl App {
             task.cancel();
         }
         if query.is_empty() {
-            self.quickfix.clear();
-            self.update_grep_picker_message();
+            self.picker_candidates.clear();
+            self.picker_items.clear();
+            self.update_picker_message();
             self.refresh_picker_preview();
             return;
         }
-        self.quickfix.clear();
+        self.picker_candidates.clear();
+        self.picker_items.clear();
         self.picker_preview_title = "Searching…".to_owned();
         self.picker_preview = "Repository search is running in the background".to_owned();
         self.picker_preview_decorations.clear();
@@ -518,7 +470,7 @@ impl App {
         }
     }
 
-    pub(super) fn poll_grep_picker(&mut self) -> Result<bool> {
+    pub(super) fn poll_grep_picker(&mut self) -> bool {
         let mut changed = false;
         if let Some(task) = &self.grep_task {
             let result = match poll_channel(&task.receiver) {
@@ -533,8 +485,10 @@ impl App {
                     match result {
                         Ok(entries) => {
                             self.quickfix = entries;
+                            self.picker_candidates = self.quickfix.iter().cloned().map(PickerItem::Location).collect();
+                            self.picker_items.clone_from(&self.picker_candidates);
                             self.picker_index = 0;
-                            self.update_grep_picker_message();
+                            self.update_picker_message();
                             self.refresh_picker_preview();
                         }
                         Err(error) => self.show_info(format!("live grep: {error}")),
@@ -555,44 +509,19 @@ impl App {
                 }
             }
         }
-        Ok(changed)
+        changed
     }
 
-    pub(super) fn open_selected_grep_result(&mut self, query: &str) -> Result<()> {
-        let entry = self.quickfix.get(self.picker_index).cloned().ok_or_else(|| anyhow!("no grep matches for {query:?}"))?;
-        self.navigate_to_entry(&entry)?;
-        self.message = format!("{}:{}: {}", entry.line, entry.column, entry.text);
-        Ok(())
-    }
-
-    pub(super) fn open_selected_location(&mut self, query: &str) -> Result<()> {
-        let entry = self.filtered_locations(query).get(self.picker_index).cloned().ok_or_else(|| anyhow!("no matching location"))?;
-        self.navigate_to_entry(&entry)?;
-        self.message = format!("{}:{}: {}", entry.line, entry.column, entry.text);
-        Ok(())
-    }
-
-    pub(super) fn filtered_locations(&self, query: &str) -> Vec<QuickfixEntry> {
-        if query.is_empty() {
-            return self.quickfix.clone();
+    pub(super) fn open_selected_picker(&mut self, source: PickerSource, query: &str) -> Result<()> {
+        let item = self.picker_items.get(self.picker_index).cloned().ok_or_else(|| anyhow!("no picker matches for {query:?}"))?;
+        match item {
+            PickerItem::Path(path) if source == PickerSource::Browser && path.is_dir() => self.start_file_browser_at(&path),
+            PickerItem::Path(path) => self.open_buffer(&path),
+            PickerItem::Location(entry) => {
+                self.navigate_to_entry(&entry)?;
+                self.set_message(format!("{}:{}: {}", entry.line, entry.column, entry.text))
+            }
         }
-        let candidates = self.quickfix.iter().map(QuickfixEntry::display).collect::<Vec<_>>();
-        let ranked = fuzzy_rank(query, candidates.iter().map(String::as_str));
-        ranked
-            .into_iter()
-            .filter_map(|label| candidates.iter().position(|candidate| candidate == label).and_then(|index| self.quickfix.get(index).cloned()))
-            .collect()
-    }
-
-    pub(super) fn update_location_picker(&mut self) {
-        let query = self.prompt.as_ref().map_or_else(String::new, |prompt| prompt.buffer.clone());
-        self.last_picker_query.clone_from(&query);
-        let locations = self.filtered_locations(&query);
-        self.picker_index = self.picker_index.min(locations.len().saturating_sub(1));
-        self.message = locations
-            .get(self.picker_index)
-            .map_or_else(|| "no matching locations".to_owned(), |entry| format!("[{}/{}] {}", self.picker_index + 1, locations.len(), entry.display()));
-        self.refresh_picker_preview();
     }
 
     pub(super) fn resume_picker(&mut self) -> Result<()> {
@@ -611,38 +540,12 @@ impl App {
     pub(super) fn word_under_cursor(&self) -> Option<String> {
         let text = self.active.editor.contents();
         let cursor = self.active.editor.primary_cursor().min(text.len());
-        let mut start = cursor;
-        while start > 0 {
-            let previous = text[..start].char_indices().next_back()?.0;
-            let character = text[previous..start].chars().next()?;
-            if !character.is_alphanumeric() && character != '_' {
-                break;
-            }
-            start = previous;
-        }
-        let mut end = cursor;
-        while end < text.len() {
-            let character = text[end..].chars().next()?;
-            if !character.is_alphanumeric() && character != '_' {
-                break;
-            }
-            end += character.len_utf8();
-        }
-        (start < end).then(|| text[start..end].to_owned())
+        let range = identifier_range(&text, cursor);
+        (!range.is_empty()).then(|| text[range].to_owned())
     }
 
     pub(super) fn move_picker(&mut self, direction: isize) {
-        let Some(prompt) = self.prompt.as_ref() else {
-            return;
-        };
-        let Some(source) = prompt.kind.picker_source() else {
-            return;
-        };
-        let length = match source.family() {
-            PickerFamily::Grep => self.quickfix.len(),
-            PickerFamily::Location => self.filtered_locations(&prompt.buffer).len(),
-            PickerFamily::Path => self.picker_matches.len(),
-        };
+        let length = self.picker_items.len();
         if length == 0 {
             self.picker_index = 0;
         } else if direction < 0 {
@@ -650,50 +553,40 @@ impl App {
         } else {
             self.picker_index = self.picker_index.saturating_add(1).min(length - 1);
         }
-        match source.family() {
-            PickerFamily::Grep => self.update_grep_picker_message(),
-            PickerFamily::Location => self.update_location_picker(),
-            PickerFamily::Path => self.update_file_picker_message(),
-        }
+        self.update_picker_message();
         self.refresh_picker_preview();
     }
 
-    pub(super) fn update_grep_picker_message(&mut self) {
-        self.message = self.quickfix.get(self.picker_index).map_or_else(
-            || "no grep matches".to_owned(),
-            |entry| {
+    pub(super) fn update_picker_message(&mut self) {
+        let Some(selected) = self.picker_items.get(self.picker_index) else {
+            self.message = match self.prompt.as_ref().and_then(|prompt| prompt.kind.picker_source()) {
+                Some(PickerSource::Grep) => "no grep matches",
+                Some(PickerSource::Jumps | PickerSource::Diagnostics) => "no matching locations",
+                _ => "no matching files",
+            }
+            .to_owned();
+            return;
+        };
+        self.message = match selected {
+            PickerItem::Location(entry) => format!("[{}/{}] {}", self.picker_index + 1, self.picker_items.len(), entry.display()),
+            PickerItem::Path(path) => {
+                let nearby = self
+                    .picker_items
+                    .iter()
+                    .skip(self.picker_index.saturating_add(1))
+                    .take(3)
+                    .map(PickerItem::path)
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("  ");
                 format!(
-                    "[{}/{}] {}:{}:{}  {}",
+                    "[{}/{}] {}{}",
                     self.picker_index + 1,
-                    self.quickfix.len(),
-                    entry.path.display(),
-                    entry.line,
-                    entry.column,
-                    compact(&entry.text, 80)
+                    self.picker_items.len(),
+                    path.display(),
+                    if nearby.is_empty() { String::new() } else { format!("  ·  {nearby}") }
                 )
-            },
-        );
-    }
-
-    pub(super) fn update_file_picker_message(&mut self) {
-        self.message = if self.picker_matches.is_empty() {
-            "no matching files".to_owned()
-        } else {
-            let selected = self.picker_matches[self.picker_index].display();
-            let nearby = self
-                .picker_matches
-                .iter()
-                .skip(self.picker_index.saturating_add(1))
-                .take(3)
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join("  ");
-            format!(
-                "[{}/{}] {selected}{}",
-                self.picker_index + 1,
-                self.picker_matches.len(),
-                if nearby.is_empty() { String::new() } else { format!("  ·  {nearby}") }
-            )
+            }
         };
     }
 

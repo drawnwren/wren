@@ -37,30 +37,43 @@ pub(super) enum WorkerControl {
     Stop(PersistenceReply),
 }
 
-struct PersistenceWorker<M> {
+impl WorkerControl {
+    fn acknowledge(self, error: &Option<String>) -> bool {
+        let (reply, stop) = match self {
+            Self::Barrier(reply) => (reply, false),
+            Self::Stop(reply) => (reply, true),
+        };
+        let _ = reply.send(persistence_status(error));
+        stop
+    }
+}
+
+pub(super) trait PersistenceMessage {
+    fn control(control: WorkerControl) -> Self;
+}
+
+pub(super) struct PersistenceWorker<M: PersistenceMessage> {
     sender: mpsc::SyncSender<M>,
     join: Option<JoinHandle<()>>,
-    stop: fn(WorkerControl) -> M,
+    #[cfg(test)]
     _temporary: Option<tempfile::TempDir>,
 }
 
-impl<M: Send + 'static> PersistenceWorker<M> {
-    fn start(
+impl<M: PersistenceMessage + Send + 'static> PersistenceWorker<M> {
+    fn spawn(
         name: &str,
         capacity: usize,
-        temporary: Option<tempfile::TempDir>,
-        stop: fn(WorkerControl) -> M,
+        #[cfg(test)] temporary: Option<tempfile::TempDir>,
         run: impl FnOnce(mpsc::Receiver<M>) + Send + 'static,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(capacity);
-        let join = thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || {
-                wren_scheduling::mark_background();
-                run(receiver);
-            })
-            .with_context(|| format!("spawn {name}"))?;
-        Ok(Self { sender, join: Some(join), stop, _temporary: temporary })
+        let join = wren_scheduling::spawn_background(name, move || run(receiver)).with_context(|| format!("spawn {name}"))?;
+        Ok(Self {
+            sender,
+            join: Some(join),
+            #[cfg(test)]
+            _temporary: temporary,
+        })
     }
 
     fn request(&self, make: impl FnOnce(PersistenceReply) -> M) -> Result<()> {
@@ -69,79 +82,98 @@ impl<M: Send + 'static> PersistenceWorker<M> {
         response.recv().map_err(|_| anyhow!("persistence worker did not acknowledge"))?.map_err(anyhow::Error::msg)
     }
 
-    fn barrier(&self, wrap: fn(WorkerControl) -> M) -> Result<()> {
-        self.request(|reply| wrap(WorkerControl::Barrier(reply)))
+    pub(super) fn barrier(&self) -> Result<()> {
+        self.request(|reply| M::control(WorkerControl::Barrier(reply)))
     }
 }
 
-impl<M> Drop for PersistenceWorker<M> {
+impl<M: PersistenceMessage> Drop for PersistenceWorker<M> {
     fn drop(&mut self) {
         let (reply, response) = mpsc::channel();
-        let _ = self.sender.send((self.stop)(WorkerControl::Stop(reply)));
+        let _ = self.sender.send(M::control(WorkerControl::Stop(reply)));
         let _ = response.recv();
         join_worker_thread(&mut self.join);
     }
 }
 
-pub(super) enum ClientStateMessage {
-    Save(Box<DurableClientState>),
+pub(super) enum LatestWrite<T> {
+    Write(T),
+    Clear(PersistenceReply),
     Control(WorkerControl),
 }
 
-pub(super) struct ClientStateWorker {
-    worker: PersistenceWorker<ClientStateMessage>,
+impl<T> PersistenceMessage for LatestWrite<T> {
+    fn control(control: WorkerControl) -> Self {
+        Self::Control(control)
+    }
 }
 
-impl ClientStateWorker {
+type ClientStateMessage = LatestWrite<Box<DurableClientState>>;
+pub(super) type ClientStateWorker = PersistenceWorker<ClientStateMessage>;
+
+impl PersistenceWorker<ClientStateMessage> {
     pub(super) fn open(client_id: ClientId) -> Result<(Self, DurableClientState)> {
         #[cfg(test)]
-        let (directory, temporary) = {
-            let temporary = tempfile::tempdir().context("create test client state")?;
-            (temporary.path().to_path_buf(), Some(temporary))
-        };
+        let temporary = tempfile::tempdir().context("create test client state")?;
+        #[cfg(test)]
+        let directory = temporary.path().to_path_buf();
         #[cfg(not(test))]
-        let (directory, temporary) = (client_state_directory()?, None);
+        let directory = client_state_directory()?;
         let store = ClientViewStateStore::new(directory);
         let state = store.load_durable(client_id).context("load durable client state")?.unwrap_or_else(|| DurableClientState::new(client_id));
-        let worker =
-            PersistenceWorker::start("wren-client-state", 1, temporary, ClientStateMessage::Control, move |receiver| client_state_loop(store, receiver))?;
-        Ok((Self { worker }, state))
+        let worker = Self::spawn(
+            "wren-client-state",
+            1,
+            #[cfg(test)]
+            Some(temporary),
+            move |receiver| {
+                latest_write_loop(receiver, Duration::from_millis(10), |state| store.save_durable(&state).map_err(Into::into), || Ok(()));
+            },
+        )?;
+        Ok((worker, state))
     }
 
     pub(super) fn try_save(&self, state: DurableClientState) {
-        let _ = self.worker.sender.try_send(ClientStateMessage::Save(Box::new(state)));
+        let _ = self.sender.try_send(LatestWrite::Write(Box::new(state)));
     }
 
-    pub(super) fn barrier(&self, state: DurableClientState) -> Result<()> {
-        self.worker.sender.send(ClientStateMessage::Save(Box::new(state))).map_err(|_| anyhow!("client state writer stopped"))?;
-        self.worker.barrier(ClientStateMessage::Control)
+    pub(super) fn flush_state(&self, state: DurableClientState) -> Result<()> {
+        self.sender.send(LatestWrite::Write(Box::new(state))).map_err(|_| anyhow!("client state writer stopped"))?;
+        self.barrier()
     }
 }
 
-pub(super) fn client_state_loop(store: ClientViewStateStore, receiver: mpsc::Receiver<ClientStateMessage>) {
+fn latest_write_loop<T>(
+    receiver: mpsc::Receiver<LatestWrite<T>>,
+    quiet_period: Duration,
+    mut write: impl FnMut(T) -> Result<()>,
+    mut clear: impl FnMut() -> Result<()>,
+) {
     let mut error: Option<String> = None;
     let mut messages = DeferredMessages::new(&receiver);
     while let Some(message) = messages.next() {
         match message {
-            ClientStateMessage::Save(state) => {
-                let mut state = state;
-                collect_latest(&mut messages, &mut state, Duration::from_millis(10), |message, latest| match message {
-                    ClientStateMessage::Save(state) => {
-                        *latest = state;
+            LatestWrite::Write(value) => {
+                let mut latest = value;
+                collect_latest(&mut messages, &mut latest, quiet_period, |message, latest| match message {
+                    LatestWrite::Write(value) => {
+                        *latest = value;
                         None
                     }
                     control => Some(control),
                 });
-                if let Err(current) = store.save_durable(&state) {
-                    error = Some(current.to_string());
+                record_persistence_error(&mut error, &write(latest));
+            }
+            LatestWrite::Clear(reply) => {
+                if error.is_none() {
+                    record_persistence_error(&mut error, &clear());
                 }
-            }
-            ClientStateMessage::Control(WorkerControl::Barrier(reply)) => {
                 let _ = reply.send(persistence_status(&error));
             }
-            ClientStateMessage::Control(WorkerControl::Stop(reply)) => {
-                let _ = reply.send(persistence_status(&error));
-                break;
+            LatestWrite::Control(control) => {
+                if control.acknowledge(&error) {
+                    break;
+                }
             }
         }
     }
@@ -156,6 +188,11 @@ pub(super) fn client_state_directory() -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(".local/state/wren"));
     }
     Ok(env::current_dir().context("locate current directory for client state")?.join(".wren-state"))
+}
+
+#[cfg(test)]
+pub(super) fn load_recent_files() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 #[cfg(not(test))]
@@ -178,29 +215,19 @@ pub(super) fn load_recent_files() -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-pub(super) fn load_recent_files() -> Vec<PathBuf> {
-    Vec::new()
+pub(super) fn save_recent_files(_paths: &[PathBuf]) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(test))]
 pub(super) fn save_recent_files(paths: &[PathBuf]) -> Result<()> {
-    let directory = client_state_directory()?;
-    std::fs::create_dir_all(&directory).with_context(|| format!("create oldfiles directory {}", directory.display()))?;
-    let path = directory.join("oldfiles");
-    let temporary = directory.join("oldfiles.tmp");
+    let path = client_state_directory()?.join("oldfiles");
     let mut contents = Vec::new();
     for path in paths.iter().take(100) {
         contents.extend_from_slice(path.to_string_lossy().as_bytes());
         contents.push(0);
     }
-    std::fs::write(&temporary, contents).with_context(|| format!("write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn save_recent_files(_paths: &[PathBuf]) -> Result<()> {
-    Ok(())
+    replace_file(&path, contents)
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -217,6 +244,11 @@ pub(super) fn undo_state_path(document: &Path) -> Result<PathBuf> {
     Ok(client_state_directory()?.join("undo").join(format!("{hash:016x}.json")))
 }
 
+#[cfg(test)]
+pub(super) fn load_undo_state(_document: &Path, _base_hash: [u8; 32]) -> Result<Option<DurableUndoState>> {
+    Ok(None)
+}
+
 #[cfg(not(test))]
 pub(super) fn load_undo_state(document: &Path, base_hash: [u8; 32]) -> Result<Option<DurableUndoState>> {
     let path = undo_state_path(document)?;
@@ -230,8 +262,8 @@ pub(super) fn load_undo_state(document: &Path, base_hash: [u8; 32]) -> Result<Op
 }
 
 #[cfg(test)]
-pub(super) fn load_undo_state(_document: &Path, _base_hash: [u8; 32]) -> Result<Option<DurableUndoState>> {
-    Ok(None)
+pub(super) fn save_undo_state(_buffer: &mut BufferState) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(not(test))]
@@ -240,24 +272,31 @@ pub(super) fn save_undo_state(buffer: &mut BufferState) -> Result<()> {
         return Ok(());
     };
     let path = undo_state_path(document)?;
-    let directory = path.parent().ok_or_else(|| anyhow!("undo state path has no parent"))?;
-    std::fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
-    let temporary = path.with_extension("json.tmp");
     let contents = serde_json::to_vec(&UndoStateFile { base_hash: buffer.base_hash, state: buffer.editor.durable_undo_state() })?;
-    std::fs::write(&temporary, contents).with_context(|| format!("write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
+    replace_file(&path, contents)
 }
 
-#[cfg(test)]
-pub(super) fn save_undo_state(_buffer: &mut BufferState) -> Result<()> {
-    Ok(())
+#[cfg(not(test))]
+fn replace_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let directory = path.parent().ok_or_else(|| anyhow!("state path has no parent"))?;
+    std::fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+    let mut name = path.file_name().ok_or_else(|| anyhow!("state path has no file name"))?.to_os_string();
+    name.push(".tmp");
+    let temporary = path.with_file_name(name);
+    std::fs::write(&temporary, contents).with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
 }
 
 pub(super) enum MutationMessage {
     Register { document_id: DocumentId, text: String, replace_stale: bool, reply: mpsc::Sender<Result<(), String>> },
     Append { document_id: DocumentId, transaction: Option<Transaction>, state_deltas: Vec<StateDelta> },
     Control(WorkerControl),
+}
+
+impl PersistenceMessage for MutationMessage {
+    fn control(control: WorkerControl) -> Self {
+        Self::Control(control)
+    }
 }
 
 const MAX_MUTATION_BATCH: usize = 512;
@@ -267,36 +306,38 @@ const DURABILITY_QUEUE_CAPACITY: usize = 4_096;
 // Stop still cut the batch immediately for save/suspend/exit frontiers.
 const DURABILITY_GROUP_COMMIT_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
-pub(super) struct MutationWorker {
-    worker: PersistenceWorker<MutationMessage>,
-}
+pub(super) type MutationWorker = PersistenceWorker<MutationMessage>;
 
-impl MutationWorker {
+impl PersistenceWorker<MutationMessage> {
     pub(super) fn start(_workspace: &Path) -> Result<Self> {
         #[cfg(test)]
-        let (session_directory, outbox_directory, temporary) = {
-            let temporary = tempfile::tempdir().context("create test session state")?;
-            (temporary.path().join("session"), temporary.path().join("outbox"), Some(temporary))
-        };
+        let temporary = tempfile::tempdir().context("create test session state")?;
+        #[cfg(test)]
+        let (session_directory, outbox_directory) = (temporary.path().join("session"), temporary.path().join("outbox"));
         #[cfg(not(test))]
-        let (session_directory, outbox_directory, temporary) = {
+        let (session_directory, outbox_directory) = {
             let workspace_key = format!("{:016x}", stable_document_id(Some(_workspace)).get());
             let root = client_state_directory()?;
-            (root.join("sessions").join(&workspace_key), root.join("outbox").join(workspace_key), None)
+            (root.join("sessions").join(&workspace_key), root.join("outbox").join(workspace_key))
         };
         std::fs::create_dir_all(&session_directory).with_context(|| format!("create durable session directory {}", session_directory.display()))?;
         std::fs::create_dir_all(&outbox_directory).with_context(|| format!("create durable outbox directory {}", outbox_directory.display()))?;
         let authority = SessionAuthority::open(SessionJournal::in_directory(session_directory), SessionId::new(1))?;
         let outbox = MutationOutbox::in_directory(outbox_directory);
-        let worker = PersistenceWorker::start("wren-in-process-session", DURABILITY_QUEUE_CAPACITY, temporary, MutationMessage::Control, move |receiver| {
-            mutation_loop(authority, outbox, receiver)
-        })?;
-        Ok(Self { worker })
+        Self::spawn(
+            "wren-in-process-session",
+            DURABILITY_QUEUE_CAPACITY,
+            #[cfg(test)]
+            Some(temporary),
+            move |receiver| {
+                mutation_loop(authority, outbox, receiver);
+            },
+        )
     }
 
     pub(super) fn register(&self, document_id: DocumentId, text: String, replace_stale: bool) -> Result<()> {
         let (reply, response) = mpsc::channel();
-        self.worker.sender.send(MutationMessage::Register { document_id, text, replace_stale, reply }).map_err(|_| anyhow!("in-process session stopped"))?;
+        self.sender.send(MutationMessage::Register { document_id, text, replace_stale, reply }).map_err(|_| anyhow!("in-process session stopped"))?;
         response.recv().map_err(|_| anyhow!("in-process session did not register document"))?.map_err(anyhow::Error::msg)
     }
 
@@ -304,11 +345,7 @@ impl MutationWorker {
         if transaction.is_none() && state_deltas.is_empty() {
             return Ok(());
         }
-        self.worker.sender.send(MutationMessage::Append { document_id, transaction, state_deltas }).map_err(|_| anyhow!("in-process session stopped"))
-    }
-
-    pub(super) fn barrier(&self) -> Result<()> {
-        self.worker.barrier(MutationMessage::Control)
+        self.sender.send(MutationMessage::Append { document_id, transaction, state_deltas }).map_err(|_| anyhow!("in-process session stopped"))
     }
 }
 
@@ -339,12 +376,10 @@ pub(super) fn mutation_loop(mut authority: SessionAuthority, outbox: MutationOut
                     Err(current) => error = Some(current.to_string()),
                 }
             }
-            MutationMessage::Control(WorkerControl::Barrier(reply)) => {
-                let _ = reply.send(persistence_status(&error));
-            }
-            MutationMessage::Control(WorkerControl::Stop(reply)) => {
-                let _ = reply.send(persistence_status(&error));
-                break;
+            MutationMessage::Control(control) => {
+                if control.acknowledge(&error) {
+                    break;
+                }
             }
         }
     }
@@ -438,12 +473,12 @@ fn persistence_status(error: &Option<String>) -> Result<(), String> {
 pub(super) fn replay_outstanding_mutations(authority: &mut SessionAuthority, outbox: &MutationOutbox) -> Result<()> {
     for mutation in outbox.outstanding()? {
         match authority.submit(mutation)? {
-            MutationSubmission::Accepted { durable, .. } => {
+            Ok(durable) => {
                 if !outbox.observe_result(&durable)? {
                     bail!("replayed durable mutation was missing from the client outbox");
                 }
             }
-            MutationSubmission::Rejected(result) => {
+            Err(result) => {
                 bail!("outstanding mutation requires reconciliation: {result:?}");
             }
         }
@@ -496,8 +531,8 @@ fn submit_local_mutations(
     let mut rejection = None;
     for submission in submissions {
         match submission {
-            MutationSubmission::Accepted { durable: acknowledged, .. } => durable.push(acknowledged),
-            MutationSubmission::Rejected(result) => rejection = Some(result),
+            Ok(acknowledged) => durable.push(acknowledged),
+            Err(result) => rejection = Some(result),
         }
     }
     let acknowledged = outbox.observe_results(&durable)?;
@@ -510,68 +545,40 @@ fn submit_local_mutations(
     Ok(())
 }
 
-pub(super) enum WalMessage {
-    AppendFrame { base_hash: [u8; 32], revision: u64, text: FrameText, cursor: usize },
-    Clear(mpsc::Sender<Result<(), String>>),
-    Control(WorkerControl),
-}
-
 pub(super) struct WalWorker {
-    worker: Option<PersistenceWorker<WalMessage>>,
+    worker: PersistenceWorker<LatestWrite<PendingWalFrame>>,
 }
 
 impl WalWorker {
-    pub(super) fn start(wal: LocalWal) -> Self {
-        let worker = PersistenceWorker::start("wren-wal", DURABILITY_QUEUE_CAPACITY, None, WalMessage::Control, move |receiver| wal_loop(&wal, receiver)).ok();
-        Self { worker }
+    pub(super) fn start(wal: LocalWal) -> Result<Self> {
+        let durable = wal.clone();
+        let worker = PersistenceWorker::spawn(
+            "wren-wal",
+            DURABILITY_QUEUE_CAPACITY,
+            #[cfg(test)]
+            None,
+            move |receiver| {
+                latest_write_loop(
+                    receiver,
+                    DURABILITY_GROUP_COMMIT_QUIET_PERIOD,
+                    |frame| persist_wal_frame(&wal, frame),
+                    || durable.clear().map_err(Into::into),
+                );
+            },
+        )?;
+        Ok(Self { worker })
     }
 
     pub(super) fn append_frame(&self, base_hash: [u8; 32], revision: u64, text: FrameText, cursor: usize) {
-        if let Some(worker) = &self.worker {
-            let _ = worker.sender.send(WalMessage::AppendFrame { base_hash, revision, text, cursor });
-        }
+        let _ = self.worker.sender.send(LatestWrite::Write((base_hash, revision, text, cursor)));
     }
 
     pub(super) fn barrier(&self) -> Result<()> {
-        self.worker.as_ref().ok_or_else(|| anyhow!("recovery WAL worker stopped"))?.barrier(WalMessage::Control)
+        self.worker.barrier()
     }
 
     pub(super) fn clear(&self) -> Result<()> {
-        self.worker.as_ref().ok_or_else(|| anyhow!("recovery WAL worker stopped"))?.request(WalMessage::Clear)
-    }
-}
-
-pub(super) fn wal_loop(wal: &LocalWal, receiver: mpsc::Receiver<WalMessage>) {
-    let mut error: Option<String> = None;
-    let mut messages = DeferredMessages::new(&receiver);
-    while let Some(message) = messages.next() {
-        match message {
-            WalMessage::AppendFrame { base_hash, revision, text, cursor } => {
-                let mut latest = (base_hash, revision, text, cursor);
-                collect_latest(&mut messages, &mut latest, DURABILITY_GROUP_COMMIT_QUIET_PERIOD, |message, latest| match message {
-                    WalMessage::AppendFrame { base_hash, revision, text, cursor } => {
-                        *latest = (base_hash, revision, text, cursor);
-                        None
-                    }
-                    control => Some(control),
-                });
-                let result = persist_wal_frame(wal, latest);
-                record_persistence_error(&mut error, &result);
-            }
-            WalMessage::Clear(reply) => {
-                if error.is_none() {
-                    record_persistence_error(&mut error, &wal.clear());
-                }
-                let _ = reply.send(persistence_status(&error));
-            }
-            WalMessage::Control(WorkerControl::Barrier(reply)) => {
-                let _ = reply.send(persistence_status(&error));
-            }
-            WalMessage::Control(WorkerControl::Stop(reply)) => {
-                let _ = reply.send(persistence_status(&error));
-                break;
-            }
-        }
+        self.worker.request(LatestWrite::Clear)
     }
 }
 
@@ -590,6 +597,8 @@ fn persist_wal_frame(wal: &LocalWal, frame: PendingWalFrame) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -597,19 +606,21 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = ClientViewStateStore::new(directory.path());
         let inspect = store.clone();
-        let (sender, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || client_state_loop(store, receiver));
+        let (sender, receiver) = mpsc::channel::<ClientStateMessage>();
+        let worker = thread::spawn(move || {
+            latest_write_loop(receiver, Duration::from_millis(10), |state| store.save_durable(&state).map_err(Into::into), || Ok(()));
+        });
         let mut stale = DurableClientState::new(ClientId::new(1));
         stale.apply(&StateDelta::CommandHistory("stale".into()));
-        sender.send(ClientStateMessage::Save(Box::new(stale))).expect("stale state");
+        sender.send(LatestWrite::Write(Box::new(stale))).expect("stale state");
         let mut latest = DurableClientState::new(ClientId::new(1));
         latest.apply(&StateDelta::CommandHistory("latest".into()));
-        sender.send(ClientStateMessage::Save(Box::new(latest.clone()))).expect("latest state");
+        sender.send(LatestWrite::Write(Box::new(latest.clone()))).expect("latest state");
         let (reply, response) = mpsc::channel();
-        sender.send(ClientStateMessage::Control(WorkerControl::Barrier(reply))).expect("barrier request");
+        sender.send(LatestWrite::Control(WorkerControl::Barrier(reply))).expect("barrier request");
         response.recv().expect("barrier response").expect("barrier");
         let (reply, response) = mpsc::channel();
-        sender.send(ClientStateMessage::Control(WorkerControl::Stop(reply))).expect("stop");
+        sender.send(LatestWrite::Control(WorkerControl::Stop(reply))).expect("stop");
         response.recv().expect("stop response").expect("stop");
         worker.join().expect("client state worker");
         assert_eq!(inspect.load_durable(ClientId::new(1)).expect("load state").expect("durable state"), latest);

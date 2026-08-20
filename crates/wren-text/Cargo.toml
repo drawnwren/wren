@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-memory-profiling = ["dep:dhat"]
+benchmarking = ["dep:ropey"]
+memory-profiling = ["dep:dhat", "benchmarking"]
 
 [dependencies]
 crop.workspace = true
 dhat = { workspace = true, optional = true }
-ropey.workspace = true
+parking_lot.workspace = true
+ropey = { workspace = true, optional = true }
 thiserror.workspace = true
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
@@ -18,11 +20,13 @@ wren-types = { version = "0.1.0", path = "../wren-types" }
 anyhow.workspace = true
 criterion.workspace = true
 proptest.workspace = true
+ropey.workspace = true
 wren-benchmark-support = { version = "0.1.0", path = "../../harness/benchmark-support" }
 
 [[bench]]
 name = "textstore"
 harness = false
+required-features = ["benchmarking"]
 
 [[example]]
 name = "textstore_memory"

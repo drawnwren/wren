@@ -99,7 +99,7 @@ pub fn check_wren_against_goldens() -> Result<()> {
     Ok(())
 }
 
-fn seed_registers(editor: &mut Editor<DefaultText>, expected: &Value) {
+fn seed_registers(editor: &mut Editor, expected: &Value) {
     let Some(registers) = expected.as_array() else {
         return;
     };
@@ -122,7 +122,7 @@ fn seed_registers(editor: &mut Editor<DefaultText>, expected: &Value) {
     }
 }
 
-fn feed_wren(editor: &mut Editor<DefaultText>, input: &str) -> Result<()> {
+fn feed_wren(editor: &mut Editor, input: &str) -> Result<()> {
     let mut rest = input;
     while !rest.is_empty() {
         let (key, after) = if let Some(after) = rest.strip_prefix("<Esc>") {
@@ -139,7 +139,7 @@ fn feed_wren(editor: &mut Editor<DefaultText>, input: &str) -> Result<()> {
     Ok(())
 }
 
-fn compare_core_state(scenario: &str, step: &str, editor: &Editor<DefaultText>, expected: &OracleState) -> Result<()> {
+fn compare_core_state(scenario: &str, step: &str, editor: &Editor, expected: &OracleState) -> Result<()> {
     let mode = match editor.mode() {
         Mode::Normal => "n",
         Mode::Insert => "i",
@@ -147,7 +147,7 @@ fn compare_core_state(scenario: &str, step: &str, editor: &Editor<DefaultText>, 
         Mode::Visual => "v",
         Mode::VisualLine => "V",
     };
-    let pending = if matches!(editor.pending_parse_state(), Some(ParseState::OperatorPending { .. })) { "no" } else { "" };
+    let pending = if editor.pending_parse_state() == Some(ParseState::Operator) { "no" } else { "" };
     let buffer: Vec<_> = editor.contents().split('\n').map(str::to_owned).collect();
     let (line, column) = editor.cursor_line_column();
     let actual_cursor = json!([line + 1, column + 1]);
@@ -176,7 +176,7 @@ fn compare_core_state(scenario: &str, step: &str, editor: &Editor<DefaultText>, 
     if differences.is_empty() { Ok(()) } else { bail!("Neovim differential mismatch in {scenario} after {step:?}: {}", differences.join("; ")) }
 }
 
-fn compare_changelist(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_changelist(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let actual_entries = editor.changelist().map(|byte| line_column(editor, byte)).collect::<Vec<_>>();
     compare_history("changelist", expected, actual_entries, editor.change_index(), true, differences);
 }
@@ -195,7 +195,7 @@ fn compare_options(expected: &Value, differences: &mut Vec<String>) {
     }
 }
 
-fn compare_selections(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_selections(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let expected_start = expected.get("start").and_then(selection_position);
     let expected_end = expected.get("end").and_then(selection_position);
     let expected = expected_start.zip(expected_end);
@@ -215,7 +215,7 @@ fn selection_position(value: &Value) -> Option<(usize, usize)> {
     Some((line - 1, if column >= i32::MAX as usize { usize::MAX } else { column.saturating_sub(1) }))
 }
 
-fn compare_marks(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_marks(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let expected_marks = ["local", "global"]
         .into_iter()
         .flat_map(|kind| expected.get(kind).and_then(Value::as_array).into_iter().flatten())
@@ -240,7 +240,7 @@ fn compare_marks(editor: &Editor<DefaultText>, expected: &Value, differences: &m
     }
 }
 
-fn compare_jumplist(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_jumplist(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     compare_history("jumplist", expected, editor.jumplist().map(|byte| line_column(editor, byte)).collect(), editor.jump_index(), false, differences);
 }
 
@@ -267,7 +267,7 @@ fn compare_history(name: &str, expected: &Value, actual_entries: Vec<(usize, usi
     }
 }
 
-fn compare_search(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_search(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let pattern = expected.get("pattern").and_then(Value::as_str).unwrap_or("");
     let forward = expected.get("forward").and_then(Value::as_u64) != Some(0);
     let actual = editor.last_search().map_or(("", true), |(pattern, direction)| (pattern, direction == SearchDirection::Forward));
@@ -276,14 +276,14 @@ fn compare_search(editor: &Editor<DefaultText>, expected: &Value, differences: &
     }
 }
 
-fn compare_messages(editor: &Editor<DefaultText>, expected: &str, differences: &mut Vec<String>) {
+fn compare_messages(editor: &Editor, expected: &str, differences: &mut Vec<String>) {
     let actual_nonempty = editor.messages().next().is_some();
     if actual_nonempty == expected.is_empty() {
         differences.push(format!("message-log emptiness expected {}, got {actual_nonempty}", !expected.is_empty()));
     }
 }
 
-fn compare_undo_tree(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_undo_tree(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let expected_total = expected.get("entries").and_then(Value::as_array).map_or(0, |entries| count_undo_entries(entries));
     let expected_at_head = expected_total == 0 || expected.get("seq_cur").and_then(Value::as_u64) == expected.get("seq_last").and_then(Value::as_u64);
     if editor.undo_tree_len() != expected_total || (editor.redo_depth() == 0) != expected_at_head {
@@ -299,7 +299,7 @@ fn count_undo_entries(entries: &[Value]) -> usize {
     entries.iter().map(|entry| 1 + entry.get("alt").and_then(Value::as_array).map_or(0, |alternate| count_undo_entries(alternate))).sum()
 }
 
-fn line_column(editor: &Editor<DefaultText>, byte: usize) -> (usize, usize) {
+fn line_column(editor: &Editor, byte: usize) -> (usize, usize) {
     let text = editor.contents();
     let byte = byte.min(text.len());
     let line = text[..byte].bytes().filter(|value| *value == b'\n').count();
@@ -307,7 +307,7 @@ fn line_column(editor: &Editor<DefaultText>, byte: usize) -> (usize, usize) {
     (line, text[start..byte].chars().count())
 }
 
-fn compare_registers(editor: &Editor<DefaultText>, expected: &Value, differences: &mut Vec<String>) {
+fn compare_registers(editor: &Editor, expected: &Value, differences: &mut Vec<String>) {
     let Some(registers) = expected.as_array() else {
         differences.push("oracle registers are not an array".to_owned());
         return;

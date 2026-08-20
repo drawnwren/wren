@@ -4,29 +4,13 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use wren_grammar::{Command, Grammar, KeyCode, KeyEvent, Modifiers, Motion, Operator, ParseResult, ParseState, RangeKind, Register, TextObject};
-use wren_text::TextStore;
+use wren_grammar::{Command, Grammar, KeyCode, KeyEvent, Modifiers, Motion, Operator, ParseResult, ParseState, RangeKind, Register, TargetAction, TextObject};
+use wren_text::{DefaultText, TextStore};
 use wren_types::{
-    Anchor, Bias, DocumentRevision, Edit, OffsetMapping, SelRange, SelectionSet, Transaction, TransactionError, floor_char_boundary, merge_ranges,
-    ranges_overlap,
+    Anchor, Bias, DocumentRevision, Edit, SelRange, SelectionSet, Transaction, TransactionError, floor_char_boundary, merge_ranges, ranges_overlap,
 };
 
 use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
-
-trait MotionBehavior {
-    fn remembers_find_target(self) -> bool;
-    fn enters_jump_list(self) -> bool;
-}
-
-impl MotionBehavior for Motion {
-    fn remembers_find_target(self) -> bool {
-        matches!(self, Self::Find { .. })
-    }
-
-    fn enters_jump_list(self) -> bool {
-        matches!(self, Self::GoToLine | Self::DocumentEnd | Self::ParagraphForward | Self::ParagraphBackward)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -61,6 +45,7 @@ pub struct RegisterValue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "conformance"))]
 pub struct VisualSelection {
     pub start_line: usize,
     pub start_column: usize,
@@ -192,38 +177,38 @@ impl SearchState {
         ranges
     }
 
-    fn map_literal_cache_through(&self, mapping: &OffsetMapping<'_>, text: &FrameText, revision: DocumentRevision) {
+    fn map_literal_cache_through(&self, transaction: &Transaction, text: &FrameText, revision: DocumentRevision) {
         let Some(context) = self.compiled.literal_width().map(|width| width.saturating_sub(1)) else {
             return;
         };
         let mut cache = self.cache.borrow_mut();
-        if cache.revision != Some(mapping.base_revision()) {
+        if cache.revision != Some(transaction.base_revision()) {
             return;
         }
-        let mut affected = mapping
+        let mut affected = transaction
             .edits()
             .iter()
             .filter_map(|edit| {
-                let range = mapping.map_range(edit.range.clone(), Bias::Left, Bias::Right).ok()?;
+                let range = transaction.map_range(edit.range.clone(), Bias::Left, Bias::Right).ok()?;
                 Some(expand_literal_context(text, range, context))
             })
             .collect::<Vec<_>>();
         merge_ranges(&mut affected);
         let mut windows = BTreeMap::new();
         for ((start, end), ranges) in std::mem::take(&mut cache.windows) {
-            let Ok(window) = mapping.map_range(start..end, Bias::Left, Bias::Right) else {
+            let Ok(window) = transaction.map_range(start..end, Bias::Left, Bias::Right) else {
                 continue;
             };
             let impacts = affected.iter().filter_map(|range| intersect_ranges(range, &window)).collect::<Vec<_>>();
             let mut mapped = ranges
                 .into_iter()
                 .filter(|range| {
-                    !mapping.edits().iter().any(|edit| {
+                    !transaction.edits().iter().any(|edit| {
                         if edit.range.is_empty() { range.start < edit.range.start && edit.range.start < range.end } else { ranges_overlap(range, &edit.range) }
                     })
                 })
                 .filter_map(|range| {
-                    let range = mapping.map_range(range, Bias::Left, Bias::Right).ok()?;
+                    let range = transaction.map_range(range, Bias::Left, Bias::Right).ok()?;
                     (!range.is_empty()).then_some(range)
                 })
                 .collect::<Vec<_>>();
@@ -302,12 +287,41 @@ enum RepeatAction {
     NumberDelta(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingControl {
-    RecordMacro,
-    ReplayMacro,
-    SetMark,
-    JumpMark { linewise: bool },
+#[derive(Debug, Clone)]
+struct LocationHistory {
+    entries: Vec<usize>,
+    index: usize,
+    limit: usize,
+}
+
+impl LocationHistory {
+    fn new(capacity: usize, limit: usize, initial: Option<usize>) -> Self {
+        let mut entries = Vec::with_capacity(capacity);
+        entries.extend(initial);
+        Self { index: entries.len(), entries, limit }
+    }
+
+    fn push(&mut self, byte: usize) {
+        if self.entries.last().copied() != Some(byte) {
+            self.entries.push(byte);
+            if self.entries.len() > self.limit {
+                self.entries.remove(0);
+            }
+        }
+        self.index = self.entries.len();
+    }
+
+    fn navigate(&mut self, backward: bool, current: Option<usize>) -> Option<usize> {
+        if backward
+            && self.index == self.entries.len()
+            && let Some(current) = current
+        {
+            self.push(current);
+            self.index = self.entries.len().saturating_sub(1);
+        }
+        self.index = if backward { self.index.checked_sub(1)? } else { self.index.checked_add(1).filter(|index| *index < self.entries.len())? };
+        self.entries.get(self.index).copied()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -333,16 +347,13 @@ pub enum EngineError {
 }
 
 #[derive(Debug, Clone)]
-pub struct Editor<T: TextStore> {
-    text: T,
-    clean_text: Option<T>,
+pub struct Editor {
     clean_frame_text: Option<FrameText>,
     frame_text: FrameText,
     revision: DocumentRevision,
     selections: SelectionSet,
     mode: Mode,
     pending_keys: Vec<KeyEvent>,
-    parse_state: Option<ParseState>,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
     undo_branches: Vec<Vec<UndoGroup>>,
@@ -356,17 +367,15 @@ pub struct Editor<T: TextStore> {
     recording_macro: Option<char>,
     recording_keys: Vec<KeyEvent>,
     last_macro: Option<char>,
-    pending_control: Option<PendingControl>,
     macro_depth: u8,
     last_change: Option<RepeatAction>,
     pending_change: Option<Command>,
     replaying_change: bool,
     search: Option<SearchState>,
+    #[cfg(any(test, feature = "conformance"))]
     last_visual: Option<VisualSelection>,
-    jumplist: Vec<usize>,
-    jump_index: usize,
-    changelist: Vec<usize>,
-    change_index: usize,
+    jumps: LocationHistory,
+    changes: LocationHistory,
     last_find: Option<Motion>,
     messages: Vec<Box<str>>,
     dirty: bool,
@@ -382,29 +391,17 @@ pub struct Editor<T: TextStore> {
     visual_region_history: Vec<SelectionSet>,
 }
 
-impl<T: TextStore> Editor<T> {
+impl Editor {
     #[must_use]
-    pub fn new(text: T) -> Self {
-        let contents = text.slice(0..text.len_bytes()).into_owned();
-        Self::with_contents(text, contents)
-    }
-
-    #[must_use]
-    pub fn with_contents(text: T, contents: String) -> Self {
-        debug_assert_eq!(text.len_bytes(), contents.len());
-        let clean_text = text.snapshot();
-        let line_starts = clean_text.line_starts();
-        let frame_text = FrameText::from_indexed(contents.into(), line_starts);
+    pub fn new(text: DefaultText) -> Self {
+        let frame_text = FrameText::from_store(text.snapshot());
         Self {
-            text,
-            clean_text: Some(clean_text),
             clean_frame_text: Some(frame_text.clone()),
             frame_text,
             revision: DocumentRevision::new(0),
             selections: SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 0, head: 0 }] },
             mode: Mode::Normal,
             pending_keys: Vec::with_capacity(8),
-            parse_state: None,
             undo: Vec::with_capacity(64),
             redo: Vec::with_capacity(64),
             undo_branches: Vec::with_capacity(8),
@@ -418,21 +415,15 @@ impl<T: TextStore> Editor<T> {
             recording_macro: None,
             recording_keys: Vec::with_capacity(64),
             last_macro: None,
-            pending_control: None,
             macro_depth: 0,
             last_change: None,
             pending_change: None,
             replaying_change: false,
             search: None,
+            #[cfg(any(test, feature = "conformance"))]
             last_visual: None,
-            jumplist: Vec::with_capacity(64),
-            jump_index: 0,
-            changelist: {
-                let mut changes = Vec::with_capacity(64);
-                changes.push(0);
-                changes
-            },
-            change_index: 1,
+            jumps: LocationHistory::new(64, usize::MAX, None),
+            changes: LocationHistory::new(64, 100, Some(0)),
             last_find: None,
             messages: Vec::with_capacity(8),
             dirty: false,
@@ -486,16 +477,21 @@ impl<T: TextStore> Editor<T> {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub fn selections(&self) -> &SelectionSet {
         &self.selections
     }
 
-    #[must_use]
-    pub fn pending_parse_state(&self) -> Option<&ParseState> {
-        self.parse_state.as_ref()
+    pub fn pending_parse_state(&self) -> Option<ParseState> {
+        if self.pending_keys.is_empty() {
+            return None;
+        }
+        match Grammar.parse(&self.pending_keys) {
+            ParseResult::Pending(state) => Some(state),
+            ParseResult::Command(_) | ParseResult::Invalid(_) => None,
+        }
     }
 
-    #[must_use]
     pub fn pending_register_name(&self) -> Option<char> {
         self.pending_keys.windows(2).find_map(|keys| {
             (keys[0].modifiers.is_empty() && keys[0].code == KeyCode::Char('"')).then_some(keys[1]).filter(|key| key.modifiers.is_empty()).and_then(|key| {
@@ -508,26 +504,29 @@ impl<T: TextStore> Editor<T> {
     }
 
     #[must_use]
-    pub fn text(&self) -> &T {
-        &self.text
+    pub fn text(&self) -> &DefaultText {
+        self.frame_text.store()
     }
 
     #[must_use]
     pub fn contents(&self) -> String {
-        self.text.slice(0..self.text.len_bytes()).into_owned()
+        self.frame_text.store().slice(0..self.frame_text.len()).into_owned()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn undo_depth(&self) -> usize {
         self.undo.len() + usize::from(self.insert_group.as_ref().is_some_and(|group| !group.is_empty()))
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub fn redo_depth(&self) -> usize {
         self.redo.len()
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub fn undo_tree_len(&self) -> usize {
         self.undo.len() + self.redo.len() + self.undo_branches.iter().map(Vec::len).sum::<usize>()
     }
@@ -555,26 +554,19 @@ impl<T: TextStore> Editor<T> {
     }
 
     pub fn mark_clean(&mut self) {
-        self.clean_text = Some(self.text.snapshot());
         self.clean_frame_text = Some(self.frame_text.clone());
         self.dirty = false;
     }
 
     pub fn mark_dirty(&mut self) {
-        self.clean_text = None;
         self.clean_frame_text = None;
         self.dirty = true;
     }
 
     fn refresh_dirty(&mut self) {
-        self.dirty = self.clean_frame_text.as_ref().is_none_or(|clean| !self.frame_text.same_snapshot(clean));
-        if self.dirty
-            && let Some(clean_text) = &self.clean_text
-            && self.text.len_bytes() == clean_text.len_bytes()
-            && self.text.content_eq(clean_text)
-        {
+        self.dirty = self.clean_frame_text.as_ref().is_none_or(|clean| !self.frame_text.same_snapshot(clean) && self.frame_text != *clean);
+        if !self.dirty {
             self.clean_frame_text = Some(self.frame_text.clone());
-            self.dirty = false;
         }
     }
 
@@ -592,8 +584,6 @@ impl<T: TextStore> Editor<T> {
 
     pub fn cancel_pending(&mut self) {
         self.pending_keys.clear();
-        self.parse_state = None;
-        self.pending_control = None;
     }
 
     #[must_use]
@@ -603,10 +593,11 @@ impl<T: TextStore> Editor<T> {
 
     #[must_use]
     pub fn cursor_line_column(&self) -> (usize, usize) {
-        let cursor = self.primary_cursor().min(self.text.len_bytes());
-        let line = self.text.line_of_byte(cursor);
-        let start = self.text.byte_of_line(line);
-        let column = self.text.slice(start..cursor).chars().count();
+        let text = self.text();
+        let cursor = self.primary_cursor().min(text.len_bytes());
+        let line = text.line_of_byte(cursor);
+        let start = text.byte_of_line(line);
+        let column = text.slice(start..cursor).chars().count();
         (line, column)
     }
 
@@ -615,7 +606,7 @@ impl<T: TextStore> Editor<T> {
         EngineFrame::new(self.frame_text.clone(), self.primary_cursor())
     }
 
-    #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub fn register(&self, name: char) -> Option<&RegisterValue> {
         self.registers.get(&name.to_ascii_lowercase())
     }
@@ -656,7 +647,6 @@ impl<T: TextStore> Editor<T> {
         self.macros.insert(name.to_ascii_lowercase(), keys);
     }
 
-    #[must_use]
     pub fn durable_repeat_data(&self) -> Option<Vec<u8>> {
         self.last_change.as_ref().and_then(|action| serde_json::to_vec(action).ok())
     }
@@ -678,51 +668,50 @@ impl<T: TextStore> Editor<T> {
     }
 
     pub fn restore_mark(&mut self, name: char, byte: usize) {
-        let byte = byte.min(self.text.len_bytes());
+        let byte = byte.min(self.frame_text.len());
         self.marks.insert(name, Anchor { byte, bias: Bias::Right });
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub const fn last_visual_selection(&self) -> Option<VisualSelection> {
         self.last_visual
     }
 
     pub fn jumplist(&self) -> impl Iterator<Item = usize> + '_ {
-        self.jumplist.iter().copied()
+        self.jumps.entries.iter().copied()
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub const fn jump_index(&self) -> usize {
-        self.jump_index
+        self.jumps.index
     }
 
+    #[cfg(any(test, feature = "conformance"))]
     pub fn changelist(&self) -> impl Iterator<Item = usize> + '_ {
-        self.changelist.iter().copied()
+        self.changes.entries.iter().copied()
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "conformance"))]
     pub const fn change_index(&self) -> usize {
-        self.change_index
+        self.changes.index
     }
 
     pub fn navigate_jump(&mut self, backward: bool) -> bool {
-        if backward && self.jump_index == self.jumplist.len() {
-            self.push_jump(self.primary_cursor());
-            self.jump_index = self.jumplist.len().saturating_sub(1);
-        }
-        let Some((next, byte)) = history_target(&self.jumplist, self.jump_index, backward) else {
+        let current = self.primary_cursor();
+        let Some(byte) = self.jumps.navigate(backward, Some(current)) else {
             return false;
         };
-        self.jump_index = next;
         self.set_cursor(byte);
         true
     }
 
     pub fn navigate_change(&mut self, backward: bool) -> bool {
-        let Some((next, byte)) = history_target(&self.changelist, self.change_index, backward) else {
+        let Some(byte) = self.changes.navigate(backward, None) else {
             return false;
         };
-        self.change_index = next;
         self.set_cursor(byte);
         true
     }
@@ -789,16 +778,15 @@ impl<T: TextStore> Editor<T> {
         Ok(Some(transaction))
     }
 
-    #[must_use]
     pub fn last_search(&self) -> Option<(&str, SearchDirection)> {
         self.search.as_ref().map(|search| (search.pattern.as_ref(), search.direction))
     }
 
+    #[cfg(any(test, feature = "conformance"))]
     pub fn messages(&self) -> impl Iterator<Item = &str> {
         self.messages.iter().map(AsRef::as_ref)
     }
 
-    #[must_use]
     pub fn mark(&self, name: char) -> Option<usize> {
         self.marks.get(&name).map(|anchor| anchor.byte)
     }
@@ -820,12 +808,10 @@ impl<T: TextStore> Editor<T> {
             return;
         }
         let selections = self.selections.clone();
-        let jump_len = self.jumplist.len();
-        let jump_index = self.jump_index;
+        let jumps = self.jumps.clone();
         let _ = self.handle_key(KeyEvent::character('G'));
         self.selections = selections;
-        self.jumplist.truncate(jump_len);
-        self.jump_index = jump_index;
+        self.jumps = jumps;
     }
 
     #[must_use]
@@ -837,10 +823,7 @@ impl<T: TextStore> Editor<T> {
         let text = self.frame_text.as_ref();
         let start = floor_char_boundary(text, range.start.min(text.len()));
         let end = floor_char_boundary(text, range.end.min(text.len()).max(start));
-        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
-            primary.anchor = start;
-            primary.head = end;
-        }
+        self.set_primary_selection(start, end);
     }
 
     /// Enters characterwise Visual mode with an explicit anchor and head.
@@ -853,10 +836,7 @@ impl<T: TextStore> Editor<T> {
         let text = self.frame_text.as_ref();
         let anchor = floor_char_boundary(text, anchor.min(text.len()));
         let head = floor_char_boundary(text, head.min(text.len()));
-        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
-            primary.anchor = anchor;
-            primary.head = head;
-        }
+        self.set_primary_selection(anchor, head);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<Option<Transaction>, EngineError> {
@@ -889,10 +869,6 @@ impl<T: TextStore> Editor<T> {
             }
         }
 
-        if let Some(control) = self.pending_control.take() {
-            return self.finish_pending_control(control, key);
-        }
-
         if self.recording_macro.is_some() && key == KeyEvent::character('q') && self.pending_keys.is_empty() {
             self.finish_macro_recording();
             return Ok(None);
@@ -901,54 +877,19 @@ impl<T: TextStore> Editor<T> {
             self.recording_keys.push(key);
         }
 
-        if self.pending_keys.is_empty() && key.modifiers.is_empty() {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.pending_control = Some(PendingControl::RecordMacro);
-                    return Ok(None);
-                }
-                KeyCode::Char('@') => {
-                    self.pending_control = Some(PendingControl::ReplayMacro);
-                    return Ok(None);
-                }
-                KeyCode::Char('m') => {
-                    self.pending_control = Some(PendingControl::SetMark);
-                    return Ok(None);
-                }
-                KeyCode::Char('\'') => {
-                    self.pending_control = Some(PendingControl::JumpMark { linewise: true });
-                    return Ok(None);
-                }
-                KeyCode::Char('`') => {
-                    self.pending_control = Some(PendingControl::JumpMark { linewise: false });
-                    return Ok(None);
-                }
-                _ => {}
-            }
-        }
-
         let Some(command) = self.parse_key(key)? else {
             return Ok(None);
         };
         self.pending_keys.clear();
-        self.parse_state = None;
-        match command {
-            Command::Move { motion, count } => self.execute_move(motion, count.get()),
-            Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert),
-            command => self.execute(command),
-        }
+        self.execute(command)
     }
 
     fn parse_key(&mut self, key: KeyEvent) -> Result<Option<Command>, EngineError> {
         self.pending_keys.push(key);
         match Grammar.parse(&self.pending_keys) {
-            ParseResult::Pending(state) => {
-                self.parse_state = Some(state);
-                Ok(None)
-            }
+            ParseResult::Pending(_) => Ok(None),
             ParseResult::Invalid(error) => {
                 let sequence = std::mem::take(&mut self.pending_keys).into_boxed_slice();
-                self.parse_state = None;
                 Err(EngineError::InvalidGrammar { sequence, reason: error.to_string().into() })
             }
             ParseResult::Command(command) => Ok(Some(command)),
@@ -960,26 +901,26 @@ impl<T: TextStore> Editor<T> {
         self.visual_region_history.clear();
         self.mode = mode;
         let cursor = self.primary_cursor();
-        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
-            primary.anchor = cursor;
-            primary.head = cursor;
-        }
+        self.set_primary_selection(cursor, cursor);
     }
 
     fn leave_visual(&mut self, cursor: usize) {
-        let text = self.contents();
-        if let Some(selection) = self.selections.ranges.get(self.selections.primary) {
-            let start = selection.anchor.min(selection.head);
-            let end = selection.anchor.max(selection.head);
-            let (start_line, start_column) = line_column_at(&text, start);
-            let (end_line, end_column) = line_column_at(&text, end);
-            self.last_visual = Some(VisualSelection {
-                start_line,
-                start_column,
-                end_line,
-                end_column: if self.mode == Mode::VisualLine { usize::MAX } else { end_column },
-                linewise: self.mode == Mode::VisualLine,
-            });
+        #[cfg(any(test, feature = "conformance"))]
+        {
+            let text = self.contents();
+            if let Some(selection) = self.selections.ranges.get(self.selections.primary) {
+                let start = selection.anchor.min(selection.head);
+                let end = selection.anchor.max(selection.head);
+                let (start_line, start_column) = line_column_at(&text, start);
+                let (end_line, end_column) = line_column_at(&text, end);
+                self.last_visual = Some(VisualSelection {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column: if self.mode == Mode::VisualLine { usize::MAX } else { end_column },
+                    linewise: self.mode == Mode::VisualLine,
+                });
+            }
         }
         self.mode = Mode::Normal;
         self.visual_region_history.clear();
@@ -1024,18 +965,11 @@ impl<T: TextStore> Editor<T> {
                     }
                     return Ok(None);
                 }
-                KeyCode::Char('d' | 'x') | KeyCode::Delete => {
-                    return self.apply_visual_operator(Operator::Delete, None);
-                }
-                KeyCode::Char('c') => {
-                    return self.apply_visual_operator(Operator::Change, None);
-                }
-                KeyCode::Char('y' | 'Y') => {
-                    return self.apply_visual_operator(Operator::Yank, None);
-                }
-                KeyCode::Char('>' | '<') => {
-                    return self.apply_visual_operator(if key.code == KeyCode::Char('>') { Operator::Indent } else { Operator::Outdent }, None);
-                }
+                KeyCode::Char('d' | 'x') | KeyCode::Delete => return self.apply_visual_operator(Operator::Delete, None),
+                KeyCode::Char('c') => return self.apply_visual_operator(Operator::Change, None),
+                KeyCode::Char('y' | 'Y') => return self.apply_visual_operator(Operator::Yank, None),
+                KeyCode::Char('>') => return self.apply_visual_operator(Operator::Indent, None),
+                KeyCode::Char('<') => return self.apply_visual_operator(Operator::Outdent, None),
                 KeyCode::Char('p' | 'P') => {
                     return self.visual_paste(key.code == KeyCode::Char('P'), None);
                 }
@@ -1052,7 +986,6 @@ impl<T: TextStore> Editor<T> {
             }
             Some(command) => {
                 let sequence = std::mem::take(&mut self.pending_keys).into_boxed_slice();
-                self.parse_state = None;
                 Err(EngineError::InvalidGrammar { sequence, reason: format!("command {command:?} is not valid in visual mode").into() })
             }
         }
@@ -1082,10 +1015,7 @@ impl<T: TextStore> Editor<T> {
         };
         self.visual_region_history.push(self.selections.clone());
         self.mode = Mode::Visual;
-        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
-            primary.anchor = next.start;
-            primary.head = previous_char_boundary(&text, next.end);
-        }
+        self.set_primary_selection(next.start, previous_char_boundary(&text, next.end));
     }
 
     fn move_visual_head(&mut self, motion: Motion, count: u32) {
@@ -1160,13 +1090,7 @@ impl<T: TextStore> Editor<T> {
             self.messages.push("already at oldest change".into());
             return Ok(None);
         };
-        let mut last = None;
-        for stored in group.inverse.iter().rev() {
-            let mut inverse = stored.clone();
-            inverse.rebase(self.revision);
-            self.apply_without_history(&inverse)?;
-            last = Some(inverse);
-        }
+        let last = self.apply_history(group.inverse.iter().rev())?;
         self.selections = group.before.clone();
         self.redo.push(group);
         self.messages.push("undo change".into());
@@ -1179,15 +1103,20 @@ impl<T: TextStore> Editor<T> {
             self.messages.push("already at newest change".into());
             return Ok(None);
         };
-        let mut last = None;
-        for stored in &group.forward {
-            let mut forward = stored.clone();
-            forward.rebase(self.revision);
-            self.apply_without_history(&forward)?;
-            last = Some(forward);
-        }
+        let last = self.apply_history(&group.forward)?;
         self.undo.push(group);
         self.messages.push("redo change".into());
+        Ok(last)
+    }
+
+    fn apply_history<'a>(&mut self, transactions: impl IntoIterator<Item = &'a Transaction>) -> Result<Option<Transaction>, EngineError> {
+        let mut last = None;
+        for transaction in transactions {
+            let mut transaction = transaction.clone();
+            transaction.rebase(self.revision);
+            self.apply_without_history(&transaction)?;
+            last = Some(transaction);
+        }
         Ok(last)
     }
 
@@ -1250,7 +1179,7 @@ impl<T: TextStore> Editor<T> {
         };
         let previous = self.primary_cursor();
         if byte != previous {
-            self.push_jump(previous);
+            self.jumps.push(previous);
         }
         self.collapse_selection(byte);
         true
@@ -1343,7 +1272,7 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn execute(&mut self, command: Command) -> Result<Option<Transaction>, EngineError> {
-        match command.clone() {
+        match &command {
             Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert),
             Command::EnterAppend => self.enter_insert_command(InsertStyle::Append),
             Command::EnterInsertAtLineStart => self.enter_insert_command(InsertStyle::LineStart),
@@ -1351,30 +1280,63 @@ impl<T: TextStore> Editor<T> {
             Command::EnterReplace => self.enter_insert_command(InsertStyle::Replace),
             Command::OpenLine { above } => {
                 self.ensure_writable()?;
-                self.open_line(above)
+                self.open_line(*above)
             }
-            Command::Move { motion, count } => self.execute_move(motion, count.get()),
+            Command::Move { motion, count } => Ok(self.execute_move(*motion, count.get())),
             Command::ApplyOperator { operator, motion, count, register, range_kind } => {
-                self.execute_operator(command, operator, motion, count.get(), register, range_kind)
+                self.execute_operator(&command, *operator, *motion, count.get(), *register, *range_kind)
             }
             Command::DeleteChar { backward, count, register } => {
-                self.finish_command_change(&command, |editor| editor.delete_chars(backward, count.get(), register))
+                self.finish_command_change(&command, |editor| editor.delete_chars(*backward, count.get(), *register))
             }
             Command::JoinLines { count } => self.finish_command_change(&command, |editor| editor.join_lines(count.get())),
-            Command::ReplaceChar { character, count } => self.finish_command_change(&command, |editor| editor.replace_chars(character, count.get())),
+            Command::ReplaceChar { character, count } => self.finish_command_change(&command, |editor| editor.replace_chars(*character, count.get())),
             Command::ToggleCase { count } => self.finish_command_change(&command, |editor| editor.toggle_case(count.get())),
-            Command::Paste { before, count, register } => self.finish_command_change(&command, |editor| editor.paste(before, count.get(), register)),
+            Command::Paste { before, count, register } => self.finish_command_change(&command, |editor| editor.paste(*before, count.get(), *register)),
             Command::Undo { count } => self.history_count(count.get(), Self::undo),
             Command::Redo { count } => self.history_count(count.get(), Self::redo),
             Command::SearchNext { reverse, count } => {
                 for _ in 0..count.get() {
-                    if !self.search_next(reverse) {
+                    if !self.search_next(*reverse) {
                         break;
                     }
                 }
                 Ok(None)
             }
             Command::Repeat { count } => self.repeat_last(count.get()),
+            Command::Target { action, target, count } => self.execute_target(*action, *target, count.get()),
+        }
+    }
+
+    fn execute_target(&mut self, action: TargetAction, target: char, count: u32) -> Result<Option<Transaction>, EngineError> {
+        match action {
+            TargetAction::RecordMacro => {
+                self.recording_macro = Some(target.to_ascii_lowercase());
+                self.recording_keys.clear();
+                Ok(None)
+            }
+            TargetAction::ReplayMacro => {
+                let mut last = None;
+                for _ in 0..count {
+                    last = self.replay_macro(target)?.or(last);
+                }
+                Ok(last)
+            }
+            TargetAction::SetMark => {
+                self.marks.insert(target, Anchor { byte: self.primary_cursor(), bias: Bias::Left });
+                Ok(None)
+            }
+            TargetAction::JumpMark { linewise } => {
+                let Some(anchor) = self.marks.get(&target).copied() else {
+                    return Ok(None);
+                };
+                let destination = if linewise { first_non_blank(self.frame_text.as_ref(), anchor.byte) } else { anchor.byte };
+                if destination != self.primary_cursor() {
+                    self.jumps.push(self.primary_cursor());
+                }
+                self.collapse_selection(destination);
+                Ok(None)
+            }
         }
     }
 
@@ -1406,21 +1368,22 @@ impl<T: TextStore> Editor<T> {
         Ok(None)
     }
 
-    fn execute_move(&mut self, motion: Motion, count: u32) -> Result<Option<Transaction>, EngineError> {
+    fn execute_move(&mut self, motion: Motion, count: u32) -> Option<Transaction> {
         let previous = self.primary_cursor();
-        if motion.remembers_find_target() {
+        if matches!(motion, Motion::Find { .. }) {
             self.last_find = Some(motion);
         }
         self.move_cursor(motion, count);
-        if motion.enters_jump_list() && self.primary_cursor() != previous {
-            self.push_jump(previous);
+        if matches!(motion, Motion::GoToLine | Motion::DocumentEnd | Motion::ParagraphForward | Motion::ParagraphBackward) && self.primary_cursor() != previous
+        {
+            self.jumps.push(previous);
         }
-        Ok(None)
+        None
     }
 
     fn execute_operator(
         &mut self,
-        command: Command,
+        command: &Command,
         operator: Operator,
         motion: Motion,
         count: u32,
@@ -1432,9 +1395,9 @@ impl<T: TextStore> Editor<T> {
             return Ok(result);
         }
         if operator == Operator::Change {
-            self.pending_change = Some(command);
+            self.pending_change = Some(command.clone());
         } else {
-            self.last_change = Some(RepeatAction::Command(command));
+            self.last_change = Some(RepeatAction::Command(command.clone()));
         }
         Ok(result)
     }
@@ -1506,7 +1469,7 @@ impl<T: TextStore> Editor<T> {
         let inverse = self.invert_transaction(&transaction)?;
         let starts_change = if insert_group { self.insert_group.as_ref().is_none_or(UndoGroup::is_empty) } else { true };
         if starts_change && !transaction.is_empty() {
-            self.push_change(transaction.edits()[0].range.start);
+            self.changes.push(transaction.edits()[0].range.start);
         }
         let before = self.selections.clone();
         self.apply_without_history(&transaction)?;
@@ -1531,18 +1494,19 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn invert_transaction(&self, transaction: &Transaction) -> Result<Transaction, EngineError> {
-        let text_len = self.text.len_bytes();
+        let text = self.frame_text.store();
+        let text_len = text.len_bytes();
         let mut deleted = Vec::with_capacity(transaction.edit_count());
         for edit in transaction.edits() {
             if edit.range.end > text_len {
                 return Err(TransactionError::OutOfBounds { offset: edit.range.end, len: text_len }.into());
             }
             for offset in [edit.range.start, edit.range.end] {
-                if !self.text.is_char_boundary(offset) {
+                if !text.is_char_boundary(offset) {
                     return Err(TransactionError::NotCharBoundary { offset }.into());
                 }
             }
-            deleted.push(self.text.slice(edit.range.clone()).into_owned().into_boxed_str());
+            deleted.push(text.slice(edit.range.clone()).into_owned().into_boxed_str());
         }
         transaction.invert(&deleted).map_err(Into::into)
     }
@@ -1550,23 +1514,20 @@ impl<T: TextStore> Editor<T> {
     fn apply_without_history(&mut self, transaction: &Transaction) -> Result<(), EngineError> {
         self.ensure_revision(transaction)?;
         let revision = self.revision.next().ok_or(EngineError::RevisionOverflow)?;
-        let mapping = transaction.offset_mapping();
         let frame_text = self.frame_text.edited(transaction)?;
         if let Some(search) = &self.search {
-            search.map_literal_cache_through(&mapping, &frame_text, revision);
+            search.map_literal_cache_through(transaction, &frame_text, revision);
         }
-        self.text.apply(transaction);
         self.frame_text = frame_text;
         self.refresh_dirty();
-        self.selections = self.selections.map_with(&mapping)?;
+        self.selections = self.selections.map_through(transaction)?;
         for anchor in self.marks.values_mut() {
-            *anchor = (*anchor).map_with(&mapping)?;
+            *anchor = (*anchor).map_through(transaction)?;
         }
-        for jump in &mut self.jumplist {
-            *jump = mapping.map_offset(*jump, Bias::Left)?;
-        }
-        for change in &mut self.changelist {
-            *change = mapping.map_offset(*change, Bias::Left)?;
+        for history in [&mut self.jumps, &mut self.changes] {
+            for byte in &mut history.entries {
+                *byte = transaction.map_offset(*byte, Bias::Left)?;
+            }
         }
         self.revision = revision;
         Ok(())
@@ -1576,16 +1537,6 @@ impl<T: TextStore> Editor<T> {
         (transaction.base_revision() == self.revision)
             .then_some(())
             .ok_or(EngineError::RevisionMismatch { expected: self.revision.get(), actual: transaction.base_revision().get() })
-    }
-
-    fn push_change(&mut self, byte: usize) {
-        if self.changelist.last().copied() != Some(byte) {
-            self.changelist.push(byte);
-            if self.changelist.len() > 100 {
-                self.changelist.remove(0);
-            }
-        }
-        self.change_index = self.changelist.len();
     }
 
     fn delete_insert_backward(&mut self) -> Result<Option<Transaction>, EngineError> {
@@ -2035,7 +1986,7 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn document_end_destination(&self) -> usize {
-        let start = self.frame_text.byte_of_line(self.frame_text.line_starts.len().saturating_sub(1));
+        let start = self.frame_text.byte_of_line(self.frame_text.line_of_byte(self.frame_text.len()));
         let tail = self.frame_text.slice(start..self.frame_text.len());
         let offset = tail.char_indices().find(|(_, character)| !matches!(character, ' ' | '\t')).map_or(tail.len(), |(offset, _)| offset);
         let offset = if offset == tail.len() && !tail.is_empty() { previous_char_boundary(&tail, offset) } else { offset };
@@ -2157,47 +2108,6 @@ impl<T: TextStore> Editor<T> {
         self.registers.get(&key)
     }
 
-    fn finish_pending_control(&mut self, control: PendingControl, key: KeyEvent) -> Result<Option<Transaction>, EngineError> {
-        let prefix = match control {
-            PendingControl::RecordMacro => 'q',
-            PendingControl::ReplayMacro => '@',
-            PendingControl::SetMark => 'm',
-            PendingControl::JumpMark { linewise: true } => '\'',
-            PendingControl::JumpMark { linewise: false } => '`',
-        };
-        let rejected = || EngineError::InvalidGrammar {
-            sequence: vec![KeyEvent::character(prefix), key].into_boxed_slice(),
-            reason: "invalid target for pending command".into(),
-        };
-        let KeyCode::Char(character) = key.code else {
-            return Err(rejected());
-        };
-        match control {
-            PendingControl::RecordMacro if character.is_ascii_alphanumeric() => {
-                self.recording_macro = Some(character.to_ascii_lowercase());
-                self.recording_keys.clear();
-                Ok(None)
-            }
-            PendingControl::ReplayMacro => self.replay_macro(character),
-            PendingControl::SetMark if character.is_ascii_alphabetic() => {
-                self.marks.insert(character, Anchor { byte: self.primary_cursor(), bias: Bias::Left });
-                Ok(None)
-            }
-            PendingControl::JumpMark { linewise } => {
-                if let Some(anchor) = self.marks.get(&character).copied() {
-                    let text = self.contents();
-                    let destination = if linewise { first_non_blank(&text, anchor.byte) } else { anchor.byte };
-                    if destination != self.primary_cursor() {
-                        self.push_jump(self.primary_cursor());
-                    }
-                    self.collapse_selection(destination);
-                }
-                Ok(None)
-            }
-            _ => Err(rejected()),
-        }
-    }
-
     fn finish_macro_recording(&mut self) {
         if let Some(register) = self.recording_macro.take() {
             let keys = std::mem::take(&mut self.recording_keys);
@@ -2231,27 +2141,19 @@ impl<T: TextStore> Editor<T> {
     }
 
     fn collapse_selection(&mut self, byte: usize) {
-        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
-            primary.anchor = byte;
-            primary.head = byte;
-        }
+        self.set_primary_selection(byte, byte);
     }
 
-    fn push_jump(&mut self, byte: usize) {
-        if self.jumplist.last().copied() != Some(byte) {
-            self.jumplist.push(byte);
+    fn set_primary_selection(&mut self, anchor: usize, head: usize) {
+        if let Some(primary) = self.selections.ranges.get_mut(self.selections.primary) {
+            primary.anchor = anchor;
+            primary.head = head;
         }
-        self.jump_index = self.jumplist.len();
     }
 
     fn ensure_writable(&self) -> Result<(), EngineError> {
         if self.read_only { Err(EngineError::ReadOnly) } else { Ok(()) }
     }
-}
-
-fn history_target(history: &[usize], current: usize, backward: bool) -> Option<(usize, usize)> {
-    let index = if backward { current.checked_sub(1)? } else { current.checked_add(1).filter(|index| *index < history.len())? };
-    Some((index, *history.get(index)?))
 }
 
 fn register_key(register: Option<Register>) -> Option<char> {
@@ -2291,6 +2193,7 @@ fn line_start(text: &str, byte: usize) -> usize {
     text[..byte].rfind('\n').map_or(0, |index| index + 1)
 }
 
+#[cfg(any(test, feature = "conformance"))]
 fn line_column_at(text: &str, byte: usize) -> (usize, usize) {
     let byte = floor_char_boundary(text, byte.min(text.len()));
     let start = line_start(text, byte);
@@ -2613,15 +2516,15 @@ fn line_edits(text: &str, range: Range<usize>, indent: bool, shift_width: usize)
 mod tests {
     use std::io::Cursor;
 
-    use wren_text::RopeyText;
+    use wren_text::CropText;
 
     use super::*;
 
-    fn editor(source: &str) -> Editor<RopeyText> {
-        Editor::new(RopeyText::from_reader(Cursor::new(source)).expect("load text"))
+    fn editor(source: &str) -> Editor {
+        Editor::new(CropText::from_reader(Cursor::new(source)).expect("load text"))
     }
 
-    fn feed(editor: &mut Editor<RopeyText>, keys: &str) {
+    fn feed(editor: &mut Editor, keys: &str) {
         for character in keys.chars() {
             editor.handle_key(if character == '\u{1b}' { KeyEvent::plain(KeyCode::Escape) } else { KeyEvent::character(character) }).expect("key is accepted");
         }
@@ -2923,7 +2826,7 @@ mod tests {
     fn exposes_pending_operator_state() {
         let mut editor = editor("abc");
         editor.handle_key(KeyEvent::character('d')).expect("pending delete");
-        assert!(matches!(editor.pending_parse_state(), Some(ParseState::OperatorPending { .. })));
+        assert_eq!(editor.pending_parse_state(), Some(ParseState::Operator));
     }
 
     #[test]

@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = []
+test-support = []
+
 [dependencies]
+compact_str.workspace = true
+catppuccin = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

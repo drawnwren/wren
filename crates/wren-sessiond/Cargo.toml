@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+parking_lot.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 wren-proto = { version = "0.1.0", path = "../wren-proto" }
@@ -16,6 +17,8 @@ wren-types = { version = "0.1.0", path = "../wren-types" }
 
 [dev-dependencies]
 tempfile.workspace = true
+wren-remote = { version = "0.1.0", path = "../wren-remote", features = ["client"] }
+wren-shmem = { version = "0.1.0", path = "../wren-shmem", features = ["benchmarking"] }
 
 [lints]
 workspace = true

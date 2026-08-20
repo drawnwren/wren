@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+conformance = []
+
 [dependencies]
 regex.workspace = true
 serde.workspace = true

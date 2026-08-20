@@ -6,11 +6,13 @@ mod local;
 mod outbox;
 mod record;
 mod wal;
+#[cfg(test)]
 mod workspace;
 
-pub use authority::{AuthorityDocument, AuthorityError, MutationService, MutationSubmission, SessionAuthority};
+pub use authority::{AuthorityDocument, AuthorityError, MutationSubmission, SessionAuthority};
 pub use journal::{SessionJournal, SessionJournalError};
 pub use local::{DocumentEncoding, FileIdentity, FileStamp, LineEnding, LocalDocument, OpenedDocument, SaveError, SaveReport, SaveWarning};
 pub use outbox::{MutationOutbox, OutboxError};
 pub use wal::{LocalWal, RecoveredState, WalError};
+#[cfg(test)]
 pub use workspace::{PersistBatchReport, PersistBatchState, WorkspaceDocument, WorkspaceError, WorkspaceExecutor};

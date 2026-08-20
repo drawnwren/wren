@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = []
+
 [dependencies]
+parking_lot.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
+wren-scheduling = { version = "0.1.0", path = "../wren-scheduling" }
 wren-types = { version = "0.1.0", path = "../wren-types" }
 
 [lints]

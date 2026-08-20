@@ -20,13 +20,12 @@ ALLOWED_INTERNAL = {
     "wren-grammar": {"wren-types"},
     "wren-config": {"wren-types", "wren-grammar"},
     "wren-provider": {"wren-types"},
-    "wren-derived": {"wren-types"},
-    "wren-workflow": {"wren-types"},
+    "wren-workflow": {"wren-types", "wren-position"},
     "wren-remote": {"wren-types", "wren-proto"},
     "wren-engine": {"wren-types", "wren-text", "wren-position", "wren-grammar"},
-    "wren-command": {"wren-types"},
+    "wren-command": {"wren-types", "wren-scheduling"},
     "wren-view": {"wren-types", "wren-engine"},
-    "wren-term": {"wren-view"},
+    "wren-term": {"wren-types", "wren-view"},
     "wren-presenter": {"wren-view", "wren-term", "wren-scheduling"},
     "wren-proto": {"wren-types"},
     "wren-session": {"wren-types", "wren-text"},
@@ -44,6 +43,7 @@ ALLOWED_INTERNAL = {
         "wren-term",
         "wren-presenter",
         "wren-provider",
+        "wren-penrose",
         "wren-proto",
         "wren-session",
         "wren-scheduling",
@@ -94,7 +94,13 @@ def main() -> int:
     ]
     for descriptor in packages:
         package = descriptor["name"]
-        dependencies = {dependency["name"] for dependency in descriptor["dependencies"]}
+        # Development-only edges belong to the validation graph, not the
+        # shipping layer graph (for example corpus generators used by benches).
+        dependencies = {
+            dependency["name"]
+            for dependency in descriptor["dependencies"]
+            if dependency.get("kind") != "dev"
+        }
         internal = {name for name in dependencies if name.startswith("wren-")}
         if package in ALLOWED_INTERNAL:
             forbidden = internal - ALLOWED_INTERNAL[package]

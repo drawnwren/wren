@@ -17,7 +17,7 @@ pub(super) fn git_ex_program(arguments: &[Box<str>]) -> &'static str {
 pub(super) fn terminal_cell_color(color: TerminalColor, default: RgbColor) -> CellColor {
     match color {
         TerminalColor::Default => CellColor::Rgb(default),
-        TerminalColor::Palette(index) => CellColor::Palette(index),
+        TerminalColor::Idx(index) => CellColor::Palette(index),
         TerminalColor::Rgb(red, green, blue) => CellColor::rgb(red, green, blue),
     }
 }

@@ -1,6 +1,6 @@
 # wren-proto
 
-Frozen protocol-major-1 Prost schema and bounded length-delimited transport for
-session mutations/results/events, resume, save, document open, and remote RPC.
-Every wire DTO converts fallibly at the semantic boundary; malformed versions,
-hashes, enums, transactions, trailing bytes, and oversized frames are rejected.
+Versioned, bounded, big-endian-u32-length-delimited transport for session mutations/results,
+events, resume, save, document open, and remote RPC. Protocol major 3 serializes
+the validated semantic types directly, eliminating the parallel wire object
+graph while rejecting malformed versions, trailing bytes, and oversized frames.

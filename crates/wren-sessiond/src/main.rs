@@ -10,9 +10,7 @@ use wren_sessiond::SessionServer;
 use wren_shmem::SharedDocumentHeadWriter;
 use wren_types::SessionId;
 
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-#[cfg(unix)]
 use std::os::unix::net::UnixListener;
 
 #[derive(Debug)]
@@ -32,37 +30,30 @@ fn arguments() -> Result<Arguments> {
     let mut head_table = None;
     let mut transport = None;
     let mut workspace = None;
-    let values: Vec<_> = env::args().skip(1).collect();
-    let mut index = 0;
-    while index < values.len() {
-        match values[index].as_str() {
+    let mut values = env::args().skip(1);
+    while let Some(argument) = values.next() {
+        match argument.as_str() {
             "--socket" => {
-                index += 1;
-                socket = Some(PathBuf::from(values.get(index).context("--socket requires a path")?));
+                socket = Some(values.next().context("--socket requires a path")?.into());
             }
             "--state-dir" => {
-                index += 1;
-                state_dir = Some(PathBuf::from(values.get(index).context("--state-dir requires a path")?));
+                state_dir = Some(values.next().context("--state-dir requires a path")?.into());
             }
             "--session-id" => {
-                index += 1;
-                session_id = SessionId::new(values.get(index).context("--session-id requires an integer")?.parse()?);
+                session_id = SessionId::new(values.next().context("--session-id requires an integer")?.parse()?);
             }
             "--head-table" => {
-                index += 1;
-                head_table = Some(PathBuf::from(values.get(index).context("--head-table requires a path")?));
+                head_table = Some(values.next().context("--head-table requires a path")?.into());
             }
             "--transport" => {
-                index += 1;
-                transport = Some(match values.get(index).map(String::as_str) {
+                transport = Some(match values.next().as_deref() {
                     Some("control") => TransportLane::Control,
                     Some("bulk") => TransportLane::Bulk,
                     _ => bail!("--transport must be control or bulk"),
                 });
             }
             "--protocol" => {
-                index += 1;
-                let protocol = values.get(index).context("--protocol requires MAJOR.MINOR")?;
+                let protocol = values.next().context("--protocol requires MAJOR.MINOR")?;
                 let (major, _) = protocol.split_once('.').context("--protocol requires MAJOR.MINOR")?;
                 let major: u16 = major.parse()?;
                 if major != REMOTE_PROTOCOL_MAJOR {
@@ -70,8 +61,7 @@ fn arguments() -> Result<Arguments> {
                 }
             }
             "--workspace" => {
-                index += 1;
-                workspace = Some(PathBuf::from(values.get(index).context("--workspace requires a path")?));
+                workspace = Some(values.next().context("--workspace requires a path")?.into());
             }
             "-h" | "--help" => {
                 println!(
@@ -82,7 +72,6 @@ fn arguments() -> Result<Arguments> {
             }
             argument => bail!("unknown argument {argument}"),
         }
-        index += 1;
     }
     Ok(Arguments { socket, state_dir: state_dir.context("--state-dir is required")?, session_id, head_table, transport, workspace })
 }
@@ -108,7 +97,6 @@ impl Write for StdioConnection {
     }
 }
 
-#[cfg(unix)]
 fn main() -> Result<()> {
     let arguments = arguments()?;
     if let Some(lane) = arguments.transport {
@@ -155,10 +143,4 @@ fn main() -> Result<()> {
         });
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn main() -> Result<()> {
-    let _ = arguments()?;
-    bail!("wren-sessiond local control sockets are not implemented on this platform")
 }

@@ -1,0 +1,26 @@
+{
+  "workspace": {"workspaceFolders": true},
+  "textDocument": {
+    "hover": {"contentFormat": ["markdown", "plaintext"]},
+    "signatureHelp": {"signatureInformation": {"documentationFormat": ["markdown", "plaintext"]}},
+    "completion": {"completionItem": {"snippetSupport": true, "documentationFormat": ["markdown", "plaintext"]}},
+    "publishDiagnostics": {"relatedInformation": true},
+    "codeAction": {"dynamicRegistration": true},
+    "rename": {"prepareSupport": true},
+    "semanticTokens": {
+      "dynamicRegistration": true,
+      "requests": {"range": false, "full": true},
+      "tokenTypes": [
+        "namespace", "type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable", "property",
+        "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp",
+        "operator", "decorator"
+      ],
+      "tokenModifiers": [
+        "declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"
+      ],
+      "formats": ["relative"],
+      "overlappingTokenSupport": false,
+      "multilineTokenSupport": false
+    }
+  }
+}

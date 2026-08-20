@@ -10,8 +10,7 @@ use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use wren_benchmark_support::{
-    ArgumentCursor, CommonArguments, bare_metal_declared, distribution, elapsed_nanos, emit_report, histogram, pin_requested_cpu, require_bare_metal_cpu,
-    ten_percent_cut,
+    CommonArguments, bare_metal_declared, distribution, elapsed_nanos, emit_report, histogram, pin_requested_cpu, require_bare_metal_cpu, ten_percent_cut,
 };
 use wren_provider::{LatestDemandQueue, ProviderActor, ProviderRequest};
 use wren_remote::{BlobCache, OpenSshSpec, RemoteMaterializer, RemoteWorkspaceClient, fastcdc_chunks};
@@ -34,21 +33,15 @@ struct Arguments {
 }
 
 fn arguments() -> Result<Arguments> {
-    let mut arguments = Arguments { common: CommonArguments::new(1_000), remote_baseline_output: None };
-    let mut cursor = ArgumentCursor::from_env();
-    while let Some(argument) = cursor.next() {
-        if arguments.common.consume(&argument, &mut cursor)? {
-            continue;
+    let mut remote_baseline_output = None;
+    let common = CommonArguments::parse_with(1_000, |argument, cursor| {
+        if argument != "--capture-remote-baseline" {
+            return Ok(false);
         }
-        match argument.as_str() {
-            "--capture-remote-baseline" => {
-                arguments.remote_baseline_output = Some(cursor.path(&argument)?);
-            }
-            argument => anyhow::bail!("unknown argument: {argument}"),
-        }
-    }
-    arguments.common.validate()?;
-    Ok(arguments)
+        remote_baseline_output = Some(cursor.path(argument)?);
+        Ok(true)
+    })?;
+    Ok(Arguments { common, remote_baseline_output })
 }
 
 fn validate_gate_environment(arguments: &Arguments, pinned: bool, has_remote: bool, has_remote_baseline: bool) -> Result<()> {

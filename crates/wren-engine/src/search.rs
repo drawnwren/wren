@@ -28,16 +28,10 @@ impl VimPattern {
     }
 
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
-    }
-
-    #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
         self.regex.is_match(text)
     }
 
-    #[must_use]
     pub fn find_at<'text>(&self, text: &'text str, start: usize) -> Option<regex::Match<'text>> {
         self.regex.find_at(text, start)
     }
@@ -67,11 +61,6 @@ impl VimReplacement {
     #[must_use]
     pub fn new(source: impl Into<Box<str>>) -> Self {
         Self { source: source.into() }
-    }
-
-    #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
     }
 
     #[must_use]
@@ -170,9 +159,10 @@ fn append_text(output: &mut String, text: &str, case: CaseTransform, next_case: 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PatternMode {
     Very,
+    #[default]
     Default,
     Nomagic,
     Literal,
@@ -196,16 +186,11 @@ fn translate_vim_pattern(pattern: &str) -> Result<TranslatedPattern, Box<str>> {
     Ok(translator.finish())
 }
 
+#[derive(Default)]
 struct PatternTranslator {
     output: String,
     magic: PatternMode,
     case_override: Option<CaseOverride>,
-}
-
-impl Default for PatternTranslator {
-    fn default() -> Self {
-        Self { output: String::new(), magic: PatternMode::Default, case_override: None }
-    }
 }
 
 impl PatternTranslator {

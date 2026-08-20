@@ -2,22 +2,24 @@
 
 use std::fmt::Display;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "benchmarking"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
+use parking_lot::Mutex;
 use thiserror::Error;
 use wren_term::TerminalBackend;
-use wren_view::{DesiredGrid, TerminalPatch, diff_into};
+use wren_view::{DesiredGrid, TerminalUpdate, diff_into};
 
+#[cfg(any(test, feature = "benchmarking"))]
 pub type PresentationObserver = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
 #[derive(Debug, Error)]
 pub enum PresenterError {
     #[error("spawn presenter thread: {0}")]
     Spawn(#[source] io::Error),
-    #[error("presenter state lock is poisoned")]
-    Poisoned,
     #[error("presenter has stopped")]
     Stopped,
     #[error("presenter thread panicked")]
@@ -26,6 +28,7 @@ pub enum PresenterError {
     Backend(String),
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresenterStats {
     pub published_frames: u64,
@@ -34,52 +37,52 @@ pub struct PresenterStats {
     pub last_presented_epoch: u64,
 }
 
-#[derive(Debug, Default)]
-struct QueueState {
-    slot: Option<Arc<DesiredGrid>>,
-    stopped: bool,
-    published: u64,
-    dropped: u64,
-}
+#[cfg(not(any(test, feature = "benchmarking")))]
+pub type PresenterStats = ();
 
 #[derive(Debug, Default)]
 struct LatestFrameQueue {
-    state: Mutex<QueueState>,
-    changed: Condvar,
+    slot: Mutex<Option<Arc<DesiredGrid>>>,
+    stopped: AtomicBool,
+    #[cfg(any(test, feature = "benchmarking"))]
+    published: AtomicU64,
+    #[cfg(any(test, feature = "benchmarking"))]
+    dropped: AtomicU64,
 }
 
 impl LatestFrameQueue {
     fn publish(&self, frame: Arc<DesiredGrid>) -> Result<(), PresenterError> {
-        let mut state = self.state.lock().map_err(|_| PresenterError::Poisoned)?;
-        if state.stopped {
+        let mut slot = self.slot.lock();
+        if self.stopped.load(Ordering::Acquire) {
             return Err(PresenterError::Stopped);
         }
-        state.published = state.published.saturating_add(1);
-        if state.slot.replace(frame).is_some() {
-            state.dropped = state.dropped.saturating_add(1);
+        #[cfg(any(test, feature = "benchmarking"))]
+        {
+            let replaced = slot.replace(frame).is_some();
+            self.published.fetch_add(1, Ordering::AcqRel);
+            if replaced {
+                self.dropped.fetch_add(1, Ordering::AcqRel);
+            }
         }
-        self.changed.notify_one();
+        #[cfg(not(any(test, feature = "benchmarking")))]
+        slot.replace(frame);
         Ok(())
     }
 
-    fn take(&self) -> Result<Option<Arc<DesiredGrid>>, PresenterError> {
-        let mut state = self.state.lock().map_err(|_| PresenterError::Poisoned)?;
-        while state.slot.is_none() && !state.stopped {
-            state = self.changed.wait(state).map_err(|_| PresenterError::Poisoned)?;
+    fn take(&self) -> Option<Arc<DesiredGrid>> {
+        loop {
+            if let Some(frame) = self.slot.lock().take() {
+                return Some(frame);
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return None;
+            }
+            thread::park();
         }
-        Ok(state.slot.take())
     }
 
     fn stop(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.stopped = true;
-            self.changed.notify_all();
-        }
-    }
-
-    fn publication_stats(&self) -> Result<(u64, u64), PresenterError> {
-        let state = self.state.lock().map_err(|_| PresenterError::Poisoned)?;
-        Ok((state.published, state.dropped))
+        self.stopped.store(true, Ordering::Release);
     }
 }
 
@@ -88,11 +91,14 @@ where
     B: TerminalBackend + Send + 'static,
     B::Error: Display + Send + 'static,
 {
-    backend: Arc<Mutex<B>>,
+    _backend: Arc<Mutex<B>>,
     queue: Arc<LatestFrameQueue>,
     failure: Arc<Mutex<Option<String>>>,
+    #[cfg(any(test, feature = "benchmarking"))]
     presented: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "benchmarking"))]
     last_epoch: Arc<AtomicU64>,
+    worker: thread::Thread,
     join: Option<JoinHandle<()>>,
 }
 
@@ -102,53 +108,82 @@ where
     B::Error: Display + Send + 'static,
 {
     pub fn start(backend: Arc<Mutex<B>>) -> Result<Self, PresenterError> {
-        Self::start_observed(backend, None)
+        Self::start_inner(
+            backend,
+            #[cfg(any(test, feature = "benchmarking"))]
+            None,
+        )
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn start_observed(backend: Arc<Mutex<B>>, observer: Option<PresentationObserver>) -> Result<Self, PresenterError> {
+        Self::start_inner(backend, observer)
+    }
+
+    fn start_inner(backend: Arc<Mutex<B>>, #[cfg(any(test, feature = "benchmarking"))] observer: Option<PresentationObserver>) -> Result<Self, PresenterError> {
         let queue = Arc::new(LatestFrameQueue::default());
         let failure = Arc::new(Mutex::new(None));
+        #[cfg(any(test, feature = "benchmarking"))]
         let presented = Arc::new(AtomicU64::new(0));
+        #[cfg(any(test, feature = "benchmarking"))]
         let last_epoch = Arc::new(AtomicU64::new(0));
         let thread_backend = Arc::clone(&backend);
         let thread_queue = Arc::clone(&queue);
         let thread_failure = Arc::clone(&failure);
+        #[cfg(any(test, feature = "benchmarking"))]
         let thread_presented = Arc::clone(&presented);
+        #[cfg(any(test, feature = "benchmarking"))]
         let thread_last_epoch = Arc::clone(&last_epoch);
+        #[cfg(any(test, feature = "benchmarking"))]
         let thread_observer = observer;
-        let join = thread::Builder::new()
-            .name("wren-presenter".to_owned())
-            .spawn(move || {
-                wren_scheduling::mark_interactive();
-                presenter_loop(&thread_backend, &thread_queue, &thread_failure, &thread_presented, &thread_last_epoch, thread_observer.as_ref());
-            })
-            .map_err(PresenterError::Spawn)?;
-        Ok(Self { backend, queue, failure, presented, last_epoch, join: Some(join) })
-    }
-
-    #[must_use]
-    pub fn backend(&self) -> Arc<Mutex<B>> {
-        Arc::clone(&self.backend)
+        let join = wren_scheduling::spawn_interactive("wren-presenter", move || {
+            presenter_loop(
+                &thread_backend,
+                &thread_queue,
+                &thread_failure,
+                #[cfg(any(test, feature = "benchmarking"))]
+                &thread_presented,
+                #[cfg(any(test, feature = "benchmarking"))]
+                &thread_last_epoch,
+                #[cfg(any(test, feature = "benchmarking"))]
+                thread_observer.as_ref(),
+            );
+        })
+        .map_err(PresenterError::Spawn)?;
+        let worker = join.thread().clone();
+        Ok(Self {
+            _backend: backend,
+            queue,
+            failure,
+            #[cfg(any(test, feature = "benchmarking"))]
+            presented,
+            #[cfg(any(test, feature = "benchmarking"))]
+            last_epoch,
+            worker,
+            join: Some(join),
+        })
     }
 
     pub fn publish(&self, frame: Arc<DesiredGrid>) -> Result<(), PresenterError> {
         self.check_failure()?;
-        self.queue.publish(frame)
+        self.queue.publish(frame)?;
+        self.worker.unpark();
+        Ok(())
     }
 
     pub fn check_failure(&self) -> Result<(), PresenterError> {
-        let failure = self.failure.lock().map_err(|_| PresenterError::Poisoned)?;
+        let failure = self.failure.lock();
         if let Some(failure) = failure.as_ref() {
             return Err(PresenterError::Backend(failure.clone()));
         }
         Ok(())
     }
 
+    #[cfg(any(test, feature = "benchmarking"))]
     pub fn stats(&self) -> Result<PresenterStats, PresenterError> {
-        let (published_frames, dropped_frames) = self.queue.publication_stats()?;
         Ok(PresenterStats {
-            published_frames,
-            dropped_frames,
+            published_frames: self.queue.published.load(Ordering::Acquire),
+            dropped_frames: self.queue.dropped.load(Ordering::Acquire),
             presented_frames: self.presented.load(Ordering::Acquire),
             last_presented_epoch: self.last_epoch.load(Ordering::Acquire),
         })
@@ -157,11 +192,15 @@ where
     pub fn finish(mut self) -> Result<PresenterStats, PresenterError> {
         self.stop_and_join()?;
         self.check_failure()?;
-        self.stats()
+        #[cfg(any(test, feature = "benchmarking"))]
+        return self.stats();
+        #[cfg(not(any(test, feature = "benchmarking")))]
+        Ok(())
     }
 
     fn stop_and_join(&mut self) -> Result<(), PresenterError> {
         self.queue.stop();
+        self.worker.unpark();
         if let Some(join) = self.join.take() {
             join.join().map_err(|_| PresenterError::Panicked)?;
         }
@@ -183,47 +222,38 @@ fn presenter_loop<B>(
     backend: &Mutex<B>,
     queue: &LatestFrameQueue,
     failure: &Mutex<Option<String>>,
-    presented: &AtomicU64,
-    last_epoch: &AtomicU64,
-    observer: Option<&PresentationObserver>,
+    #[cfg(any(test, feature = "benchmarking"))] presented: &AtomicU64,
+    #[cfg(any(test, feature = "benchmarking"))] last_epoch: &AtomicU64,
+    #[cfg(any(test, feature = "benchmarking"))] observer: Option<&PresentationObserver>,
 ) where
     B: TerminalBackend,
     B::Error: Display,
 {
     let mut last_fully_written: Option<Arc<DesiredGrid>> = None;
-    let mut patches = Vec::<TerminalPatch>::new();
+    let mut update = TerminalUpdate::default();
     loop {
-        let frame = match queue.take() {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return,
-            Err(error) => {
-                store_failure(failure, error.to_string());
-                return;
-            }
-        };
-        diff_into(last_fully_written.as_deref(), &frame, &mut patches);
-        let write_result = backend
-            .lock()
-            .map_err(|_| "terminal backend lock is poisoned".to_owned())
-            .and_then(|mut backend| backend.submit(&patches).map_err(|error| error.to_string()));
+        let Some(frame) = queue.take() else { return };
+        diff_into(last_fully_written.as_deref(), &frame, &mut update);
+        let write_result = backend.lock().submit(&update).map_err(|error| error.to_string());
         if let Err(error) = write_result {
             store_failure(failure, error);
             queue.stop();
             return;
         }
-        last_epoch.store(frame.epoch, Ordering::Release);
-        presented.fetch_add(1, Ordering::AcqRel);
-        if let Some(observer) = observer {
-            observer(frame.epoch);
+        #[cfg(any(test, feature = "benchmarking"))]
+        {
+            last_epoch.store(frame.epoch, Ordering::Release);
+            presented.fetch_add(1, Ordering::AcqRel);
+            if let Some(observer) = observer {
+                observer(frame.epoch);
+            }
         }
         last_fully_written = Some(frame);
     }
 }
 
 fn store_failure(failure: &Mutex<Option<String>>, error: String) {
-    if let Ok(mut failure) = failure.lock() {
-        *failure = Some(error);
-    }
+    *failure.lock() = Some(error);
 }
 
 #[cfg(test)]
@@ -241,7 +271,7 @@ mod tests {
     impl TerminalBackend for SlowBackend {
         type Error = Infallible;
 
-        fn submit(&mut self, _patch: &[wren_view::TerminalPatch]) -> Result<(), Self::Error> {
+        fn submit(&mut self, _update: &wren_view::TerminalUpdate) -> Result<(), Self::Error> {
             thread::sleep(Duration::from_millis(1));
             Ok(())
         }
@@ -270,7 +300,7 @@ mod tests {
     impl TerminalBackend for BrokenBackend {
         type Error = &'static str;
 
-        fn submit(&mut self, _patch: &[wren_view::TerminalPatch]) -> Result<(), Self::Error> {
+        fn submit(&mut self, _update: &wren_view::TerminalUpdate) -> Result<(), Self::Error> {
             Err("write failed")
         }
     }
@@ -289,14 +319,10 @@ mod tests {
         let backend = Arc::new(Mutex::new(SlowBackend));
         let epochs = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&epochs);
-        let observer: PresentationObserver = Arc::new(move |epoch| {
-            if let Ok(mut epochs) = observed.lock() {
-                epochs.push(epoch);
-            }
-        });
+        let observer: PresentationObserver = Arc::new(move |epoch| observed.lock().push(epoch));
         let presenter = Presenter::start_observed(backend, Some(observer)).expect("presenter");
         presenter.publish(grid(3)).expect("publish");
         presenter.finish().expect("finish");
-        assert_eq!(*epochs.lock().expect("epochs"), vec![3]);
+        assert_eq!(*epochs.lock(), vec![3]);
     }
 }

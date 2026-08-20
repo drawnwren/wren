@@ -3,8 +3,8 @@
 mod ex;
 mod expression;
 
-pub use ex::{BufferAction, EX_COMMAND_COMPLETIONS, EX_COMMAND_NAMES, ExAddress, ExCommand, ExError, ExRange, SubstituteFlags, TabAction, parse_ex};
-pub use expression::{ExpressionContext, ExpressionError, Value, evaluate_expression};
+pub use ex::{BufferAction, EX_COMMAND_COMPLETIONS, ExAddress, ExCommand, ExError, ExRange, SubstituteFlags, TabAction, parse_ex};
+pub use expression::{ExpressionContext, ExpressionError, Value, evaluate_expression, expression_editor_text};
 
 use std::num::NonZeroU32;
 
@@ -81,6 +81,14 @@ pub enum Register {
     Expression,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetAction {
+    RecordMacro,
+    ReplayMacro,
+    SetMark,
+    JumpMark { linewise: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     ApplyOperator { operator: Operator, motion: Motion, count: NonZeroU32, register: Option<Register>, range_kind: RangeKind },
@@ -100,17 +108,15 @@ pub enum Command {
     Redo { count: NonZeroU32 },
     SearchNext { reverse: bool, count: NonZeroU32 },
     Repeat { count: NonZeroU32 },
+    Target { action: TargetAction, target: char, count: NonZeroU32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseState {
-    Count { value: NonZeroU32 },
-    Register { count: NonZeroU32 },
-    OperatorPending { operator: Operator, count: NonZeroU32, register: Option<Register> },
-    TextObjectPending { operator: Operator, count: NonZeroU32, register: Option<Register>, around: bool },
-    FindCharacterPending { operator: Option<Operator>, count: NonZeroU32, register: Option<Register>, forward: bool, till: bool },
-    PrefixG { operator: Option<Operator>, count: NonZeroU32, register: Option<Register> },
-    ReplaceCharacterPending { count: NonZeroU32 },
+    Count(NonZeroU32),
+    Register,
+    Operator,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,21 +171,21 @@ fn parse_impl(keys: &[KeyEvent]) -> Result<ParseResult, GrammarError> {
     let prefix_count = parse_count(keys, &mut cursor)?;
     let count = nonzero(prefix_count.unwrap_or(1));
     if cursor == keys.len() {
-        return Ok(ParseResult::Pending(ParseState::Count { value: count }));
+        return Ok(ParseResult::Pending(ParseState::Count(count)));
     }
 
     let mut register = None;
     if char_at(keys, cursor)? == Some('"') {
         cursor += 1;
         if cursor == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::Register { count }));
+            return Ok(ParseResult::Pending(ParseState::Register));
         }
         let character = require_char(keys, cursor)?;
         register = Some(parse_register(character, cursor)?);
         cursor += 1;
     }
     if cursor == keys.len() {
-        return Ok(ParseResult::Pending(ParseState::Register { count }));
+        return Ok(ParseResult::Pending(ParseState::Register));
     }
 
     let key = checked_key(keys, cursor)?;
@@ -189,7 +195,7 @@ fn parse_impl(keys: &[KeyEvent]) -> Result<ParseResult, GrammarError> {
         let combined = count.get().checked_mul(post_count).ok_or(GrammarError::CountOverflow { index: cursor })?;
         let operator_count = nonzero(combined);
         if cursor == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::OperatorPending { operator, count: operator_count, register }));
+            return Ok(ParseResult::Pending(ParseState::Operator));
         }
         let motion_key = checked_key(keys, cursor)?;
         if operator_for(motion_key.code) == Some(operator) {
@@ -203,7 +209,7 @@ fn parse_impl(keys: &[KeyEvent]) -> Result<ParseResult, GrammarError> {
             let around = motion_key.code == KeyCode::Char('a');
             cursor += 1;
             if cursor == keys.len() {
-                return Ok(ParseResult::Pending(ParseState::TextObjectPending { operator, count: operator_count, register, around }));
+                return Ok(ParseResult::Pending(ParseState::Other));
             }
             let object = text_object(require_char(keys, cursor)?, cursor)?;
             return finish(
@@ -218,38 +224,38 @@ fn parse_impl(keys: &[KeyEvent]) -> Result<ParseResult, GrammarError> {
                 },
             );
         }
-        return parse_operator_motion(keys, cursor, operator, operator_count, register);
+        return parse_motion_command(keys, cursor, Some(operator), operator_count, register);
     }
 
     parse_normal_command(keys, cursor, count, register)
 }
 
-fn parse_operator_motion(
+fn parse_motion_command(
     keys: &[KeyEvent],
     cursor: usize,
-    operator: Operator,
+    operator: Option<Operator>,
     count: NonZeroU32,
     register: Option<Register>,
 ) -> Result<ParseResult, GrammarError> {
     let key = checked_key(keys, cursor)?;
-    if matches!(key.code, KeyCode::Char('f' | 'F' | 't' | 'T')) {
-        let forward = matches!(key.code, KeyCode::Char('f' | 't'));
-        let till = matches!(key.code, KeyCode::Char('t' | 'T'));
-        if cursor + 1 == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::FindCharacterPending { operator: Some(operator), count, register, forward, till }));
+    let (motion, end) = match key.code {
+        KeyCode::Char(character @ ('f' | 'F' | 't' | 'T')) => {
+            let forward = matches!(character, 'f' | 't');
+            let till = matches!(character, 't' | 'T');
+            if cursor + 1 == keys.len() {
+                return Ok(ParseResult::Pending(ParseState::Other));
+            }
+            (Motion::Find { character: require_char(keys, cursor + 1)?, forward, till }, cursor + 2)
         }
-        let character = require_char(keys, cursor + 1)?;
-        return finish_operator(keys, cursor + 2, operator, find_motion(forward, till, character), count, register);
-    }
-    if key.code == KeyCode::Char('g') {
-        if cursor + 1 == keys.len() {
-            return Ok(ParseResult::Pending(ParseState::PrefixG { operator: Some(operator), count, register }));
+        KeyCode::Char('g') => {
+            if cursor + 1 == keys.len() {
+                return Ok(ParseResult::Pending(ParseState::Other));
+            }
+            (g_motion(keys, cursor + 1)?, cursor + 2)
         }
-        let motion = g_motion(keys, cursor + 1)?;
-        return finish_operator(keys, cursor + 2, operator, motion, count, register);
-    }
-    let motion = motion_for(key.code).ok_or(GrammarError::UnexpectedKey { index: cursor, key: key.code })?;
-    finish_operator(keys, cursor + 1, operator, motion, count, register)
+        code => (motion_for(code).ok_or(GrammarError::UnexpectedKey { index: cursor, key: code })?, cursor + 1),
+    };
+    operator.map_or_else(|| finish(keys, end, Command::Move { motion, count }), |operator| finish_operator(keys, end, operator, motion, count, register))
 }
 
 fn finish_operator(
@@ -280,19 +286,37 @@ fn finish_operator(
 fn parse_normal_command(keys: &[KeyEvent], cursor: usize, count: NonZeroU32, register: Option<Register>) -> Result<ParseResult, GrammarError> {
     let key = checked_key(keys, cursor)?;
     match key.code {
-        KeyCode::Char('g') => parse_g_command(keys, cursor, count, register),
-        KeyCode::Char('f' | 'F' | 't' | 'T') => parse_find_command(keys, cursor, key.code, count, register),
+        KeyCode::Char('g' | 'f' | 'F' | 't' | 'T') => parse_motion_command(keys, cursor, None, count, register),
         KeyCode::Char('r') => parse_replace_command(keys, cursor, count),
+        KeyCode::Char(prefix @ ('q' | '@' | 'm' | '\'' | '`')) if register.is_none() => parse_target_command(keys, cursor, count, target_action(prefix)),
         code => finish(keys, cursor + 1, simple_normal_command(code, cursor, count, register)?),
     }
 }
 
-fn parse_g_command(keys: &[KeyEvent], cursor: usize, count: NonZeroU32, register: Option<Register>) -> Result<ParseResult, GrammarError> {
+fn parse_target_command(keys: &[KeyEvent], cursor: usize, count: NonZeroU32, action: TargetAction) -> Result<ParseResult, GrammarError> {
     if cursor + 1 == keys.len() {
-        return Ok(ParseResult::Pending(ParseState::PrefixG { operator: None, count, register }));
+        return Ok(ParseResult::Pending(ParseState::Other));
     }
-    let motion = g_motion(keys, cursor + 1)?;
-    finish(keys, cursor + 2, Command::Move { motion, count })
+    let target = require_char(keys, cursor + 1)?;
+    let valid = match action {
+        TargetAction::RecordMacro => target.is_ascii_alphanumeric(),
+        TargetAction::SetMark => target.is_ascii_alphabetic(),
+        TargetAction::ReplayMacro | TargetAction::JumpMark { .. } => true,
+    };
+    if !valid {
+        return Err(GrammarError::UnexpectedKey { index: cursor + 1, key: KeyCode::Char(target) });
+    }
+    finish(keys, cursor + 2, Command::Target { action, target, count })
+}
+
+const fn target_action(prefix: char) -> TargetAction {
+    match prefix {
+        'q' => TargetAction::RecordMacro,
+        '@' => TargetAction::ReplayMacro,
+        'm' => TargetAction::SetMark,
+        '\'' => TargetAction::JumpMark { linewise: true },
+        _ => TargetAction::JumpMark { linewise: false },
+    }
 }
 
 fn g_motion(keys: &[KeyEvent], cursor: usize) -> Result<Motion, GrammarError> {
@@ -310,24 +334,9 @@ fn g_motion(keys: &[KeyEvent], cursor: usize) -> Result<Motion, GrammarError> {
     Ok(motion)
 }
 
-fn parse_find_command(keys: &[KeyEvent], cursor: usize, code: KeyCode, count: NonZeroU32, register: Option<Register>) -> Result<ParseResult, GrammarError> {
-    let forward = matches!(code, KeyCode::Char('f' | 't'));
-    let till = matches!(code, KeyCode::Char('t' | 'T'));
-    if cursor + 1 == keys.len() {
-        return Ok(ParseResult::Pending(ParseState::FindCharacterPending { operator: None, count, register, forward, till }));
-    }
-    let character = require_char(keys, cursor + 1)?;
-    let motion = find_motion(forward, till, character);
-    finish(keys, cursor + 2, Command::Move { motion, count })
-}
-
-const fn find_motion(forward: bool, till: bool, character: char) -> Motion {
-    Motion::Find { character, forward, till }
-}
-
 fn parse_replace_command(keys: &[KeyEvent], cursor: usize, count: NonZeroU32) -> Result<ParseResult, GrammarError> {
     if cursor + 1 == keys.len() {
-        return Ok(ParseResult::Pending(ParseState::ReplaceCharacterPending { count }));
+        return Ok(ParseResult::Pending(ParseState::Other));
     }
     finish(keys, cursor + 2, Command::ReplaceChar { character: require_char(keys, cursor + 1)?, count })
 }
@@ -531,10 +540,7 @@ mod tests {
                     range_kind: RangeKind::CharacterWise,
                 }),
             ),
-            (
-                "2\"ad",
-                ParseResult::Pending(ParseState::OperatorPending { operator: Operator::Delete, count: nonzero(2), register: Some(Register::Named('a')) }),
-            ),
+            ("2\"ad", ParseResult::Pending(ParseState::Operator)),
             (
                 "2\"ad3w",
                 ParseResult::Command(Command::ApplyOperator {
@@ -558,7 +564,7 @@ mod tests {
 
     #[test]
     fn expression_register_is_typed_but_expression_input_stays_outside_key_grammar() {
-        assert!(matches!(Grammar.parse(&keys("\"=")), ParseResult::Pending(ParseState::Register { .. })));
+        assert_eq!(Grammar.parse(&keys("\"=")), ParseResult::Pending(ParseState::Register));
         assert!(matches!(Grammar.parse(&keys("\"=p")), ParseResult::Command(Command::Paste { register: Some(Register::Expression), .. })));
     }
 }

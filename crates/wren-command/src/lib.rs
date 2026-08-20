@@ -1,22 +1,15 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashMap;
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(any(test, feature = "benchmarking"))]
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use thiserror::Error;
 use wren_types::{CommandTask, CommandTaskId, DocumentId, Effects};
-
-type TaskWork = Box<dyn FnOnce(&mut TaskContext) -> Result<Effects, TaskFailure> + Send + 'static>;
-
-enum WorkerMessage {
-    Run { task: CommandTask, cancellation: CancellationToken, work: TaskWork },
-    Stop,
-}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TaskFailure {
@@ -30,27 +23,17 @@ pub enum TaskFailure {
 
 #[derive(Debug, Error)]
 pub enum TaskRunnerError {
-    #[error("task queue is closed")]
-    QueueClosed,
     #[error("task queue is full")]
     QueueFull,
     #[error("spawn task worker: {0}")]
-    Spawn(#[source] io::Error),
-    #[error("task runner lock is poisoned")]
-    Poisoned,
+    Spawn(Box<str>),
     #[error("task ID {0:?} is already running")]
     DuplicateTask(CommandTaskId),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl CancellationToken {
@@ -72,31 +55,48 @@ impl CancellationToken {
 #[derive(Debug)]
 pub struct TaskContext {
     cancellation: CancellationToken,
+    #[cfg(any(test, feature = "benchmarking"))]
     last_checkpoint: Instant,
+    #[cfg(any(test, feature = "benchmarking"))]
     max_checkpoint_gap: Duration,
+    #[cfg(any(test, feature = "benchmarking"))]
     checkpoints: u64,
 }
 
 impl TaskContext {
     fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation, last_checkpoint: Instant::now(), max_checkpoint_gap: Duration::ZERO, checkpoints: 0 }
+        Self {
+            cancellation,
+            #[cfg(any(test, feature = "benchmarking"))]
+            last_checkpoint: Instant::now(),
+            #[cfg(any(test, feature = "benchmarking"))]
+            max_checkpoint_gap: Duration::ZERO,
+            #[cfg(any(test, feature = "benchmarking"))]
+            checkpoints: 0,
+        }
     }
 
     pub fn checkpoint(&mut self) -> Result<(), TaskFailure> {
-        self.checkpoint_with(thread::yield_now)
+        self.checkpoint_with(std::thread::yield_now)
     }
 
     fn checkpoint_with(&mut self, yield_worker: impl FnOnce()) -> Result<(), TaskFailure> {
-        let now = Instant::now();
-        self.max_checkpoint_gap = self.max_checkpoint_gap.max(now.saturating_duration_since(self.last_checkpoint));
-        self.checkpoints = self.checkpoints.saturating_add(1);
+        #[cfg(any(test, feature = "benchmarking"))]
+        {
+            let now = Instant::now();
+            self.max_checkpoint_gap = self.max_checkpoint_gap.max(now.saturating_duration_since(self.last_checkpoint));
+            self.checkpoints = self.checkpoints.saturating_add(1);
+        }
         if self.cancellation.is_cancelled() {
             return Err(TaskFailure::Cancelled);
         }
         yield_worker();
         // A scheduler stall after yielding is time made available to the UI,
         // not time during which this task withheld its next checkpoint.
-        self.last_checkpoint = Instant::now();
+        #[cfg(any(test, feature = "benchmarking"))]
+        {
+            self.last_checkpoint = Instant::now();
+        }
         Ok(())
     }
 
@@ -110,8 +110,11 @@ impl TaskContext {
 pub struct TaskResult {
     pub task: CommandTask,
     pub outcome: Result<Effects, TaskFailure>,
+    #[cfg(feature = "benchmarking")]
     pub elapsed: Duration,
+    #[cfg(feature = "benchmarking")]
     pub max_checkpoint_gap: Duration,
+    #[cfg(any(test, feature = "benchmarking"))]
     pub checkpoints: u64,
 }
 
@@ -122,30 +125,32 @@ struct BarrierState {
 }
 
 pub struct TaskRunner {
-    sender: SyncSender<WorkerMessage>,
+    pool: rayon::ThreadPool,
     results: Receiver<TaskResult>,
+    result_sender: Sender<TaskResult>,
     barriers: Arc<Mutex<BarrierState>>,
-    workers: Vec<JoinHandle<()>>,
+    pending: Arc<AtomicUsize>,
+    capacity: usize,
 }
 
 impl TaskRunner {
     pub fn new(worker_count: usize, queue_capacity: usize) -> Result<Self, TaskRunnerError> {
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity.max(1));
-        let receiver = Arc::new(Mutex::new(receiver));
+        let workers = worker_count.max(1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("wren-command-{index}"))
+            .start_handler(|_| wren_scheduling::mark_background())
+            .build()
+            .map_err(|error| TaskRunnerError::Spawn(error.to_string().into()))?;
         let (result_sender, results) = mpsc::channel();
-        let barriers = Arc::new(Mutex::new(BarrierState::default()));
-        let mut workers = Vec::with_capacity(worker_count.max(1));
-        for index in 0..worker_count.max(1) {
-            let receiver = Arc::clone(&receiver);
-            let result_sender = result_sender.clone();
-            let barriers = Arc::clone(&barriers);
-            let worker = thread::Builder::new()
-                .name(format!("wren-command-{index}"))
-                .spawn(move || worker_loop(&receiver, &result_sender, &barriers))
-                .map_err(TaskRunnerError::Spawn)?;
-            workers.push(worker);
-        }
-        Ok(Self { sender, results, barriers, workers })
+        Ok(Self {
+            pool,
+            results,
+            result_sender,
+            barriers: Arc::new(Mutex::new(BarrierState::default())),
+            pending: Arc::new(AtomicUsize::new(0)),
+            capacity: workers.saturating_add(queue_capacity.max(1)),
+        })
     }
 
     pub fn submit(
@@ -153,87 +158,56 @@ impl TaskRunner {
         task: CommandTask,
         work: impl FnOnce(&mut TaskContext) -> Result<Effects, TaskFailure> + Send + 'static,
     ) -> Result<CancellationToken, TaskRunnerError> {
-        {
-            let mut barriers = self.barriers.lock().map_err(|_| TaskRunnerError::Poisoned)?;
-            if barriers.tasks.contains_key(&task.task_id) {
-                return Err(TaskRunnerError::DuplicateTask(task.task_id));
-            }
-            for document_id in &task.affected_documents {
-                *barriers.documents.entry(*document_id).or_default() += 1;
-            }
-            barriers.tasks.insert(task.task_id, task.affected_documents.clone());
+        let mut barriers = self.barriers.lock();
+        if barriers.tasks.contains_key(&task.task_id) {
+            return Err(TaskRunnerError::DuplicateTask(task.task_id));
         }
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| (pending < self.capacity).then_some(pending + 1))
+            .map_err(|_| TaskRunnerError::QueueFull)?;
+        for document_id in &task.affected_documents {
+            *barriers.documents.entry(*document_id).or_default() += 1;
+        }
+        barriers.tasks.insert(task.task_id, task.affected_documents.clone());
+        drop(barriers);
         let cancellation = CancellationToken::new();
-        match self.sender.try_send(WorkerMessage::Run { task: task.clone(), cancellation: cancellation.clone(), work: Box::new(work) }) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                release_barrier(&self.barriers, task.task_id);
-                return Err(TaskRunnerError::QueueFull);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                release_barrier(&self.barriers, task.task_id);
-                return Err(TaskRunnerError::QueueClosed);
-            }
-        }
+        let worker_cancellation = cancellation.clone();
+        let barriers = Arc::clone(&self.barriers);
+        let pending = Arc::clone(&self.pending);
+        let results = self.result_sender.clone();
+        self.pool.spawn(move || {
+            #[cfg(feature = "benchmarking")]
+            let started = Instant::now();
+            let mut context = TaskContext::new(worker_cancellation);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut context))).unwrap_or(Err(TaskFailure::Panicked));
+            release_barrier(&barriers, task.task_id);
+            pending.fetch_sub(1, Ordering::AcqRel);
+            let _ = results.send(TaskResult {
+                task,
+                outcome,
+                #[cfg(feature = "benchmarking")]
+                elapsed: started.elapsed(),
+                #[cfg(feature = "benchmarking")]
+                max_checkpoint_gap: context.max_checkpoint_gap,
+                #[cfg(any(test, feature = "benchmarking"))]
+                checkpoints: context.checkpoints,
+            });
+        });
         Ok(cancellation)
     }
 
-    pub fn try_result(&self) -> Result<Option<TaskResult>, TaskRunnerError> {
-        match self.results.try_recv() {
-            Ok(result) => Ok(Some(result)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(TaskRunnerError::QueueClosed),
-        }
+    pub fn try_result(&self) -> Option<TaskResult> {
+        self.results.try_recv().ok()
     }
 
     #[must_use]
     pub fn is_document_blocked(&self, document_id: DocumentId) -> bool {
-        self.barriers.lock().ok().is_some_and(|barriers| barriers.documents.contains_key(&document_id))
+        self.barriers.lock().documents.contains_key(&document_id)
     }
 }
 
-impl Drop for TaskRunner {
-    fn drop(&mut self) {
-        for _ in &self.workers {
-            let _ = self.sender.send(WorkerMessage::Stop);
-        }
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn worker_loop(receiver: &Mutex<mpsc::Receiver<WorkerMessage>>, results: &mpsc::Sender<TaskResult>, barriers: &Mutex<BarrierState>) {
-    loop {
-        let message = match receiver.lock() {
-            Ok(receiver) => receiver.recv(),
-            Err(_) => return,
-        };
-        let Ok(message) = message else {
-            return;
-        };
-        let WorkerMessage::Run { task, cancellation, work } = message else {
-            return;
-        };
-        let started = Instant::now();
-        let mut context = TaskContext::new(cancellation);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut context))).unwrap_or(Err(TaskFailure::Panicked));
-        let elapsed = started.elapsed();
-        release_barrier_direct(barriers, task.task_id);
-        let _ = results.send(TaskResult { task, outcome, elapsed, max_checkpoint_gap: context.max_checkpoint_gap, checkpoints: context.checkpoints });
-    }
-}
-
-fn release_barrier(barriers: &Arc<Mutex<BarrierState>>, task_id: CommandTaskId) {
-    if let Ok(mut barriers) = barriers.lock() {
-        release_barrier_state(&mut barriers, task_id);
-    }
-}
-
-fn release_barrier_direct(barriers: &Mutex<BarrierState>, task_id: CommandTaskId) {
-    if let Ok(mut barriers) = barriers.lock() {
-        release_barrier_state(&mut barriers, task_id);
-    }
+fn release_barrier(barriers: &Mutex<BarrierState>, task_id: CommandTaskId) {
+    release_barrier_state(&mut barriers.lock(), task_id);
 }
 
 fn release_barrier_state(barriers: &mut BarrierState, task_id: CommandTaskId) {
@@ -254,6 +228,7 @@ fn release_barrier_state(barriers: &mut BarrierState, task_id: CommandTaskId) {
 mod tests {
     use std::cell::Cell;
     use std::sync::mpsc;
+    use std::thread;
 
     use super::*;
 
@@ -264,7 +239,7 @@ mod tests {
     fn wait_result(runner: &TaskRunner) -> TaskResult {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some(result) = runner.try_result().expect("poll result") {
+            if let Some(result) = runner.try_result() {
                 return result;
             }
             assert!(Instant::now() < deadline, "task timed out");

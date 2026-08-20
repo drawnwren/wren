@@ -22,17 +22,16 @@ fn language_bundle(language_id: &str) -> LanguageBundle {
 #[test]
 fn provider_is_a_restartable_process_failure_boundary() {
     let executable = env!("CARGO_BIN_EXE_wren-client-providers");
-    let mut supervisor = ProviderSupervisor::spawn(executable).expect("spawn provider");
+    let mut supervisor = ProviderSupervisor::spawn_with_args(executable, std::iter::empty::<&str>()).expect("spawn provider");
     assert_eq!(supervisor.request(&ProviderRequest::Hello { protocol: 1 }).expect("hello"), ProviderResponse::Hello { protocol: 1 });
     assert!(supervisor.request(&ProviderRequest::CrashForTest).is_err());
-    assert_eq!(supervisor.restart_count(), 1);
     assert_eq!(supervisor.request(&ProviderRequest::Hello { protocol: 1 }).expect("hello after restart"), ProviderResponse::Hello { protocol: 1 });
 }
 
 #[test]
 fn provider_process_loads_nix_tree_sitter_without_runtime_installation() {
     let executable = env!("CARGO_BIN_EXE_wren-client-providers");
-    let mut supervisor = ProviderSupervisor::spawn(executable).expect("spawn provider");
+    let mut supervisor = ProviderSupervisor::spawn_with_args(executable, std::iter::empty::<&str>()).expect("spawn provider");
     let source = "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n";
     let document_id = DocumentId::new(7);
     let revision = DocumentRevision::new(0);

@@ -14,27 +14,35 @@ pub fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
 
 pub fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
     ranges.sort_by_key(|range| (range.start, range.end));
-    let mut written = 0;
-    for current in 0..ranges.len() {
-        if written > 0 && ranges[current].start <= ranges[written - 1].end {
-            ranges[written - 1].end = ranges[written - 1].end.max(ranges[current].end);
-        } else {
-            if written != current {
-                ranges.swap(written, current);
-            }
-            written += 1;
+    ranges.dedup_by(|next, current| {
+        let overlaps = next.start <= current.end;
+        if overlaps {
+            current.end = current.end.max(next.end);
         }
-    }
-    ranges.truncate(written);
+        overlaps
+    });
 }
 
 #[must_use]
-pub fn floor_char_boundary(text: &str, mut byte: usize) -> usize {
-    byte = byte.min(text.len());
-    while byte > 0 && !text.is_char_boundary(byte) {
-        byte -= 1;
-    }
-    byte
+pub fn floor_char_boundary(text: &str, byte: usize) -> usize {
+    text.floor_char_boundary(byte.min(text.len()))
+}
+
+#[must_use]
+pub fn identifier_prefix_start(text: &str, byte: usize) -> usize {
+    let byte = floor_char_boundary(text, byte);
+    text[..byte].char_indices().rev().take_while(|(_, character)| character.is_alphanumeric() || *character == '_').last().map_or(byte, |(offset, _)| offset)
+}
+
+#[must_use]
+pub fn identifier_range(text: &str, byte: usize) -> Range<usize> {
+    let byte = floor_char_boundary(text, byte);
+    let end = text[byte..]
+        .char_indices()
+        .take_while(|(_, character)| character.is_alphanumeric() || *character == '_')
+        .last()
+        .map_or(byte, |(offset, character)| byte + offset + character.len_utf8());
+    identifier_prefix_start(text, byte)..end
 }
 
 /// Stable, platform-independent FNV-1a identity for persisted names and
@@ -74,6 +82,7 @@ pub enum KeyCode {
     Down,
 }
 
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub code: KeyCode,
@@ -81,17 +90,14 @@ pub struct KeyEvent {
 }
 
 impl KeyEvent {
-    #[must_use]
     pub const fn plain(code: KeyCode) -> Self {
         Self { code, modifiers: Modifiers::empty() }
     }
 
-    #[must_use]
     pub const fn character(character: char) -> Self {
         Self::plain(KeyCode::Char(character))
     }
 
-    #[must_use]
     pub const fn modified(code: KeyCode, modifiers: Modifiers) -> Self {
         Self { code, modifiers }
     }
@@ -115,6 +121,11 @@ impl KeyEvent {
     pub const fn super_key(self) -> bool {
         self.modifiers.contains(Modifiers::SUPER)
     }
+
+    #[must_use]
+    pub const fn command_modified(self) -> bool {
+        self.modifiers.intersects(Modifiers::CONTROL.union(Modifiers::ALT).union(Modifiers::SUPER))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +141,6 @@ impl RgbColor {
         Self { red, green, blue }
     }
 
-    #[must_use]
     pub fn from_hex(value: &str) -> Option<Self> {
         let value = value.strip_prefix('#').unwrap_or(value);
         (value.len() == 6).then_some(Self {
@@ -141,50 +151,75 @@ impl RgbColor {
     }
 }
 
-macro_rules! id_type {
-    ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        pub struct $name(u64);
+const ID_NAMES: [&str; 21] = [
+    "DocumentId",
+    "BufferId",
+    "WindowId",
+    "TabId",
+    "DecorationNamespaceId",
+    "ExtmarkId",
+    "DocumentRevision",
+    "ClientSequence",
+    "LeaseEpoch",
+    "ClientId",
+    "MutationId",
+    "SessionId",
+    "SessionEpoch",
+    "SessionSequence",
+    "SemanticGroupId",
+    "WorkspaceGeneration",
+    "ViewId",
+    "ConfigGeneration",
+    "CommandTaskId",
+    "PersistBatchId",
+    "ProviderGeneration",
+];
 
-        impl $name {
-            #[must_use]
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Id<const KIND: usize>(u64);
 
-            #[must_use]
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-        }
-    };
+impl<const KIND: usize> Id<KIND> {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
-id_type!(DocumentId);
-id_type!(BufferId);
-id_type!(WindowId);
-id_type!(TabId);
-id_type!(FloatingSurfaceId);
-id_type!(DecorationNamespaceId);
-id_type!(ExtmarkId);
-id_type!(DocumentRevision);
-id_type!(ClientSequence);
-id_type!(LeaseEpoch);
-id_type!(ClientId);
-id_type!(MutationId);
-id_type!(SessionId);
-id_type!(SessionEpoch);
-id_type!(SessionSequence);
-id_type!(SemanticGroupId);
-id_type!(WorkspaceGeneration);
-id_type!(ViewId);
-id_type!(ConfigGeneration);
-id_type!(CommandTaskId);
-id_type!(PersistBatchId);
-id_type!(ProviderGeneration);
+impl<const KIND: usize> std::fmt::Debug for Id<KIND> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple(ID_NAMES.get(KIND).copied().unwrap_or("Id")).field(&self.0).finish()
+    }
+}
 
-impl DocumentRevision {
-    #[must_use]
+pub type DocumentId = Id<0>;
+pub type BufferId = Id<1>;
+pub type WindowId = Id<2>;
+pub type TabId = Id<3>;
+pub type DocumentRevision = Id<6>;
+pub type ClientSequence = Id<7>;
+pub type LeaseEpoch = Id<8>;
+pub type ClientId = Id<9>;
+pub type MutationId = Id<10>;
+pub type SessionId = Id<11>;
+pub type SessionEpoch = Id<12>;
+pub type SessionSequence = Id<13>;
+pub type SemanticGroupId = Id<14>;
+pub type WorkspaceGeneration = Id<15>;
+#[cfg(any(test, feature = "benchmarking"))]
+pub type ViewId = Id<16>;
+#[cfg(any(test, feature = "benchmarking", feature = "test-support"))]
+pub type ConfigGeneration = Id<17>;
+pub type CommandTaskId = Id<18>;
+#[cfg(any(test, feature = "test-support"))]
+pub type PersistBatchId = Id<19>;
+pub type ProviderGeneration = Id<20>;
+
+impl Id<6> {
     pub const fn next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),
@@ -217,6 +252,7 @@ pub struct Transaction {
     /// the final byte edits alone (for example, an edit at a collapsed edge).
     #[doc(hidden)]
     #[serde(skip)]
+    #[cfg(test)]
     composition: Option<Box<Composition>>,
 }
 
@@ -234,18 +270,11 @@ impl TryFrom<TransactionData> for Transaction {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Composition {
     first: Transaction,
     second: Transaction,
-}
-
-/// A transaction whose structural invariants have already been checked.
-/// Reusing this view avoids validating the same immutable edit list for every
-/// anchor in decoration, selection, and viewport batches.
-#[derive(Debug, Clone, Copy)]
-pub struct OffsetMapping<'a> {
-    transaction: &'a Transaction,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -258,6 +287,7 @@ pub enum TransactionError {
     OutOfBounds { offset: usize, len: usize },
     #[error("byte offset {offset} is not a UTF-8 character boundary")]
     NotCharBoundary { offset: usize },
+    #[cfg(test)]
     #[error("the following transaction must target revision {expected}, not {actual}")]
     RevisionMismatch { expected: u64, actual: u64 },
     #[error("document revision overflow")]
@@ -268,20 +298,31 @@ pub enum TransactionError {
     DeletedTextCount { expected: usize, actual: usize },
     #[error("deleted text {index} has {actual} bytes; expected {expected}")]
     DeletedTextLength { index: usize, expected: usize, actual: usize },
+    #[cfg(test)]
     #[error("transactions cannot be represented as a monotonic edit composition")]
     InvalidComposition,
 }
 
 impl Transaction {
     pub fn new(base_revision: DocumentRevision, edits: Vec<Edit>) -> Result<Self, TransactionError> {
-        let transaction = Self { base_revision, edits, composition: None };
+        let transaction = Self {
+            base_revision,
+            edits,
+            #[cfg(test)]
+            composition: None,
+        };
         validate_edits(&transaction.edits)?;
         Ok(transaction)
     }
 
     #[must_use]
     pub const fn empty(base_revision: DocumentRevision) -> Self {
-        Self { base_revision, edits: Vec::new(), composition: None }
+        Self {
+            base_revision,
+            edits: Vec::new(),
+            #[cfg(test)]
+            composition: None,
+        }
     }
 
     #[must_use]
@@ -295,17 +336,32 @@ impl Transaction {
     }
 
     /// Reports whether two transactions produce the same anchor mapping even
-    /// when they belong to different document revisions. Composition
-    /// provenance remains part of the comparison because collapsed-edge bias
-    /// can differ despite identical final byte edits.
+    /// when they belong to different document revisions.
     #[must_use]
     pub fn has_same_mapping_as(&self, other: &Self) -> bool {
         self.edits == other.edits
-            && match (&self.composition, &other.composition) {
-                (None, None) => true,
-                (Some(left), Some(right)) => left.first.has_same_mapping_as(&right.first) && left.second.has_same_mapping_as(&right.second),
-                (None, Some(_)) | (Some(_), None) => false,
+    }
+
+    #[must_use]
+    pub fn is_mapping_inverse(&self, next: &Self) -> bool {
+        if self.base_revision.next() != Some(next.base_revision) || self.edits.len() != next.edits.len() {
+            return false;
+        }
+        let mut delta = 0_i128;
+        for (forward, inverse) in self.edits.iter().zip(&next.edits) {
+            let Some(start) = i128::try_from(forward.range.start).ok().and_then(|start| start.checked_add(delta)).and_then(|start| usize::try_from(start).ok())
+            else {
+                return false;
+            };
+            if inverse.range != (start..start.saturating_add(forward.insert.len())) || inverse.insert.len() != forward.range.len() {
+                return false;
             }
+            let (Ok(inserted), Ok(deleted)) = (i128::try_from(forward.insert.len()), i128::try_from(forward.range.len())) else {
+                return false;
+            };
+            delta += inserted - deleted;
+        }
+        true
     }
 
     #[must_use]
@@ -325,30 +381,31 @@ impl Transaction {
     }
 
     pub fn validate_for_text(&self, text: &str) -> Result<(), TransactionError> {
-        for edit in &self.edits {
-            for offset in [edit.range.start, edit.range.end] {
-                if offset > text.len() {
-                    return Err(TransactionError::OutOfBounds { offset, len: text.len() });
-                }
-                if !text.is_char_boundary(offset) {
-                    return Err(TransactionError::NotCharBoundary { offset });
-                }
+        self.validate_boundaries(text.len(), |offset| text.is_char_boundary(offset))
+    }
+
+    pub fn validate_boundaries(&self, len: usize, is_char_boundary: impl Fn(usize) -> bool) -> Result<(), TransactionError> {
+        for offset in self.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]) {
+            if offset > len {
+                return Err(TransactionError::OutOfBounds { offset, len });
+            }
+            if !is_char_boundary(offset) {
+                return Err(TransactionError::NotCharBoundary { offset });
             }
         }
         Ok(())
     }
 
-    /// Validate once before mapping any number of offsets through this
-    /// immutable transaction.
-    pub const fn offset_mapping(&self) -> OffsetMapping<'_> {
-        OffsetMapping { transaction: self }
+    pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
+        self.map_offset_validated(byte, bias)
     }
 
-    pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
-        self.offset_mapping().map_offset(byte, bias)
+    pub fn map_range(&self, range: Range<usize>, start_bias: Bias, end_bias: Bias) -> Result<Range<usize>, TransactionError> {
+        Ok(self.map_offset(range.start, start_bias)?..self.map_offset(range.end, end_bias)?)
     }
 
     fn map_offset_validated(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
+        #[cfg(test)]
         if let Some(composition) = &self.composition {
             let intermediate = composition.first.map_offset_validated(byte, bias)?;
             return composition.second.map_offset_validated(intermediate, bias);
@@ -427,6 +484,7 @@ impl Transaction {
     ///
     /// The implementation uses symbolic base and inserted pieces, so it does not
     /// need the original document contents.
+    #[cfg(test)]
     pub fn then(&self, next: &Self) -> Result<Self, TransactionError> {
         let expected = self.base_revision.next().ok_or(TransactionError::RevisionOverflow)?;
         if next.base_revision != expected {
@@ -476,6 +534,7 @@ impl Transaction {
     }
 
     /// Extracts deleted strings from `base_text` and returns the inverse.
+    #[cfg(test)]
     pub fn inverted_against(&self, base_text: &str) -> Result<Self, TransactionError> {
         self.validate_for_text(base_text)?;
         let mut deleted = Vec::with_capacity(self.edits.len());
@@ -486,6 +545,7 @@ impl Transaction {
         self.invert(&deleted)
     }
 
+    #[cfg(test)]
     fn symbolic_pieces(&self, base_extent: usize) -> Result<Vec<Piece>, TransactionError> {
         let mut pieces = Vec::new();
         let mut cursor = 0;
@@ -524,26 +584,6 @@ fn validate_edits(edits: &[Edit]) -> Result<(), TransactionError> {
     Ok(())
 }
 
-impl OffsetMapping<'_> {
-    #[must_use]
-    pub const fn base_revision(&self) -> DocumentRevision {
-        self.transaction.base_revision
-    }
-
-    #[must_use]
-    pub fn edits(&self) -> &[Edit] {
-        &self.transaction.edits
-    }
-
-    pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
-        self.transaction.map_offset_validated(byte, bias)
-    }
-
-    pub fn map_range(&self, range: Range<usize>, start_bias: Bias, end_bias: Bias) -> Result<Range<usize>, TransactionError> {
-        Ok(self.map_offset(range.start, start_bias)?..self.map_offset(range.end, end_bias)?)
-    }
-}
-
 fn usize_from_i128(value: i128) -> Result<usize, TransactionError> {
     usize::try_from(value).map_err(|_| TransactionError::OffsetOverflow)
 }
@@ -562,11 +602,7 @@ pub struct Anchor {
 
 impl Anchor {
     pub fn map_through(self, transaction: &Transaction) -> Result<Self, TransactionError> {
-        self.map_with(&transaction.offset_mapping())
-    }
-
-    pub fn map_with(self, mapping: &OffsetMapping<'_>) -> Result<Self, TransactionError> {
-        Ok(Self { byte: mapping.map_offset(self.byte, self.bias)?, bias: self.bias })
+        Ok(Self { byte: transaction.map_offset(self.byte, self.bias)?, bias: self.bias })
     }
 }
 
@@ -588,10 +624,6 @@ impl SelectionSet {
     }
 
     pub fn map_through(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
-        self.map_with(&transaction.offset_mapping())
-    }
-
-    pub fn map_with(&self, mapping: &OffsetMapping<'_>) -> Result<Self, TransactionError> {
         let mut ranges = Vec::with_capacity(self.ranges.len());
         for range in &self.ranges {
             let (anchor_bias, head_bias) = if range.anchor < range.head {
@@ -601,7 +633,7 @@ impl SelectionSet {
             } else {
                 (Bias::Right, Bias::Right)
             };
-            ranges.push(SelRange { anchor: mapping.map_offset(range.anchor, anchor_bias)?, head: mapping.map_offset(range.head, head_bias)? });
+            ranges.push(SelRange { anchor: transaction.map_offset(range.anchor, anchor_bias)?, head: transaction.map_offset(range.head, head_bias)? });
         }
         Ok(Self { primary: self.primary, ranges })
     }
@@ -661,20 +693,7 @@ impl DocumentClass {
 
     #[must_use]
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Large => "large",
-            Self::Pathological => "pathological",
-        }
-    }
-
-    #[must_use]
-    pub const fn status_suffix(self) -> &'static str {
-        match self {
-            Self::Normal => "",
-            Self::Large => " [large]",
-            Self::Pathological => " [pathological]",
-        }
+        ["normal", "large", "pathological"][self as usize]
     }
 
     #[must_use]
@@ -701,34 +720,26 @@ impl DocumentClass {
 
     #[must_use]
     pub const fn policy(self) -> DocumentPolicy {
-        match self {
-            Self::Normal => DocumentPolicy {
-                syntax_cpu_budget_micros: 2_000,
-                whole_document_syntax: true,
-                lsp_freshness_slo_millis: Some(250),
-                native_completion: true,
-                incremental_git_diff_budget_bytes: 4 * 1_048_576,
-                display_work_budget_cells: 1_000_000,
-                approximate_display_columns: false,
-            },
-            Self::Large => DocumentPolicy {
-                syntax_cpu_budget_micros: 1_000,
-                whole_document_syntax: false,
-                lsp_freshness_slo_millis: None,
-                native_completion: true,
-                incremental_git_diff_budget_bytes: 512 * 1_024,
-                display_work_budget_cells: 250_000,
-                approximate_display_columns: false,
-            },
-            Self::Pathological => DocumentPolicy {
-                syntax_cpu_budget_micros: 250,
-                whole_document_syntax: false,
-                lsp_freshness_slo_millis: None,
-                native_completion: true,
-                incremental_git_diff_budget_bytes: 64 * 1_024,
-                display_work_budget_cells: 32_768,
-                approximate_display_columns: true,
-            },
+        let (
+            syntax_cpu_budget_micros,
+            whole_document_syntax,
+            lsp_freshness_slo_millis,
+            incremental_git_diff_budget_bytes,
+            display_work_budget_cells,
+            approximate_display_columns,
+        ) = [
+            (2_000, true, Some(250), 4 * 1_048_576, 1_000_000, false),
+            (1_000, false, None, 512 * 1_024, 250_000, false),
+            (250, false, None, 64 * 1_024, 32_768, true),
+        ][self as usize];
+        DocumentPolicy {
+            syntax_cpu_budget_micros,
+            whole_document_syntax,
+            lsp_freshness_slo_millis,
+            native_completion: true,
+            incremental_git_diff_budget_bytes,
+            display_work_budget_cells,
+            approximate_display_columns,
         }
     }
 }
@@ -739,6 +750,15 @@ pub enum Priority {
     NearViewport,
     Visible,
     Interactive,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum DurabilityFrontier {
+    Applied,
+    LocalDurable,
+    RemoteDurable,
+    Persisted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,12 +829,14 @@ impl LanguageBundle {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteFrameAuthority {
     Correct,
     Speculative,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteOpenState {
     CachedHeadValidated { revision: DocumentRevision },
@@ -823,6 +845,7 @@ pub enum RemoteOpenState {
     Materialized { authoritative_revision: DocumentRevision, content_hash: [u8; 32] },
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl RemoteOpenState {
     #[must_use]
     pub const fn frame_authority(&self) -> RemoteFrameAuthority {
@@ -838,11 +861,6 @@ impl RemoteOpenState {
     #[must_use]
     pub const fn editing_enabled(&self) -> bool {
         matches!(self, Self::CachedHeadValidated { .. } | Self::Materialized { .. })
-    }
-
-    #[must_use]
-    pub const fn whole_document_operations_enabled(&self) -> bool {
-        self.editing_enabled()
     }
 }
 
@@ -1019,6 +1037,7 @@ pub struct FileIdentity {
     pub generation: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateCheckpoint {
     pub client_id: ClientId,
@@ -1061,20 +1080,14 @@ pub enum ResumeResult {
     SnapshotRequired { new_session_epoch: SessionEpoch, workspace_generation: WorkspaceGeneration, document_heads: Vec<DocumentFrontier> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum DurabilityFrontier {
-    Applied,
-    LocalDurable,
-    RemoteDurable,
-    Persisted,
-}
-
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceTransaction {
     pub document_edits: Vec<DocumentMutation>,
     pub resource_ops: Vec<ResourceOp>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResourceOp {
     Create { path: Box<str>, expected_absent: bool },
@@ -1082,12 +1095,14 @@ pub enum ResourceOp {
     Delete { path: Box<str>, expected_identity: FileIdentity },
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpectedTarget {
     Absent,
     Identity(FileIdentity),
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeViewState {
     pub client_id: ClientId,
@@ -1108,6 +1123,7 @@ pub struct DocumentHead {
     pub authoritative_revision: DocumentRevision,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedViewportKey {
     pub client_id: ClientId,
@@ -1120,6 +1136,7 @@ pub struct PublishedViewportKey {
     pub renderer_version: u32,
 }
 
+#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadValidation {
     Correct,
@@ -1183,19 +1200,9 @@ pub struct EditProposal {
     pub label: Box<str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UiEffect {
-    OpenDocument { document_id: DocumentId },
-    RevealRange { document_id: DocumentId, range: Range<usize> },
-    ShowPicker { provider: Box<str> },
-    Notify { message: Box<str> },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Effects {
     pub edit_proposals: Vec<EditProposal>,
-    pub workspace_transactions: Vec<WorkspaceTransaction>,
-    pub ui_effects: Vec<UiEffect>,
     pub messages: Vec<Box<str>>,
 }
 
@@ -1206,18 +1213,14 @@ pub struct CommandTask {
     pub label: Box<str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CommandOutcome {
-    Immediate(Effects),
-    Pending(CommandTask),
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Piece {
     Base(Range<usize>),
     Inserted { text: Box<str>, anchor: usize },
 }
 
+#[cfg(test)]
 impl Piece {
     fn len(&self) -> usize {
         match self {
@@ -1227,6 +1230,7 @@ impl Piece {
     }
 }
 
+#[cfg(test)]
 fn apply_symbolic_edits(pieces: &[Piece], edits: &[Edit], base_extent: usize) -> Result<Vec<Piece>, TransactionError> {
     let total_len = pieces.iter().try_fold(0_usize, |sum, piece| sum.checked_add(piece.len())).ok_or(TransactionError::OffsetOverflow)?;
     let mut output = Vec::new();
@@ -1246,6 +1250,7 @@ fn apply_symbolic_edits(pieces: &[Piece], edits: &[Edit], base_extent: usize) ->
     Ok(coalesce_pieces(output))
 }
 
+#[cfg(test)]
 fn slice_pieces(pieces: &[Piece], wanted: Range<usize>) -> Result<Vec<Piece>, TransactionError> {
     if wanted.start > wanted.end {
         return Err(TransactionError::ReversedRange { start: wanted.start, end: wanted.end });
@@ -1275,6 +1280,7 @@ fn slice_pieces(pieces: &[Piece], wanted: Range<usize>) -> Result<Vec<Piece>, Tr
     Ok(output)
 }
 
+#[cfg(test)]
 fn coalesce_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
     let mut output: Vec<Piece> = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -1296,6 +1302,7 @@ fn coalesce_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
     output
 }
 
+#[cfg(test)]
 fn pieces_to_edits(pieces: &[Piece], base_extent: usize) -> Result<Vec<Edit>, TransactionError> {
     let mut edits = Vec::new();
     let mut base_cursor = 0;
@@ -1331,6 +1338,7 @@ fn pieces_to_edits(pieces: &[Piece], base_extent: usize) -> Result<Vec<Edit>, Tr
     Ok(edits)
 }
 
+#[cfg(test)]
 fn anchor_at_position(pieces: &[Piece], position: usize, base_extent: usize) -> Result<usize, TransactionError> {
     let mut offset = 0_usize;
     for piece in pieces {
@@ -1464,7 +1472,7 @@ mod tests {
         let progressive = RemoteOpenState::Progressive { authoritative_revision: DocumentRevision::new(7), received_bytes: 1_024, total_bytes: 8_192 };
         assert_eq!(progressive.frame_authority(), RemoteFrameAuthority::Speculative);
         assert!(!progressive.editing_enabled());
-        assert!(!progressive.whole_document_operations_enabled());
+        assert!(!progressive.editing_enabled());
         let cached = RemoteOpenState::CachedHeadValidated { revision: DocumentRevision::new(7) };
         assert_eq!(cached.frame_authority(), RemoteFrameAuthority::Correct);
         assert!(cached.editing_enabled());

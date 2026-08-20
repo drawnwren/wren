@@ -1,8 +1,17 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use super::*;
+
+fn row_text(row: &CellRow) -> String {
+    row.cells.iter().map(|cell| cell.grapheme.as_str()).collect()
+}
+
+fn grid_text(grid: &DesiredGrid) -> String {
+    grid.rows.iter().map(|row| row_text(row)).collect::<Vec<_>>().join("\n")
+}
 
 // Debug unit tests share the process with dozens of parser/provider threads;
 // release keeps the product budget while the hard isolated distributions live
@@ -23,15 +32,7 @@ fn terminal_control(character: char) -> TerminalKey {
     TerminalKey::modified(TerminalKeyCode::Char(character), Modifiers::CONTROL)
 }
 
-trait TestAppInput {
-    fn test_key(&mut self, key: TerminalKey);
-    fn test_input(&mut self, input: TerminalInput);
-    fn test_prompt_key(&mut self, key: TerminalKey);
-    fn test_ex(&mut self, command: &str);
-    fn type_text(&mut self, text: &str);
-}
-
-impl TestAppInput for App {
+impl App {
     fn test_key(&mut self, key: TerminalKey) {
         self.handle_editor_key(key).expect("handle editor test key");
     }
@@ -61,6 +62,25 @@ fn app_with_text(text: impl Into<String>) -> App {
     App::from_opened(document, opened, None, None).expect("app")
 }
 
+fn fixture_file(directory: &Path, name: &str, text: impl AsRef<[u8]>) -> PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, text).expect("write fixture");
+    path
+}
+
+fn app_with_fixture(name: &str, text: impl AsRef<[u8]>, line: Option<usize>) -> (tempfile::TempDir, PathBuf, App) {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = fixture_file(directory.path(), name, text);
+    let app = App::open(Some(&path), line).expect("open fixture");
+    (directory, path, app)
+}
+
+fn dotfile_layout(width: usize, height: usize) -> ViewportLayout {
+    let mut layout = ViewportLayout::new(width, height);
+    layout.configure_dotfile_profile();
+    layout
+}
+
 fn type_prompt(app: &mut App, text: &str) {
     for character in text.chars() {
         app.test_prompt_key(terminal_character(character));
@@ -69,6 +89,11 @@ fn type_prompt(app: &mut App, text: &str) {
 
 fn submit_prompt(app: &mut App) {
     app.test_prompt_key(terminal_key(TerminalKeyCode::Enter));
+}
+
+fn status_text(app: &App) -> String {
+    let status = app.status_overlay();
+    status.left.into_iter().chain(status.right).map(|segment| segment.text).collect()
 }
 
 #[cfg(unix)]
@@ -110,7 +135,7 @@ fn parses_escaped_literal_substitutions() {
 fn wal_worker_observes_barriers_and_clear() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let wal = LocalWal::in_directory(directory.path(), b"app-test");
-    let worker = WalWorker::start(wal.clone());
+    let worker = WalWorker::start(wal.clone()).expect("start WAL worker");
     worker.append_frame([0; 32], 1, FrameText::from("edit"), 4);
     worker.barrier().expect("barrier");
     assert!(wal.recover_latest().expect("recover").is_some());
@@ -122,7 +147,7 @@ fn wal_worker_observes_barriers_and_clear() {
 fn wal_worker_coalesces_a_burst_without_losing_the_latest_revision() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let wal = LocalWal::in_directory(directory.path(), b"app-coalescing-test");
-    let worker = WalWorker::start(wal.clone());
+    let worker = WalWorker::start(wal.clone()).expect("start WAL worker");
     for revision in 1..=100 {
         worker.append_frame([0; 32], revision, FrameText::from(format!("revision {revision}")), revision as usize);
     }
@@ -138,7 +163,7 @@ fn wal_worker_coalesces_a_burst_without_losing_the_latest_revision() {
 fn wal_worker_removes_recovery_state_when_edits_return_to_the_saved_base() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let wal = LocalWal::in_directory(directory.path(), b"app-clean-state-test");
-    let worker = WalWorker::start(wal.clone());
+    let worker = WalWorker::start(wal.clone()).expect("start WAL worker");
     let base_hash = *blake3::hash(b"base").as_bytes();
     worker.append_frame(base_hash, 1, FrameText::from("changed"), 7);
     worker.barrier().expect("dirty barrier");
@@ -221,10 +246,7 @@ fn quit_requires_force_when_changes_are_unsaved() {
 
 #[test]
 fn quit_succeeds_after_undo_restores_the_opened_file() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("main.rs");
-    fs::write(&path, "fn main() {}\n").expect("write source");
-    let mut app = App::open(Some(&path), None).expect("open source");
+    let (_directory, _path, mut app) = app_with_fixture("main.rs", "fn main() {}\n", None);
 
     app.dispatch_key(KeyEvent::character('i'));
     app.dispatch_key(KeyEvent::character('x'));
@@ -234,7 +256,7 @@ fn quit_succeeds_after_undo_restores_the_opened_file() {
 
     assert_eq!(app.active.editor.contents(), "fn main() {}\n");
     assert!(!app.active.editor.is_dirty());
-    assert!(!app.status().contains("[+]"));
+    assert!(!status_text(&app).contains("[+]"));
     app.test_ex("q");
     assert!(app.quit);
 }
@@ -268,7 +290,7 @@ fn dotfile_leader_q_and_ff_are_exact_native_sequences() {
 fn leader_a_is_the_embedded_agent_terminal_binding() {
     let keymap = RuntimeKeymap::defaults();
     let binding = keymap.leader.get("a").expect("leader-a binding");
-    assert_eq!(binding.invocation.command.as_ref(), "ai.chat");
+    assert!(std::ptr::fn_addr_eq(binding.execute, App::toggle_agent_sidebar as fn(&mut App) -> Result<()>));
     assert_eq!(binding.description.as_ref(), "Oh My Pi pane");
 }
 
@@ -289,14 +311,13 @@ fn focused_agent_sidebar_forwards_input_and_terminal_escape_returns_to_editor() 
         thread::yield_now();
     }
     assert!(app.agent_terminal.as_ref().is_some_and(|terminal| terminal.surface().contents().contains("HARNESS:a界b")));
-    let mut layout = ViewportLayout::new(80, 12);
-    layout.configure_dotfile_profile();
-    let rendered = desired_frame(&mut layout, &app).text();
+    let mut layout = dotfile_layout(80, 12);
+    let rendered = grid_text(&desired_frame(&mut layout, &app));
     assert!(rendered.contains("HARNESS:a界b"));
 
     app.test_input(TerminalInput::Key(terminal_control('\\')));
     app.test_input(TerminalInput::Key(terminal_control('n')));
-    assert!(app.agent_sidebar.visible);
+    assert!(app.agent_sidebar_visible);
     assert!(!app.input_focus.is_agent());
 }
 
@@ -317,11 +338,11 @@ fn embedded_agent_participates_in_ctrl_w_window_navigation() {
     app.open_agent_sidebar_in("sh", &["-c", "sleep 5"]).expect("open embedded harness");
 
     app.test_input(TerminalInput::Key(terminal_character('q')));
-    assert!(app.agent_sidebar.visible && app.input_focus.is_agent());
+    assert!(app.agent_sidebar_visible && app.input_focus.is_agent());
 
     app.test_input(TerminalInput::Key(terminal_control('w')));
     app.test_input(TerminalInput::Key(terminal_character('h')));
-    assert!(app.agent_sidebar.visible);
+    assert!(app.agent_sidebar_visible);
     assert!(!app.input_focus.is_agent());
 
     app.test_input(TerminalInput::Key(terminal_control('w')));
@@ -330,17 +351,14 @@ fn embedded_agent_participates_in_ctrl_w_window_navigation() {
 
     app.test_input(TerminalInput::Key(terminal_control('w')));
     app.test_input(TerminalInput::Key(terminal_character('q')));
-    assert!(!app.agent_sidebar.visible);
+    assert!(!app.agent_sidebar_visible);
     assert!(!app.input_focus.is_agent());
     assert!(app.agent_terminal.as_ref().is_some_and(|terminal| terminal.exit_code().is_none()));
 }
 
 #[test]
 fn normal_prefixes_open_which_key_hints_without_consuming_the_next_key() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("motions.txt");
-    fs::write(&path, "first\nsecond\n").expect("write source");
-    let mut app = App::open(Some(&path), Some(2)).expect("open source");
+    let (_directory, _path, mut app) = app_with_fixture("motions.txt", "first\nsecond\n", Some(2));
 
     app.test_key(terminal_character('g'));
 
@@ -382,37 +400,36 @@ fn goto_hints_include_only_advertised_lsp_navigation() {
 #[test]
 fn file_picker_is_a_telescope_surface_with_results_and_preview() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let source = directory.path().join("main.rs");
-    fs::write(&source, "fn main() {\n    println!(\"preview\");\n}\n").expect("source");
+    let source = fixture_file(directory.path(), "main.rs", "fn main() {\n    println!(\"preview\");\n}\n");
     let mut app = App::open(None, None).expect("app");
+    let mut layout = dotfile_layout(100, 30);
+    let startup = desired_frame(&mut layout, &app);
+    assert!(startup.raster_overlay.is_some());
+
     app.prompt = Some(Prompt { kind: PromptKind::Picker(PickerSource::Files), buffer: "main".to_owned(), history_index: None });
-    app.picker_matches = vec![source];
+    app.picker_items = vec![PickerItem::Path(source)];
     app.refresh_picker_preview();
-    let mut layout = ViewportLayout::new(100, 30);
-    layout.configure_dotfile_profile();
     let frame = desired_frame(&mut layout, &app);
-    let rendered = frame.text();
+    assert!(frame.raster_overlay.is_none(), "the startup tiling must yield to the picker");
+    assert_eq!(wren_view::diff(Some(&startup), &frame).raster_overlay, Some(None));
+    let rendered = grid_text(&frame);
     assert!(rendered.contains("Find Files (1)"));
     assert!(rendered.contains("main.rs"), "{rendered}");
     assert!(rendered.contains("println!(\"preview\")"));
     assert!(rendered.contains("❯ main"));
     assert!(!rendered.contains("find>"));
-    assert!(
-        frame
-            .rows
-            .iter()
-            .any(|row| { row.cells.iter().any(|cell| cell.grapheme.as_ref() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.mauve))) })
-    );
+    assert!(frame.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))))
+    }));
 }
 
 #[test]
 fn colorscheme_and_runtime_color_override_are_customizable() {
     let mut app = App::open(None, None).expect("app");
     app.test_ex("colorscheme catppuccin-latte");
-    assert_eq!(app.theme_flavor, CatppuccinFlavor::Latte);
-    assert_eq!(app.theme, CatppuccinPalette::LATTE);
+    assert_eq!(app.theme, CatppuccinPalette::for_flavor(CatppuccinFlavor::Latte));
     app.test_ex("setcolor mauve #010203");
-    assert_eq!(app.theme.mauve, RgbColor::new(1, 2, 3));
+    assert_eq!(app.theme.color(CatppuccinColor::Mauve), RgbColor::new(1, 2, 3));
     assert!(app.execute_ex("setcolor missing #ffffff").is_err());
 }
 
@@ -458,10 +475,10 @@ fn assert_counted_view_navigation(app: &mut App) {
 fn assert_window_commands(app: &mut App) {
     app.test_key(terminal_control('w'));
     app.test_key(terminal_character('v'));
-    assert_eq!(app.views.windows.len(), 2);
+    assert_eq!(app.views.window_count(), 2);
     app.test_key(terminal_control('w'));
     app.test_key(terminal_character('h'));
-    assert_eq!(app.views.windows.len(), 2);
+    assert_eq!(app.views.window_count(), 2);
     assert!(!app.message.contains("grammar"));
 }
 
@@ -481,11 +498,8 @@ fn assert_number_and_replace_commands(app: &mut App) {
 
 #[test]
 fn syntax_demand_follows_scrolling_and_preserves_highlighted_viewports() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let source = directory.path().join("scroll.rs");
     let text = (0..120).map(|line| format!("fn item_{line}() {{ let value: i32 = {line}; }}\n")).collect::<String>();
-    fs::write(&source, &text).expect("source");
-    let mut app = App::open(Some(&source), None).expect("app");
+    let (_directory, _source, mut app) = app_with_fixture("scroll.rs", &text, None);
     app.schedule_provider_refreshes(10);
     let first_spans = app.decorations.get(&app.active.buffer_id).expect("first-frame decorations").spans.clone();
     let late_start = app.active.editor.text().byte_of_line(90);
@@ -500,12 +514,10 @@ fn syntax_demand_follows_scrolling_and_preserves_highlighted_viewports() {
 #[test]
 fn full_syntax_is_ready_on_file_open_viewport_change_and_buffer_change() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("latency_first.rs");
-    let second = directory.path().join("latency_second.rs");
     let first_text = (0..240).map(|line| format!("fn item_{line}() {{ let value: i32 = {line}; }}\n")).collect::<String>();
     let second_text = (0..160).map(|line| format!("pub fn other_{line}() -> usize {{ {line} }}\n")).collect::<String>();
-    fs::write(&first, &first_text).expect("first source");
-    fs::write(&second, &second_text).expect("second source");
+    let first = fixture_file(directory.path(), "latency_first.rs", &first_text);
+    let second = fixture_file(directory.path(), "latency_second.rs", &second_text);
 
     let opened_at = Instant::now();
     let mut app = App::open(Some(&first), None).expect("open first");
@@ -584,10 +596,9 @@ fn assert_prepared_edit_decorations(app: &App, edit_range: Range<usize>) {
 #[test]
 fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let source = directory.path().join("large.rs");
     let text =
         (0..14_000).map(|line| format!("pub fn item_{line:05}() -> usize {{ let value_{line:05}: usize = {line}; value_{line:05} }}\n")).collect::<String>();
-    fs::write(&source, &text).expect("large Rust source");
+    let source = fixture_file(directory.path(), "large.rs", &text);
 
     let opened_at = Instant::now();
     let mut app = App::open(Some(&source), None).expect("open large Rust source");
@@ -600,15 +611,8 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
     app.semantic_decorations.insert(app.active.buffer_id, BufferDecorations::new(app.active.editor.revision(), semantic));
     app.active.editor.search("value_", SearchDirection::Forward).expect("search highlight");
     app.search_highlight = true;
-    app.diagnostics.push(DiagnosticEntry {
-        path: source.clone(),
-        line: 1,
-        column: 1,
-        severity: DiagnosticSeverity::Warning,
-        message: "benchmark diagnostic".to_owned(),
-    });
-    let mut layout = ViewportLayout::new(120, 40);
-    layout.configure_dotfile_profile();
+    app.diagnostics.push(QuickfixEntry::diagnostic(source.clone(), 1, 1, Severity::Warning, "benchmark diagnostic"));
+    let mut layout = dotfile_layout(120, 40);
     app.resize_terminal(40, 120);
     app.schedule_provider_refreshes(layout.height);
     let (_frame, first_frame) = desired_frame_profiled(&mut layout, &app);
@@ -849,11 +853,8 @@ fn unchanged_provider_text_advances_revision_without_reupload_or_reparse() {
 
 #[test]
 fn changed_provider_revision_waits_for_the_typing_quiet_period() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let source = directory.path().join("debounce.rs");
     let text = (0..200).map(|line| format!("fn debounce_{line}() {{}}\n")).collect::<String>();
-    fs::write(&source, &text).expect("source");
-    let mut app = App::open(Some(&source), None).expect("app");
+    let (_directory, _source, mut app) = app_with_fixture("debounce.rs", &text, None);
     app.dispatch_key(KeyEvent::character('i'));
     app.dispatch_key(KeyEvent::character('x'));
     let revision = app.active.editor.revision();
@@ -863,9 +864,8 @@ fn changed_provider_revision_waits_for_the_typing_quiet_period() {
     app.schedule_provider_refreshes(20);
     assert_eq!(app.provider_submitted.get(&app.active.document_id).map(|key| key.revision), Some(revision));
     let submitted = app.provider_submitted.get(&app.active.document_id).expect("submitted changed-line refresh");
-    assert_eq!(submitted.visible_start, submitted.near_start);
-    assert_eq!(submitted.visible_end, submitted.near_end);
-    assert!(submitted.visible_end < text.len() / 4, "a local edit must not replace a whole viewport or document of syntax spans");
+    assert_eq!(submitted.visible, submitted.near_viewport);
+    assert!(submitted.visible.end < text.len() / 4, "a local edit must not replace a whole viewport or document of syntax spans");
 }
 
 #[test]
@@ -875,17 +875,14 @@ fn hover_text_renders_as_a_rounded_float_not_status_text() {
     app.popup = Some(TextPopup::new("", text).with_decorations(decorations));
     let mut layout = ViewportLayout::new(100, 30);
     let frame = desired_frame(&mut layout, &app);
-    let rendered = frame.text();
+    let rendered = grid_text(&frame);
     assert!(rendered.contains("╭"));
     assert!(rendered.contains("fn hover() -> i32"));
     assert!(!rendered.contains("```"));
-    assert!(!app.status().contains("fn hover"));
-    assert!(
-        frame
-            .rows
-            .iter()
-            .any(|row| { row.cells.iter().any(|cell| cell.grapheme.as_ref() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.mauve))) })
-    );
+    assert!(!status_text(&app).contains("fn hover"));
+    assert!(frame.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))))
+    }));
 }
 
 #[test]
@@ -893,10 +890,10 @@ fn hover_popup_expires_after_its_deadline() {
     let mut app = App::open(None, None).expect("app");
     app.popup = Some(TextPopup::new("", "hover"));
     app.popup_deadline = Instant::now().checked_sub(Duration::from_millis(1));
-    assert!(app.poll_popup_timeout().expect("poll popup timeout"));
+    assert!(app.poll_popup_timeout());
     assert!(app.popup.is_none());
     assert!(app.popup_deadline.is_none());
-    assert!(!app.poll_popup_timeout().expect("poll popup timeout"));
+    assert!(!app.poll_popup_timeout());
 }
 
 #[test]
@@ -956,7 +953,7 @@ fn recoverable_errors_render_as_timed_help_style_floats() {
     assert!(app.popup.as_ref().is_some_and(|popup| { popup.title.as_ref() == "Error" && popup.text.contains("omitted its URI") }));
 
     let mut layout = ViewportLayout::new(80, 24);
-    let rendered = desired_frame(&mut layout, &app).text();
+    let rendered = grid_text(&desired_frame(&mut layout, &app));
     assert!(rendered.contains("╭"));
     assert!(rendered.contains("Error"));
     assert!(rendered.contains("definition response omitted its URI"));
@@ -978,7 +975,6 @@ fn messages_command_opens_bounded_severity_tagged_history_buffer() {
     assert_ne!(app.active.buffer_id, messages_buffer_id);
     app.show_info("formatter complete");
     app.test_ex("debuglog");
-    assert_eq!(app.views.buffers.len(), 2);
     assert_eq!(app.inactive.len(), 1);
     assert_eq!(app.active.buffer_id, messages_buffer_id);
     assert!(app.active.editor.contents().contains("formatter complete"));
@@ -992,7 +988,7 @@ fn assert_messages_buffer(app: &App) {
     assert!(app.active.editor.is_read_only());
     assert!(app.active.editor.contents().contains("[INFO] language server starting"));
     assert!(app.active.editor.contents().contains("[ERROR] provider worker disconnected"));
-    assert!(app.status().contains("[Messages] [RO]"));
+    assert!(status_text(app).contains("[Messages] [RO]"));
 }
 
 #[test]
@@ -1005,20 +1001,17 @@ fn rejected_grammar_sequence_is_info_and_does_not_open_an_error_popup() {
     assert!(app.popup.is_none());
     assert!(app.popup_deadline.is_none());
     assert!(app.message.contains("grammar rejected sequence \"dQ\""));
-    assert!(app.views.messages.entries.last().is_some_and(|entry| { entry.severity == MessageSeverity::Info && entry.text.contains("\"dQ\"") }));
+    assert!(app.debug_messages.last().is_some_and(|(severity, text)| { *severity == Severity::Info && text.contains("\"dQ\"") }));
 
     app.show_error("provider crashed");
     assert!(app.popup.as_ref().is_some_and(|popup| { popup.title.as_ref() == "Error" && popup.text.as_ref() == "provider crashed" }));
-    assert!(app.views.messages.entries.last().is_some_and(|entry| { entry.severity == MessageSeverity::Error && entry.text.as_ref() == "provider crashed" }));
+    assert!(app.debug_messages.last().is_some_and(|(severity, text)| { *severity == Severity::Error && text.as_ref() == "provider crashed" }));
 }
 
 #[cfg(unix)]
 #[test]
 fn launch_workspace_lsp_survives_ctrl_o_across_roots_and_gd_stays_async() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let source = directory.path().join("main.rs");
-    fs::write(&source, "fn main() { target(); }\n").expect("source");
-    let mut app = App::open(Some(&source), None).expect("app");
+    let (directory, source, mut app) = app_with_fixture("main.rs", "fn main() { target(); }\n", None);
     let workspace_root = app.lsp_root();
     let revision = attach_fake_root_lsp(&mut app, directory.path(), &source, &workspace_root);
     exercise_lsp_prefix_hints(&mut app);
@@ -1064,7 +1057,7 @@ fn attach_fake_root_lsp(app: &mut App, directory: &Path, source: &Path, workspac
     assert!(!startup_log.contains("semanticTokens/full"));
 
     let document_id = app.active.document_id;
-    app.lsp = Some(PersistentLsp {
+    app.lsps.push(PersistentLsp {
         document_id,
         revision,
         uri: uri.clone(),
@@ -1075,9 +1068,15 @@ fn attach_fake_root_lsp(app: &mut App, directory: &Path, source: &Path, workspac
         capabilities,
         semantic_due: None,
     });
-    let lsp = app.lsp.as_ref().expect("attached LSP");
-    app.lsp_navigation_capabilities.insert(lsp.server.language_id.clone().into_boxed_str(), lsp.capabilities.navigation);
     revision
+}
+
+fn active_test_lsp(app: &App) -> Option<&PersistentLsp> {
+    app.active_lsp_index().and_then(|index| app.lsps.get(index))
+}
+
+fn test_lsp_job(starting: bool, receiver: mpsc::Receiver<LspCompletion>) -> LspJob {
+    LspJob { starting, language_id: "rust".into(), navigation: None, receiver }
 }
 
 #[cfg(unix)]
@@ -1101,9 +1100,9 @@ fn assert_elapsed_below(started: Instant, budget: Duration, operation: &str) {
 #[cfg(unix)]
 fn poll_lsp_until_complete(app: &mut App, operation: &str) {
     let deadline = Instant::now() + Duration::from_secs(1);
-    while app.lsp_background.is_some() {
+    while app.lsp_job.is_some() {
         assert!(Instant::now() < deadline, "fake {operation} timed out");
-        let _ = app.poll_lsp_background().expect("poll LSP operation");
+        let _ = app.poll_lsp();
         thread::yield_now();
     }
 }
@@ -1111,13 +1110,13 @@ fn poll_lsp_until_complete(app: &mut App, operation: &str) {
 #[cfg(unix)]
 fn exercise_async_lsp_requests(app: &mut App) {
     let semantic_due = Instant::now() + Duration::from_secs(10);
-    app.lsp.as_mut().expect("fake LSP").semantic_due = Some(semantic_due);
+    app.active_lsp_mut().expect("fake LSP").semantic_due = Some(semantic_due);
     app.test_input(TerminalInput::Key(terminal_character('l')));
-    assert_eq!(app.lsp.as_ref().and_then(|lsp| lsp.semantic_due), Some(semantic_due), "cursor movement must not postpone semantic highlighting");
+    assert_eq!(active_test_lsp(app).and_then(|lsp| lsp.semantic_due), Some(semantic_due), "cursor movement must not postpone semantic highlighting");
     let dispatched = Instant::now();
-    app.lsp_location("textDocument/definition").expect("dispatch gd");
+    app.dispatch_lsp_cursor_request(PendingLspRequest::DEFINITION).expect("dispatch gd");
     assert_elapsed_below(dispatched, Duration::from_millis(20), "gd blocked the input loop");
-    assert!(app.lsp_background.is_some());
+    assert!(app.lsp_job.is_some());
     app.test_key(terminal_character('g'));
     assert!(app.popup.as_ref().is_some_and(|popup| { popup.text.contains("d  definition") && popup.text.contains("r  references") }));
     app.test_key(terminal_key(TerminalKeyCode::Escape));
@@ -1127,7 +1126,7 @@ fn exercise_async_lsp_requests(app: &mut App) {
     let dispatched = Instant::now();
     app.test_key(terminal_character('K'));
     assert_elapsed_below(dispatched, Duration::from_millis(20), "K blocked the input loop");
-    assert!(app.lsp_background.is_some());
+    assert!(app.lsp_job.is_some());
     let motion = Instant::now();
     app.test_key(terminal_character('l'));
     assert_elapsed_below(motion, Duration::from_millis(20), "pending hover blocked ordinary input");
@@ -1139,14 +1138,13 @@ fn exercise_async_lsp_requests(app: &mut App) {
 #[cfg(unix)]
 fn open_outside_rust(app: &mut App, workspace_root: &Path) -> (tempfile::TempDir, PathBuf) {
     let outside_workspace = tempfile::tempdir().expect("outside workspace");
-    let second = outside_workspace.path().join("other.rs");
-    fs::write(&second, "pub fn target() {}\n").expect("second source");
-    assert!(app.lsp.is_some(), "definition worker did not restore LSP");
-    assert_eq!(app.lsp.as_ref().map(|lsp| &lsp.server), language_server_invocation(Some(&second)).as_ref());
-    assert_eq!(app.lsp.as_ref().map(|lsp| lsp.root.as_path()), std::fs::canonicalize(workspace_root).ok().as_deref());
+    let second = fixture_file(outside_workspace.path(), "other.rs", "pub fn target() {}\n");
+    assert!(active_test_lsp(app).is_some(), "definition worker did not restore LSP");
+    assert_eq!(active_test_lsp(app).map(|lsp| &lsp.server), language_server_invocation(Some(&second)).as_ref());
+    assert_eq!(active_test_lsp(app).map(|lsp| lsp.root.as_path()), std::fs::canonicalize(workspace_root).ok().as_deref());
     app.navigate_to_entry(&QuickfixEntry::new(second.clone(), 1, 1, "outside definition").utf16()).expect("cross-workspace navigation open");
-    assert!(app.lsp_start.is_none());
-    let reused = app.lsp.as_ref().expect("LSP was discarded");
+    assert!(app.lsp_job.is_none());
+    let reused = active_test_lsp(app).expect("LSP was discarded");
     assert_eq!(reused.document_id, app.active.document_id);
     assert_eq!(reused.open_documents.len(), 2);
     assert_eq!(reused.root, workspace_root);
@@ -1157,36 +1155,34 @@ fn open_outside_rust(app: &mut App, workspace_root: &Path) -> (tempfile::TempDir
 fn exercise_cross_workspace_jumps(app: &mut App, source: &Path, second: &Path, workspace_root: &Path) {
     assert!(app.navigate_jump_count(true, 1).expect("Ctrl-O to root"));
     assert!(app.active.document.presentation_path().is_some_and(|path| { same_path(path, source) }));
-    assert!(app.lsp_start.is_none());
-    assert_eq!(app.lsp.as_ref().map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
+    assert!(app.lsp_job.is_none());
+    assert_eq!(active_test_lsp(app).map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
     assert!(app.navigate_jump_count(false, 1).expect("Ctrl-I outside"));
     assert!(app.active.document.presentation_path().is_some_and(|path| { same_path(path, second) }));
-    assert!(app.lsp_start.is_none());
-    assert_eq!(app.lsp.as_ref().map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
+    assert!(app.lsp_job.is_none());
+    assert_eq!(active_test_lsp(app).map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
 }
 
 #[cfg(unix)]
 fn exercise_non_lsp_jump(app: &mut App, outside: &Path, second: &Path, workspace_root: &Path) {
-    let notes = outside.join("notes.txt");
-    fs::write(&notes, "not an LSP buffer\n").expect("notes");
-    if let Some(lsp) = &mut app.lsp {
+    let notes = fixture_file(outside, "notes.txt", "not an LSP buffer\n");
+    if let Some(lsp) = app.active_lsp_mut() {
         lsp.semantic_due = Some(Instant::now());
     }
     app.navigate_to_entry(&QuickfixEntry::new(notes.clone(), 1, 1, "notes").utf16()).expect("visit non-LSP buffer");
-    assert!(app.lsp.is_some(), "non-LSP buffer killed the root server");
-    assert_eq!(app.lsp.as_ref().and_then(|lsp| lsp.semantic_due), None);
+    assert_eq!(app.lsps.len(), 1, "non-LSP buffer killed the root server");
+    assert_eq!(app.lsps.first().and_then(|lsp| lsp.semantic_due), None);
     assert!(app.navigate_jump_count(true, 1).expect("Ctrl-O from notes"));
     assert!(app.active.document.presentation_path().is_some_and(|path| { same_path(path, second) }));
-    assert!(app.lsp_start.is_none());
-    assert!(app.lsp.as_ref().and_then(|lsp| lsp.semantic_due).is_some());
-    assert_eq!(app.lsp.as_ref().map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
+    assert!(app.lsp_job.is_none());
+    assert!(active_test_lsp(app).and_then(|lsp| lsp.semantic_due).is_some());
+    assert_eq!(active_test_lsp(app).map(|lsp| (lsp.root.as_path(), lsp.open_documents.len())), Some((workspace_root, 2)));
 }
 
 #[cfg(unix)]
 fn exercise_language_server_parking(app: &mut App, second: &Path, workspace_root: &Path, revision: DocumentRevision) {
     let python_workspace = tempfile::tempdir().expect("Python workspace");
-    let python_source = python_workspace.path().join("tool.py");
-    fs::write(&python_source, "def tool():\n  pass\n").expect("Python source");
+    let python_source = fixture_file(python_workspace.path(), "tool.py", "def tool():\n  pass\n");
     let (python_fake, _) = fake_lsp_server(python_workspace.path());
     let (python_client, python_uri, python_capabilities) = spawn_lsp_client(
         &python_fake,
@@ -1197,7 +1193,7 @@ fn exercise_language_server_parking(app: &mut App, second: &Path, workspace_root
         env::vars().map(|(name, value)| (name.into_boxed_str(), value.into_boxed_str())).collect(),
     )
     .expect("Python client");
-    app.parked_lsps.push(PersistentLsp {
+    app.lsps.push(PersistentLsp {
         document_id: DocumentId::new(999),
         revision,
         uri: python_uri,
@@ -1209,32 +1205,29 @@ fn exercise_language_server_parking(app: &mut App, second: &Path, workspace_root
         semantic_due: None,
     });
     app.open_buffer(&python_source).expect("activate Python");
-    assert_eq!(app.lsp.as_ref().map(|lsp| lsp.server.language_id.as_str()), Some("python"));
-    assert_eq!(app.parked_lsps.len(), 1);
+    assert_eq!(active_test_lsp(app).map(|lsp| lsp.server.language_id.as_str()), Some("python"));
+    assert_eq!(app.lsps.len(), 2);
     app.lsp_request_at_cursor("textDocument/hover", serde_json::json!({})).expect("parked Python client remains live");
     app.open_buffer(second).expect("return to Rust");
-    assert_eq!(app.lsp.as_ref().map(|lsp| lsp.server.language_id.as_str()), Some("rust"));
-    assert_eq!(app.parked_lsps.len(), 1);
+    assert_eq!(active_test_lsp(app).map(|lsp| lsp.server.language_id.as_str()), Some("rust"));
+    assert_eq!(app.lsps.len(), 2);
     app.lsp_request_at_cursor("textDocument/hover", serde_json::json!({})).expect("parked Rust client remains live");
 }
 
 #[cfg(unix)]
 fn exercise_malformed_definition_recovery(app: &mut App) {
-    let lsp = app.lsp.take().expect("reused LSP");
+    let lsp = app.lsps.swap_remove(app.active_lsp_index().expect("reused LSP"));
     let (sender, receiver) = mpsc::channel();
-    sender
-        .send(LspBackgroundResult {
-            lsp,
-            outcome: LspBackgroundOutcome::Location {
-                method: "textDocument/definition".to_owned(),
-                response: Ok(serde_json::json!({"range": {"start": {"line": 0}}})),
-            },
-        })
-        .expect("queue malformed definition result");
-    app.lsp_background = Some(receiver);
+    let complete = PendingLspRequest::DEFINITION.completion(
+        app.active.document_id,
+        app.active.editor.revision(),
+        Ok(serde_json::json!({"range": {"start": {"line": 0}}})),
+    );
+    sender.send(Box::new(move |app: &mut App| app.finish_lsp_background(lsp, complete)) as LspCompletion).expect("queue malformed definition result");
+    app.lsp_job = Some(test_lsp_job(false, receiver));
     app.test_key(terminal_character(' '));
-    assert!(app.poll_lsp_background().expect("malformed gd must remain recoverable"));
-    assert!(app.lsp.is_some(), "gd failure lost the reusable LSP client");
+    assert!(app.poll_lsp());
+    assert!(active_test_lsp(app).is_some(), "gd failure lost the reusable LSP client");
     assert!(app.popup.as_ref().is_some_and(|popup| { popup.title.as_ref() == "Error" && popup.text.contains("omitted URI") }));
 
     app.test_key(terminal_character('q'));
@@ -1244,30 +1237,30 @@ fn exercise_malformed_definition_recovery(app: &mut App) {
 #[test]
 fn gd_queues_behind_in_progress_startup_instead_of_starting_a_second_server() {
     let mut app = App::open(None, None).expect("app");
-    let (_sender, receiver) = mpsc::channel::<Result<PersistentLsp, String>>();
-    app.lsp_start = Some(receiver);
+    let (_sender, receiver) = mpsc::channel::<LspCompletion>();
+    app.lsp_job = Some(test_lsp_job(true, receiver));
     let dispatched = Instant::now();
-    app.lsp_location("textDocument/definition").expect("queue gd");
+    app.dispatch_lsp_cursor_request(PendingLspRequest::DEFINITION).expect("queue gd");
     assert!(dispatched.elapsed() < Duration::from_millis(10));
-    assert_eq!(app.pending_lsp_request, Some(PendingLspRequest::Location("textDocument/definition".to_owned())));
+    assert_eq!(app.pending_lsp_request, Some(PendingLspRequest::DEFINITION));
     assert!(app.message.contains("queued"));
 }
 
 #[test]
 fn automatic_lsp_failures_are_logged_without_error_popups() {
     let mut app = App::open(None, None).expect("app");
-    app.apply_lsp_background_outcome(LspBackgroundOutcome::Semantic {
-        buffer_id: app.active.buffer_id,
-        revision: app.active.editor.revision(),
-        decorations: Err("compile_commands.json is incomplete".to_owned()),
-    });
+    app_lsp_actions::semantic_lsp_completion(app.active.buffer_id, app.active.editor.revision(), Err("compile_commands.json is incomplete".to_owned()))(
+        &mut app,
+    );
     assert!(app.popup.is_none());
     assert!(app.message.contains("semanticTokens/full unavailable"));
 
     let (sender, receiver) = mpsc::channel();
-    sender.send(Err("clangd could not initialize this partial project".to_owned())).expect("startup result");
-    app.lsp_start = Some(receiver);
-    assert!(app.poll_lsp_start().expect("poll startup"));
+    sender
+        .send(Box::new(|app: &mut App| app.finish_lsp_start(Err("clangd could not initialize this partial project".to_owned()))) as LspCompletion)
+        .expect("startup result");
+    app.lsp_job = Some(test_lsp_job(true, receiver));
+    assert!(app.poll_lsp());
     assert!(app.popup.is_none());
     assert!(app.message.contains("language server unavailable"));
 }
@@ -1275,16 +1268,15 @@ fn automatic_lsp_failures_are_logged_without_error_popups() {
 #[test]
 fn first_hover_queues_behind_workspace_startup_without_starting_another_server() {
     let mut app = App::open(None, None).expect("app");
-    let (_sender, receiver) = mpsc::channel::<Result<PersistentLsp, String>>();
-    app.lsp_start = Some(receiver);
+    let (_sender, receiver) = mpsc::channel::<LspCompletion>();
+    app.lsp_job = Some(test_lsp_job(true, receiver));
 
     let dispatched = Instant::now();
-    app.lsp_hover("textDocument/hover").expect("queue first hover");
+    app.dispatch_lsp_cursor_request(PendingLspRequest::HOVER).expect("queue first hover");
 
     assert!(dispatched.elapsed() < Duration::from_millis(10));
-    assert_eq!(app.pending_lsp_request, Some(PendingLspRequest::Hover("textDocument/hover".to_owned())));
-    assert!(app.lsp_start.is_some());
-    assert!(app.lsp_background.is_none());
+    assert_eq!(app.pending_lsp_request, Some(PendingLspRequest::HOVER));
+    assert!(app.lsp_job.as_ref().is_some_and(|job| job.starting));
     assert!(app.message.is_empty());
 }
 
@@ -1318,34 +1310,39 @@ fn mouse_wheel_bursts_wait_for_the_decoder_and_coalesce_without_losing_the_next_
 #[test]
 fn left_click_moves_the_editor_cursor_through_rendered_cell_geometry() {
     let mut app = app_with_text("zero\n\twide界 tail\nthird");
-    let mut layout = ViewportLayout::new(30, 6);
-    layout.configure_dotfile_profile();
+    let layout = dotfile_layout(30, 6);
 
-    app.handle_mouse_click(&layout, 10, 1).expect("click wide character");
+    app.handle_mouse_pointer(&layout, MouseAction::Click, 10, 1).expect("click wide character");
     assert_eq!(app.active.editor.primary_cursor(), app.active.editor.contents().find('界').expect("wide character"));
     let cursor = app.active.editor.primary_cursor();
-    app.handle_mouse_click(&layout, 10, 5).expect("ignore status line");
+    app.handle_mouse_pointer(&layout, MouseAction::Click, 10, 5).expect("ignore status line");
     assert_eq!(app.active.editor.primary_cursor(), cursor);
 }
 
 #[test]
 fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
     let mut app = app_with_text("fn main() {}\n");
-    let mut layout = ViewportLayout::new(30, 5);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(30, 5);
     app.decorations.insert(
         app.active.buffer_id,
-        BufferDecorations::new(app.active.editor.revision(), vec![DecorationSpan::new(0..2, CellStyle::rgb(app.theme.blue, app.theme.surface0), u32::MAX)]),
+        BufferDecorations::new(
+            app.active.editor.revision(),
+            vec![DecorationSpan::new(0..2, CellStyle::rgb(app.theme.color(CatppuccinColor::Blue), app.theme.color(CatppuccinColor::Surface0)), u32::MAX)],
+        ),
     );
     let normal = desired_frame(&mut layout, &app);
     let normal_foregrounds =
-        normal.rows[0].cells.iter().filter(|cell| matches!(cell.grapheme.as_ref(), "f" | "n")).take(2).map(|cell| cell.style.foreground).collect::<Vec<_>>();
+        normal.rows[0].cells.iter().filter(|cell| matches!(cell.grapheme.as_str(), "f" | "n")).take(2).map(|cell| cell.style.foreground).collect::<Vec<_>>();
     app.test_key(terminal_character('v'));
     app.test_key(terminal_character('l'));
     let grid = desired_frame(&mut layout, &app);
-    let selected =
-        grid.rows.iter().flat_map(|row| row.cells.iter()).filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface2))).collect::<Vec<_>>();
-    assert_eq!(selected.iter().map(|cell| cell.grapheme.as_ref()).collect::<String>(), "fn");
+    let selected = grid
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface2))))
+        .collect::<Vec<_>>();
+    assert_eq!(selected.iter().map(|cell| cell.grapheme.as_str()).collect::<String>(), "fn");
     assert_eq!(
         selected.iter().map(|cell| cell.style.foreground).collect::<Vec<_>>(),
         normal_foregrounds,
@@ -1355,10 +1352,7 @@ fn keyboard_visual_mode_is_painted_without_erasing_syntax_foreground() {
 
 #[test]
 fn markdown_plain_words_do_not_gain_code_keyword_highlights_after_editing() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("notes.md");
-    fs::write(&path, "").expect("Markdown file");
-    let mut app = App::open(Some(&path), None).expect("app");
+    let (_directory, _path, mut app) = app_with_fixture("notes.md", "", None);
 
     app.test_key(terminal_character('i'));
     app.type_text("use for");
@@ -1366,28 +1360,24 @@ fn markdown_plain_words_do_not_gain_code_keyword_highlights_after_editing() {
 
     let spans = app.decorations.get(&app.active.buffer_id).expect("syntax state").spans_in(0..app.active.editor.text().len_bytes());
     assert!(
-        spans.iter().all(|span| { span.style.foreground != Some(CellColor::Rgb(app.theme.mauve)) || !span.style.bold }),
+        spans.iter().all(|span| { span.style.foreground != Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))) || !span.style.bold() }),
         "plain Markdown was classified as a code keyword: {spans:?}"
     );
 }
 
 #[test]
 fn entering_visual_mode_does_not_move_a_markdown_viewport() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("viewport.md");
     let text = (0..40).map(|line| format!("paragraph {line}: this is a deliberately long Markdown line that wraps in a narrow terminal\n")).collect::<String>();
-    fs::write(&path, &text).expect("Markdown file");
-    let mut app = App::open(Some(&path), None).expect("app");
+    let (_directory, _path, mut app) = app_with_fixture("viewport.md", &text, None);
     let cursor = text.find("paragraph 25").expect("target paragraph");
     app.active.editor.set_cursor(cursor);
-    let mut layout = ViewportLayout::new(42, 10);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(42, 10);
     let normal = desired_frame(&mut layout, &app);
-    let normal_rows = normal.rows[..normal.height - 1].iter().map(|row| row.text()).collect::<Vec<_>>();
+    let normal_rows = normal.rows[..normal.height - 1].iter().map(|row| row_text(row)).collect::<Vec<_>>();
 
     app.test_key(terminal_character('v'));
     let visual = desired_frame(&mut layout, &app);
-    let visual_rows = visual.rows[..visual.height - 1].iter().map(|row| row.text()).collect::<Vec<_>>();
+    let visual_rows = visual.rows[..visual.height - 1].iter().map(|row| row_text(row)).collect::<Vec<_>>();
 
     assert_eq!(visual.cursor, normal.cursor);
     assert_eq!(visual_rows, normal_rows);
@@ -1475,16 +1465,12 @@ fn prepared_replacement_state_is_reused_by_the_first_real_edit() {
 
 #[test]
 fn first_document_end_insert_reuses_the_prepared_visible_syntax() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("prepared.rs");
     let text = (0..200).map(|line| format!("pub fn item_{line}() {{ let value = {line}; }}\n")).collect::<String>();
-    fs::write(&path, text).expect("fixture");
-    let mut app = App::open(Some(&path), None).expect("app");
+    let (_directory, _path, mut app) = app_with_fixture("prepared.rs", text, None);
     let semantic = app.decorations.get(&app.active.buffer_id).expect("syntax decorations").spans.iter().step_by(6).cloned().collect();
     app.semantic_decorations.insert(app.active.buffer_id, BufferDecorations::new(app.active.editor.revision(), semantic));
     app.resize_terminal(40, 120);
-    let mut layout = ViewportLayout::new(120, 40);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(120, 40);
     app.schedule_provider_refreshes(layout.height);
     let _ = desired_frame(&mut layout, &app);
 
@@ -1519,8 +1505,7 @@ fn first_document_end_insert_reuses_the_prepared_visible_syntax() {
 #[test]
 fn click_drag_enters_visual_mode_and_selects_rendered_cells() {
     let mut app = app_with_text("abcdef\n");
-    let mut layout = ViewportLayout::new(30, 5);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(30, 5);
     let frames = [(app.active.buffer_id, app.active.editor.frame())];
     let coordinate_for = |wanted| {
         (0..5)
@@ -1530,9 +1515,9 @@ fn click_drag_enters_visual_mode_and_selects_rendered_cells() {
     };
     let start = coordinate_for(1);
     let end = coordinate_for(4);
-    app.handle_mouse_click(&layout, start.0, start.1).expect("mouse down");
-    app.handle_mouse_drag(&layout, end.0, end.1).expect("mouse drag");
-    app.handle_mouse_release(&layout, end.0, end.1).expect("mouse release");
+    app.handle_mouse_pointer(&layout, MouseAction::Click, start.0, start.1).expect("mouse down");
+    app.handle_mouse_pointer(&layout, MouseAction::Drag, end.0, end.1).expect("mouse drag");
+    app.handle_mouse_pointer(&layout, MouseAction::Release, end.0, end.1).expect("mouse release");
     assert_eq!(app.active.editor.mode(), Mode::Visual);
     assert_eq!(app.active.editor.selection_byte_range(), 1..5);
 
@@ -1541,8 +1526,8 @@ fn click_drag_enters_visual_mode_and_selects_rendered_cells() {
         .rows
         .iter()
         .flat_map(|row| row.cells.iter())
-        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.surface2)))
-        .map(|cell| cell.grapheme.as_ref())
+        .filter(|cell| cell.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface2))))
+        .map(|cell| cell.grapheme.as_str())
         .collect::<String>();
     assert_eq!(selected, "bcde");
 }
@@ -1559,15 +1544,11 @@ fn space_jj_labels_every_visible_match_and_jumps_by_label() {
     assert_eq!(overlay.targets.len(), 2);
     assert_eq!(overlay.targets[0].label.as_ref(), "a");
     assert_eq!(overlay.targets[1].label.as_ref(), "s");
-    let mut layout = ViewportLayout::new(60, 8);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(60, 8);
     let frame = desired_frame(&mut layout, &app);
-    assert!(
-        frame
-            .rows
-            .iter()
-            .any(|row| { row.cells.iter().any(|cell| cell.grapheme.as_ref() == "a" && cell.style.background == Some(CellColor::Rgb(app.theme.peach))) })
-    );
+    assert!(frame.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| cell.grapheme.as_str() == "a" && cell.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Peach))))
+    }));
     app.test_key(terminal_character('s'));
     assert_eq!(app.active.editor.primary_cursor(), app.active.editor.contents().rfind('x').expect("last x"));
     assert!(app.ace_jump.is_none());
@@ -1576,10 +1557,8 @@ fn space_jj_labels_every_visible_match_and_jumps_by_label() {
 #[test]
 fn dotfile_profile_expands_tabs_and_autosaves_on_buffer_leave() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("first.rs");
-    let second = directory.path().join("second.rs");
-    fs::write(&first, "one\n").expect("first source");
-    fs::write(&second, "two\n").expect("second source");
+    let first = fixture_file(directory.path(), "first.rs", "one\n");
+    let second = fixture_file(directory.path(), "second.rs", "two\n");
     let mut app = App::open(Some(&first), None).expect("app");
     app.dispatch_key(KeyEvent::character('i'));
     app.test_key(terminal_key(TerminalKeyCode::Tab));
@@ -1592,10 +1571,8 @@ fn dotfile_profile_expands_tabs_and_autosaves_on_buffer_leave() {
 #[test]
 fn dotfile_live_grep_picker_searches_the_buffer_workspace_and_opens_result() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("first.rs");
-    let second = directory.path().join("second.rs");
-    fs::write(&first, "fn first() {}\n").expect("first source");
-    fs::write(&second, "fn needle() {}\n").expect("second source");
+    let first = fixture_file(directory.path(), "first.rs", "fn first() {}\n");
+    let second = fixture_file(directory.path(), "second.rs", "fn needle() {}\n");
     let mut app = App::open(Some(&first), None).expect("app");
 
     let scheduled = Instant::now();
@@ -1606,7 +1583,7 @@ fn dotfile_live_grep_picker_searches_the_buffer_workspace_and_opens_result() {
     app.grep_due = Some(Instant::now());
     let deadline = Instant::now() + Duration::from_secs(3);
     while app.quickfix.is_empty() && Instant::now() < deadline {
-        app.poll_grep_picker().expect("poll grep picker");
+        app.poll_grep_picker();
         thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(app.quickfix.len(), 1);
@@ -1706,15 +1683,14 @@ fn assert_search_cancel_restores_origin(app: &mut App) {
 }
 
 fn assert_search_highlight_rendered(app: &App) {
-    let mut layout = ViewportLayout::new(80, 10);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(80, 10);
     let frame = desired_frame(&mut layout, app);
     assert!(frame.rows.iter().any(|row| row.cells.iter().any(|cell| {
-        cell.grapheme.as_ref() == "h"
+        cell.grapheme.as_str() == "h"
             && matches!(
                 cell.style.background,
                 Some(CellColor::Rgb(color))
-                    if color == app.theme.yellow || color == app.theme.peach
+                    if color == app.theme.color(CatppuccinColor::Yellow) || color == app.theme.color(CatppuccinColor::Peach)
             )
     })));
 }
@@ -1842,10 +1818,8 @@ fn ex_addresses_global_and_inccommand_share_the_vim_regex_engine() {
 #[test]
 fn search_direction_is_shared_across_buffers_and_star_uses_word_boundaries() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("first.txt");
-    let second = directory.path().join("second.txt");
-    fs::write(&first, "hit one hit\n").expect("first");
-    fs::write(&second, "hit one hit\n").expect("second");
+    let first = fixture_file(directory.path(), "first.txt", "hit one hit\n");
+    let second = fixture_file(directory.path(), "second.txt", "hit one hit\n");
     let mut app = App::open(Some(&first), None).expect("app");
     app.active.editor.set_cursor(app.active.editor.text().len_bytes());
     app.execute_prompt(Prompt { kind: PromptKind::Search(SearchDirection::Backward), buffer: "hit".to_owned(), history_index: None }).expect("backward search");
@@ -1909,15 +1883,14 @@ fn terminal_grid_preserves_ansi_diff_colors_without_editor_gutters() {
     let terminal = app.terminal.as_ref().expect("terminal session");
     assert_eq!(terminal.surface().size(), (11, 60));
 
-    let mut layout = ViewportLayout::new(60, 12);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(60, 12);
     let grid = desired_frame(&mut layout, &app);
     let first = &grid.rows[0].cells[0];
-    assert_eq!(first.grapheme.as_ref(), "R");
+    assert_eq!(first.grapheme.as_str(), "R");
     assert_eq!(first.style.foreground, Some(CellColor::Palette(1)));
     assert_eq!(first.style.background, Some(CellColor::Palette(4)));
-    assert!(first.style.bold);
-    assert_ne!(first.grapheme.as_ref(), "1");
+    assert!(first.style.bold());
+    assert_ne!(first.grapheme.as_str(), "1");
 
     assert_eq!(terminal_mouse_bytes(&TerminalInput::click(2, 3)), b"\x1b[<0;3;4M");
     assert_eq!(terminal_mouse_bytes(&TerminalInput::scroll(-6, 2, 3)), b"\x1b[<64;3;4M\x1b[<64;3;4M");
@@ -1926,10 +1899,8 @@ fn terminal_grid_preserves_ansi_diff_colors_without_editor_gutters() {
 #[test]
 fn ex_ranges_global_buffers_splits_and_tabs_execute_in_the_app() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("first.txt");
-    let second = directory.path().join("second.txt");
-    fs::write(&first, "keep one\ndrop one\nkeep one\n").expect("first file");
-    fs::write(&second, "second\n").expect("second file");
+    let first = fixture_file(directory.path(), "first.txt", "keep one\ndrop one\nkeep one\n");
+    let second = fixture_file(directory.path(), "second.txt", "second\n");
     let mut app = App::open(Some(&first), None).expect("open first");
 
     app.test_ex("2s/one/TWO/g");
@@ -1948,9 +1919,9 @@ fn ex_ranges_global_buffers_splits_and_tabs_execute_in_the_app() {
     let canonical_first = fs::canonicalize(&first).expect("canonical first path");
     assert_eq!(app.active.document.presentation_path(), Some(canonical_first.as_path()));
     app.test_ex("vsplit");
-    assert_eq!(app.views.windows.len(), 2);
+    assert_eq!(app.views.window_count(), 2);
     app.test_ex("close!");
-    assert_eq!(app.views.windows.len(), 1);
+    assert_eq!(app.views.window_count(), 1);
     app.test_ex("tabnew");
     assert_eq!(app.views.tabs.len(), 2);
     app.test_ex("tabclose");
@@ -1965,7 +1936,7 @@ fn provider_completion_is_revision_checked_and_accepted_atomically() {
     app.request_completion();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while app.completion.is_none() {
-        app.poll_provider_results().expect("poll provider results");
+        app.poll_provider_results();
         assert!(std::time::Instant::now() < deadline, "completion timed out");
         thread::yield_now();
     }
@@ -2063,10 +2034,7 @@ fn assert_language_server_profiles() {
 
 #[test]
 fn nix_file_has_tree_sitter_decorations_before_its_first_frame() {
-    let directory = tempfile::tempdir().expect("tempdir");
-    let path = directory.path().join("flake.nix");
-    fs::write(&path, "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n").expect("Nix source");
-    let app = App::open(Some(&path), None).expect("open Nix file");
+    let (_directory, _path, app) = app_with_fixture("flake.nix", "{ lib, ... }: let greeting = \"hello\"; in { enabled = lib.mkDefault true; } # note\n", None);
     let decorations = app.decorations.get(&app.active.buffer_id).expect("first-frame syntax decorations");
     assert_eq!(decorations.revision, app.active.editor.revision());
     let text = app.active.editor.contents();
@@ -2131,13 +2099,10 @@ fn lsp_location_links_use_target_selection_and_utf16_columns() {
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].path, PathBuf::from("/tmp/wren-target.rs"));
     assert_eq!((locations[0].line, locations[0].column), (3, 3));
-    assert_eq!(locations[0].selection_end, Some(QuickfixPosition { line: 3, column: 9 }));
+    assert_eq!(locations[0].selection_end, Some((3, 9)));
     assert!(locations[0].column_utf16);
 
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("unicode.rs");
-    fs::write(&path, "😀target\n").expect("write source");
-    let app = App::open(Some(&path), None).expect("open app");
+    let (_directory, path, app) = app_with_fixture("unicode.rs", "😀target\n", None);
     let entry = QuickfixEntry::new(path, 1, 3, "").utf16().with_end(1, 9);
     assert_eq!(app.entry_cursor_byte(&entry), "😀".len());
     assert_eq!(entry.selection_byte_range("😀target\n"), Some(4..10));
@@ -2164,12 +2129,10 @@ fn lsp_navigation_capabilities_follow_initialize_provider_advertisements() {
 #[test]
 fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let path = directory.path().join("references.rs");
-    let second_path = directory.path().join("second.rs");
     let source = "// 😀 target and other\n";
     let second_source = "fn other_reference() {}\n";
-    fs::write(&path, source).expect("write source");
-    fs::write(&second_path, second_source).expect("write second source");
+    let path = fixture_file(directory.path(), "references.rs", source);
+    let second_path = fixture_file(directory.path(), "second.rs", second_source);
     let mut app = App::open(Some(&path), None).expect("open app");
     app.quickfix = vec![
         QuickfixEntry::new(path, 1, 7, "language-server location").utf16().with_end(1, 13),
@@ -2183,7 +2146,7 @@ fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
     assert!(app.picker_preview_decorations.iter().any(|decoration| {
         decoration.range == (8..14)
             && decoration.style.foreground.is_none()
-            && decoration.style.background == Some(CellColor::Rgb(app.theme.surface0))
+            && decoration.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface0)))
             && decoration.priority == u32::MAX
     }));
 
@@ -2192,9 +2155,9 @@ fn reference_picker_preview_decorates_only_the_exact_utf16_range() {
     assert_eq!(app.picker_preview, second_source);
     assert_eq!(app.picker_preview_highlight_line, None);
     assert!(
-        app.picker_preview_decorations
-            .iter()
-            .any(|decoration| { decoration.range == (3..18) && decoration.style.background == Some(CellColor::Rgb(app.theme.surface0)) })
+        app.picker_preview_decorations.iter().any(|decoration| {
+            decoration.range == (3..18) && decoration.style.background == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Surface0)))
+        })
     );
     assert!(!app.picker_preview_decorations.iter().any(|decoration| decoration.range == (8..14) && decoration.priority == u32::MAX));
 }
@@ -2222,19 +2185,18 @@ fn lsp_semantic_tokens_override_tree_sitter_with_dotfile_groups() {
     let revision = app.active.editor.revision();
     app.decorations
         .insert(buffer_id, BufferDecorations::new(revision, vec![provider_decoration(HighlightSpan::new(value..value + 5, "function", 1_000_000), app.theme)]));
-    let mut layout = ViewportLayout::new(80, 8);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(80, 8);
     let tree_sitter_frame = desired_frame(&mut layout, &app);
     let tree_sitter_value =
-        tree_sitter_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_ref() == "v").expect("Tree-sitter value cell");
-    assert_eq!(tree_sitter_value.style.foreground, Some(CellColor::Rgb(app.theme.blue)));
+        tree_sitter_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_str() == "v").expect("Tree-sitter value cell");
+    assert_eq!(tree_sitter_value.style.foreground, Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Blue))));
 
     app.semantic_decorations.insert(buffer_id, BufferDecorations::new(revision, spans.into_iter().map(|span| provider_decoration(span, app.theme)).collect()));
     let semantic_frame = desired_frame(&mut layout, &app);
-    let semantic_value = semantic_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_ref() == "v").expect("semantic value cell");
+    let semantic_value = semantic_frame.rows.iter().flat_map(|row| &row.cells).find(|cell| cell.grapheme.as_str() == "v").expect("semantic value cell");
     assert_eq!(
         semantic_value.style.foreground,
-        Some(CellColor::Rgb(app.theme.peach)),
+        Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Peach))),
         "readonly semantic token must override the overlapping Tree-sitter function capture"
     );
 }
@@ -2299,25 +2261,22 @@ fn rust_semantic_tokens_preserve_transparent_tree_sitter_colors() {
     app.semantic_decorations
         .insert(buffer_id, BufferDecorations::new(revision, semantic.into_iter().map(|span| provider_decoration(span, app.theme)).collect()));
 
-    let mut layout = ViewportLayout::new(60, 5);
-    layout.configure_dotfile_profile();
+    let mut layout = dotfile_layout(60, 5);
     let grid = desired_frame(&mut layout, &app);
     let color_of = |wanted: &str| {
-        grid.rows[0].cells.iter().find(|cell| cell.grapheme.as_ref() == wanted).and_then(|cell| cell.style.foreground).expect("colored source cell")
+        grid.rows[0].cells.iter().find(|cell| cell.grapheme.as_str() == wanted).and_then(|cell| cell.style.foreground).expect("colored source cell")
     };
-    assert_eq!(color_of("s"), CellColor::Rgb(app.theme.red));
-    assert_eq!(color_of("r"), CellColor::Rgb(app.theme.lavender));
-    assert_eq!(color_of("c"), CellColor::Rgb(app.theme.blue));
-    assert_eq!(color_of("R"), CellColor::Rgb(app.theme.teal));
+    assert_eq!(color_of("s"), CellColor::Rgb(app.theme.color(CatppuccinColor::Red)));
+    assert_eq!(color_of("r"), CellColor::Rgb(app.theme.color(CatppuccinColor::Lavender)));
+    assert_eq!(color_of("c"), CellColor::Rgb(app.theme.color(CatppuccinColor::Blue)));
+    assert_eq!(color_of("R"), CellColor::Rgb(app.theme.color(CatppuccinColor::Teal)));
 }
 
 #[test]
 fn lsp_navigation_mouse_scroll_and_cross_buffer_jumplist_round_trip() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let first = directory.path().join("first.rs");
-    let second = directory.path().join("second.rs");
-    fs::write(&first, (0..40).map(|line| format!("fn first_{line}() {{}}\n")).collect::<String>()).expect("write first");
-    fs::write(&second, "fn target() {}\n").expect("write second");
+    let first = fixture_file(directory.path(), "first.rs", (0..40).map(|line| format!("fn first_{line}() {{}}\n")).collect::<String>());
+    let second = fixture_file(directory.path(), "second.rs", "fn target() {}\n");
     let mut app = App::open(Some(&first), None).expect("open app");
     app.viewport_rows = 10;
     app.test_input(TerminalInput::scroll(3, 2, 4));

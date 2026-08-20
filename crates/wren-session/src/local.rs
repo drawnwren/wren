@@ -27,7 +27,6 @@ pub enum LineEnding {
 pub struct FileStamp {
     pub identity: FileIdentity,
     pub content_hash: [u8; 32],
-    pub len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,12 +137,10 @@ impl LocalDocument {
         )
     }
 
-    #[must_use]
     pub fn presentation_path(&self) -> Option<&Path> {
         self.presentation_path.as_deref()
     }
 
-    #[must_use]
     pub const fn stamp(&self) -> Option<&FileStamp> {
         self.stamp.as_ref()
     }
@@ -276,9 +273,6 @@ impl LocalDocument {
 }
 
 fn read_extended_attributes(path: &Path) -> io::Result<Vec<(OsString, Vec<u8>)>> {
-    if !xattr::SUPPORTED_PLATFORM {
-        return Ok(Vec::new());
-    }
     let mut attributes = Vec::new();
     for name in xattr::list(path)? {
         if let Some(value) = xattr::get(path, &name)? {
@@ -291,11 +285,7 @@ fn read_extended_attributes(path: &Path) -> io::Result<Vec<(OsString, Vec<u8>)>>
 
 impl LineEnding {
     const fn bytes(self) -> &'static [u8] {
-        match self {
-            Self::Lf => b"\n",
-            Self::Crlf => b"\r\n",
-            Self::Cr => b"\r",
-        }
+        [b"\n".as_slice(), b"\r\n".as_slice(), b"\r".as_slice()][self as usize]
     }
 }
 
@@ -306,36 +296,25 @@ struct Decoded {
     default_line_ending: LineEnding,
 }
 
+impl Decoded {
+    fn read_only(bytes: &[u8], encoding: DocumentEncoding, class: DocumentClass) -> Self {
+        Self {
+            opened: OpenedDocument { text: escaped_bytes(bytes), encoding, class, mixed_line_endings: false, read_only: true },
+            encoding,
+            line_endings: Vec::new(),
+            default_line_ending: LineEnding::Lf,
+        }
+    }
+}
+
 fn decode(bytes: &[u8]) -> Decoded {
     let nul_count = bytes.iter().filter(|byte| **byte == 0).count();
     let binary = nul_count > 0 && nul_count.saturating_mul(100) >= bytes.len().max(1);
     if binary {
-        return Decoded {
-            opened: OpenedDocument {
-                text: escaped_bytes(bytes),
-                encoding: DocumentEncoding::Binary,
-                class: DocumentClass::Pathological,
-                mixed_line_endings: false,
-                read_only: true,
-            },
-            encoding: DocumentEncoding::Binary,
-            line_endings: Vec::new(),
-            default_line_ending: LineEnding::Lf,
-        };
+        return Decoded::read_only(bytes, DocumentEncoding::Binary, DocumentClass::Pathological);
     }
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return Decoded {
-            opened: OpenedDocument {
-                text: escaped_bytes(bytes),
-                encoding: DocumentEncoding::InvalidUtf8,
-                class: classify(bytes.len(), longest_line(bytes)),
-                mixed_line_endings: false,
-                read_only: true,
-            },
-            encoding: DocumentEncoding::InvalidUtf8,
-            line_endings: Vec::new(),
-            default_line_ending: LineEnding::Lf,
-        };
+        return Decoded::read_only(bytes, DocumentEncoding::InvalidUtf8, classify(bytes.len(), longest_line(bytes)));
     };
     let (line_endings, default_line_ending, normalized) = normalize_line_endings(text);
     let mixed_line_endings = line_endings.first().is_some_and(|first| line_endings.iter().any(|ending| ending != first));
@@ -445,23 +424,15 @@ fn escape_invalid_utf8(bytes: &[u8]) -> String {
 }
 
 fn stamp(metadata: &Metadata, bytes: &[u8]) -> FileStamp {
-    FileStamp { identity: file_identity(metadata), content_hash: *blake3::hash(bytes).as_bytes(), len: metadata.len() }
+    FileStamp { identity: file_identity(metadata), content_hash: *blake3::hash(bytes).as_bytes() }
 }
 
-#[cfg(unix)]
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
 
     FileIdentity { device: metadata.dev(), file: metadata.ino(), generation: metadata.len() }
 }
 
-#[cfg(not(unix))]
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    let modified = metadata.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |duration| duration.as_nanos() as u64);
-    FileIdentity { device: metadata.len(), file: modified, generation: metadata.len() }
-}
-
-#[cfg(unix)]
 fn hard_link_warning(path: &Path) -> io::Result<Option<SaveWarning>> {
     use std::os::unix::fs::MetadataExt;
 
@@ -471,11 +442,6 @@ fn hard_link_warning(path: &Path) -> io::Result<Option<SaveWarning>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-#[cfg(not(unix))]
-fn hard_link_warning(_path: &Path) -> io::Result<Option<SaveWarning>> {
-    Ok(None)
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {

@@ -1,10 +1,4 @@
-use std::fs::{File, OpenOptions};
-use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
-use std::os::unix::fs::OpenOptionsExt as _;
 
 use serde::{Deserialize, Serialize};
 use wren_types::{
@@ -31,80 +25,36 @@ pub(crate) enum JournalEntry {
 
 pub type SessionJournalError = crate::record::DurableRecordError;
 
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct SessionJournal {
-    path: PathBuf,
-    writer: Arc<Mutex<Option<File>>>,
+    records: crate::record::RecordStore,
 }
 
 impl SessionJournal {
-    #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), writer: Arc::new(Mutex::new(None)) }
+        Self { records: crate::record::RecordStore::new("session journal", path, MAGIC) }
     }
 
-    #[must_use]
     pub fn in_directory(directory: impl AsRef<Path>) -> Self {
         Self::new(directory.as_ref().join("session.journal"))
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.records.path()
     }
 
     pub(crate) fn append(&self, entry: &JournalEntry) -> Result<(), SessionJournalError> {
-        self.append_value(entry)
+        self.records.append(entry)
     }
 
     pub(crate) fn append_many(&self, entries: &[JournalEntry]) -> Result<(), SessionJournalError> {
-        self.append_values(entries)
-    }
-
-    fn append_value(&self, entry: &impl Serialize) -> Result<(), SessionJournalError> {
-        self.append_values(std::slice::from_ref(entry))
-    }
-
-    fn append_values<T: Serialize>(&self, entries: &[T]) -> Result<(), SessionJournalError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let mut writer = self.writer.lock().map_err(|_| self.io(io::Error::other("session journal writer lock poisoned")))?;
-        if writer.is_none() {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
-            }
-            let mut options = OpenOptions::new();
-            options.create(true).append(true);
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
-            options.custom_flags(nix::fcntl::OFlag::O_DSYNC.bits());
-            *writer = Some(options.open(&self.path).map_err(|error| self.io(error))?);
-        }
-        let file = writer.as_mut().ok_or_else(|| self.io(io::Error::other("session journal writer unavailable")))?;
-        self.records().write_many(file, entries)?;
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd"))]
-        {
-            // O_DSYNC makes completion of the record write itself the durable
-            // frontier; issuing a second sync syscall adds latency but no
-            // stronger guarantee.
-            Ok(())
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "netbsd", target_os = "openbsd")))]
-        {
-            file.sync_data().map_err(|error| self.io(error))
-        }
+        self.records.append_many(entries)
     }
 
     pub(crate) fn recover(&self) -> Result<Vec<JournalEntry>, SessionJournalError> {
-        self.records().recover()
-    }
-
-    fn io(&self, source: io::Error) -> SessionJournalError {
-        self.records().error(source)
-    }
-
-    fn records(&self) -> crate::record::RecordStore<'_> {
-        crate::record::RecordStore::new("session journal", &self.path, MAGIC)
+        self.records.recover()
     }
 }
 

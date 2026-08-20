@@ -1,110 +1,72 @@
 use super::*;
 use std::collections::HashMap;
 
-#[derive(Clone, Copy)]
-enum HighlightStyle {
-    Keyword,
-    Comment,
-    Pink,
-    Sky,
-    Overlay,
-    Green,
-    Teal,
-    Peach,
-    Mauve,
-    Yellow,
-    ItalicYellow,
-    Blue,
-    Maroon,
-    Lavender,
-    Red,
-    Sapphire,
-    Text,
-    Raw,
-    Link,
-    Strong,
-    Italic,
-}
-
 struct HighlightRule {
-    style: HighlightStyle,
+    color: CatppuccinColor,
+    attributes: u8,
+    background: Option<CatppuccinColor>,
     exact: &'static [&'static str],
     prefixes: &'static [&'static str],
     suffixes: &'static [&'static str],
 }
 
 impl HighlightRule {
+    const fn new(color: CatppuccinColor, exact: &'static [&'static str], prefixes: &'static [&'static str], suffixes: &'static [&'static str]) -> Self {
+        Self { color, attributes: 0, background: None, exact, prefixes, suffixes }
+    }
+
+    const fn attributes(mut self, attributes: u8) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    const fn background(mut self, background: CatppuccinColor) -> Self {
+        self.background = Some(background);
+        self
+    }
+
     fn matches(&self, kind: &str) -> bool {
         self.exact.contains(&kind) || self.prefixes.iter().any(|prefix| kind.starts_with(prefix)) || self.suffixes.iter().any(|suffix| kind.ends_with(suffix))
     }
 }
 
-macro_rules! highlight_rule {
-    ($style:ident; $exact:expr; $prefixes:expr; $suffixes:expr) => {
-        HighlightRule { style: HighlightStyle::$style, exact: $exact, prefixes: $prefixes, suffixes: $suffixes }
-    };
-}
-
 const HIGHLIGHT_RULES: &[HighlightRule] = &[
-    highlight_rule!(
-        Keyword;
-        &[
-            "conditional",
-            "repeat",
-            "exception",
-            "type.qualifier",
-            "type.definition",
-            "storage",
-            "storageclass",
-        ];
-        &["keyword"];
-        &[]
-    ),
-    highlight_rule!(Comment; &[]; &["comment"]; &[]),
-    highlight_rule!(
-        Pink;
-        &["include", "constant.macro", "function.macro"];
-        &["preproc", "attribute", "decorator"];
-        &[]
-    ),
-    highlight_rule!(Sky; &["operator"]; &[]; &[]),
-    highlight_rule!(Overlay; &[]; &["punctuation"]; &[]),
-    highlight_rule!(Pink; &["escape"]; &["string.escape", "string.special"]; &[]),
-    highlight_rule!(Green; &[]; &["string"]; &[]),
-    highlight_rule!(Pink; &[]; &["character.special"]; &[]),
-    highlight_rule!(Teal; &[]; &["character"]; &[]),
-    highlight_rule!(Peach; &["boolean", "float"]; &["number", "constant"]; &[]),
-    highlight_rule!(Mauve; &["type.builtin"]; &[]; &[]),
-    highlight_rule!(Yellow; &["constructor"]; &["type"]; &[]),
-    highlight_rule!(Peach; &["function.builtin"]; &[]; &[]),
-    highlight_rule!(Blue; &["tag"]; &["function", "method"]; &[]),
-    highlight_rule!(Pink; &["variable.parameter.builtin"]; &[]; &[]),
-    highlight_rule!(Maroon; &["parameter"]; &["variable.parameter"]; &[]),
-    highlight_rule!(Lavender; &["property", "field"]; &["variable.member"]; &[]),
-    highlight_rule!(Teal; &["semantic.enum-member"]; &[]; &[]),
-    highlight_rule!(Yellow; &["semantic.event"]; &[]; &[]),
-    highlight_rule!(Pink; &["semantic.regexp"]; &[]; &[]),
-    highlight_rule!(Blue; &["semantic.decorator"]; &[]; &[]),
-    highlight_rule!(
-        ItalicYellow;
-        &[
-            "semantic.namespace",
-            "tag.attribute",
-            "namespace",
-            "module",
-            "module.builtin",
-        ];
-        &[];
-        &[]
-    ),
-    highlight_rule!(Red; &["variable.builtin"]; &[]; &[]),
-    highlight_rule!(Keyword; &[]; &["markup.heading"]; &[]),
-    highlight_rule!(Raw; &[]; &["markup.raw"]; &[]),
-    highlight_rule!(Link; &[]; &["markup.link"]; &[".url"]),
-    highlight_rule!(Strong; &["markup.strong"]; &[]; &[]),
-    highlight_rule!(Italic; &["markup.italic"]; &[]; &[]),
-    highlight_rule!(Sapphire; &["label", "symbol"]; &[]; &[]),
-    highlight_rule!(Text; &[]; &["variable"]; &[]),
+    HighlightRule::new(
+        CatppuccinColor::Mauve,
+        &["conditional", "repeat", "exception", "type.qualifier", "type.definition", "storage", "storageclass"],
+        &["keyword"],
+        &[],
+    )
+    .attributes(1),
+    HighlightRule::new(CatppuccinColor::Overlay2, &[], &["comment"], &[]).attributes(2),
+    HighlightRule::new(CatppuccinColor::Pink, &["include", "constant.macro", "function.macro"], &["preproc", "attribute", "decorator"], &[]),
+    HighlightRule::new(CatppuccinColor::Sky, &["operator"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Overlay2, &[], &["punctuation"], &[]),
+    HighlightRule::new(CatppuccinColor::Pink, &["escape"], &["string.escape", "string.special"], &[]),
+    HighlightRule::new(CatppuccinColor::Green, &[], &["string"], &[]),
+    HighlightRule::new(CatppuccinColor::Pink, &[], &["character.special"], &[]),
+    HighlightRule::new(CatppuccinColor::Teal, &[], &["character"], &[]),
+    HighlightRule::new(CatppuccinColor::Peach, &["boolean", "float"], &["number", "constant"], &[]),
+    HighlightRule::new(CatppuccinColor::Mauve, &["type.builtin"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Yellow, &["constructor"], &["type"], &[]),
+    HighlightRule::new(CatppuccinColor::Peach, &["function.builtin"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Blue, &["tag"], &["function", "method"], &[]),
+    HighlightRule::new(CatppuccinColor::Pink, &["variable.parameter.builtin"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Maroon, &["parameter"], &["variable.parameter"], &[]),
+    HighlightRule::new(CatppuccinColor::Lavender, &["property", "field"], &["variable.member"], &[]),
+    HighlightRule::new(CatppuccinColor::Teal, &["semantic.enum-member"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Yellow, &["semantic.event"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Pink, &["semantic.regexp"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Blue, &["semantic.decorator"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Yellow, &["semantic.namespace", "tag.attribute", "namespace", "module", "module.builtin"], &[], &[]).attributes(2),
+    HighlightRule::new(CatppuccinColor::Red, &["variable.builtin"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Mauve, &[], &["markup.heading"], &[]).attributes(1),
+    HighlightRule::new(CatppuccinColor::Green, &[], &["markup.raw"], &[]).background(CatppuccinColor::Surface0),
+    HighlightRule::new(CatppuccinColor::Blue, &[], &["markup.link"], &[".url"]).attributes(4),
+    HighlightRule::new(CatppuccinColor::Text, &["markup.strong"], &[], &[]).attributes(1),
+    HighlightRule::new(CatppuccinColor::Text, &["markup.italic"], &[], &[]).attributes(2),
+    HighlightRule::new(CatppuccinColor::Sapphire, &["label", "symbol"], &[], &[]),
+    HighlightRule::new(CatppuccinColor::Text, &[], &["variable"], &[]),
 ];
 
 pub(super) fn provider_decoration(span: HighlightSpan, theme: CatppuccinPalette) -> DecorationSpan {
@@ -127,77 +89,14 @@ pub(super) fn provider_decorations(spans: Vec<HighlightSpan>, theme: CatppuccinP
 }
 
 fn provider_cell_style(kind: &str, theme: CatppuccinPalette) -> CellStyle {
-    let style = HIGHLIGHT_RULES.iter().find(|rule| rule.matches(kind)).map_or(HighlightStyle::Text, |rule| rule.style);
-    highlight_cell_style(style, theme)
-}
-
-fn highlight_cell_style(style: HighlightStyle, theme: CatppuccinPalette) -> CellStyle {
-    let (foreground, bold, italic, underline, background) = match style {
-        HighlightStyle::Keyword => (theme.mauve, true, false, false, None),
-        HighlightStyle::Comment => (theme.overlay2, false, true, false, None),
-        HighlightStyle::Pink => (theme.pink, false, false, false, None),
-        HighlightStyle::Sky => (theme.sky, false, false, false, None),
-        HighlightStyle::Overlay => (theme.overlay2, false, false, false, None),
-        HighlightStyle::Green => (theme.green, false, false, false, None),
-        HighlightStyle::Teal => (theme.teal, false, false, false, None),
-        HighlightStyle::Peach => (theme.peach, false, false, false, None),
-        HighlightStyle::Mauve => (theme.mauve, false, false, false, None),
-        HighlightStyle::Yellow => (theme.yellow, false, false, false, None),
-        HighlightStyle::ItalicYellow => (theme.yellow, false, true, false, None),
-        HighlightStyle::Blue => (theme.blue, false, false, false, None),
-        HighlightStyle::Maroon => (theme.maroon, false, false, false, None),
-        HighlightStyle::Lavender => (theme.lavender, false, false, false, None),
-        HighlightStyle::Red => (theme.red, false, false, false, None),
-        HighlightStyle::Sapphire => (theme.sapphire, false, false, false, None),
-        HighlightStyle::Text => (theme.text, false, false, false, None),
-        HighlightStyle::Raw => (theme.green, false, false, false, Some(theme.surface0)),
-        HighlightStyle::Link => (theme.blue, false, false, true, None),
-        HighlightStyle::Strong => (theme.text, true, false, false, None),
-        HighlightStyle::Italic => (theme.text, false, true, false, None),
-    };
-    CellStyle { bold, italic, underline, foreground: Some(CellColor::Rgb(foreground)), background: background.map(CellColor::Rgb), ..CellStyle::default() }
-}
-
-pub(super) fn markdown_decorations(text: &str, theme: CatppuccinPalette) -> Vec<DecorationSpan> {
-    let mut spans = Vec::new();
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let indentation = line.len().saturating_sub(trimmed.len());
-        if trimmed.starts_with('#') {
-            spans.push(DecorationSpan::new(
-                offset + indentation..offset + line.trim_end().len(),
-                CellStyle::default().with_foreground(CellColor::Rgb(theme.mauve)).with_bold(),
-                1_100_000,
-            ));
-        } else if trimmed.starts_with("> ") {
-            spans.push(DecorationSpan::new(
-                offset + indentation..offset + line.trim_end().len(),
-                CellStyle::default().with_foreground(CellColor::Rgb(theme.overlay2)).with_italic(),
-                1_100_000,
-            ));
-        }
-        for (delimiter, mut style) in
-            [("**", CellStyle::default().with_bold()), ("~~", CellStyle::default().with_strikethrough()), ("`", CellStyle::rgb(theme.green, theme.surface0))]
-        {
-            let mut search = 0;
-            while let Some(start) = line[search..].find(delimiter) {
-                let start = search + start;
-                let content_start = start + delimiter.len();
-                let Some(end) = line[content_start..].find(delimiter) else {
-                    break;
-                };
-                let end = content_start + end + delimiter.len();
-                if delimiter == "`" {
-                    style.italic = false;
-                }
-                spans.push(DecorationSpan::new(offset + start..offset + end, style, 1_100_000));
-                search = end;
-            }
-        }
-        offset += line.len();
+    let rule = HIGHLIGHT_RULES.iter().find(|rule| rule.matches(kind));
+    let color = rule.map_or(CatppuccinColor::Text, |rule| rule.color);
+    let attributes = rule.map_or(0, |rule| rule.attributes);
+    CellStyle {
+        attributes,
+        foreground: Some(CellColor::Rgb(theme.color(color))),
+        background: rule.and_then(|rule| rule.background).map(|color| CellColor::Rgb(theme.color(color))),
     }
-    spans
 }
 
 pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (String, Vec<DecorationSpan>) {
@@ -208,11 +107,7 @@ pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (S
         let trimmed = line.trim();
         if let Some(fence) = trimmed.strip_prefix("```") {
             if let Some((start, language)) = code_block.take() {
-                let _language = normalized_fence_language(&language);
-                code_spans.extend(lexical_highlight_text(&text[start..]).into_iter().map(|mut span| {
-                    span.range = start + span.range.start..start + span.range.end;
-                    provider_decoration(span, theme)
-                }));
+                append_fenced_highlights(&text, start, &language, theme, &mut code_spans);
             } else {
                 code_block = Some((text.len(), fence.trim().to_owned()));
             }
@@ -221,18 +116,21 @@ pub(super) fn lsp_popup_markdown(markdown: &str, theme: CatppuccinPalette) -> (S
         text.push_str(line);
     }
     if let Some((start, language)) = code_block {
-        let _language = normalized_fence_language(&language);
-        code_spans.extend(lexical_highlight_text(&text[start..]).into_iter().map(|mut span| {
-            span.range = start + span.range.start..start + span.range.end;
-            provider_decoration(span, theme)
-        }));
+        append_fenced_highlights(&text, start, &language, theme, &mut code_spans);
     }
     while text.ends_with('\n') {
         text.pop();
     }
-    let mut decorations = markdown_decorations(&text, theme);
+    let mut decorations = provider_decorations(highlight_text(&text, "markdown"), theme);
     decorations.extend(code_spans);
     (text, decorations)
+}
+
+fn append_fenced_highlights(text: &str, start: usize, language: &str, theme: CatppuccinPalette, output: &mut Vec<DecorationSpan>) {
+    output.extend(provider_decorations(highlight_text(&text[start..], normalized_fence_language(language)), theme).into_iter().map(|mut span| {
+        span.range = start + span.range.start..start + span.range.end;
+        span
+    }));
 }
 
 pub(super) fn normalized_fence_language(language: &str) -> &str {

@@ -18,18 +18,13 @@ impl App {
         let columns = u16::try_from(self.viewport_columns).unwrap_or(u16::MAX).max(1);
         self.terminal = Some(PtySession::spawn_in(&program, &arguments, rows, columns, directory)?);
         self.input_focus = InputFocus::Terminal { escape_pending: false };
-        self.message = format!("terminal: {program}");
-        Ok(())
+        self.set_message(format!("terminal: {program}"))
     }
 
     pub(super) fn handle_terminal_input(&mut self, input: TerminalInput) -> Result<()> {
         match input {
             TerminalInput::Resized { columns, rows } => self.resize_terminal(rows, columns),
-            TerminalInput::Paste(text) => {
-                if let Some(terminal) = &mut self.terminal {
-                    terminal.send_input(text.as_bytes())?;
-                }
-            }
+            TerminalInput::Paste(text) => send_pty(&mut self.terminal, text.as_bytes())?,
             TerminalInput::Key(key) => {
                 let escape_pending = matches!(self.input_focus, InputFocus::Terminal { escape_pending: true });
                 self.input_focus = InputFocus::Terminal { escape_pending: false };
@@ -39,27 +34,17 @@ impl App {
                         self.message = "terminal hidden; :terminal returns".to_owned();
                         return Ok(());
                     }
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.send_input(&[0x1c])?;
-                    }
+                    send_pty(&mut self.terminal, &[0x1c])?;
                 }
                 if key.control() && key.code == TerminalKeyCode::Char('\\') {
                     self.input_focus = InputFocus::Terminal { escape_pending: true };
                     return Ok(());
                 }
-                if let Some(bytes) = terminal_key_bytes(key)
-                    && let Some(terminal) = &mut self.terminal
-                {
-                    terminal.send_input(&bytes)?;
+                if let Some(bytes) = terminal_key_bytes(key) {
+                    send_pty(&mut self.terminal, &bytes)?;
                 }
             }
-            event @ TerminalInput::Mouse { .. } => {
-                if let Some(terminal) = &mut self.terminal
-                    && terminal.surface().accepts_sgr_mouse()
-                {
-                    terminal.send_input(&terminal_mouse_bytes(&event))?;
-                }
-            }
+            event @ TerminalInput::Mouse { .. } => send_pty_mouse(&mut self.terminal, &event)?,
             TerminalInput::Ignored => {}
         }
         Ok(())
@@ -81,7 +66,7 @@ impl App {
 
     pub(super) fn take_normal_count(&mut self) -> Option<usize> {
         let count = match self.active.editor.pending_parse_state() {
-            Some(ParseState::Count { value }) => usize::try_from(value.get()).ok(),
+            Some(ParseState::Count(value)) => usize::try_from(value.get()).ok(),
             _ => None,
         };
         if count.is_some() {
@@ -124,65 +109,6 @@ impl App {
             moved = true;
         }
         moved
-    }
-
-    pub(super) fn handle_window_prefix(&mut self, key: TerminalKey) -> Result<()> {
-        let count = self.take_normal_count().unwrap_or(1);
-        let direction = match key.code {
-            TerminalKeyCode::Char('h' | 'H') | TerminalKeyCode::Left => Some(WindowDirection::Left),
-            TerminalKeyCode::Char('j' | 'J') | TerminalKeyCode::Down => Some(WindowDirection::Down),
-            TerminalKeyCode::Char('k' | 'K') | TerminalKeyCode::Up => Some(WindowDirection::Up),
-            TerminalKeyCode::Char('l' | 'L') | TerminalKeyCode::Right => Some(WindowDirection::Right),
-            _ => None,
-        };
-        if let Some(direction) = direction {
-            let previous = self.views.active_window().id;
-            self.views.focus_window(direction)?;
-            if direction == WindowDirection::Right && self.agent_sidebar.visible && self.views.active_window().id == previous {
-                self.input_focus = InputFocus::Agent(AgentInputPrefix::None);
-                self.popup = None;
-                self.popup_deadline = None;
-                self.message = "Oh My Pi window focused".to_owned();
-                return Ok(());
-            }
-            self.activate_view_buffer()?;
-            self.message.clear();
-            return Ok(());
-        }
-        match key.code {
-            TerminalKeyCode::Char('s' | 'S') => {
-                self.views.split_active(SplitAxis::Horizontal)?;
-                self.message.clear();
-            }
-            TerminalKeyCode::Char('v' | 'V') => {
-                self.views.split_active(SplitAxis::Vertical)?;
-                self.message.clear();
-            }
-            TerminalKeyCode::Char('c' | 'C' | 'q' | 'Q') => {
-                if let Err(error) = self.views.close_active_window() {
-                    self.show_error(error);
-                } else {
-                    self.activate_view_buffer()?;
-                    self.message.clear();
-                }
-            }
-            TerminalKeyCode::Char('o' | 'O') => {
-                self.views.only_active_window()?;
-                self.message.clear();
-            }
-            TerminalKeyCode::Char('w' | 'W') => {
-                self.views.cycle_window(if key.shift() { -1 } else { 1_isize }.saturating_mul(isize::try_from(count).unwrap_or(isize::MAX)))?;
-                self.activate_view_buffer()?;
-                self.message.clear();
-            }
-            TerminalKeyCode::Char('=') => {
-                self.views.equalize_windows()?;
-                self.message.clear();
-            }
-            TerminalKeyCode::Escape => self.message.clear(),
-            _ => self.message = "unknown Ctrl-W command".to_owned(),
-        }
-        Ok(())
     }
 
     pub(super) fn scroll_page(&mut self, direction: isize, full_page: bool, count: Option<usize>) {
@@ -317,11 +243,8 @@ impl App {
     }
 
     pub(super) fn poll_terminal(&mut self) -> Result<bool> {
-        let Some(terminal) = &mut self.terminal else {
-            return Ok(false);
-        };
-        let changed = terminal.poll()?;
-        if changed && let Some(code) = terminal.exit_code() {
+        let (changed, exit) = poll_pty(&mut self.terminal)?;
+        if let Some(code) = exit {
             self.input_focus = InputFocus::Editor;
             self.message = format!("terminal exited with status {code}");
         }
@@ -368,30 +291,33 @@ impl App {
                     let Some(source) = surface.cell(u16::try_from(row).unwrap_or(u16::MAX), u16::try_from(column).unwrap_or(u16::MAX)) else {
                         break;
                     };
-                    if source.wide_continuation {
+                    if source.is_wide_continuation() {
                         column = column.saturating_add(1);
                         continue;
                     }
-                    let width = if source.wide { 2 } else { 1 };
+                    let width = if source.is_wide() { 2 } else { 1 };
                     if column.saturating_add(width) > columns {
                         break;
                     }
                     cells.push(ViewCell {
-                        grapheme: if source.contents.is_empty() { " ".into() } else { source.contents.into() },
+                        grapheme: if source.contents().is_empty() { " ".into() } else { source.contents().into() },
                         width: u8::try_from(width).unwrap_or(1),
                         style: CellStyle {
-                            bold: source.bold,
-                            italic: source.italic,
-                            underline: source.underline,
-                            strikethrough: false,
-                            reverse: source.reverse,
-                            foreground: Some(terminal_cell_color(source.foreground, self.theme.text)),
-                            background: Some(terminal_cell_color(source.background, self.theme.base)),
+                            attributes: u8::from(source.bold())
+                                | u8::from(source.italic()) << 1
+                                | u8::from(source.underline()) << 2
+                                | u8::from(source.inverse()) << 4,
+                            foreground: Some(terminal_cell_color(source.fgcolor(), self.theme.color(CatppuccinColor::Text))),
+                            background: Some(terminal_cell_color(source.bgcolor(), self.theme.color(CatppuccinColor::Base))),
                         },
                     });
                     column = column.saturating_add(width);
                 }
-                cells.extend((column..columns).map(|_| ViewCell { grapheme: " ".into(), width: 1, style: CellStyle::rgb(self.theme.text, self.theme.base) }));
+                cells.extend((column..columns).map(|_| ViewCell {
+                    grapheme: " ".into(),
+                    width: 1,
+                    style: CellStyle::rgb(self.theme.color(CatppuccinColor::Text), self.theme.color(CatppuccinColor::Base)),
+                }));
                 CellRow { cells }
             })
             .collect()
@@ -408,83 +334,58 @@ impl App {
     }
 
     pub(super) fn start_make_task(&mut self, program: &str, arguments: &[Box<str>]) -> Result<()> {
-        if self.active_task.is_some() {
-            bail!("a TaskCommand is already running");
-        }
-        let task_id = CommandTaskId::new(self.next_task_id);
-        self.next_task_id = self.next_task_id.checked_add(1).ok_or_else(|| anyhow!("task ID overflow"))?;
-        let mut environment = BTreeMap::new();
-        if let Ok(path) = env::var("PATH") {
-            environment.insert("PATH".into(), path.into());
-        }
-        let spec = WorkflowTaskSpec::persisted(program, arguments.to_vec(), environment, 1024 * 1024);
-        let cancellation =
-            self.tasks.submit(CommandTask { task_id, affected_documents: Vec::new(), label: format!("make {program}").into() }, move |context| {
-                context.checkpoint()?;
-                let token = context.cancellation_token();
-                let output = TaskSupervisor::new(true)
-                    .run_until_cancelled(&spec, || token.is_cancelled())
-                    .map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
-                context.checkpoint()?;
-                if output.cancelled {
-                    return Err(TaskFailure::Cancelled);
-                }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-                let status = output.status.map_or_else(|| "signal".to_owned(), |status| status.to_string());
-                Ok(Effects {
-                    messages: vec![format!("task {task_id:?} status {status}: {}", if detail.is_empty() { "no output" } else { detail }).into()],
-                    ..Effects::default()
-                })
-            })?;
-        self.active_task = Some(cancellation);
-        self.message = format!("task {} running", task_id.get());
-        Ok(())
+        let spec = WorkflowTaskSpec::persisted(program, arguments.to_vec(), inherited_path_environment(), 1024 * 1024);
+        self.start_task(Vec::new(), format!("make {program}"), "task ", move |task_id, context| {
+            context.checkpoint()?;
+            let token = context.cancellation_token();
+            let output =
+                TaskSupervisor::new(true).run_until_cancelled(&spec, || token.is_cancelled()).map_err(|error| TaskFailure::Failed(error.to_string().into()))?;
+            context.checkpoint()?;
+            if output.cancelled {
+                return Err(TaskFailure::Cancelled);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+            let status = output.status.map_or_else(|| "signal".to_owned(), |status| status.to_string());
+            Ok(Effects {
+                messages: vec![format!("task {task_id:?} status {status}: {}", if detail.is_empty() { "no output" } else { detail }).into()],
+                ..Effects::default()
+            })
+        })
     }
 
     pub(super) fn start_format_task(&mut self, program: &str, arguments: &[Box<str>]) -> Result<()> {
-        if self.active_task.is_some() {
-            bail!("a TaskCommand is already running");
-        }
         if self.active.editor.is_read_only() {
             bail!("document is read-only");
         }
-        let task_id = CommandTaskId::new(self.next_task_id);
-        self.next_task_id = self.next_task_id.checked_add(1).ok_or_else(|| anyhow!("task ID overflow"))?;
         let document_id = self.active.document_id;
         let base_revision = self.active.editor.revision();
         let input = self.active.editor.contents();
-        let mut environment = BTreeMap::new();
-        if let Ok(path) = env::var("PATH") {
-            environment.insert("PATH".into(), path.into());
-        }
-        let spec = WorkflowTaskSpec::persisted(program, arguments.to_vec(), environment, input.len().saturating_mul(4).max(1024 * 1024));
-        let cancellation =
-            self.tasks.submit(CommandTask { task_id, affected_documents: vec![document_id], label: format!("format {program}").into() }, move |context| {
-                context.checkpoint()?;
-                let token = context.cancellation_token();
-                let formatted = run_formatter_until_cancelled(&spec, true, document_id, base_revision, base_revision, &input, || token.is_cancelled())
-                    .map_err(|error| match error {
+        let spec = WorkflowTaskSpec::persisted(program, arguments.to_vec(), inherited_path_environment(), input.len().saturating_mul(4).max(1024 * 1024));
+        self.start_task(vec![document_id], format!("format {program}"), "formatter task ", move |_, context| {
+            context.checkpoint()?;
+            let token = context.cancellation_token();
+            let formatted =
+                run_formatter_until_cancelled(&spec, true, document_id, base_revision, base_revision, &input, || token.is_cancelled()).map_err(|error| {
+                    match error {
                         WorkflowError::Cancelled => TaskFailure::Cancelled,
                         error => TaskFailure::Failed(error.to_string().into()),
-                    })?;
-                context.checkpoint()?;
-                let edit_proposals = if formatted.edits.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![EditProposal {
-                        document_id,
-                        base_revision,
-                        transactions: vec![Transaction::new(base_revision, formatted.edits).map_err(|error| TaskFailure::Failed(error.to_string().into()))?],
-                        label: "formatter".into(),
-                    }]
-                };
-                Ok(Effects { edit_proposals, messages: vec!["format complete".into()], ..Effects::default() })
-            })?;
-        self.active_task = Some(cancellation);
-        self.message = format!("formatter task {} running", task_id.get());
-        Ok(())
+                    }
+                })?;
+            context.checkpoint()?;
+            let edit_proposals = if formatted.edits.is_empty() {
+                Vec::new()
+            } else {
+                vec![EditProposal {
+                    document_id,
+                    base_revision,
+                    transactions: vec![Transaction::new(base_revision, formatted.edits).map_err(|error| TaskFailure::Failed(error.to_string().into()))?],
+                    label: "formatter".into(),
+                }]
+            };
+            Ok(Effects { edit_proposals, messages: vec!["format complete".into()] })
+        })
     }
 
     pub(super) fn format_active_language(&mut self) -> Result<()> {
@@ -524,8 +425,7 @@ impl App {
         let source = text.get(range.clone()).unwrap_or_default();
         let formatted = wrap_editor_text(source, 79);
         if formatted == source {
-            self.message = "text already fits textwidth=79".to_owned();
-            return Ok(());
+            return self.set_message("text already fits textwidth=79".to_owned());
         }
         if was_visual {
             self.dispatch_key(KeyEvent::plain(KeyCode::Escape));
@@ -533,8 +433,7 @@ impl App {
         let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(range, formatted)])?;
         self.active.editor.apply_transaction(transaction.clone())?;
         self.after_transaction(Some(transaction));
-        self.message = "formatted to textwidth=79".to_owned();
-        Ok(())
+        self.set_message("formatted to textwidth=79".to_owned())
     }
 
     pub(super) fn format_active_sync(&mut self, explicit: bool) -> Result<bool> {
@@ -590,7 +489,7 @@ impl App {
             }
             return Ok(false);
         }
-        let (mut client, uri) = self.start_lsp()?;
+        let (client, uri) = self.active_lsp_client()?;
         let result = client.request(
             "textDocument/formatting",
             serde_json::json!({
@@ -599,14 +498,31 @@ impl App {
             }),
         )?;
         let edits: Vec<LspTextEdit> = serde_json::from_value(result)?;
-        let revision = self.active.editor.revision();
-        let text = self.active.editor.contents();
-        let lowered = lower_lsp_text_edits(self.active.document_id, revision, revision, &text, edits)?;
-        if !lowered.edits.is_empty() {
-            let transaction = Transaction::new(revision, lowered.edits)?;
-            self.active.editor.apply_transaction(transaction.clone())?;
-            self.after_transaction(Some(transaction));
-        }
+        self.apply_lsp_text_edits(edits)?;
         Ok(true)
     }
+}
+
+fn inherited_path_environment() -> BTreeMap<Box<str>, Box<str>> {
+    env::var("PATH").map(|path| BTreeMap::from([("PATH".into(), path.into())])).unwrap_or_default()
+}
+
+pub(super) fn poll_pty(terminal: &mut Option<PtySession>) -> Result<(bool, Option<u32>)> {
+    let Some(terminal) = terminal else { return Ok((false, None)) };
+    let changed = terminal.poll()?;
+    Ok((changed, changed.then_some(terminal.exit_code()).flatten()))
+}
+
+pub(super) fn send_pty(terminal: &mut Option<PtySession>, bytes: &[u8]) -> Result<()> {
+    terminal.as_mut().map_or(Ok(()), |terminal| terminal.send_input(bytes)).map_err(Into::into)
+}
+
+pub(super) fn send_pty_mouse(terminal: &mut Option<PtySession>, event: &TerminalInput) -> Result<()> {
+    let Some(terminal) = terminal.as_mut().filter(|terminal| {
+        terminal.surface().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+            && terminal.surface().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
+    }) else {
+        return Ok(());
+    };
+    terminal.send_input(&terminal_mouse_bytes(event)).map_err(Into::into)
 }

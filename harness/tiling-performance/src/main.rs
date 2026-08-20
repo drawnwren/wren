@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use hdrhistogram::Histogram;
 use serde_json::{Value, json};
 use wren_benchmark_support::{
-    ArgumentCursor, CommonArguments, bare_metal_declared, distribution, emit_report, histogram, pin_requested_cpu, require_bare_metal_cpu, ten_percent_cut,
+    CommonArguments, bare_metal_declared, distribution, emit_report, histogram, isolated_child_report, pin_requested_cpu, require_bare_metal_cpu,
+    ten_percent_cut,
 };
 use wren_tui::{TilingPerformanceReport, run_tiling_performance_probe};
 
@@ -70,18 +70,6 @@ const SCENARIO_GATES: [ScenarioGate; 4] = [
     },
 ];
 
-fn arguments() -> Result<Arguments> {
-    let mut arguments = Arguments::new(1_000);
-    let mut cursor = ArgumentCursor::from_env();
-    while let Some(argument) = cursor.next() {
-        if !arguments.consume(&argument, &mut cursor)? {
-            anyhow::bail!("unknown argument: {argument}");
-        }
-    }
-    arguments.validate()?;
-    Ok(arguments)
-}
-
 #[derive(Debug)]
 struct ScenarioMetrics {
     desired: Histogram<u64>,
@@ -106,19 +94,7 @@ impl ScenarioMetrics {
 }
 
 fn isolate_probe(iterations: u64) -> Result<TilingPerformanceReport> {
-    let isolated = tempfile::tempdir().context("create isolated tiling benchmark home")?;
-    let output = Command::new(env::current_exe().context("locate tiling benchmark executable")?)
-        .arg("--probe-child")
-        .arg(iterations.to_string())
-        .current_dir(isolated.path())
-        .env("HOME", isolated.path())
-        .env("XDG_STATE_HOME", isolated.path().join("state"))
-        .env("XDG_DATA_HOME", isolated.path().join("data"))
-        .env("XDG_CONFIG_HOME", isolated.path().join("config"))
-        .output()
-        .context("run isolated tiling performance probe")?;
-    anyhow::ensure!(output.status.success(), "tiling performance probe failed: {}", String::from_utf8_lossy(&output.stderr));
-    let report: TilingPerformanceReport = serde_json::from_slice(&output.stdout).context("decode tiling performance probe")?;
+    let report: TilingPerformanceReport = isolated_child_report("--probe-child", iterations, "tiling performance probe")?;
     anyhow::ensure!(report.schema == 1, "unsupported tiling probe schema");
     anyhow::ensure!(report.requested_iterations == iterations, "tiling probe iteration count changed");
     anyhow::ensure!(
@@ -204,7 +180,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let arguments = arguments()?;
+    let arguments = Arguments::parse(1_000)?;
     let pinned = pin_requested_cpu(arguments.cpu);
     require_bare_metal_cpu(arguments.gate, arguments.cpu, pinned, "--gate")?;
     let probe = isolate_probe(arguments.iterations)?;

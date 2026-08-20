@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = []
+test-support = []
+
 [dependencies]
 bitflags.workspace = true
 blake3.workspace = true

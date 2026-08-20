@@ -1,6 +1,4 @@
 use std::env;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,14 +16,14 @@ pub type WalError = crate::record::DurableRecordError;
 
 #[derive(Debug, Clone)]
 pub struct LocalWal {
-    path: PathBuf,
+    records: crate::record::RecordStore,
 }
 
 impl LocalWal {
     #[must_use]
     pub fn in_directory(directory: impl AsRef<Path>, document_key: &[u8]) -> Self {
         let name = format!("{}.wal", blake3::hash(document_key).to_hex());
-        Self { path: directory.as_ref().join(name) }
+        Self { records: crate::record::RecordStore::new("WAL", directory.as_ref().join(name), MAGIC) }
     }
 
     pub fn for_document(path: &Path) -> Result<Self, WalError> {
@@ -40,31 +38,19 @@ impl LocalWal {
 
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.records.path()
     }
 
     pub fn append(&self, state: &RecoveredState) -> Result<(), WalError> {
-        self.records().append(state)
+        self.records.append(state)
     }
 
     pub fn recover_latest(&self) -> Result<Option<RecoveredState>, WalError> {
-        self.records().recover().map(|records: Vec<RecoveredState>| records.into_iter().next_back())
+        self.records.recover().map(|records: Vec<RecoveredState>| records.into_iter().next_back())
     }
 
     pub fn clear(&self) -> Result<(), WalError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(self.io(error)),
-        }
-    }
-
-    fn io(&self, source: io::Error) -> WalError {
-        self.records().error(source)
-    }
-
-    fn records(&self) -> crate::record::RecordStore<'_> {
-        crate::record::RecordStore::new("WAL", &self.path, MAGIC)
+        self.records.remove()
     }
 }
 
@@ -74,6 +60,7 @@ fn state_directory() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write as _;
 

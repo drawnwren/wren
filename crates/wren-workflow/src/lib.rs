@@ -12,41 +12,27 @@ use std::time::{Duration, Instant};
 use imara_diff::{Algorithm, Diff, InternedInput};
 pub use ls_types::{Position as LspPosition, Range as LspRange, TextEdit as LspTextEdit};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+pub use vt100::{Color as TerminalColor, Screen as TerminalSurface};
 use wren_position::utf16_position_to_byte;
-use wren_types::{
-    Bias, DocumentId, DocumentMutation, DocumentRevision, Edit, ExpectedTarget, FileIdentity, LeaseEpoch, ResourceOp, SemanticGroupId, SemanticGroupKind,
-    Transaction, WorkspaceTransaction,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocumentVisibility {
-    Persisted,
-    RemoteAcked,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SavePolicy {
-    Never,
-    Prompt,
-    All,
-}
+#[cfg(test)]
+use wren_types::{Bias, DocumentMutation, ExpectedTarget, FileIdentity, LeaseEpoch, ResourceOp, SemanticGroupId, SemanticGroupKind, WorkspaceTransaction};
+use wren_types::{DocumentId, DocumentRevision, Edit, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     pub program: PathBuf,
     pub arguments: Vec<Box<str>>,
     pub environment: BTreeMap<Box<str>, Box<str>>,
-    pub visibility: DocumentVisibility,
-    pub save: SavePolicy,
     pub max_output_bytes: usize,
 }
 
 impl TaskSpec {
     #[must_use]
     pub fn persisted(program: impl Into<PathBuf>, arguments: Vec<Box<str>>, environment: BTreeMap<Box<str>, Box<str>>, max_output_bytes: usize) -> Self {
-        Self { program: program.into(), arguments, environment, visibility: DocumentVisibility::Persisted, save: SavePolicy::Never, max_output_bytes }
+        Self { program: program.into(), arguments, environment, max_output_bytes }
     }
 }
 
@@ -57,7 +43,6 @@ pub struct TaskOutput {
     pub stderr: Vec<u8>,
     pub truncated: bool,
     pub cancelled: bool,
-    pub elapsed: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +51,7 @@ pub enum WorkflowError {
     Io(#[from] io::Error),
     #[error("PTY operation failed: {0}")]
     Pty(String),
+    #[cfg(test)]
     #[error("DAP frame is malformed: {0}")]
     Dap(Box<str>),
     #[error("JSON protocol failed: {0}")]
@@ -78,6 +64,7 @@ pub enum WorkflowError {
     UntrustedTask,
     #[error("invalid semantic transaction: {0}")]
     Transaction(Box<str>),
+    #[cfg(test)]
     #[error("structural search failed: {0}")]
     Structural(Box<str>),
     #[error("workflow process exited unsuccessfully: {0}")]
@@ -98,11 +85,8 @@ fn task_command(spec: &TaskSpec) -> Command {
         .args(spec.arguments.iter().map(AsRef::<str>::as_ref))
         .env_clear()
         .envs(spec.environment.iter().map(|(name, value)| (name.as_ref(), value.as_ref())));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
     command
 }
 
@@ -112,7 +96,8 @@ impl TaskSupervisor {
         Self { trusted }
     }
 
-    pub fn run(&self, spec: &TaskSpec) -> Result<TaskOutput, WorkflowError> {
+    #[cfg(test)]
+    fn run(&self, spec: &TaskSpec) -> Result<TaskOutput, WorkflowError> {
         self.run_until_cancelled(spec, || false)
     }
 
@@ -124,7 +109,6 @@ impl TaskSupervisor {
         if !self.trusted {
             return Err(WorkflowError::UntrustedTask);
         }
-        let started = Instant::now();
         let mut command = task_command(spec);
         command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
@@ -165,7 +149,7 @@ impl TaskSupervisor {
         if let Some(writer) = input_writer {
             writer.join().map_err(|_| io::Error::other("task input writer panicked"))??;
         }
-        Ok(TaskOutput { status: status.code(), stdout, stderr, truncated: stdout_truncated || stderr_truncated, cancelled, elapsed: started.elapsed() })
+        Ok(TaskOutput { status: status.code(), stdout, stderr, truncated: stdout_truncated || stderr_truncated, cancelled })
     }
 }
 
@@ -187,105 +171,13 @@ fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, boo
 }
 
 fn signal_process_group(child: &mut std::process::Child, force: bool) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, killpg};
-        use nix::unistd::Pid;
-        let process_group = i32::try_from(child.id()).map(Pid::from_raw).map_err(|_| io::Error::other("task process ID exceeds platform range"))?;
-        let signal = if force { Signal::SIGKILL } else { Signal::SIGTERM };
-        match killpg(process_group, signal) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
-            Err(error) => Err(io::Error::other(error)),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = force;
-        child.kill()
-    }
-}
-
-pub struct TerminalSurface {
-    parser: vt100::Parser,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalColor {
-    Default,
-    Palette(u8),
-    Rgb(u8, u8, u8),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TerminalCell<'a> {
-    pub contents: &'a str,
-    pub wide: bool,
-    pub wide_continuation: bool,
-    pub foreground: TerminalColor,
-    pub background: TerminalColor,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub reverse: bool,
-}
-
-impl TerminalSurface {
-    #[must_use]
-    pub fn new(rows: u16, columns: u16) -> Self {
-        Self { parser: vt100::Parser::new(rows, columns, 0) }
-    }
-
-    pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-    }
-
-    pub fn resize(&mut self, rows: u16, columns: u16) {
-        self.parser.screen_mut().set_size(rows, columns);
-    }
-
-    #[must_use]
-    pub fn contents(&self) -> String {
-        self.parser.screen().contents()
-    }
-
-    #[must_use]
-    pub fn cursor_position(&self) -> (u16, u16) {
-        self.parser.screen().cursor_position()
-    }
-
-    #[must_use]
-    pub fn size(&self) -> (u16, u16) {
-        self.parser.screen().size()
-    }
-
-    #[must_use]
-    pub fn cell(&self, row: u16, column: u16) -> Option<TerminalCell<'_>> {
-        let cell = self.parser.screen().cell(row, column)?;
-        Some(TerminalCell {
-            contents: cell.contents(),
-            wide: cell.is_wide(),
-            wide_continuation: cell.is_wide_continuation(),
-            foreground: terminal_color(cell.fgcolor()),
-            background: terminal_color(cell.bgcolor()),
-            bold: cell.bold(),
-            italic: cell.italic(),
-            underline: cell.underline(),
-            reverse: cell.inverse(),
-        })
-    }
-
-    #[must_use]
-    pub fn accepts_sgr_mouse(&self) -> bool {
-        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
-            && self.parser.screen().mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
-    }
-}
-
-const fn terminal_color(color: vt100::Color) -> TerminalColor {
-    match color {
-        vt100::Color::Default => TerminalColor::Default,
-        vt100::Color::Idx(index) => TerminalColor::Palette(index),
-        vt100::Color::Rgb(red, green, blue) => TerminalColor::Rgb(red, green, blue),
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+    let process_group = i32::try_from(child.id()).map(Pid::from_raw).map_err(|_| io::Error::other("task process ID exceeds platform range"))?;
+    let signal = if force { Signal::SIGKILL } else { Signal::SIGTERM };
+    match killpg(process_group, signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
@@ -296,18 +188,13 @@ pub struct PtySession {
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: mpsc::Receiver<Vec<u8>>,
-    surface: TerminalSurface,
+    terminal: vt100::Parser,
     bytes_read: usize,
     pending_exit_code: Option<u32>,
     exit_code: Option<u32>,
 }
 
 impl PtySession {
-    pub fn spawn(program: &str, arguments: &[&str], rows: u16, columns: u16) -> Result<Self, WorkflowError> {
-        let directory = std::env::current_dir().ok();
-        Self::spawn_with_directory(program, arguments, rows, columns, directory.as_deref())
-    }
-
     pub fn spawn_in(program: &str, arguments: &[&str], rows: u16, columns: u16, directory: &Path) -> Result<Self, WorkflowError> {
         Self::spawn_with_directory(program, arguments, rows, columns, Some(directory))
     }
@@ -345,7 +232,7 @@ impl PtySession {
             writer,
             child,
             output,
-            surface: TerminalSurface::new(rows, columns),
+            terminal: vt100::Parser::new(rows, columns, 0),
             bytes_read: 0,
             pending_exit_code: None,
             exit_code: None,
@@ -360,7 +247,7 @@ impl PtySession {
 
     pub fn resize(&mut self, rows: u16, columns: u16) -> Result<(), WorkflowError> {
         self.master.resize(PtySize { rows, cols: columns, pixel_width: 0, pixel_height: 0 }).map_err(|error| WorkflowError::Pty(error.to_string()))?;
-        self.surface.resize(rows, columns);
+        self.terminal.screen_mut().set_size(rows, columns);
         Ok(())
     }
 
@@ -370,7 +257,7 @@ impl PtySession {
             match self.output.try_recv() {
                 Ok(bytes) => {
                     self.bytes_read = self.bytes_read.saturating_add(bytes.len());
-                    self.surface.process(&bytes);
+                    self.terminal.process(&bytes);
                     changed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break false,
@@ -394,7 +281,7 @@ impl PtySession {
 
     #[must_use]
     pub fn surface(&self) -> &TerminalSurface {
-        &self.surface
+        self.terminal.screen()
     }
 
     #[must_use]
@@ -402,19 +289,14 @@ impl PtySession {
         self.bytes_read
     }
 
-    #[must_use]
     pub const fn exit_code(&self) -> Option<u32> {
         self.exit_code
     }
 
+    #[cfg(test)]
     pub fn terminate(&mut self) -> Result<(), WorkflowError> {
         self.child.kill()?;
         Ok(())
-    }
-
-    fn into_result(mut self) -> PtyResult {
-        let surface = std::mem::replace(&mut self.surface, TerminalSurface::new(1, 1));
-        PtyResult { surface, exit_success: self.exit_code == Some(0), bytes_read: self.bytes_read }
     }
 }
 
@@ -424,22 +306,6 @@ impl Drop for PtySession {
             let _ = self.child.kill();
         }
     }
-}
-
-pub struct PtyResult {
-    pub surface: TerminalSurface,
-    pub exit_success: bool,
-    pub bytes_read: usize,
-}
-
-pub fn run_pty(program: &str, arguments: &[&str], rows: u16, columns: u16) -> Result<PtyResult, WorkflowError> {
-    let mut session = PtySession::spawn(program, arguments, rows, columns)?;
-    while session.exit_code().is_none() {
-        if !session.poll()? {
-            thread::yield_now();
-        }
-    }
-    Ok(session.into_result())
 }
 
 fn resolve_pty_program(program: &str) -> PathBuf {
@@ -459,46 +325,16 @@ fn is_executable_file(path: &Path) -> bool {
     if !metadata.is_file() {
         return false;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DapMessage {
     pub seq: u64,
     #[serde(flatten)]
     pub body: serde_json::Value,
-}
-
-pub fn encode_dap(message: &DapMessage) -> Result<Vec<u8>, WorkflowError> {
-    let body = serde_json::to_vec(message)?;
-    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    frame.extend(body);
-    Ok(frame)
-}
-
-pub fn decode_dap(frame: &[u8]) -> Result<DapMessage, WorkflowError> {
-    let separator = b"\r\n\r\n";
-    let header_end =
-        frame.windows(separator.len()).position(|window| window == separator).ok_or_else(|| WorkflowError::Dap("missing header terminator".into()))?;
-    let header = std::str::from_utf8(&frame[..header_end]).map_err(|_| WorkflowError::Dap("header is not UTF-8".into()))?;
-    let length = header
-        .lines()
-        .find_map(|line| line.strip_prefix("Content-Length:"))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .ok_or_else(|| WorkflowError::Dap("missing Content-Length".into()))?;
-    let body = &frame[header_end + separator.len()..];
-    if body.len() != length {
-        return Err(WorkflowError::Dap("Content-Length mismatch".into()));
-    }
-    Ok(serde_json::from_slice(body)?)
 }
 
 struct FramedProcess {
@@ -564,6 +400,7 @@ impl FramedProcess {
         Ok(body)
     }
 
+    #[cfg(test)]
     fn terminate(&mut self) -> Result<(), WorkflowError> {
         signal_process_group(&mut self.child, true)?;
         let _ = self.child.wait()?;
@@ -580,10 +417,12 @@ impl Drop for FramedProcess {
     }
 }
 
+#[cfg(test)]
 pub struct DapClient {
     process: FramedProcess,
 }
 
+#[cfg(test)]
 impl DapClient {
     pub fn spawn(spec: &TaskSpec, trusted: bool, max_frame_bytes: usize) -> Result<Self, WorkflowError> {
         Ok(Self { process: FramedProcess::spawn(spec, trusted, "DAP", max_frame_bytes)? })
@@ -708,10 +547,6 @@ impl LspClient {
         }))
     }
 
-    pub fn initialize(&mut self, root_uri: &str, capabilities: serde_json::Value) -> Result<serde_json::Value, WorkflowError> {
-        self.initialize_with_options(root_uri, capabilities, serde_json::Value::Null)
-    }
-
     pub fn initialize_with_options(
         &mut self,
         root_uri: &str,
@@ -787,7 +622,8 @@ pub fn formatter_edits(
     Ok(RevisionedEdits { document_id, base_revision, edits })
 }
 
-pub fn run_formatter_process(
+#[cfg(test)]
+fn run_formatter_process(
     spec: &TaskSpec,
     trusted: bool,
     document_id: DocumentId,
@@ -827,6 +663,7 @@ pub fn run_formatter_until_cancelled(
     formatter_edits(document_id, base_revision, current_revision, input, &formatted)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspDocumentEdit {
     pub document_id: DocumentId,
@@ -835,6 +672,7 @@ pub struct LspDocumentEdit {
     pub edits: Vec<Edit>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspResourceEdit {
     Create { path: PathBuf, expected_absent: bool },
@@ -842,6 +680,7 @@ pub enum LspResourceEdit {
     Delete { path: PathBuf, expected_identity: FileIdentity },
 }
 
+#[cfg(test)]
 pub fn lower_lsp_workspace_edit(
     group_id: SemanticGroupId,
     documents: Vec<LspDocumentEdit>,
@@ -882,6 +721,7 @@ pub fn lower_lsp_workspace_edit(
     Ok(WorkspaceTransaction { document_edits, resource_ops })
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Excerpt {
     pub document_id: DocumentId,
@@ -891,11 +731,13 @@ pub struct Excerpt {
     pub lease_epoch: LeaseEpoch,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExcerptBuffer {
     pub excerpts: Vec<Excerpt>,
 }
 
+#[cfg(test)]
 impl ExcerptBuffer {
     pub fn commit(&self, group_id: SemanticGroupId, replacements: &BTreeMap<DocumentId, Vec<Edit>>) -> Result<WorkspaceTransaction, WorkflowError> {
         let mut grouped: BTreeMap<DocumentId, (LeaseEpoch, DocumentRevision)> = BTreeMap::new();
@@ -946,25 +788,14 @@ pub fn git_hunks(before: &str, after: &str) -> Vec<GitHunk> {
     diff.hunks().map(|hunk| GitHunk { before: hunk.before, after: hunk.after }).collect()
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuralMatch {
     pub range: Range<usize>,
     pub metavariables: BTreeMap<Box<str>, Range<usize>>,
 }
 
-/// The compiled backend identity is exposed so manifests can report exactly
-/// which structural engine produced a result. A language-specific tree-sitter
-/// document is supplied by the workspace provider in production.
-#[must_use]
-pub fn structural_backend() -> &'static str {
-    std::any::type_name::<ast_grep_core::MatchStrictness>()
-}
-
-#[must_use]
-pub fn structural_literal_search(text: &str, pattern: &str) -> Vec<StructuralMatch> {
-    text.match_indices(pattern).map(|(start, value)| StructuralMatch { range: start..start + value.len(), metavariables: BTreeMap::new() }).collect()
-}
-
+#[cfg(test)]
 pub fn structural_search(language: &str, text: &str, pattern: &str, max_matches: usize) -> Result<Vec<StructuralMatch>, WorkflowError> {
     use ast_grep_core::Pattern;
     use ast_grep_core::meta_var::MetaVariable;
@@ -995,6 +826,7 @@ pub fn structural_search(language: &str, text: &str, pattern: &str, max_matches:
         .collect())
 }
 
+#[cfg(test)]
 pub fn structural_rewrite(language: &str, text: &str, pattern: &str, replacement: &str, max_edits: usize) -> Result<Vec<Edit>, WorkflowError> {
     use ast_grep_core::Pattern;
     use ast_grep_language::{LanguageExt, SupportLang};
@@ -1016,8 +848,7 @@ pub fn structural_rewrite(language: &str, text: &str, pattern: &str, replacement
     Ok(edits)
 }
 
-pub type AiReviewBranch = RevisionedEdits;
-
+#[cfg(test)]
 impl RevisionedEdits {
     pub fn accept(&self, selected: &[usize], current_revision: DocumentRevision, intervening: &[Transaction]) -> Result<Transaction, WorkflowError> {
         let mut expected_revision = self.base_revision;
@@ -1067,15 +898,13 @@ mod tests {
     }
 
     #[test]
-    fn task_visibility_is_explicit_and_output_is_bounded() {
+    fn task_output_is_bounded() {
         let supervisor = TaskSupervisor::new(true);
         let output = supervisor
             .run(&TaskSpec {
                 program: resolve_pty_program("sh"),
                 arguments: vec!["-c".into(), "printf 123456".into()],
                 environment: BTreeMap::new(),
-                visibility: DocumentVisibility::Persisted,
-                save: SavePolicy::Prompt,
                 max_output_bytes: 4,
             })
             .expect("task");
@@ -1121,21 +950,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pty_output_is_emulated_into_a_terminal_surface() {
-        let output = run_pty("sh", &["-c", "printf '\\033[1;31;44mRED\\033[0m\\033[?1000h\\033[?1006h'"], 4, 20).expect("pty");
-        assert!(output.exit_success);
-        assert_eq!(output.surface.contents(), "RED");
-        let cell = output.surface.cell(0, 0).expect("styled terminal cell");
-        assert_eq!(cell.contents, "R");
-        assert_eq!(cell.foreground, TerminalColor::Palette(1));
-        assert_eq!(cell.background, TerminalColor::Palette(4));
-        assert!(cell.bold);
-        assert!(output.surface.accepts_sgr_mouse());
+        let mut session =
+            PtySession::spawn_in("sh", &["-c", "printf '\\033[1;31;44mRED\\033[0m\\033[?1000h\\033[?1006h'"], 4, 20, Path::new(".")).expect("pty");
+        while session.exit_code().is_none() {
+            session.poll().expect("poll");
+        }
+        assert_eq!(session.surface().contents(), "RED");
+        let cell = session.surface().cell(0, 0).expect("styled terminal cell");
+        assert_eq!(cell.contents(), "R");
+        assert_eq!(cell.fgcolor(), TerminalColor::Idx(1));
+        assert_eq!(cell.bgcolor(), TerminalColor::Idx(4));
+        assert!(cell.bold());
+        assert_ne!(session.surface().mouse_protocol_mode(), vt100::MouseProtocolMode::None);
+        assert_eq!(session.surface().mouse_protocol_encoding(), vt100::MouseProtocolEncoding::Sgr);
     }
 
     #[cfg(unix)]
     #[test]
     fn live_pty_accepts_input_and_streams_a_resizable_surface() {
-        let mut session = PtySession::spawn("sh", &["-c", "IFS= read -r line; printf 'got:%s' \"$line\""], 4, 20).expect("spawn live pty");
+        let mut session = PtySession::spawn_in("sh", &["-c", "IFS= read -r line; printf 'got:%s' \"$line\""], 4, 20, Path::new(".")).expect("spawn live pty");
         session.resize(5, 30).expect("resize");
         session.send_input(b"hello\n").expect("input");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1164,14 +997,6 @@ mod tests {
             Path::new(session.surface().contents().trim()).canonicalize().expect("canonical PTY directory"),
             directory.path().canonicalize().expect("canonical workspace")
         );
-    }
-
-    #[test]
-    fn dap_framing_round_trips_and_rejects_truncation() {
-        let message = DapMessage { seq: 4, body: json!({"type":"request","command":"continue"}) };
-        let frame = encode_dap(&message).expect("encode");
-        assert_eq!(decode_dap(&frame).expect("decode"), message);
-        assert!(decode_dap(&frame[..frame.len() - 1]).is_err());
     }
 
     #[cfg(unix)]
@@ -1252,7 +1077,7 @@ mod tests {
         .expect("LSP edit");
         assert_eq!(transaction.document_edits.len(), 1);
 
-        let branch = AiReviewBranch { document_id: DocumentId::new(1), base_revision: DocumentRevision::new(1), edits: vec![Edit::new(2..3, "AI")] };
+        let branch = RevisionedEdits { document_id: DocumentId::new(1), base_revision: DocumentRevision::new(1), edits: vec![Edit::new(2..3, "AI")] };
         let mapped = branch
             .accept(&[0], DocumentRevision::new(2), &[Transaction::new(DocumentRevision::new(1), vec![Edit::new(0..0, "xx")]).expect("intervening")])
             .expect("partial accept");
@@ -1289,8 +1114,6 @@ mod tests {
     fn git_and_structural_results_are_native_and_bounded() {
         let hunks = git_hunks("one\ntwo\n", "one\nchanged\n");
         assert_eq!(hunks.len(), 1);
-        assert_eq!(structural_literal_search("foo(bar); foo(baz)", "foo").len(), 2);
-        assert!(structural_backend().contains("ast_grep_core"));
         let matches = structural_search("rust", "fn one() { Some(1); Some(2); }", "Some($A)", 1).expect("ast-grep search");
         assert_eq!(matches.len(), 1);
         assert!(matches[0].metavariables.contains_key("A"));

@@ -1,9 +1,10 @@
 use super::*;
 
 impl App {
-    pub(super) fn start_ace_jump(&mut self) {
+    pub(super) fn start_ace_jump(&mut self) -> Result<()> {
         self.ace_jump = Some(AceJumpState::AwaitTarget);
         self.message = "jump to character: ".to_owned();
+        Ok(())
     }
 
     pub(super) fn handle_ace_jump_key(&mut self, key: TerminalKey) -> Result<()> {
@@ -17,8 +18,7 @@ impl App {
         match state {
             AceJumpState::AwaitTarget => {
                 let TerminalKeyCode::Char(target) = key.code else {
-                    self.message = "jump cancelled".to_owned();
-                    return Ok(());
+                    return self.set_message("jump cancelled".to_owned());
                 };
                 self.populate_ace_jump(target);
             }
@@ -28,8 +28,7 @@ impl App {
                 } else if let TerminalKeyCode::Char(label) = key.code {
                     prefix.push(label.to_ascii_lowercase());
                 } else {
-                    self.message = "jump cancelled".to_owned();
-                    return Ok(());
+                    return self.set_message("jump cancelled".to_owned());
                 }
                 let matching = targets.iter().filter(|candidate| candidate.label.starts_with(&prefix)).collect::<Vec<_>>();
                 if matching.len() == 1 {
@@ -132,11 +131,18 @@ impl App {
     }
 
     pub(super) fn show_normal_prefix_hints(&mut self, prefix: char) {
-        let entries = normal_prefix_hint_entries(prefix, self.active_lsp_navigation_capabilities());
+        let language = language_bundle(self.active.document.presentation_path()).language_id;
+        let navigation = self
+            .lsps
+            .iter()
+            .find(|lsp| lsp.server.language_id == language.as_ref())
+            .map(|lsp| lsp.capabilities.navigation)
+            .or_else(|| self.lsp_job.as_ref().filter(|job| job.language_id.as_ref() == language.as_ref()).and_then(|job| job.navigation));
+        let entries = normal_prefix_hint_entries(prefix, navigation);
         if entries.is_empty() {
             return;
         }
-        let title = PREFIX_GROUPS.iter().find(|group| group.prefix == prefix).map_or(" NORMAL ", |group| group.title);
+        let title = PREFIX_TITLES.iter().find(|(candidate, _)| *candidate == prefix).map_or(" NORMAL ", |(_, title)| *title);
         self.show_key_hints(title.to_owned(), entries);
     }
 
@@ -155,11 +161,10 @@ impl App {
         let Some(sequence) = self.leader_keys.take() else {
             return Ok(false);
         };
-        self.popup = None;
-        self.popup_deadline = None;
-        let binding = self.keymap.leader.get(sequence.as_str()).filter(|binding| self.binding_enabled(binding)).cloned();
-        if let Some(binding) = binding {
-            self.execute_runtime_command(&binding.invocation)?;
+        self.close_editor_popup();
+        let execute = self.keymap.leader.get(sequence.as_str()).filter(|binding| self.binding_enabled(binding)).map(|binding| binding.execute);
+        if let Some(execute) = execute {
+            execute(self)?;
         } else {
             self.message = format!("incomplete mapping <Space>{sequence}");
         }
@@ -167,18 +172,23 @@ impl App {
     }
 
     pub(super) fn show_info(&mut self, information: impl std::fmt::Display) {
-        self.show_message(MessageSeverity::Info, information);
+        self.show_message(Severity::Info, information);
     }
 
     pub(super) fn show_error(&mut self, error: impl std::fmt::Display) {
-        self.show_message(MessageSeverity::Error, error);
+        self.show_message(Severity::Error, error);
     }
 
-    pub(super) fn show_message(&mut self, severity: MessageSeverity, message: impl std::fmt::Display) {
+    pub(super) fn set_message(&mut self, message: impl Into<String>) -> Result<()> {
+        self.message = message.into();
+        Ok(())
+    }
+
+    pub(super) fn show_message(&mut self, severity: Severity, message: impl std::fmt::Display) {
         let message = message.to_string();
         self.record_debug_output(severity, &message);
         self.message = message.clone();
-        if severity == MessageSeverity::Error {
+        if severity == Severity::Error {
             self.popup = Some(TextPopup::new("Error", message));
             self.popup_deadline = Some(Instant::now() + Duration::from_secs(8));
         }
@@ -189,63 +199,58 @@ impl App {
             return;
         }
         let message = self.message.clone();
-        self.record_debug_output(MessageSeverity::Info, &message);
+        self.record_debug_output(Severity::Info, &message);
     }
 
-    pub(super) fn record_debug_output(&mut self, severity: MessageSeverity, text: &str) {
+    pub(super) fn record_debug_output(&mut self, severity: Severity, text: &str) {
         const MAX_ENTRIES: usize = 512;
-        if text.trim().is_empty() || self.views.messages.entries.last().is_some_and(|entry| entry.text.as_ref() == text) {
+        if text.trim().is_empty() || self.debug_messages.last().is_some_and(|(_, previous)| previous.as_ref() == text) {
             return;
         }
-        let sequence = self.views.messages.entries.last().map_or(1, |entry| entry.sequence.saturating_add(1));
-        self.views.messages.entries.push(MessageEntry { sequence, severity, text: text.into() });
-        let overflow = self.views.messages.entries.len().saturating_sub(MAX_ENTRIES);
+        self.debug_messages.push((severity, text.into()));
+        let overflow = self.debug_messages.len().saturating_sub(MAX_ENTRIES);
         if overflow > 0 {
-            self.views.messages.entries.drain(..overflow);
+            self.debug_messages.drain(..overflow);
         }
     }
 
     pub(super) fn show_debug_output(&mut self) -> Result<()> {
         self.capture_debug_output();
-        let text = if self.views.messages.entries.is_empty() {
+        let text = if self.debug_messages.is_empty() {
             "No debug output has been recorded.".to_owned()
         } else {
-            self.views
-                .messages
-                .entries
+            self.debug_messages
                 .iter()
-                .map(|entry| {
-                    let severity = entry.severity.label();
-                    format!("{:04} [{severity}] {}", entry.sequence, entry.text)
+                .enumerate()
+                .map(|(index, (severity, text))| {
+                    let severity = severity.label().to_ascii_uppercase();
+                    format!("{:04} [{severity}] {text}", index + 1)
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
         self.open_messages_buffer(text)?;
-        self.popup = None;
-        self.popup_deadline = None;
+        self.close_editor_popup();
         self.message.clear();
         Ok(())
     }
 
     pub(super) fn open_messages_buffer(&mut self, text: String) -> Result<()> {
-        let document_id = virtual_document_id(MESSAGES_BUFFER_NAME, &text);
+        let document_id = DocumentId::new(
+            stable_hash(b"wren:virtual-buffer\0".iter().copied().chain(MESSAGES_BUFFER_NAME.bytes()).chain(std::iter::once(0)).chain(text.bytes())).max(2),
+        );
         let active_is_messages = self.active.has_display_name(MESSAGES_BUFFER_NAME);
         let inactive_index = self.inactive.iter().position(|buffer| buffer.has_display_name(MESSAGES_BUFFER_NAME));
-        let is_new = !active_is_messages && inactive_index.is_none();
         let buffer_id = if active_is_messages {
             self.active.buffer_id
         } else if let Some(index) = inactive_index {
             self.inactive[index].buffer_id
         } else {
-            self.views.add_buffer(document_id, MESSAGES_BUFFER_NAME)
+            self.views.add_buffer()
         };
         let mut messages = match BufferState::virtual_buffer(buffer_id, document_id, MESSAGES_BUFFER_NAME, text) {
             Ok(messages) => messages,
             Err(error) => {
-                if is_new {
-                    self.views.buffers.retain(|buffer| buffer.id != buffer_id);
-                }
                 return Err(error);
             }
         };
@@ -253,12 +258,7 @@ impl App {
         if let Some(pattern) = self.client_state.search_history.last() {
             messages.editor.restore_search(pattern.clone(), self.last_search_direction)?;
         }
-        if let Err(error) = self.mutations.register(document_id, messages.editor.contents(), true) {
-            if is_new {
-                self.views.buffers.retain(|buffer| buffer.id != buffer_id);
-            }
-            return Err(error);
-        }
+        self.mutations.register(document_id, messages.editor.contents(), true)?;
 
         if active_is_messages {
             self.active = messages;
@@ -270,28 +270,29 @@ impl App {
             } else {
                 self.inactive.push(previous);
             }
-            self.views.set_active_buffer(buffer_id)?;
+            self.views.set_active_buffer(buffer_id);
         }
-        let view = self.views.buffers.iter_mut().find(|buffer| buffer.id == buffer_id).ok_or_else(|| anyhow!("messages buffer view disappeared"))?;
-        view.document_id = document_id;
-        view.name = MESSAGES_BUFFER_NAME.into();
         self.decorations.remove(&buffer_id);
         self.semantic_decorations.remove(&buffer_id);
         self.prime_active_syntax();
-        self.ensure_workspace_lsp_started();
+        self.begin_lsp_start();
         Ok(())
     }
 
-    pub(super) fn poll_popup_timeout(&mut self) -> Result<bool> {
+    pub(super) fn poll_popup_timeout(&mut self) -> bool {
         if self.popup_deadline.is_none_or(|deadline| Instant::now() < deadline) {
-            return Ok(false);
+            return false;
         }
         self.popup_deadline = None;
-        Ok(self.popup.take().is_some())
+        self.popup.take().is_some()
     }
 
     pub(super) fn dispatch_key(&mut self, key: KeyEvent) {
-        if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace) && insert_mutation_key(key) {
+        if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace)
+            && (matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Delete)
+                || matches!(key.code, KeyCode::Char(_) if key.modifiers.is_empty())
+                || matches!(key.code, KeyCode::Char('w' | 'u') if key.modifiers == Modifiers::CONTROL))
+        {
             match self.active.editor.handle_key(key) {
                 Ok(transaction) => {
                     self.message.clear();
@@ -301,16 +302,14 @@ impl App {
             }
             return;
         }
-        let registers_before = register_snapshot(&self.active.editor);
-        let marks_before = mark_snapshot(&self.active.editor);
-        let macros_before = macro_snapshot(&self.active.editor);
+        let registers_before = self.active.editor.registers().map(|(name, value)| (name, (value.text.clone(), value.linewise))).collect();
+        let marks_before = self.active.editor.marks().collect();
+        let macros_before = self.active.editor.macros().map(|(name, keys)| (name, keys.to_vec())).collect();
         let repeat_before = self.active.editor.durable_repeat_data();
         match self.active.editor.handle_key(key) {
             Ok(transaction) => {
                 self.message.clear();
-                let mut state_deltas = changed_registers(&registers_before, &self.active.editor);
-                state_deltas.extend(changed_global_marks(&marks_before, &self.active.editor, self.active.document_id));
-                state_deltas.extend(changed_macros(&macros_before, &self.active.editor));
+                let mut state_deltas = changed_editor_state(&registers_before, &marks_before, &macros_before, &self.active.editor, self.active.document_id);
                 let repeat_after = self.active.editor.durable_repeat_data();
                 if repeat_after != repeat_before
                     && let Some(repeat) = repeat_after
@@ -327,7 +326,7 @@ impl App {
         match error {
             EngineError::InvalidGrammar { sequence, reason } => {
                 self.active.editor.cancel_pending();
-                self.show_info(format!("grammar rejected sequence {:?}: {reason}", format_key_sequence(&sequence)));
+                self.show_info(format!("grammar rejected sequence {:?}: {reason}", sequence.iter().map(format_key_event).collect::<String>()));
             }
             error => self.show_error(error),
         }
@@ -381,77 +380,27 @@ impl App {
             self.active.git_hunks.clear();
         }
         self.schedule_lsp_semantics();
-        self.append_recovery_frame();
-    }
-
-    fn schedule_lsp_semantics(&mut self) {
-        if let Some(lsp) = &mut self.lsp {
-            if lsp.capabilities.semantic_legend.is_some() {
-                lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
-            }
-        } else if self.lsp_start.is_some() || self.lsp_background.is_some() {
-            self.lsp_semantic_dirty = true;
-        }
-    }
-
-    fn append_recovery_frame(&self) {
         if let Some(wal) = &self.active.wal {
             wal.append_frame(self.active.base_hash, self.active.editor.revision().get(), self.active.editor.frame().text, self.active.editor.primary_cursor());
         }
     }
-}
 
-fn insert_mutation_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Delete)
-        || matches!(key.code, KeyCode::Char(_) if key.modifiers.is_empty())
-        || matches!(key.code, KeyCode::Char('w' | 'u') if key.modifiers == Modifiers::CONTROL)
+    fn schedule_lsp_semantics(&mut self) {
+        if let Some(lsp) = self.active_lsp_mut() {
+            if lsp.capabilities.semantic_legend.is_some() {
+                lsp.semantic_due = Some(Instant::now() + LSP_SEMANTIC_IDLE_PERIOD);
+            }
+        } else if self.lsp_job.is_some() {
+            self.lsp_semantic_dirty = true;
+        }
+    }
 }
 
 pub(super) fn normal_prefix_hint_entries(prefix: char, navigation: Option<LspNavigationCapabilities>) -> BTreeMap<String, String> {
-    let mut entries = PREFIX_GROUPS
+    PREFIX_BINDINGS
         .iter()
-        .find(|group| group.prefix == prefix)
-        .into_iter()
-        .flat_map(|group| group.hints)
-        .map(|&(key, description)| (key.to_owned(), description.to_owned()))
-        .collect::<BTreeMap<_, _>>();
-    if prefix == 'g' {
-        let navigation = navigation.unwrap_or_default();
-        for (enabled, key, description) in [
-            (navigation.declaration, "D", "declaration"),
-            (navigation.definition, "d", "definition"),
-            (navigation.implementation, "i", "implementation"),
-            (navigation.references, "r", "references"),
-        ] {
-            if enabled {
-                entries.insert(key.to_owned(), description.to_owned());
-            }
-        }
-    }
-    entries
-}
-
-struct PrefixGroup {
-    prefix: char,
-    title: &'static str,
-    hints: &'static [(&'static str, &'static str)],
-}
-
-macro_rules! prefix_groups {
-    ($($prefix:literal => $title:literal [$($key:literal: $description:literal),*];)*) => {
-        const PREFIX_GROUPS: &[PrefixGroup] = &[$(PrefixGroup {
-            prefix: $prefix,
-            title: $title,
-            hints: &[$(($key, $description)),*],
-        }),*];
-    };
-}
-
-prefix_groups! {
-    'g' => " goto " ["g": "first line / [count] line", "e": "previous word end", "E": "previous WORD end", "0": "line start", "$": "line end", "_": "last nonblank", "q": "format to text width", ";": "older change", ",": "newer change"];
-    '[' => " previous " ["c": "previous Git hunk", "d": "previous diagnostic"];
-    ']' => " next " ["c": "next Git hunk", "d": "next diagnostic"];
-    'z' => " viewport " ["b": "cursor line at bottom", "t": "cursor line at top", "z": "cursor line centered"];
-    'Z' => " quit " ["Q": "quit without saving", "Z": "write and quit"];
-    '\u{17}' => " window " ["h": "focus left", "j": "focus down", "k": "focus up / signature help", "l": "focus right", "s": "horizontal split", "v": "vertical split", "c": "close window", "q": "close window", "o": "close other windows", "w": "next window"];
+        .filter(|binding| binding.prefix == prefix)
+        .filter(|binding| binding.enabled.is_none_or(|enabled| enabled(navigation.unwrap_or_default())))
+        .map(|binding| (binding.key.to_string(), binding.description.to_owned()))
+        .collect()
 }

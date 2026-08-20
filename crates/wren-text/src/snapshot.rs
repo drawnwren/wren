@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use thiserror::Error;
 use wren_types::{DocumentId, DocumentRevision};
 
@@ -44,8 +44,6 @@ pub enum SnapshotError {
     RevisionQuota { provider: Box<str>, max_revisions: usize },
     #[error("snapshot range {start}..{end} is outside {len} bytes or not UTF-8 aligned")]
     InvalidRange { start: usize, end: usize, len: usize },
-    #[error("snapshot manager lock was poisoned")]
-    Poisoned,
 }
 
 #[derive(Debug)]
@@ -87,6 +85,7 @@ impl SnapshotHandle {
         self.record.text.is_empty()
     }
 
+    #[cfg(test)]
     pub fn with_text<T>(&self, read: impl FnOnce(&str) -> T) -> T {
         read(&self.record.text)
     }
@@ -103,17 +102,12 @@ impl SnapshotHandle {
 #[derive(Debug)]
 struct ManagerState {
     default_quota: SnapshotQuota,
-    provider_quotas: BTreeMap<Box<str>, SnapshotQuota>,
     records: Vec<Weak<SnapshotRecord>>,
 }
 
 impl ManagerState {
     fn prune(&mut self) {
         self.records.retain(|record| record.strong_count() > 0);
-    }
-
-    fn quota_for(&self, provider: &str) -> SnapshotQuota {
-        self.provider_quotas.get(provider).copied().unwrap_or(self.default_quota)
     }
 }
 
@@ -126,12 +120,7 @@ pub struct SnapshotManager {
 impl SnapshotManager {
     #[must_use]
     pub fn new(default_quota: SnapshotQuota) -> Self {
-        Self { state: Arc::new(Mutex::new(ManagerState { default_quota, provider_quotas: BTreeMap::new(), records: Vec::new() })) }
-    }
-
-    pub fn set_provider_quota(&self, provider: impl Into<Box<str>>, quota: SnapshotQuota) -> Result<(), SnapshotError> {
-        self.state.lock().map_err(|_| SnapshotError::Poisoned)?.provider_quotas.insert(provider.into(), quota);
-        Ok(())
+        Self { state: Arc::new(Mutex::new(ManagerState { default_quota, records: Vec::new() })) }
     }
 
     pub fn issue(
@@ -144,9 +133,9 @@ impl SnapshotManager {
         let provider = provider.into();
         let text = text.into();
         let requested_bytes = text.len();
-        let mut state = self.state.lock().map_err(|_| SnapshotError::Poisoned)?;
+        let mut state = self.state.lock();
         state.prune();
-        let quota = state.quota_for(&provider);
+        let quota = state.default_quota;
         let live = state.records.iter().filter_map(Weak::upgrade).filter(|record| record.provider == provider).collect::<Vec<_>>();
         let current_bytes = live.iter().try_fold(0_usize, |total, record| total.checked_add(record.bytes));
         let current_bytes = current_bytes.unwrap_or(usize::MAX);
@@ -162,7 +151,7 @@ impl SnapshotManager {
     }
 
     pub fn metrics(&self) -> Result<SnapshotMetrics, SnapshotError> {
-        let mut state = self.state.lock().map_err(|_| SnapshotError::Poisoned)?;
+        let mut state = self.state.lock();
         state.prune();
         let now = Instant::now();
         let live = state.records.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
@@ -172,7 +161,7 @@ impl SnapshotManager {
             .iter()
             .filter_map(|record| {
                 let age = now.saturating_duration_since(record.issued_at);
-                (age >= state.quota_for(&record.provider).held_too_long).then(|| HeldSnapshot {
+                (age >= state.default_quota.held_too_long).then(|| HeldSnapshot {
                     provider: record.provider.clone(),
                     document_id: record.document_id,
                     revision: record.revision,

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+benchmarking = ["wren-command/benchmarking", "wren-presenter/benchmarking"]
+
 [[bin]]
 name = "wren"
 path = "src/main.rs"
@@ -11,17 +14,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+glam.workspace = true
 ls-types.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tempfile.workspace = true
+vt100.workspace = true
 wren-command = { version = "0.1.0", path = "../wren-command" }
 wren-client-state = { version = "0.1.0", path = "../wren-client-state" }
 wren-config = { version = "0.1.0", path = "../wren-config" }
 wren-engine = { version = "0.1.0", path = "../wren-engine" }
 wren-grammar = { version = "0.1.0", path = "../wren-grammar" }
-wren-penrose = { version = "0.1.0", path = "../wren-penrose" }
 wren-position = { version = "0.1.0", path = "../wren-position" }
 wren-presenter = { version = "0.1.0", path = "../wren-presenter" }
 wren-provider = { version = "0.1.0", path = "../wren-provider" }
@@ -32,6 +37,9 @@ wren-text = { version = "0.1.0", path = "../wren-text" }
 wren-types = { version = "0.1.0", path = "../wren-types" }
 wren-view = { version = "0.1.0", path = "../wren-view" }
 wren-workflow = { version = "0.1.0", path = "../wren-workflow" }
+
+[dev-dependencies]
+wren-view = { version = "0.1.0", path = "../wren-view", features = ["test-support"] }
 
 [lints]
 workspace = true
