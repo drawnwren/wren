@@ -497,16 +497,21 @@ fn scan_directory(
         let metadata = fs::symlink_metadata(&path)?;
         let relative = path.strip_prefix(root).map_err(|_| RemoteError::InvalidPath)?;
         let key = normalized_relative(relative)?;
-        let (kind, symlink_target, content_hash, tree_hash) = if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&path)?.to_string_lossy().into_owned().into_boxed_str();
-            let hash = *blake3::hash(target.as_bytes()).as_bytes();
-            (ManifestEntryKind::Symlink, Some(target), Some(hash), None)
-        } else if metadata.is_dir() {
-            let hash = scan_directory(root, &path, generation, entries)?;
-            (ManifestEntryKind::Directory, None, None, Some(hash))
-        } else {
-            let hash = hash_file(&path)?;
-            (ManifestEntryKind::File, None, Some(hash), None)
+        let file_type = metadata.file_type();
+        let (kind, symlink_target, content_hash, tree_hash) = match (file_type.is_symlink(), file_type.is_dir()) {
+            (true, _) => {
+                let target = fs::read_link(&path)?.to_string_lossy().into_owned().into_boxed_str();
+                let hash = *blake3::hash(target.as_bytes()).as_bytes();
+                (ManifestEntryKind::Symlink, Some(target), Some(hash), None)
+            }
+            (false, true) => {
+                let hash = scan_directory(root, &path, generation, entries)?;
+                (ManifestEntryKind::Directory, None, None, Some(hash))
+            }
+            (false, false) => {
+                let hash = hash_file(&path)?;
+                (ManifestEntryKind::File, None, Some(hash), None)
+            }
         };
         tree.update(key.as_bytes());
         tree.update(&[kind as u8]);
@@ -530,15 +535,13 @@ fn scan_directory(
 }
 
 fn normalized_relative(path: &Path) -> Result<String, RemoteError> {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(value) => {
-                components.push(value.to_string_lossy().into_owned());
-            }
-            _ => return Err(RemoteError::InvalidPath),
-        }
-    }
+    let components = path
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_string_lossy().into_owned()),
+            _ => Err(RemoteError::InvalidPath),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(components.join("/"))
 }
 

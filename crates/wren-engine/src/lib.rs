@@ -12,7 +12,7 @@ use wren_types::{Transaction, TransactionError};
 
 #[cfg(any(test, feature = "conformance"))]
 pub use editor::VisualSelection;
-pub use editor::{DurableUndoState, Editor, EngineError, InsertStyle, Mode, RegisterValue, SearchDirection, UndoGroup};
+pub use editor::{DurableUndoState, Editor, EditorState, EngineError, InsertStyle, Mode, RegisterValue, SearchDirection, TransactionBatch, UndoGroup};
 pub use search::{CaseOverride, VimPattern, VimReplacement, resolve_previous_replacement};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +92,11 @@ impl FrameText {
     #[must_use]
     pub fn len(&self) -> usize {
         self.snapshot.text.len_bytes()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.snapshot.text.len_bytes() == 0
     }
 
     #[must_use]

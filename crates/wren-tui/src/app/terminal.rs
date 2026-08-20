@@ -120,12 +120,10 @@ impl App {
 
     pub(super) fn scroll_page(&mut self, direction: isize, full_page: bool, count: Option<usize>) {
         let content_rows = self.viewport_rows.saturating_sub(1).max(1);
-        let amount = if full_page {
-            content_rows.saturating_sub(2).max(1).saturating_mul(count.unwrap_or(1))
-        } else if let Some(count) = count {
-            count
-        } else {
-            content_rows.checked_div(2).unwrap_or(1).max(1)
+        let amount = match (full_page, count) {
+            (true, count) => content_rows.saturating_sub(2).max(1).saturating_mul(count.unwrap_or(1)),
+            (false, Some(count)) => count,
+            (false, None) => content_rows.checked_div(2).unwrap_or(1).max(1),
         };
         let text_store = self.active.editor.text();
         let line_count = text_store.line_of_byte(text_store.len_bytes()).saturating_add(1);
@@ -456,8 +454,13 @@ impl App {
             }
             return Ok(false);
         };
+        let cursor = self.active.editor.cursor_line_column();
         let Some(invocation) = formatter_invocation(path) else {
-            return self.lsp_format_sync(explicit);
+            let formatted = self.lsp_format_sync(explicit)?;
+            if formatted {
+                self.active.editor.set_cursor_line_column(cursor.0, cursor.1);
+            }
+            return Ok(formatted);
         };
         if !executable_exists(&invocation.program) {
             if explicit {
@@ -483,10 +486,16 @@ impl App {
         if formatted == input {
             return Ok(true);
         }
-        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..input.len(), formatted)])?;
-        self.active.editor.apply_transaction(transaction.clone())?;
-        self.after_transaction(Some(transaction));
+        self.apply_formatter_output(input.len(), formatted, cursor)?;
         Ok(true)
+    }
+
+    pub(super) fn apply_formatter_output(&mut self, replaced_len: usize, formatted: String, cursor: (usize, usize)) -> Result<()> {
+        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..replaced_len, formatted)])?;
+        self.active.editor.apply_transaction(transaction.clone())?;
+        self.active.editor.set_cursor_line_column(cursor.0, cursor.1);
+        self.after_transaction(Some(transaction));
+        Ok(())
     }
 
     pub(super) fn lsp_format_sync(&mut self, explicit: bool) -> Result<bool> {
@@ -505,7 +514,15 @@ impl App {
             }),
         )?;
         let edits: Vec<LspTextEdit> = serde_json::from_value(result)?;
-        self.apply_lsp_text_edits(edits)?;
+        let cursor = self.active.editor.cursor_line_column();
+        let revision = self.active.editor.revision();
+        let text = self.active.editor.contents();
+        let edits = lower_lsp_text_edits(self.active.document_id, revision, revision, &text, edits)?.edits;
+        if let Some(transaction) = (!edits.is_empty()).then(|| Transaction::new(revision, edits)).transpose()? {
+            self.active.editor.apply_transaction(transaction.clone())?;
+            self.active.editor.set_cursor_line_column(cursor.0, cursor.1);
+            self.after_transaction(Some(transaction));
+        }
         Ok(true)
     }
 }

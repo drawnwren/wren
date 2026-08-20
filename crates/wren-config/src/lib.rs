@@ -149,23 +149,22 @@ impl CommandRegistry {
 
     pub fn validate(&self, command: &str, arguments: &BTreeMap<String, toml::Value>) -> Result<CommandInvocation, ConfigError> {
         let schema = self.schemas.get(command).ok_or_else(|| ConfigError::UnknownCommand(command.into()))?;
-        for argument in arguments.keys() {
-            if !schema.arguments.iter().any(|candidate| candidate.name.as_ref() == argument) {
-                return Err(ConfigError::UnknownArgument { command: command.into(), argument: argument.as_str().into() });
-            }
+        if let Some(argument) = arguments.keys().find(|argument| !schema.arguments.iter().any(|candidate| candidate.name.as_ref() == argument.as_str())) {
+            return Err(ConfigError::UnknownArgument { command: command.into(), argument: argument.as_str().into() });
         }
-        let mut values = BTreeMap::new();
-        for argument in &schema.arguments {
-            let Some(value) = arguments.get(argument.name.as_ref()) else {
-                if argument.required {
-                    return Err(ConfigError::MissingArgument { command: command.into(), argument: argument.name.clone() });
-                }
-                continue;
-            };
-            let value = command_value(value, &argument.argument_type)
-                .ok_or_else(|| ConfigError::ArgumentType { command: command.into(), argument: argument.name.clone() })?;
-            values.insert(argument.name.clone(), value);
-        }
+        let values = schema
+            .arguments
+            .iter()
+            .filter_map(|argument| match arguments.get(argument.name.as_ref()) {
+                Some(value) => Some(
+                    command_value(value, &argument.argument_type)
+                        .map(|value| (argument.name.clone(), value))
+                        .ok_or_else(|| ConfigError::ArgumentType { command: command.into(), argument: argument.name.clone() }),
+                ),
+                None if argument.required => Some(Err(ConfigError::MissingArgument { command: command.into(), argument: argument.name.clone() })),
+                None => None,
+            })
+            .collect::<Result<_, _>>()?;
         Ok(CommandInvocation { command: command.into(), arguments: values })
     }
 }
@@ -173,23 +172,25 @@ impl CommandRegistry {
 pub fn parse_and_validate(source: &str, registry: &CommandRegistry, trust: WorkspaceTrust) -> Result<Config, ConfigError> {
     let config: Config = toml::from_str(source).map_err(|error| ConfigError::Toml(error.to_string()))?;
     let context = validation_context();
-    for (mode, bindings) in &config.keys {
-        for (keys, binding) in bindings {
+    config.keys.iter().try_for_each(|(mode, bindings)| {
+        bindings.iter().try_for_each(|(keys, binding)| {
             registry.validate(&binding.command, &binding.args)?;
             if let Some(when) = &binding.when {
                 evaluate_expression(when, &context)
                     .map_err(|error| ConfigError::When { key: format!("{mode}.{keys}").into(), reason: error.to_string().into() })?;
             }
-        }
-    }
-    for (name, task) in &config.tasks {
+            Ok(())
+        })
+    })?;
+    config.tasks.iter().try_for_each(|(name, task)| {
         if !matches!(task.document_view.as_str(), "persisted" | "remote-acked") {
             return Err(ConfigError::DocumentView { task: name.as_str().into(), value: task.document_view.as_str().into() });
         }
         if !matches!(task.save.as_str(), "never" | "prompt" | "all") {
             return Err(ConfigError::SavePolicy { task: name.as_str().into(), value: task.save.as_str().into() });
         }
-    }
+        Ok(())
+    })?;
     let executable_hash = executable_hash(&config);
     if has_executable_contributions(&config) && !trust.allows(executable_hash) {
         return Err(ConfigError::TrustRequired("tasks, extensions, or environment activation".into()));

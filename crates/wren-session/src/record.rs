@@ -82,8 +82,7 @@ impl RecordStore {
     /// Serializes independently recoverable records into one write. The caller
     /// chooses the durability frontier after this returns.
     pub(crate) fn write_many<T: Serialize>(&self, writer: &mut impl Write, values: &[T]) -> Result<(), DurableRecordError> {
-        let mut records = Vec::new();
-        for value in values {
+        let records = values.iter().try_fold(Vec::new(), |mut records, value| {
             let payload = serde_json::to_vec(value).map_err(|source| DurableRecordError::Serialization { store: self.store, source })?;
             let length = u64::try_from(payload.len()).map_err(|_| self.malformed("record length exceeds u64"))?;
             records.reserve(self.magic.len() + LENGTH_LEN + CHECKSUM_LEN + payload.len());
@@ -91,7 +90,8 @@ impl RecordStore {
             records.extend_from_slice(&length.to_le_bytes());
             records.extend_from_slice(blake3::hash(&payload).as_bytes());
             records.extend_from_slice(&payload);
-        }
+            Ok::<_, DurableRecordError>(records)
+        })?;
         writer.write_all(&records).map_err(|error| self.error(error))
     }
 

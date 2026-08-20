@@ -1,31 +1,31 @@
 use super::*;
 
-pub(super) fn restore_client_state(buffer: &mut BufferState, state: &DurableClientState) -> Result<()> {
-    for (name, register) in &state.registers {
-        buffer.editor.restore_register(*name, register.text.clone(), register.linewise);
-    }
-    if let Some(pattern) = state.search_history.last() {
-        buffer.editor.restore_search(pattern.clone(), if state.search_backward { SearchDirection::Backward } else { SearchDirection::Forward })?;
-    }
-    for (name, mark) in &state.global_marks {
-        if mark.document_id == buffer.document_id {
-            buffer.editor.restore_mark(*name, mark.anchor.byte);
-        }
-    }
+pub(super) fn apply_client_state(buffer: &mut BufferState, state: &DurableClientState) -> Result<()> {
+    let document_len = buffer.editor.frame().text.len();
+    let editor_state = buffer.editor.state_mut();
+    state.registers.iter().for_each(|(name, register)| editor_state.set_register(*name, register.text.clone(), register.linewise));
+    state
+        .global_marks
+        .iter()
+        .filter(|(_, mark)| mark.document_id == buffer.document_id)
+        .for_each(|(name, mark)| editor_state.set_mark(*name, mark.anchor.byte, document_len));
     if let Some(repeat) = &state.repeat_data {
-        buffer.editor.restore_repeat_data(repeat)?;
+        editor_state.set_repeat_data(repeat)?;
     }
     for (name, recording) in &state.macro_recordings {
         let keys: Vec<KeyEvent> = serde_json::from_slice(&recording.raw_keys).with_context(|| format!("restore macro {name}"))?;
-        buffer.editor.restore_macro(*name, keys);
+        editor_state.set_macro(*name, keys);
+    }
+    if let Some(pattern) = state.search_history.last() {
+        buffer.editor.set_search(pattern.clone(), if state.search_backward { SearchDirection::Backward } else { SearchDirection::Forward })?;
     }
     Ok(())
 }
 
 pub(super) fn sync_client_state(active: &mut BufferState, inactive: &mut [BufferState], state: &DurableClientState) -> Result<()> {
-    restore_client_state(active, state)?;
+    apply_client_state(active, state)?;
     for buffer in inactive {
-        restore_client_state(buffer, state)?;
+        apply_client_state(buffer, state)?;
     }
     Ok(())
 }
@@ -289,7 +289,7 @@ fn replace_file(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
 
 pub(super) enum MutationMessage {
     Register { document_id: DocumentId, text: String, replace_stale: bool, reply: mpsc::Sender<Result<(), String>> },
-    Append { document_id: DocumentId, transaction: Option<Transaction>, state_deltas: Vec<StateDelta> },
+    Append { document_id: DocumentId, transactions: TransactionBatch, state_deltas: Vec<StateDelta> },
     Control(WorkerControl),
 }
 
@@ -341,11 +341,11 @@ impl PersistenceWorker<MutationMessage> {
         response.recv().map_err(|_| anyhow!("in-process session did not register document"))?.map_err(anyhow::Error::msg)
     }
 
-    pub(super) fn append(&self, document_id: DocumentId, transaction: Option<Transaction>, state_deltas: Vec<StateDelta>) -> Result<()> {
-        if transaction.is_none() && state_deltas.is_empty() {
+    pub(super) fn append(&self, document_id: DocumentId, transactions: TransactionBatch, state_deltas: Vec<StateDelta>) -> Result<()> {
+        if transactions.is_empty() && state_deltas.is_empty() {
             return Ok(());
         }
-        self.sender.send(MutationMessage::Append { document_id, transaction, state_deltas }).map_err(|_| anyhow!("in-process session stopped"))
+        self.sender.send(MutationMessage::Append { document_id, transactions, state_deltas }).map_err(|_| anyhow!("in-process session stopped"))
     }
 }
 
@@ -364,8 +364,8 @@ pub(super) fn mutation_loop(mut authority: SessionAuthority, outbox: MutationOut
                 record_persistence_error(&mut error, &result);
                 let _ = reply.send(result.map(|_| ()));
             }
-            MutationMessage::Append { document_id, transaction, state_deltas } => {
-                let batch = collect_mutation_batch(&mut messages, (document_id, transaction, state_deltas));
+            MutationMessage::Append { document_id, transactions, state_deltas } => {
+                let batch = collect_mutation_batch(&mut messages, (document_id, transactions, state_deltas));
                 if error.is_some() {
                     continue;
                 }
@@ -436,7 +436,7 @@ fn register_mutation_document(
         // never discards recovered user edits.
         Some(document) if replace_stale => {
             let replacement = Transaction::new(document.revision, vec![Edit::new(0..document.text().len(), text)]).map_err(|error| error.to_string())?;
-            submit_local_mutations(authority, outbox, client_id, next_sequence, vec![(document_id, Some(replacement), Vec::new())])
+            submit_local_mutations(authority, outbox, client_id, next_sequence, vec![(document_id, std::iter::once(replacement).collect(), Vec::new())])
                 .map_err(|error| error.to_string())?;
             next_sequence.checked_add(1).ok_or_else(|| "client mutation sequence overflow".to_owned())
         }
@@ -449,7 +449,7 @@ fn collect_mutation_batch(messages: &mut DeferredMessages<'_, MutationMessage>, 
     let mut batch = vec![first];
     while batch.len() < MAX_MUTATION_BATCH {
         match messages.recv_timeout(DURABILITY_GROUP_COMMIT_QUIET_PERIOD) {
-            Ok(MutationMessage::Append { document_id, transaction, state_deltas }) => batch.push((document_id, transaction, state_deltas)),
+            Ok(MutationMessage::Append { document_id, transactions, state_deltas }) => batch.push((document_id, transactions, state_deltas)),
             Ok(control) => {
                 messages.defer(control);
                 break;
@@ -486,7 +486,7 @@ pub(super) fn replay_outstanding_mutations(authority: &mut SessionAuthority, out
     Ok(())
 }
 
-type PendingMutation = (DocumentId, Option<Transaction>, Vec<StateDelta>);
+type PendingMutation = (DocumentId, TransactionBatch, Vec<StateDelta>);
 
 fn submit_local_mutations(
     authority: &mut SessionAuthority,
@@ -497,24 +497,27 @@ fn submit_local_mutations(
 ) -> Result<()> {
     let mut document_revisions = std::collections::BTreeMap::new();
     let mut mutations = Vec::with_capacity(pending.len());
-    for (offset, (document_id, transaction, state_deltas)) in pending.into_iter().enumerate() {
+    for (offset, (document_id, mut transactions, state_deltas)) in pending.into_iter().enumerate() {
         let offset = u64::try_from(offset).context("mutation batch exceeds u64")?;
         let sequence = first_sequence.checked_add(offset).ok_or_else(|| anyhow!("client mutation sequence overflow"))?;
         let document = authority.document(document_id).ok_or_else(|| anyhow!("document is not registered"))?;
         let revision = document_revisions.entry(document_id).or_insert(document.revision);
         let mut documents = Vec::new();
-        if let Some(mut transaction) = transaction {
-            transaction.rebase(*revision);
+        if !transactions.is_empty() {
+            let base_revision = *revision;
+            for transaction in &mut transactions {
+                transaction.rebase(*revision);
+                *revision = revision.next().ok_or_else(|| anyhow!("document revision overflow"))?;
+            }
             documents.push(DocumentMutation {
                 document_id,
                 lease_epoch: document.lease.lease_epoch,
-                base_revision: *revision,
+                base_revision,
                 semantic_group_id: SemanticGroupId::new(sequence),
                 semantic_group_kind: SemanticGroupKind::Operator,
                 undo_parent: None,
-                transactions: vec![transaction],
+                transactions: transactions.into_vec(),
             });
-            *revision = revision.next().ok_or_else(|| anyhow!("document revision overflow"))?;
         }
         mutations.push(ClientMutation {
             mutation_id: MutationId::new(sequence),
@@ -645,7 +648,7 @@ mod tests {
             sender
                 .send(MutationMessage::Append {
                     document_id: DocumentId::new(1),
-                    transaction: Some(Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "x")]).expect("transaction")),
+                    transactions: vec![Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "x")]).expect("transaction")].into(),
                     state_deltas: Vec::new(),
                 })
                 .expect("append request");
@@ -661,6 +664,41 @@ mod tests {
         assert!(inspect_outbox.outstanding().expect("outbox").is_empty());
         let recovered = SessionAuthority::open(journal, SessionId::new(1)).expect("recover authority");
         assert_eq!(recovered.document(DocumentId::new(1)).expect("document").text(), format!("{}base", "x".repeat(128)));
+    }
+
+    #[test]
+    fn one_editor_event_persists_its_complete_revision_chain() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let journal = SessionJournal::in_directory(directory.path().join("session"));
+        let authority = SessionAuthority::open(journal.clone(), SessionId::new(1)).expect("open authority");
+        let outbox = MutationOutbox::in_directory(directory.path().join("outbox"));
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || mutation_loop(authority, outbox, receiver));
+
+        let document_id = DocumentId::new(2);
+        let (reply, response) = mpsc::channel();
+        sender.send(MutationMessage::Register { document_id, text: "ab".to_owned(), replace_stale: true, reply }).expect("register request");
+        response.recv().expect("register response").expect("register");
+        sender
+            .send(MutationMessage::Append {
+                document_id,
+                transactions: vec![
+                    Transaction::new(DocumentRevision::new(0), vec![Edit::new(0..0, "x")]).expect("first transaction"),
+                    Transaction::new(DocumentRevision::new(1), vec![Edit::new(1..1, "y")]).expect("second transaction"),
+                ]
+                .into(),
+                state_deltas: Vec::new(),
+            })
+            .expect("append revision chain");
+        let (reply, response) = mpsc::channel();
+        sender.send(MutationMessage::Control(WorkerControl::Stop(reply))).expect("stop request");
+        response.recv().expect("stop response").expect("stop");
+        worker.join().expect("mutation worker");
+
+        let recovered = SessionAuthority::open(journal, SessionId::new(1)).expect("recover authority");
+        let document = recovered.document(document_id).expect("document");
+        assert_eq!(document.revision, DocumentRevision::new(2));
+        assert_eq!(document.text(), "xyab");
     }
 
     #[test]

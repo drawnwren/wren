@@ -118,7 +118,7 @@ fn seed_registers(editor: &mut Editor, expected: &Value) {
         if expected_type == "V" {
             text.push('\n');
         }
-        editor.restore_register(name, text, expected_type == "V");
+        editor.state_mut().set_register(name, text, expected_type == "V");
     }
 }
 

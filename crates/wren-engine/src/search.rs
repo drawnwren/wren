@@ -116,14 +116,13 @@ pub fn resolve_previous_replacement(input: &str, previous: Option<&str>) -> Stri
     let mut output = String::new();
     let mut characters = input.chars().peekable();
     while let Some(character) = characters.next() {
-        if character == '\\' && characters.peek() == Some(&'~') {
-            output.push('\\');
-            output.push('~');
-            characters.next();
-        } else if character == '~' {
-            output.push_str(previous.unwrap_or(""));
-        } else {
-            output.push(character);
+        match (character, characters.peek()) {
+            ('\\', Some('~')) => {
+                output.extend(['\\', '~']);
+                characters.next();
+            }
+            ('~', _) => output.push_str(previous.unwrap_or("")),
+            _ => output.push(character),
         }
     }
     output

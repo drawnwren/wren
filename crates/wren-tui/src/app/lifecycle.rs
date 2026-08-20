@@ -19,7 +19,7 @@ impl App {
         let mut messages = Vec::new();
         push_message(&mut messages, opened_message);
         let (client_state_worker, client_state) = ClientStateWorker::open(ClientId::new(1))?;
-        if let Err(error) = restore_client_state(&mut active, &client_state) {
+        if let Err(error) = apply_client_state(&mut active, &client_state) {
             messages.push(format!("client state: {error}"));
         }
         let jump_history = client_state.jump_list.iter().filter(|entry| entry.path_hint.is_some()).cloned().collect::<Vec<_>>();
@@ -151,7 +151,9 @@ impl App {
         let store = DefaultText::from_reader(Cursor::new(source.as_bytes())).context("create realtime preparation text store")?;
         let mut editor = Editor::new(store);
         let _ = editor.handle_key(KeyEvent::character('i'))?;
-        let _ = editor.handle_key(KeyEvent::character('x'))?.ok_or_else(|| anyhow!("realtime preparation edit produced no transaction"))?;
+        if editor.handle_key(KeyEvent::character('x'))?.is_empty() {
+            bail!("realtime preparation edit produced no transaction");
+        }
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Backspace))?;
         let _ = editor.handle_key(KeyEvent::plain(KeyCode::Escape))?;
         std::hint::black_box(editor.frame());

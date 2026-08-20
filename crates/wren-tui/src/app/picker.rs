@@ -355,8 +355,9 @@ impl App {
 
     pub(super) fn update_prompt_picker(&mut self) -> Result<()> {
         match self.prompt.as_ref().map(|prompt| prompt.kind) {
-            Some(PromptKind::Picker(PickerSource::Files | PickerSource::Browser | PickerSource::Buffers | PickerSource::Recent))
-            | Some(PromptKind::Picker(PickerSource::Jumps | PickerSource::Diagnostics)) => {
+            Some(PromptKind::Picker(
+                PickerSource::Files | PickerSource::Browser | PickerSource::Buffers | PickerSource::Recent | PickerSource::Jumps | PickerSource::Diagnostics,
+            )) => {
                 self.update_picker();
                 Ok(())
             }
@@ -546,13 +547,11 @@ impl App {
 
     pub(super) fn move_picker(&mut self, direction: isize) {
         let length = self.picker_items.len();
-        if length == 0 {
-            self.picker_index = 0;
-        } else if direction < 0 {
-            self.picker_index = self.picker_index.saturating_sub(1);
-        } else {
-            self.picker_index = self.picker_index.saturating_add(1).min(length - 1);
-        }
+        self.picker_index = match (length, direction.is_negative()) {
+            (0, _) => 0,
+            (_, true) => self.picker_index.saturating_sub(1),
+            (_, false) => self.picker_index.saturating_add(1).min(length - 1),
+        };
         self.update_picker_message();
         self.refresh_picker_preview();
     }

@@ -3,7 +3,7 @@
 mod ex;
 mod expression;
 
-pub use ex::{BufferAction, EX_COMMAND_COMPLETIONS, ExAddress, ExCommand, ExError, ExRange, SubstituteFlags, TabAction, parse_ex};
+pub use ex::{BufferAction, ExAddress, ExCommand, ExError, ExRange, SubstituteFlags, TabAction, ex_command_completions, parse_ex};
 pub use expression::{ExpressionContext, ExpressionError, Value, evaluate_expression, expression_editor_text};
 
 use std::num::NonZeroU32;

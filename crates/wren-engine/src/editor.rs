@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use thiserror::Error;
 use wren_grammar::{Command, Grammar, KeyCode, KeyEvent, Modifiers, Motion, Operator, ParseResult, ParseState, RangeKind, Register, TargetAction, TextObject};
 use wren_text::{DefaultText, TextStore};
@@ -11,6 +12,12 @@ use wren_types::{
 };
 
 use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
+
+pub type TransactionBatch = SmallVec<[Transaction; 1]>;
+
+fn transactions(transaction: Option<Transaction>) -> TransactionBatch {
+    transaction.into_iter().collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -87,15 +94,76 @@ struct SearchState {
     cache: RefCell<SearchMatchCache>,
 }
 
+/// The restorable editor-owned state. Text, revision, presentation options,
+/// and transient input parsing stay on [`Editor`]; durable editing history and
+/// user state cross persistence boundaries as this single value.
+#[derive(Debug, Clone, Default)]
+pub struct EditorState {
+    undo: Vec<UndoGroup>,
+    redo: Vec<UndoGroup>,
+    undo_branches: Vec<Vec<UndoGroup>>,
+    registers: BTreeMap<char, RegisterValue>,
+    marks: BTreeMap<char, Anchor>,
+    macros: BTreeMap<char, Vec<KeyEvent>>,
+    last_change: Option<RepeatAction>,
+    search: Option<SearchState>,
+}
+
+impl EditorState {
+    pub fn set_undo(&mut self, state: DurableUndoState) {
+        self.undo = state.undo;
+        self.redo = state.redo;
+        self.undo_branches = state.branches;
+    }
+
+    pub fn set_register(&mut self, name: char, text: impl Into<Box<str>>, linewise: bool) {
+        self.registers.insert(name, RegisterValue { text: text.into(), linewise });
+    }
+
+    pub fn set_macro(&mut self, name: char, keys: Vec<KeyEvent>) {
+        self.macros.insert(name.to_ascii_lowercase(), keys);
+    }
+
+    pub fn set_repeat_data(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        self.last_change = Some(serde_json::from_slice(bytes).map_err(|error| EngineError::InvalidRepeatData(error.to_string().into()))?);
+        Ok(())
+    }
+
+    pub fn set_search(&mut self, pattern: impl Into<Box<str>>, direction: SearchDirection, ignore_case: bool, smart_case: bool) -> Result<(), EngineError> {
+        let pattern = pattern.into();
+        let compiled = VimPattern::compile(&pattern, ignore_case, smart_case, CaseOverride::Default).map_err(EngineError::InvalidSearchPattern)?;
+        self.search = Some(SearchState { pattern, direction, compiled, cache: RefCell::default() });
+        Ok(())
+    }
+
+    pub fn set_mark(&mut self, name: char, byte: usize, document_len: usize) {
+        self.marks.insert(name, Anchor { byte: byte.min(document_len), bias: Bias::Right });
+    }
+
+    fn validate(&self) -> Result<(), EngineError> {
+        self.undo.iter().chain(self.redo.iter()).chain(self.undo_branches.iter().flatten()).try_for_each(|group| {
+            group.before.validate().map_err(|error| EngineError::InvalidUndoState(error.to_string().into()))?;
+            group.after.validate().map_err(|error| EngineError::InvalidUndoState(error.to_string().into()))
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct SearchMatchCache {
     revision: Option<DocumentRevision>,
     all: Option<Vec<Range<usize>>>,
-    windows: BTreeMap<(usize, usize), Vec<Range<usize>>>,
+    windows: BTreeMap<(usize, usize), CachedMatchWindow>,
     #[cfg(test)]
     window_scans: usize,
     #[cfg(test)]
     full_scans: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMatchWindow {
+    ranges: Vec<Range<usize>>,
+    /// Whether `ranges` contains every non-empty match in the window.
+    complete: bool,
 }
 
 impl SearchState {
@@ -136,44 +204,33 @@ impl SearchState {
             return all[start..]
                 .iter()
                 .take_while(|range| range.start < byte_range.end)
-                .filter(|range| !range.is_empty() && range.end <= byte_range.end)
+                .filter(|range| is_non_empty_range_within(range, &byte_range))
                 .take(limit)
                 .cloned()
                 .collect();
         }
-        if let Some(ranges) = cache.windows.get(&key) {
-            return ranges.iter().take(limit).cloned().collect();
+        if let Some(window) = cache.windows.get(&key)
+            && (window.complete || window.ranges.len() >= limit)
+        {
+            return window.ranges.iter().take(limit).cloned().collect();
         }
-        let mut ranges = Vec::new();
-        let relative_start = byte_range.start.saturating_sub(text_origin).min(text.len());
-        let relative_end = byte_range.end.saturating_sub(text_origin).min(text.len());
-        let mut cursor = relative_start;
-        while cursor <= relative_end && ranges.len() < limit {
-            let Some(found) = self.compiled.find_at(text, cursor) else {
-                break;
-            };
-            if found.start() >= relative_end || found.end() > relative_end {
-                break;
-            }
-            if !found.is_empty() {
-                ranges.push(text_origin.saturating_add(found.start())..text_origin.saturating_add(found.end()));
-            }
-            cursor = if found.is_empty() { next_char_boundary(text, found.start()) } else { found.end() };
-            if cursor == text.len() && found.is_empty() {
-                break;
-            }
-        }
+        drop(cache);
+        let window = scan_match_window(&self.compiled, text, byte_range.clone(), text_origin, limit);
+
+        let mut cache = self.cache.borrow_mut();
+        cache.prepare_revision(revision);
         const MAX_CACHED_WINDOWS: usize = 32;
         if cache.windows.len() >= MAX_CACHED_WINDOWS
-            && let Some(oldest) = cache.windows.keys().next().copied()
+            && let Some(first) = cache.windows.keys().next().copied()
         {
-            cache.windows.remove(&oldest);
+            cache.windows.remove(&first);
         }
         #[cfg(test)]
         {
             cache.window_scans += 1;
         }
-        cache.windows.insert(key, ranges.clone());
+        let ranges = window.ranges.iter().take(limit).cloned().collect();
+        cache.windows.insert(key, window);
         ranges
     }
 
@@ -195,12 +252,13 @@ impl SearchState {
             .collect::<Vec<_>>();
         merge_ranges(&mut affected);
         let mut windows = BTreeMap::new();
-        for ((start, end), ranges) in std::mem::take(&mut cache.windows) {
+        for ((start, end), cached) in std::mem::take(&mut cache.windows) {
             let Ok(window) = transaction.map_range(start..end, Bias::Left, Bias::Right) else {
                 continue;
             };
             let impacts = affected.iter().filter_map(|range| intersect_ranges(range, &window)).collect::<Vec<_>>();
-            let mut mapped = ranges
+            let mut mapped = cached
+                .ranges
                 .into_iter()
                 .filter(|range| {
                     !transaction.edits().iter().any(|edit| {
@@ -219,12 +277,72 @@ impl SearchState {
             }
             mapped.sort_by_key(|range| (range.start, range.end));
             mapped.dedup();
-            windows.insert((window.start, window.end), mapped);
+            windows.insert((window.start, window.end), CachedMatchWindow { ranges: mapped, complete: cached.complete });
         }
         cache.revision = Some(revision);
         cache.all = None;
         cache.windows = windows;
     }
+}
+
+fn scan_match_window(compiled: &VimPattern, text: &str, byte_range: Range<usize>, text_origin: usize, limit: usize) -> CachedMatchWindow {
+    let Some(text_end) = text_origin.checked_add(text.len()) else {
+        unreachable!("search context must fit in the document coordinate space");
+    };
+    assert!(
+        text_origin <= byte_range.start && byte_range.start <= byte_range.end && byte_range.end <= text_end,
+        "search window must be contained in its text context"
+    );
+    let relative_start = byte_range.start - text_origin;
+    let relative_end = byte_range.end - text_origin;
+    assert!(text.is_char_boundary(relative_start) && text.is_char_boundary(relative_end), "search window must begin and end at character boundaries");
+
+    let mut ranges = Vec::new();
+    let mut cursor = relative_start;
+    while cursor <= relative_end && ranges.len() < limit.saturating_add(1) {
+        let Some(found) = compiled.find_at(text, cursor) else {
+            break;
+        };
+        let found_range = text_origin + found.start()..text_origin + found.end();
+        if found_range.start >= byte_range.end || found_range.end > byte_range.end {
+            break;
+        }
+        let empty = found.is_empty();
+        if is_non_empty_range_within(&found_range, &byte_range) {
+            ranges.push(found_range);
+        }
+        cursor = if empty { next_char_boundary(text, found.start()) } else { found.end() };
+        if cursor == text.len() && empty {
+            break;
+        }
+    }
+    let complete = ranges.len() <= limit;
+    ranges.truncate(limit);
+    CachedMatchWindow { ranges, complete }
+}
+
+fn is_non_empty_range_within(range: &Range<usize>, window: &Range<usize>) -> bool {
+    !range.is_empty() && window.start <= range.start && range.end <= window.end
+}
+
+fn previous_frame_char_boundary(text: &FrameText, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    if byte == 0 {
+        return 0;
+    }
+    byte -= 1;
+    while !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
+fn next_frame_char_boundary(text: &FrameText, byte: usize) -> usize {
+    let mut byte = byte.saturating_add(1).min(text.len());
+    while byte < text.len() && !text.is_char_boundary(byte) {
+        byte += 1;
+    }
+    byte
 }
 
 impl SearchMatchCache {
@@ -354,24 +472,17 @@ pub struct Editor {
     selections: SelectionSet,
     mode: Mode,
     pending_keys: Vec<KeyEvent>,
-    undo: Vec<UndoGroup>,
-    redo: Vec<UndoGroup>,
-    undo_branches: Vec<Vec<UndoGroup>>,
+    state: EditorState,
     insert_group: Option<UndoGroup>,
     insert_style: InsertStyle,
     insert_capture: String,
-    registers: BTreeMap<char, RegisterValue>,
     pending_clipboard_writes: Vec<(char, Box<str>)>,
-    marks: BTreeMap<char, Anchor>,
-    macros: BTreeMap<char, Vec<KeyEvent>>,
     recording_macro: Option<char>,
     recording_keys: Vec<KeyEvent>,
     last_macro: Option<char>,
     macro_depth: u8,
-    last_change: Option<RepeatAction>,
     pending_change: Option<Command>,
     replaying_change: bool,
-    search: Option<SearchState>,
     #[cfg(any(test, feature = "conformance"))]
     last_visual: Option<VisualSelection>,
     jumps: LocationHistory,
@@ -402,24 +513,17 @@ impl Editor {
             selections: SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 0, head: 0 }] },
             mode: Mode::Normal,
             pending_keys: Vec::with_capacity(8),
-            undo: Vec::with_capacity(64),
-            redo: Vec::with_capacity(64),
-            undo_branches: Vec::with_capacity(8),
+            state: EditorState { undo: Vec::with_capacity(64), redo: Vec::with_capacity(64), undo_branches: Vec::with_capacity(8), ..EditorState::default() },
             insert_group: None,
             insert_style: InsertStyle::Insert,
             insert_capture: String::with_capacity(64),
-            registers: BTreeMap::new(),
             pending_clipboard_writes: Vec::with_capacity(4),
-            marks: BTreeMap::new(),
-            macros: BTreeMap::new(),
             recording_macro: None,
             recording_keys: Vec::with_capacity(64),
             last_macro: None,
             macro_depth: 0,
-            last_change: None,
             pending_change: None,
             replaying_change: false,
-            search: None,
             #[cfg(any(test, feature = "conformance"))]
             last_visual: None,
             jumps: LocationHistory::new(64, usize::MAX, None),
@@ -443,7 +547,7 @@ impl Editor {
     pub fn set_search_options(&mut self, ignore_case: bool, smart_case: bool) {
         self.ignore_case = ignore_case;
         self.smart_case = smart_case;
-        if let Some(search) = &mut self.search
+        if let Some(search) = &mut self.state.search
             && let Ok(compiled) = VimPattern::compile(&search.pattern, ignore_case, smart_case, CaseOverride::Default)
         {
             search.compiled = compiled;
@@ -516,36 +620,38 @@ impl Editor {
     #[must_use]
     #[cfg(test)]
     pub fn undo_depth(&self) -> usize {
-        self.undo.len() + usize::from(self.insert_group.as_ref().is_some_and(|group| !group.is_empty()))
+        self.state.undo.len() + usize::from(self.insert_group.as_ref().is_some_and(|group| !group.is_empty()))
     }
 
     #[must_use]
     #[cfg(any(test, feature = "conformance"))]
     pub fn redo_depth(&self) -> usize {
-        self.redo.len()
+        self.state.redo.len()
     }
 
     #[must_use]
     #[cfg(any(test, feature = "conformance"))]
     pub fn undo_tree_len(&self) -> usize {
-        self.undo.len() + self.redo.len() + self.undo_branches.iter().map(Vec::len).sum::<usize>()
+        self.state.undo.len() + self.state.redo.len() + self.state.undo_branches.iter().map(Vec::len).sum::<usize>()
     }
 
     pub fn durable_undo_state(&mut self) -> DurableUndoState {
         self.finish_insert_group();
-        DurableUndoState { undo: self.undo.clone(), redo: self.redo.clone(), branches: self.undo_branches.clone() }
+        DurableUndoState { undo: self.state.undo.clone(), redo: self.state.redo.clone(), branches: self.state.undo_branches.clone() }
     }
 
-    pub fn restore_undo_state(&mut self, state: DurableUndoState) -> Result<(), EngineError> {
-        for group in state.undo.iter().chain(state.redo.iter()).chain(state.branches.iter().flatten()) {
-            group.before.validate().map_err(|error| EngineError::InvalidUndoState(error.to_string().into()))?;
-            group.after.validate().map_err(|error| EngineError::InvalidUndoState(error.to_string().into()))?;
+    pub fn restore(&mut self, mut state: EditorState) -> Result<(), EngineError> {
+        state.validate()?;
+        for anchor in state.marks.values_mut() {
+            anchor.byte = anchor.byte.min(self.frame_text.len());
         }
-        self.undo = state.undo;
-        self.redo = state.redo;
-        self.undo_branches = state.branches;
+        self.state = state;
         self.insert_group = None;
         Ok(())
+    }
+
+    pub fn state_mut(&mut self) -> &mut EditorState {
+        &mut self.state
     }
 
     #[must_use]
@@ -608,19 +714,19 @@ impl Editor {
 
     #[cfg(any(test, feature = "conformance"))]
     pub fn register(&self, name: char) -> Option<&RegisterValue> {
-        self.registers.get(&name.to_ascii_lowercase())
+        self.state.registers.get(&name.to_ascii_lowercase())
     }
 
     pub fn registers(&self) -> impl Iterator<Item = (char, &RegisterValue)> {
-        self.registers.iter().map(|(name, value)| (*name, value))
+        self.state.registers.iter().map(|(name, value)| (*name, value))
     }
 
     pub fn set_register(&mut self, name: char, text: impl Into<Box<str>>, linewise: bool) {
         let value = RegisterValue { text: text.into(), linewise };
-        self.registers.insert(name, value.clone());
-        self.registers.insert('"', value.clone());
+        self.state.registers.insert(name, value.clone());
+        self.state.registers.insert('"', value.clone());
         if self.clipboard_unnamed {
-            self.registers.insert('+', value);
+            self.state.registers.insert('+', value);
         }
     }
 
@@ -631,45 +737,20 @@ impl Editor {
         std::mem::take(&mut self.pending_clipboard_writes)
     }
 
-    /// Restores one durable register without applying interactive unnamed-
-    /// register side effects. Client-state replay uses this for exact startup.
-    pub fn restore_register(&mut self, name: char, text: impl Into<Box<str>>, linewise: bool) {
-        self.registers.insert(name, RegisterValue { text: text.into(), linewise });
-    }
-
     pub fn macros(&self) -> impl Iterator<Item = (char, &[KeyEvent])> + '_ {
-        self.macros.iter().map(|(name, keys)| (*name, keys.as_slice()))
-    }
-
-    /// Restores raw physical-key macro input. The synchronous grammar remains
-    /// closed: restored keys are replayed through the same parser as live keys.
-    pub fn restore_macro(&mut self, name: char, keys: Vec<KeyEvent>) {
-        self.macros.insert(name.to_ascii_lowercase(), keys);
+        self.state.macros.iter().map(|(name, keys)| (*name, keys.as_slice()))
     }
 
     pub fn durable_repeat_data(&self) -> Option<Vec<u8>> {
-        self.last_change.as_ref().and_then(|action| serde_json::to_vec(action).ok())
+        self.state.last_change.as_ref().and_then(|action| serde_json::to_vec(action).ok())
     }
 
-    pub fn restore_repeat_data(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        self.last_change = Some(serde_json::from_slice(bytes).map_err(|error| EngineError::InvalidRepeatData(error.to_string().into()))?);
-        Ok(())
-    }
-
-    pub fn restore_search(&mut self, pattern: impl Into<Box<str>>, direction: SearchDirection) -> Result<(), EngineError> {
-        let pattern = pattern.into();
-        let compiled = self.compile_search_pattern(&pattern, CaseOverride::Default)?;
-        self.search = Some(SearchState { pattern, direction, compiled, cache: RefCell::default() });
-        Ok(())
+    pub fn set_search(&mut self, pattern: impl Into<Box<str>>, direction: SearchDirection) -> Result<(), EngineError> {
+        self.state.set_search(pattern, direction, self.ignore_case, self.smart_case)
     }
 
     pub fn clear_search(&mut self) {
-        self.search = None;
-    }
-
-    pub fn restore_mark(&mut self, name: char, byte: usize) {
-        let byte = byte.min(self.frame_text.len());
-        self.marks.insert(name, Anchor { byte, bias: Bias::Right });
+        self.state.search = None;
     }
 
     #[must_use]
@@ -769,17 +850,17 @@ impl Editor {
         let transaction = Transaction::new(self.revision, vec![Edit::new(start..end, replacement)])?;
         self.apply_recorded(transaction.clone(), false)?;
         self.collapse_selection(start);
-        if let Some(group) = self.undo.last_mut() {
+        if let Some(group) = self.state.undo.last_mut() {
             group.after = self.selections.clone();
         }
         if !self.replaying_change {
-            self.last_change = Some(RepeatAction::NumberDelta(delta));
+            self.state.last_change = Some(RepeatAction::NumberDelta(delta));
         }
         Ok(Some(transaction))
     }
 
     pub fn last_search(&self) -> Option<(&str, SearchDirection)> {
-        self.search.as_ref().map(|search| (search.pattern.as_ref(), search.direction))
+        self.state.search.as_ref().map(|search| (search.pattern.as_ref(), search.direction))
     }
 
     #[cfg(any(test, feature = "conformance"))]
@@ -788,16 +869,28 @@ impl Editor {
     }
 
     pub fn mark(&self, name: char) -> Option<usize> {
-        self.marks.get(&name).map(|anchor| anchor.byte)
+        self.state.marks.get(&name).map(|anchor| anchor.byte)
     }
 
     pub fn marks(&self) -> impl Iterator<Item = (char, usize)> + '_ {
-        self.marks.iter().map(|(name, anchor)| (*name, anchor.byte))
+        self.state.marks.iter().map(|(name, anchor)| (*name, anchor.byte))
     }
 
     pub fn set_cursor(&mut self, byte: usize) {
         let destination = floor_char_boundary(self.frame_text.as_ref(), byte.min(self.frame_text.as_ref().len()));
         self.collapse_selection(destination);
+    }
+
+    /// Restores a logical source position after a whole-document transform.
+    /// The line and character column are clamped to the transformed text.
+    pub fn set_cursor_line_column(&mut self, line: usize, column: usize) {
+        let line = line.min(self.frame_text.line_of_byte(self.frame_text.len()));
+        let start = self.frame_text.byte_of_line(line);
+        let raw_end = self.frame_text.byte_of_line(line.saturating_add(1));
+        let line = self.frame_text.slice(start..raw_end);
+        let content_len = line.len().saturating_sub(usize::from(line.as_bytes().last() == Some(&b'\n')));
+        let relative = line[..content_len].char_indices().nth(column).map_or(content_len, |(byte, _)| byte);
+        self.set_cursor(start.saturating_add(relative));
     }
 
     /// Pre-fault the synchronous single-key navigation path before the first
@@ -839,31 +932,34 @@ impl Editor {
         self.set_primary_selection(anchor, head);
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> Result<Option<Transaction>, EngineError> {
+    /// Applies one key and returns every text transaction it produced in
+    /// revision order. Most keys produce zero or one transaction; undo,
+    /// redo, repeats, and macros can produce a revision chain.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Result<TransactionBatch, EngineError> {
         if matches!(self.mode, Mode::Insert | Mode::Replace) {
             if self.recording_macro.is_some() {
                 self.recording_keys.push(key);
             }
-            return self.handle_insert_key(key);
+            return self.handle_insert_key(key).map(transactions);
         }
         if matches!(self.mode, Mode::Visual | Mode::VisualLine) {
-            return self.handle_visual_key(key);
+            return self.handle_visual_key(key).map(transactions);
         }
 
         if key.code == KeyCode::Escape && key.modifiers.is_empty() {
             self.cancel_pending();
-            return Ok(None);
+            return Ok(TransactionBatch::new());
         }
 
         if self.pending_keys.is_empty() && key.modifiers.is_empty() {
             match key.code {
                 KeyCode::Char('v') => {
                     self.enter_visual(Mode::Visual);
-                    return Ok(None);
+                    return Ok(TransactionBatch::new());
                 }
                 KeyCode::Char('V') => {
                     self.enter_visual(Mode::VisualLine);
-                    return Ok(None);
+                    return Ok(TransactionBatch::new());
                 }
                 _ => {}
             }
@@ -871,14 +967,14 @@ impl Editor {
 
         if self.recording_macro.is_some() && key == KeyEvent::character('q') && self.pending_keys.is_empty() {
             self.finish_macro_recording();
-            return Ok(None);
+            return Ok(TransactionBatch::new());
         }
         if self.recording_macro.is_some() {
             self.recording_keys.push(key);
         }
 
         let Some(command) = self.parse_key(key)? else {
-            return Ok(None);
+            return Ok(TransactionBatch::new());
         };
         self.pending_keys.clear();
         self.execute(command)
@@ -1084,48 +1180,47 @@ impl Editor {
         self.apply_recorded(transaction, false)
     }
 
-    pub fn undo(&mut self) -> Result<Option<Transaction>, EngineError> {
+    pub fn undo(&mut self) -> Result<TransactionBatch, EngineError> {
         self.finish_insert_group();
-        let Some(group) = self.undo.pop() else {
+        let Some(group) = self.state.undo.pop() else {
             self.messages.push("already at oldest change".into());
-            return Ok(None);
+            return Ok(TransactionBatch::new());
         };
-        let last = self.apply_history(group.inverse.iter().rev())?;
+        let transactions = self.apply_history(group.inverse.iter().rev())?;
         self.selections = group.before.clone();
-        self.redo.push(group);
+        self.state.redo.push(group);
         self.messages.push("undo change".into());
-        Ok(last)
+        Ok(transactions)
     }
 
-    pub fn redo(&mut self) -> Result<Option<Transaction>, EngineError> {
+    pub fn redo(&mut self) -> Result<TransactionBatch, EngineError> {
         self.finish_insert_group();
-        let Some(group) = self.redo.pop() else {
+        let Some(group) = self.state.redo.pop() else {
             self.messages.push("already at newest change".into());
-            return Ok(None);
+            return Ok(TransactionBatch::new());
         };
-        let last = self.apply_history(&group.forward)?;
-        self.undo.push(group);
+        let transactions = self.apply_history(&group.forward)?;
+        self.state.undo.push(group);
         self.messages.push("redo change".into());
-        Ok(last)
+        Ok(transactions)
     }
 
-    fn apply_history<'a>(&mut self, transactions: impl IntoIterator<Item = &'a Transaction>) -> Result<Option<Transaction>, EngineError> {
-        let mut last = None;
+    fn apply_history<'a>(&mut self, transactions: impl IntoIterator<Item = &'a Transaction>) -> Result<TransactionBatch, EngineError> {
+        let mut applied = TransactionBatch::new();
         for transaction in transactions {
             let mut transaction = transaction.clone();
             transaction.rebase(self.revision);
             self.apply_without_history(&transaction)?;
-            last = Some(transaction);
+            applied.push(transaction);
         }
-        Ok(last)
+        Ok(applied)
     }
 
     pub fn search(&mut self, pattern: &str, direction: SearchDirection) -> Result<bool, EngineError> {
         if pattern.is_empty() {
             return Ok(false);
         }
-        let compiled = self.compile_search_pattern(pattern, CaseOverride::Default)?;
-        self.search = Some(SearchState { pattern: Box::from(pattern), direction, compiled, cache: RefCell::default() });
+        self.set_search(pattern, direction)?;
         Ok(self.move_to_search_match(direction))
     }
 
@@ -1139,7 +1234,7 @@ impl Editor {
 
     #[must_use]
     pub fn search_match_ranges(&self, byte_range: Range<usize>, limit: usize) -> Vec<Range<usize>> {
-        let Some(search) = &self.search else {
+        let Some(search) = &self.state.search else {
             return Vec::new();
         };
         if search.pattern.is_empty() || limit == 0 {
@@ -1153,12 +1248,14 @@ impl Editor {
         while end > start && !self.frame_text.is_char_boundary(end) {
             end -= 1;
         }
-        let text = self.frame_text.slice(start..end);
-        search.match_ranges(&text, self.revision, start..end, start, limit)
+        let context_start = previous_frame_char_boundary(&self.frame_text, start);
+        let context_end = next_frame_char_boundary(&self.frame_text, end);
+        let text = self.frame_text.slice(context_start..context_end);
+        search.match_ranges(&text, self.revision, start..end, context_start, limit)
     }
 
     pub fn search_next(&mut self, reverse: bool) -> bool {
-        let Some(search) = self.search.clone() else {
+        let Some(search) = self.state.search.clone() else {
             return false;
         };
         let direction = if reverse {
@@ -1173,7 +1270,7 @@ impl Editor {
     }
 
     fn move_to_search_match(&mut self, direction: SearchDirection) -> bool {
-        let byte = self.search.as_ref().and_then(|search| search.find_from(&self.contents(), self.revision, direction, self.primary_cursor()));
+        let byte = self.state.search.as_ref().and_then(|search| search.find_from(&self.contents(), self.revision, direction, self.primary_cursor()));
         let Some(byte) = byte else {
             return false;
         };
@@ -1191,7 +1288,7 @@ impl Editor {
 
     #[cfg(test)]
     fn search_scan_counts(&self) -> (usize, usize) {
-        self.search.as_ref().map_or((0, 0), |search| {
+        self.state.search.as_ref().map_or((0, 0), |search| {
             let cache = search.cache.borrow();
             (cache.window_scans, cache.full_scans)
         })
@@ -1271,28 +1368,32 @@ impl Editor {
         Ok(Some(transaction))
     }
 
-    fn execute(&mut self, command: Command) -> Result<Option<Transaction>, EngineError> {
+    fn execute(&mut self, command: Command) -> Result<TransactionBatch, EngineError> {
         match &command {
-            Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert),
-            Command::EnterAppend => self.enter_insert_command(InsertStyle::Append),
-            Command::EnterInsertAtLineStart => self.enter_insert_command(InsertStyle::LineStart),
-            Command::EnterInsertAtLineEnd => self.enter_insert_command(InsertStyle::LineEnd),
-            Command::EnterReplace => self.enter_insert_command(InsertStyle::Replace),
+            Command::EnterInsert => self.enter_insert_command(InsertStyle::Insert).map(transactions),
+            Command::EnterAppend => self.enter_insert_command(InsertStyle::Append).map(transactions),
+            Command::EnterInsertAtLineStart => self.enter_insert_command(InsertStyle::LineStart).map(transactions),
+            Command::EnterInsertAtLineEnd => self.enter_insert_command(InsertStyle::LineEnd).map(transactions),
+            Command::EnterReplace => self.enter_insert_command(InsertStyle::Replace).map(transactions),
             Command::OpenLine { above } => {
                 self.ensure_writable()?;
-                self.open_line(*above)
+                self.open_line(*above).map(transactions)
             }
-            Command::Move { motion, count } => Ok(self.execute_move(*motion, count.get())),
+            Command::Move { motion, count } => Ok(transactions(self.execute_move(*motion, count.get()))),
             Command::ApplyOperator { operator, motion, count, register, range_kind } => {
-                self.execute_operator(&command, *operator, *motion, count.get(), *register, *range_kind)
+                self.execute_operator(&command, *operator, *motion, count.get(), *register, *range_kind).map(transactions)
             }
             Command::DeleteChar { backward, count, register } => {
-                self.finish_command_change(&command, |editor| editor.delete_chars(*backward, count.get(), *register))
+                self.finish_command_change(&command, |editor| editor.delete_chars(*backward, count.get(), *register)).map(transactions)
             }
-            Command::JoinLines { count } => self.finish_command_change(&command, |editor| editor.join_lines(count.get())),
-            Command::ReplaceChar { character, count } => self.finish_command_change(&command, |editor| editor.replace_chars(*character, count.get())),
-            Command::ToggleCase { count } => self.finish_command_change(&command, |editor| editor.toggle_case(count.get())),
-            Command::Paste { before, count, register } => self.finish_command_change(&command, |editor| editor.paste(*before, count.get(), *register)),
+            Command::JoinLines { count } => self.finish_command_change(&command, |editor| editor.join_lines(count.get())).map(transactions),
+            Command::ReplaceChar { character, count } => {
+                self.finish_command_change(&command, |editor| editor.replace_chars(*character, count.get())).map(transactions)
+            }
+            Command::ToggleCase { count } => self.finish_command_change(&command, |editor| editor.toggle_case(count.get())).map(transactions),
+            Command::Paste { before, count, register } => {
+                self.finish_command_change(&command, |editor| editor.paste(*before, count.get(), *register)).map(transactions)
+            }
             Command::Undo { count } => self.history_count(count.get(), Self::undo),
             Command::Redo { count } => self.history_count(count.get(), Self::redo),
             Command::SearchNext { reverse, count } => {
@@ -1301,41 +1402,41 @@ impl Editor {
                         break;
                     }
                 }
-                Ok(None)
+                Ok(TransactionBatch::new())
             }
             Command::Repeat { count } => self.repeat_last(count.get()),
             Command::Target { action, target, count } => self.execute_target(*action, *target, count.get()),
         }
     }
 
-    fn execute_target(&mut self, action: TargetAction, target: char, count: u32) -> Result<Option<Transaction>, EngineError> {
+    fn execute_target(&mut self, action: TargetAction, target: char, count: u32) -> Result<TransactionBatch, EngineError> {
         match action {
             TargetAction::RecordMacro => {
                 self.recording_macro = Some(target.to_ascii_lowercase());
                 self.recording_keys.clear();
-                Ok(None)
+                Ok(TransactionBatch::new())
             }
             TargetAction::ReplayMacro => {
-                let mut last = None;
+                let mut transactions = TransactionBatch::new();
                 for _ in 0..count {
-                    last = self.replay_macro(target)?.or(last);
+                    transactions.extend(self.replay_macro(target)?);
                 }
-                Ok(last)
+                Ok(transactions)
             }
             TargetAction::SetMark => {
-                self.marks.insert(target, Anchor { byte: self.primary_cursor(), bias: Bias::Left });
-                Ok(None)
+                self.state.marks.insert(target, Anchor { byte: self.primary_cursor(), bias: Bias::Left });
+                Ok(TransactionBatch::new())
             }
             TargetAction::JumpMark { linewise } => {
-                let Some(anchor) = self.marks.get(&target).copied() else {
-                    return Ok(None);
+                let Some(anchor) = self.state.marks.get(&target).copied() else {
+                    return Ok(TransactionBatch::new());
                 };
                 let destination = if linewise { first_non_blank(self.frame_text.as_ref(), anchor.byte) } else { anchor.byte };
                 if destination != self.primary_cursor() {
                     self.jumps.push(self.primary_cursor());
                 }
                 self.collapse_selection(destination);
-                Ok(None)
+                Ok(TransactionBatch::new())
             }
         }
     }
@@ -1397,7 +1498,7 @@ impl Editor {
         if operator == Operator::Change {
             self.pending_change = Some(command.clone());
         } else {
-            self.last_change = Some(RepeatAction::Command(command.clone()));
+            self.state.last_change = Some(RepeatAction::Command(command.clone()));
         }
         Ok(result)
     }
@@ -1409,21 +1510,21 @@ impl Editor {
     ) -> Result<Option<Transaction>, EngineError> {
         let result = operation(self)?;
         if result.is_some() && !self.replaying_change {
-            self.last_change = Some(RepeatAction::Command(command.clone()));
+            self.state.last_change = Some(RepeatAction::Command(command.clone()));
         }
         Ok(result)
     }
 
-    fn history_count(&mut self, count: u32, operation: fn(&mut Self) -> Result<Option<Transaction>, EngineError>) -> Result<Option<Transaction>, EngineError> {
-        let mut last = None;
+    fn history_count(&mut self, count: u32, operation: fn(&mut Self) -> Result<TransactionBatch, EngineError>) -> Result<TransactionBatch, EngineError> {
+        let mut transactions = TransactionBatch::new();
         for _ in 0..count {
-            if let Some(transaction) = operation(self)? {
-                last = Some(transaction);
-            } else {
+            let applied = operation(self)?;
+            if applied.is_empty() {
                 break;
             }
+            transactions.extend(applied);
         }
-        Ok(last)
+        Ok(transactions)
     }
 
     fn enter_insert(&mut self, style: InsertStyle) {
@@ -1447,9 +1548,9 @@ impl Editor {
         self.finish_insert_group();
         if !self.replaying_change {
             if let Some(command) = self.pending_change.take() {
-                self.last_change = Some(RepeatAction::ChangeInsert { command, text: self.insert_capture.clone().into_boxed_str() });
+                self.state.last_change = Some(RepeatAction::ChangeInsert { command, text: self.insert_capture.clone().into_boxed_str() });
             } else if !self.insert_capture.is_empty() {
-                self.last_change = Some(RepeatAction::Insert { style: self.insert_style, text: self.insert_capture.clone().into_boxed_str() });
+                self.state.last_change = Some(RepeatAction::Insert { style: self.insert_style, text: self.insert_capture.clone().into_boxed_str() });
             }
         }
         self.insert_capture.clear();
@@ -1459,7 +1560,7 @@ impl Editor {
         if let Some(group) = self.insert_group.take()
             && !group.is_empty()
         {
-            self.undo.push(group);
+            self.state.undo.push(group);
         }
     }
 
@@ -1485,10 +1586,10 @@ impl Editor {
             group.forward.push(transaction);
             group.inverse.push(inverse);
             group.after = after;
-            self.undo.push(group);
+            self.state.undo.push(group);
         }
-        if !self.redo.is_empty() {
-            self.undo_branches.push(std::mem::take(&mut self.redo));
+        if !self.state.redo.is_empty() {
+            self.state.undo_branches.push(std::mem::take(&mut self.state.redo));
         }
         Ok(())
     }
@@ -1496,18 +1597,19 @@ impl Editor {
     fn invert_transaction(&self, transaction: &Transaction) -> Result<Transaction, EngineError> {
         let text = self.frame_text.store();
         let text_len = text.len_bytes();
-        let mut deleted = Vec::with_capacity(transaction.edit_count());
-        for edit in transaction.edits() {
-            if edit.range.end > text_len {
-                return Err(TransactionError::OutOfBounds { offset: edit.range.end, len: text_len }.into());
-            }
-            for offset in [edit.range.start, edit.range.end] {
-                if !text.is_char_boundary(offset) {
-                    return Err(TransactionError::NotCharBoundary { offset }.into());
+        let deleted = transaction
+            .edits()
+            .iter()
+            .map(|edit| {
+                if edit.range.end > text_len {
+                    return Err(TransactionError::OutOfBounds { offset: edit.range.end, len: text_len });
                 }
-            }
-            deleted.push(text.slice(edit.range.clone()).into_owned().into_boxed_str());
-        }
+                [edit.range.start, edit.range.end]
+                    .into_iter()
+                    .try_for_each(|offset| text.is_char_boundary(offset).then_some(()).ok_or(TransactionError::NotCharBoundary { offset }))?;
+                Ok(text.slice(edit.range.clone()).into_owned().into_boxed_str())
+            })
+            .collect::<Result<Vec<_>, TransactionError>>()?;
         transaction.invert(&deleted).map_err(Into::into)
     }
 
@@ -1515,13 +1617,13 @@ impl Editor {
         self.ensure_revision(transaction)?;
         let revision = self.revision.next().ok_or(EngineError::RevisionOverflow)?;
         let frame_text = self.frame_text.edited(transaction)?;
-        if let Some(search) = &self.search {
+        if let Some(search) = &self.state.search {
             search.map_literal_cache_through(transaction, &frame_text, revision);
         }
         self.frame_text = frame_text;
         self.refresh_dirty();
         self.selections = self.selections.map_through(transaction)?;
-        for anchor in self.marks.values_mut() {
+        for anchor in self.state.marks.values_mut() {
             *anchor = (*anchor).map_through(transaction)?;
         }
         for history in [&mut self.jumps, &mut self.changes] {
@@ -1541,7 +1643,7 @@ impl Editor {
 
     fn delete_insert_backward(&mut self) -> Result<Option<Transaction>, EngineError> {
         if self.mode == Mode::Replace {
-            return self.restore_replaced_character();
+            return self.undo_last_replacement();
         }
         let cursor = self.primary_cursor();
         if cursor == 0 {
@@ -1580,7 +1682,7 @@ impl Editor {
         Ok(Some(transaction))
     }
 
-    fn restore_replaced_character(&mut self) -> Result<Option<Transaction>, EngineError> {
+    fn undo_last_replacement(&mut self) -> Result<Option<Transaction>, EngineError> {
         let cursor = self.primary_cursor();
         let Some((forward, stored_inverse)) = self
             .insert_group
@@ -1874,22 +1976,22 @@ impl Editor {
 
     fn finish_recorded_edit(&mut self, destination: usize) {
         self.collapse_selection(destination);
-        if let Some(group) = self.undo.last_mut() {
+        if let Some(group) = self.state.undo.last_mut() {
             group.after = self.selections.clone();
         }
     }
 
-    fn repeat_last(&mut self, count: u32) -> Result<Option<Transaction>, EngineError> {
-        let Some(action) = self.last_change.clone() else {
-            return Ok(None);
+    fn repeat_last(&mut self, count: u32) -> Result<TransactionBatch, EngineError> {
+        let Some(action) = self.state.last_change.clone() else {
+            return Ok(TransactionBatch::new());
         };
         self.replaying_change = true;
         let result = (|| {
-            let mut last = None;
+            let mut transactions = TransactionBatch::new();
             for _ in 0..count {
                 match &action {
                     RepeatAction::Command(command) => {
-                        last = self.execute(command.clone())?;
+                        transactions.extend(self.execute(command.clone())?);
                     }
                     RepeatAction::Insert { style, text } => {
                         let transaction = self.repeated_insert(*style, text)?;
@@ -1904,27 +2006,27 @@ impl Editor {
                                 _ => previous_char_boundary(&current, edit.range.start.saturating_add(edit.insert.len())),
                             };
                             self.collapse_selection(destination);
-                            if let Some(group) = self.undo.last_mut() {
+                            if let Some(group) = self.state.undo.last_mut() {
                                 group.after = self.selections.clone();
                             }
                         }
-                        last = Some(transaction);
+                        transactions.push(transaction);
                     }
                     RepeatAction::ChangeInsert { command, text } => {
-                        last = self.execute(command.clone())?;
+                        transactions.extend(self.execute(command.clone())?);
                         if self.mode == Mode::Insert {
                             if let Some(transaction) = self.insert_text(text)? {
-                                last = Some(transaction);
+                                transactions.push(transaction);
                             }
                             self.leave_insert();
                         }
                     }
                     RepeatAction::NumberDelta(delta) => {
-                        last = self.adjust_number(*delta)?;
+                        transactions.extend(self.adjust_number(*delta)?);
                     }
                 }
             }
-            Ok(last)
+            Ok(transactions)
         })();
         self.replaying_change = false;
         result
@@ -2046,15 +2148,16 @@ impl Editor {
             return;
         }
         let value = RegisterValue { text: Box::from(text), linewise };
-        self.registers.insert('"', value.clone());
+        self.state.registers.insert('"', value.clone());
         if self.clipboard_unnamed {
-            self.registers.insert('+', value.clone());
+            self.state.registers.insert('+', value.clone());
             self.pending_clipboard_writes.push(('+', value.text.clone()));
         }
         if let Some(name) = register_key(register) {
             if name.is_ascii_uppercase() {
                 let key = name.to_ascii_lowercase();
-                self.registers
+                self.state
+                    .registers
                     .entry(key)
                     .and_modify(|existing| {
                         let mut joined = existing.text.to_string();
@@ -2063,7 +2166,7 @@ impl Editor {
                     })
                     .or_insert(value);
             } else {
-                self.registers.insert(name, value.clone());
+                self.state.registers.insert(name, value.clone());
                 if matches!(name, '+' | '*') && !self.pending_clipboard_writes.iter().any(|(pending, _)| *pending == name) {
                     self.pending_clipboard_writes.push((name, value.text));
                 }
@@ -2077,7 +2180,7 @@ impl Editor {
         }
         self.write_register(register, text, linewise);
         if register.is_none() || register == Some(Register::Unnamed) {
-            self.registers.insert('0', RegisterValue { text: text.into(), linewise });
+            self.state.registers.insert('0', RegisterValue { text: text.into(), linewise });
         }
     }
 
@@ -2089,13 +2192,13 @@ impl Editor {
         let value = RegisterValue { text: text.into(), linewise };
         if linewise || text.contains('\n') {
             for number in (2_u8..=9).rev() {
-                if let Some(previous) = self.registers.get(&char::from(b'0' + number - 1)).cloned() {
-                    self.registers.insert(char::from(b'0' + number), previous);
+                if let Some(previous) = self.state.registers.get(&char::from(b'0' + number - 1)).cloned() {
+                    self.state.registers.insert(char::from(b'0' + number), previous);
                 }
             }
-            self.registers.insert('1', value);
+            self.state.registers.insert('1', value);
         } else {
-            self.registers.insert('-', value);
+            self.state.registers.insert('-', value);
         }
     }
 
@@ -2105,22 +2208,22 @@ impl Editor {
         } else {
             register_key(register).unwrap_or('"').to_ascii_lowercase()
         };
-        self.registers.get(&key)
+        self.state.registers.get(&key)
     }
 
     fn finish_macro_recording(&mut self) {
         if let Some(register) = self.recording_macro.take() {
             let keys = std::mem::take(&mut self.recording_keys);
             let text: String = keys.iter().filter_map(macro_key_character).collect();
-            self.macros.insert(register, keys);
-            self.registers.insert(register, RegisterValue { text: text.into_boxed_str(), linewise: false });
+            self.state.macros.insert(register, keys);
+            self.state.registers.insert(register, RegisterValue { text: text.into_boxed_str(), linewise: false });
         }
     }
 
-    fn replay_macro(&mut self, register: char) -> Result<Option<Transaction>, EngineError> {
+    fn replay_macro(&mut self, register: char) -> Result<TransactionBatch, EngineError> {
         let register = if register == '@' { self.last_macro.unwrap_or('@') } else { register.to_ascii_lowercase() };
-        let Some(keys) = self.macros.get(&register).cloned() else {
-            return Ok(None);
+        let Some(keys) = self.state.macros.get(&register).cloned() else {
+            return Ok(TransactionBatch::new());
         };
         if self.macro_depth >= 32 {
             return Err(EngineError::MacroRecursion);
@@ -2128,13 +2231,11 @@ impl Editor {
         self.last_macro = Some(register);
         self.macro_depth += 1;
         let result = (|| {
-            let mut last = None;
+            let mut transactions = TransactionBatch::new();
             for key in keys {
-                if let Some(transaction) = self.handle_key(key)? {
-                    last = Some(transaction);
-                }
+                transactions.extend(self.handle_key(key)?);
             }
-            Ok(last)
+            Ok(transactions)
         })();
         self.macro_depth -= 1;
         result
@@ -2262,12 +2363,10 @@ fn vertical_motion(text: &str, byte: usize, direction: i8) -> usize {
 }
 
 fn word_class(character: char, big: bool) -> u8 {
-    if character.is_whitespace() {
-        0
-    } else if big || character.is_alphanumeric() || character == '_' {
-        1
-    } else {
-        2
+    match character {
+        character if character.is_whitespace() => 0,
+        character if big || character.is_alphanumeric() || character == '_' => 1,
+        _ => 2,
     }
 }
 
@@ -2530,6 +2629,11 @@ mod tests {
         }
     }
 
+    fn assert_two_transaction_revision_chain(transactions: &[Transaction], label: &str) {
+        assert_eq!(transactions.len(), 2, "a grouped {label} must expose its complete revision chain");
+        assert_eq!(transactions[0].base_revision().next(), Some(transactions[1].base_revision()));
+    }
+
     macro_rules! edit_scenarios {
         ($($name:ident: $source:expr => [$($keys:expr => $expected:expr),+ $(,)?];)+) => {$(
             #[test]
@@ -2556,10 +2660,12 @@ mod tests {
         assert_eq!(editor.contents(), "界xab");
         assert!(editor.is_dirty());
         assert_eq!(editor.undo_depth(), 1);
-        feed(&mut editor, "u");
+        let undo = editor.handle_key(KeyEvent::character('u')).expect("undo");
+        assert_two_transaction_revision_chain(&undo, "undo");
         assert_eq!(editor.contents(), "ab");
         assert!(!editor.is_dirty());
-        editor.handle_key(KeyEvent { code: KeyCode::Char('r'), modifiers: Modifiers::CONTROL }).expect("redo");
+        let redo = editor.handle_key(KeyEvent { code: KeyCode::Char('r'), modifiers: Modifiers::CONTROL }).expect("redo");
+        assert_two_transaction_revision_chain(&redo, "redo");
         assert_eq!(editor.contents(), "界xab");
         assert!(editor.is_dirty());
     }
@@ -2652,7 +2758,7 @@ mod tests {
         feed(&mut editor, "yw");
         assert_eq!(editor.register('+').map(|value| value.text.as_ref()), Some("Alpha "));
 
-        editor.restore_register('+', "system", false);
+        editor.state_mut().set_register('+', "system", false);
         editor.set_cursor(0);
         feed(&mut editor, "p");
         assert_eq!(editor.contents(), "Asystemlpha alpha BETA\n");
@@ -2681,7 +2787,7 @@ mod tests {
         assert_eq!(editor.take_clipboard_writes(), vec![('+', Box::<str>::from("alpha ")), ('*', Box::<str>::from("alpha "))]);
         assert!(editor.take_clipboard_writes().is_empty());
 
-        editor.restore_register('+', "clipboard", false);
+        editor.state_mut().set_register('+', "clipboard", false);
         editor.set_cursor(0);
         feed(&mut editor, "p");
         assert_eq!(editor.contents(), "aclipboardlpha beta\n");
@@ -2712,7 +2818,7 @@ mod tests {
         assert_eq!(cached.search_scan_counts().0, 1);
 
         let mut crossing = editor("val_ tail");
-        crossing.restore_search("value_", SearchDirection::Forward).expect("literal search");
+        crossing.set_search("value_", SearchDirection::Forward).expect("literal search");
         let end = crossing.text().len_bytes();
         assert!(crossing.search_match_ranges(0..end, 16).is_empty());
         crossing.apply_transaction(Transaction::new(crossing.revision(), vec![Edit::new(3..3, "ue")]).expect("crossing transaction")).expect("crossing edit");
@@ -2724,13 +2830,38 @@ mod tests {
     #[test]
     fn regex_search_windows_are_invalidated_after_edits() {
         let mut editor = editor("one two one\n");
-        editor.restore_search("o.e", SearchDirection::Forward).expect("regex search");
+        editor.set_search("o.e", SearchDirection::Forward).expect("regex search");
         let end = editor.text().len_bytes();
         assert_eq!(editor.search_match_ranges(0..end, 16).len(), 2);
         editor.apply_transaction(Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")]).expect("transaction")).expect("edit");
         let end = editor.text().len_bytes();
         assert_eq!(editor.search_match_ranges(0..end, 16).len(), 3);
         assert_eq!(editor.search_scan_counts().0, 2);
+    }
+
+    #[test]
+    fn search_window_cache_rescans_for_a_larger_limit() {
+        let mut editor = editor("one one one");
+        editor.set_search("one", SearchDirection::Forward).expect("search");
+        let end = editor.text().len_bytes();
+
+        assert_eq!(editor.search_match_ranges(0..end, 1), vec![0..3]);
+        assert_eq!(editor.search_scan_counts().0, 1);
+        assert_eq!(editor.search_match_ranges(0..end, 8), vec![0..3, 4..7, 8..11]);
+        assert_eq!(editor.search_scan_counts().0, 2);
+        assert_eq!(editor.search_match_ranges(0..end, 2), vec![0..3, 4..7]);
+        assert_eq!(editor.search_scan_counts().0, 2);
+    }
+
+    #[test]
+    fn search_window_matches_use_text_outside_the_window_for_context() {
+        let mut editor = editor("sword\nwordx\nword\n");
+        for pattern in ["^word$", r"\<word\>"] {
+            editor.set_search(pattern, SearchDirection::Forward).expect("search");
+            assert!(editor.search_match_ranges(1..5, 16).is_empty(), "{pattern} must see the leading s");
+            assert!(editor.search_match_ranges(6..10, 16).is_empty(), "{pattern} must see the trailing x");
+            assert_eq!(editor.search_match_ranges(12..16, 16), vec![12..16], "{pattern} must match the complete word");
+        }
     }
 
     #[test]
@@ -2788,10 +2919,12 @@ mod tests {
         let durable = original.durable_repeat_data().expect("repeat state");
 
         let mut restored = editor("alpha\nbeta");
-        restored.restore_repeat_data(&durable).expect("restore repeat");
+        let mut state = EditorState::default();
+        state.set_repeat_data(&durable).expect("restore repeat data");
+        restored.restore(state).expect("restore repeat");
         feed(&mut restored, "j.");
         assert_eq!(restored.contents(), "alpha\nbeta!");
-        assert!(restored.restore_repeat_data(b"not-json").is_err());
+        assert!(EditorState::default().set_repeat_data(b"not-json").is_err());
     }
 
     #[test]
@@ -2814,7 +2947,9 @@ mod tests {
         let state = original.durable_undo_state();
 
         let mut restored = editor("Zbc");
-        restored.restore_undo_state(state).expect("restore undo tree");
+        let mut editor_state = EditorState::default();
+        editor_state.set_undo(state);
+        restored.restore(editor_state).expect("restore undo tree");
         feed(&mut restored, "u");
         assert_eq!(restored.contents(), "abc");
         assert_eq!(restored.undo_tree_len(), 2);

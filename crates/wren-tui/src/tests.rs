@@ -397,6 +397,25 @@ fn goto_hints_include_only_advertised_lsp_navigation() {
     assert!(entries.contains_key("g"));
 }
 
+fn open_test_file_picker(app: &mut App, source: PathBuf) {
+    app.prompt = Some(Prompt { kind: PromptKind::Picker(PickerSource::Files), buffer: "main".to_owned(), history_index: None });
+    app.picker_items = vec![PickerItem::Path(source)];
+    app.refresh_picker_preview();
+}
+
+fn assert_test_file_picker(app: &App, frame: &DesiredGrid) {
+    let rendered = grid_text(frame);
+    assert!(frame.raster_overlay.is_none(), "the startup tiling must yield to the picker");
+    assert!(rendered.contains("Find Files (1)"));
+    assert!(rendered.contains("main.rs"), "{rendered}");
+    assert!(rendered.contains("println!(\"preview\")"));
+    assert!(rendered.contains("❯ main"));
+    assert!(!rendered.contains("find>"));
+    assert!(frame.rows.iter().any(|row| {
+        row.cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))))
+    }));
+}
+
 #[test]
 fn file_picker_is_a_telescope_surface_with_results_and_preview() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -406,21 +425,10 @@ fn file_picker_is_a_telescope_surface_with_results_and_preview() {
     let startup = desired_frame(&mut layout, &app);
     assert!(startup.raster_overlay.is_some());
 
-    app.prompt = Some(Prompt { kind: PromptKind::Picker(PickerSource::Files), buffer: "main".to_owned(), history_index: None });
-    app.picker_items = vec![PickerItem::Path(source)];
-    app.refresh_picker_preview();
+    open_test_file_picker(&mut app, source);
     let frame = desired_frame(&mut layout, &app);
-    assert!(frame.raster_overlay.is_none(), "the startup tiling must yield to the picker");
+    assert_test_file_picker(&app, &frame);
     assert_eq!(wren_view::diff(Some(&startup), &frame).raster_overlay, Some(None));
-    let rendered = grid_text(&frame);
-    assert!(rendered.contains("Find Files (1)"));
-    assert!(rendered.contains("main.rs"), "{rendered}");
-    assert!(rendered.contains("println!(\"preview\")"));
-    assert!(rendered.contains("❯ main"));
-    assert!(!rendered.contains("find>"));
-    assert!(frame.rows.iter().any(|row| {
-        row.cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve))))
-    }));
 
     app.test_prompt_key(terminal_key(TerminalKeyCode::Escape));
     let restored = desired_frame(&mut layout, &app);
@@ -473,6 +481,101 @@ fn cached_syntax_resolves_against_the_current_theme_on_every_frame() {
     let after_color = after.rows[0].cells.iter().find(|cell| cell.grapheme.as_str() == "f").and_then(|cell| cell.style.foreground);
     assert_eq!(after_color, Some(CellColor::Rgb(replacement)));
     assert_eq!(app.decorations[&buffer_id].spans[0].style.foreground, Some(CellColor::Theme(CatppuccinColor::Blue)));
+}
+
+#[test]
+fn same_line_edits_keep_tree_sitter_colors_before_the_provider_replies() {
+    let source = "pub fn alpha() { let value = 1; }\n";
+    let (_directory, _path, mut app) = app_with_fixture("stable-colors.rs", source, None);
+    let function = source.find("alpha").expect("function name");
+    let mut layout = dotfile_layout(80, 6);
+    let before = desired_frame(&mut layout, &app);
+    let before_color = before.rows[0].cells[3 + function].style.foreground;
+    assert_eq!(before_color, Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Blue))));
+
+    app.active.editor.set_cursor(source.find('1').expect("number"));
+    app.dispatch_key(KeyEvent::character('i'));
+    app.dispatch_key(KeyEvent::character('x'));
+    let after = desired_frame(&mut layout, &app);
+
+    assert_eq!(after.rows[0].cells[3 + function].style.foreground, before_color);
+    assert_eq!(app.decorations[&app.active.buffer_id].revision, app.active.editor.revision());
+}
+
+#[test]
+fn identifier_edits_keep_semantic_colors_until_the_lsp_replies() {
+    let source = "pub fn alpha() {}\n";
+    let (_directory, _path, mut app) = app_with_fixture("stable-semantics.rs", source, None);
+    let function = source.find("alpha").expect("function name");
+    let revision = app.active.editor.revision();
+    app.semantic_decorations.insert(
+        app.active.buffer_id,
+        BufferDecorations::new(revision, vec![provider_decoration(HighlightSpan::new(function..function + 5, "constant", u32::MAX))]),
+    );
+    let mut layout = dotfile_layout(80, 6);
+    let before = desired_frame(&mut layout, &app);
+    let before_color = before.rows[0].cells[3 + function].style.foreground;
+    assert_eq!(before_color, Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Peach))));
+
+    app.active.editor.set_cursor(function + 2);
+    app.dispatch_key(KeyEvent::character('i'));
+    app.dispatch_key(KeyEvent::character('p'));
+    let after = desired_frame(&mut layout, &app);
+
+    assert_eq!(after.rows[0].cells[3 + function].style.foreground, before_color);
+    let semantic = &app.semantic_decorations[&app.active.buffer_id];
+    assert_eq!(semantic.revision, app.active.editor.revision());
+    let mapped_function = function..function + 6;
+    assert!(semantic.spans_in(mapped_function.clone()).iter().any(|span| span.range == mapped_function));
+}
+
+#[test]
+fn visual_navigation_and_grouped_history_keep_full_buffer_highlighting() {
+    let source = "pub fn alpha() { let first = 1; }\npub fn beta() { let second = 2; }\npub fn omega() { let stable = 3; }\n";
+    let (_directory, _path, mut app) = app_with_fixture("visual-history-colors.rs", source, None);
+    let mut layout = dotfile_layout(80, 8);
+    let function_color = Some(CellColor::Rgb(app.theme.color(CatppuccinColor::Mauve)));
+    let omega_is_colored = |grid: &DesiredGrid| grid.rows[2].cells.iter().any(|cell| cell.grapheme.as_str() == "f" && cell.style.foreground == function_color);
+
+    assert!(omega_is_colored(&desired_frame(&mut layout, &app)));
+    app.test_key(terminal_character('i'));
+    app.type_text("xyz");
+    app.test_key(terminal_key(TerminalKeyCode::Escape));
+
+    app.test_key(terminal_character('v'));
+    for _ in 0..5 {
+        app.test_key(terminal_character('l'));
+        assert!(omega_is_colored(&desired_frame(&mut layout, &app)), "Visual motion discarded syntax outside the selection");
+    }
+    app.test_key(terminal_key(TerminalKeyCode::Escape));
+
+    app.test_key(terminal_character('u'));
+    assert_eq!(app.active.editor.contents(), source);
+    assert_eq!(app.decorations[&app.active.buffer_id].revision, app.active.editor.revision());
+    assert!(omega_is_colored(&desired_frame(&mut layout, &app)), "grouped undo discarded the full syntax baseline");
+
+    app.test_key(terminal_control('r'));
+    assert!(app.active.editor.contents().starts_with("xyzpub fn"));
+    assert_eq!(app.decorations[&app.active.buffer_id].revision, app.active.editor.revision());
+    assert!(omega_is_colored(&desired_frame(&mut layout, &app)), "grouped redo discarded the full syntax baseline");
+}
+
+#[test]
+fn whole_document_format_on_save_preserves_the_logical_cursor() {
+    let source = "fn main() {\nlet first = 1;\nlet second = 2;\n}\n";
+    let (directory, path, mut app) = app_with_fixture("format-cursor.rs", source, None);
+    app.format_on_save = false;
+    app.active.editor.set_cursor_line_column(1, 4);
+    let cursor = app.active.editor.cursor_line_column();
+    let formatted = "fn main() {\n    let first = 1;\n    let second = 2;\n}\n".to_owned();
+
+    app.apply_formatter_output(source.len(), formatted.clone(), cursor).expect("apply formatter output");
+    app.save(None).expect("save formatted file");
+
+    assert_eq!(app.active.editor.cursor_line_column(), cursor);
+    assert_ne!(app.active.editor.primary_cursor(), app.active.editor.document_end_byte());
+    assert_eq!(fs::read_to_string(path).expect("saved source"), formatted);
+    drop(directory);
 }
 
 #[test]
@@ -1704,7 +1807,7 @@ fn terminal_clipboard_paste_targets_unnamedplus_and_explicit_star() {
     app.dispatch_key(KeyEvent::character('"'));
     app.dispatch_key(KeyEvent::character('*'));
     assert_eq!(app.clipboard_register_for_paste(&paste), Some('*'));
-    app.restore_clipboard_register('*', "primary".to_owned());
+    app.set_clipboard_register('*', "primary".to_owned());
     assert!(app.take_clipboard_writes().is_empty());
     app.dispatch_key(KeyEvent::character('p'));
     assert_eq!(app.active.editor.contents(), "primary");

@@ -344,24 +344,20 @@ impl Transaction {
 
     #[must_use]
     pub fn is_mapping_inverse(&self, next: &Self) -> bool {
-        if self.base_revision.next() != Some(next.base_revision) || self.edits.len() != next.edits.len() {
-            return false;
-        }
-        let mut delta = 0_i128;
-        for (forward, inverse) in self.edits.iter().zip(&next.edits) {
-            let Some(start) = i128::try_from(forward.range.start).ok().and_then(|start| start.checked_add(delta)).and_then(|start| usize::try_from(start).ok())
-            else {
-                return false;
-            };
-            if inverse.range != (start..start.saturating_add(forward.insert.len())) || inverse.insert.len() != forward.range.len() {
-                return false;
-            }
-            let (Ok(inserted), Ok(deleted)) = (i128::try_from(forward.insert.len()), i128::try_from(forward.range.len())) else {
-                return false;
-            };
-            delta += inserted - deleted;
-        }
-        true
+        self.base_revision.next() == Some(next.base_revision)
+            && self.edits.len() == next.edits.len()
+            && self
+                .edits
+                .iter()
+                .zip(&next.edits)
+                .try_fold(0_i128, |delta, (forward, inverse)| {
+                    let start = i128::try_from(forward.range.start).ok()?.checked_add(delta).and_then(|start| usize::try_from(start).ok())?;
+                    (inverse.range == (start..start.saturating_add(forward.insert.len())) && inverse.insert.len() == forward.range.len()).then_some(())?;
+                    let inserted = i128::try_from(forward.insert.len()).ok()?;
+                    let deleted = i128::try_from(forward.range.len()).ok()?;
+                    Some(delta + inserted - deleted)
+                })
+                .is_some()
     }
 
     #[must_use]
@@ -385,15 +381,15 @@ impl Transaction {
     }
 
     pub fn validate_boundaries(&self, len: usize, is_char_boundary: impl Fn(usize) -> bool) -> Result<(), TransactionError> {
-        for offset in self.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]) {
+        self.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).try_for_each(|offset| {
             if offset > len {
                 return Err(TransactionError::OutOfBounds { offset, len });
             }
             if !is_char_boundary(offset) {
                 return Err(TransactionError::NotCharBoundary { offset });
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn map_offset(&self, byte: usize, bias: Bias) -> Result<usize, TransactionError> {
@@ -516,20 +512,20 @@ impl Transaction {
         }
 
         let base_revision = self.base_revision.next().ok_or(TransactionError::RevisionOverflow)?;
-        let mut delta = 0_i128;
-        let mut inverse = Vec::with_capacity(self.edits.len());
-        for (index, (edit, deleted)) in self.edits.iter().zip(deleted_text).enumerate() {
-            let expected = edit.range.len();
-            if deleted.len() != expected {
-                return Err(TransactionError::DeletedTextLength { index, expected, actual: deleted.len() });
-            }
-            let start = i128::try_from(edit.range.start).map_err(|_| TransactionError::OffsetOverflow)? + delta;
-            let insert_len = i128::try_from(edit.insert.len()).map_err(|_| TransactionError::OffsetOverflow)?;
-            let inverse_start = usize_from_i128(start)?;
-            let inverse_end = usize_from_i128(start + insert_len)?;
-            inverse.push(Edit::new(inverse_start..inverse_end, deleted.clone()));
-            delta += insert_len - i128::try_from(edit.range.len()).map_err(|_| TransactionError::OffsetOverflow)?;
-        }
+        let (_, inverse) = self.edits.iter().zip(deleted_text).enumerate().try_fold(
+            (0_i128, Vec::with_capacity(self.edits.len())),
+            |(delta, mut inverse), (index, (edit, deleted))| {
+                let expected = edit.range.len();
+                if deleted.len() != expected {
+                    return Err(TransactionError::DeletedTextLength { index, expected, actual: deleted.len() });
+                }
+                let start = i128::try_from(edit.range.start).map_err(|_| TransactionError::OffsetOverflow)? + delta;
+                let insert_len = i128::try_from(edit.insert.len()).map_err(|_| TransactionError::OffsetOverflow)?;
+                inverse.push(Edit::new(usize_from_i128(start)?..usize_from_i128(start + insert_len)?, deleted.clone()));
+                let deleted_len = i128::try_from(edit.range.len()).map_err(|_| TransactionError::OffsetOverflow)?;
+                Ok((delta + insert_len - deleted_len, inverse))
+            },
+        )?;
         Self::new(base_revision, inverse)
     }
 
@@ -569,18 +565,17 @@ impl Transaction {
 }
 
 fn validate_edits(edits: &[Edit]) -> Result<(), TransactionError> {
-    let mut previous_end = 0;
-    let mut has_previous = false;
-    for edit in edits {
+    edits.iter().try_fold(None, |previous_end, edit| {
         if edit.range.start > edit.range.end {
             return Err(TransactionError::ReversedRange { start: edit.range.start, end: edit.range.end });
         }
-        if has_previous && edit.range.start < previous_end {
+        if let Some(previous_end) = previous_end
+            && edit.range.start < previous_end
+        {
             return Err(TransactionError::OverlappingEdits { start: edit.range.start, previous_end });
         }
-        previous_end = edit.range.end;
-        has_previous = true;
-    }
+        Ok(Some(edit.range.end))
+    })?;
     Ok(())
 }
 
@@ -624,17 +619,18 @@ impl SelectionSet {
     }
 
     pub fn map_through(&self, transaction: &Transaction) -> Result<Self, TransactionError> {
-        let mut ranges = Vec::with_capacity(self.ranges.len());
-        for range in &self.ranges {
-            let (anchor_bias, head_bias) = if range.anchor < range.head {
-                (Bias::Left, Bias::Right)
-            } else if range.anchor > range.head {
-                (Bias::Right, Bias::Left)
-            } else {
-                (Bias::Right, Bias::Right)
-            };
-            ranges.push(SelRange { anchor: transaction.map_offset(range.anchor, anchor_bias)?, head: transaction.map_offset(range.head, head_bias)? });
-        }
+        let ranges = self
+            .ranges
+            .iter()
+            .map(|range| {
+                let (anchor_bias, head_bias) = match range.anchor.cmp(&range.head) {
+                    std::cmp::Ordering::Less => (Bias::Left, Bias::Right),
+                    std::cmp::Ordering::Greater => (Bias::Right, Bias::Left),
+                    std::cmp::Ordering::Equal => (Bias::Right, Bias::Right),
+                };
+                Ok(SelRange { anchor: transaction.map_offset(range.anchor, anchor_bias)?, head: transaction.map_offset(range.head, head_bias)? })
+            })
+            .collect::<Result<_, TransactionError>>()?;
         Ok(Self { primary: self.primary, ranges })
     }
 }
@@ -881,13 +877,12 @@ impl ClientMutation {
             return Err(MutationValidationError::EmptyMutation);
         }
         let mut document_ids = std::collections::BTreeSet::new();
-        for document in &self.documents {
+        self.documents.iter().try_for_each(|document| {
             if !document_ids.insert(document.document_id) {
                 return Err(MutationValidationError::DuplicateDocument { document_id: document.document_id });
             }
-            document.validate()?;
-        }
-        Ok(())
+            document.validate()
+        })
     }
 }
 
@@ -930,8 +925,7 @@ impl DocumentMutation {
         if self.transactions.is_empty() {
             return Err(MutationValidationError::EmptyDocumentMutation { document_id: self.document_id });
         }
-        let mut expected = self.base_revision;
-        for transaction in &self.transactions {
+        self.transactions.iter().try_fold(self.base_revision, |expected, transaction| {
             if transaction.base_revision() != expected {
                 return Err(MutationValidationError::RevisionChain {
                     document_id: self.document_id,
@@ -939,8 +933,8 @@ impl DocumentMutation {
                     actual: transaction.base_revision().get(),
                 });
             }
-            expected = expected.next().ok_or(MutationValidationError::RevisionOverflow)?;
-        }
+            expected.next().ok_or(MutationValidationError::RevisionOverflow)
+        })?;
         Ok(())
     }
 

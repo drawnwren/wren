@@ -101,7 +101,8 @@ pub enum ExError {
 }
 
 pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
-    let input = input.trim().strip_prefix(':').unwrap_or(input.trim());
+    let input = input.trim();
+    let input = input.strip_prefix(':').unwrap_or(input);
     if input.is_empty() {
         return Err(ExError::Empty);
     }
@@ -116,7 +117,7 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     if let Some(argument) = rest.strip_prefix('~') {
         return parse_substitute_repeat(range, true, argument);
     }
-    let name_end = rest.char_indices().find(|(_, character)| !character.is_ascii_alphabetic()).map_or(rest.len(), |(index, _)| index);
+    let name_end = rest.char_indices().find(|(_, character)| !character.is_ascii_alphanumeric()).map_or(rest.len(), |(index, _)| index);
     if name_end == 0 {
         return Err(ExError::UnknownCommand(rest.into()));
     }
@@ -131,55 +132,99 @@ pub fn parse_ex(input: &str) -> Result<ExCommand, ExError> {
     parse_named_ex(range, name, bang, argument)
 }
 
-pub const EX_COMMAND_COMPLETIONS: &str = include_str!("ex-commands.txt");
+type ExCommandParser = fn(Option<ExRange>, &str, bool, &str) -> Result<ExCommand, ExError>;
 
-fn parse_named_ex(range: Option<ExRange>, name: &str, bang: bool, argument: &str) -> Result<ExCommand, ExError> {
-    match name {
-        "bn" | "bnext" => Ok(buffer(BufferAction::Next, bang, argument)),
-        "bp" | "bprevious" => Ok(buffer(BufferAction::Previous, bang, argument)),
-        "bf" | "bfirst" => Ok(buffer(BufferAction::First, bang, argument)),
-        "bl" | "blast" => Ok(buffer(BufferAction::Last, bang, argument)),
-        "bd" | "bdelete" => Ok(buffer(BufferAction::Delete, bang, argument)),
-        "b" | "buffer" => Ok(buffer(BufferAction::Select, bang, argument)),
-        "tabnew" | "tabe" | "tabedit" => Ok(tab(TabAction::New, argument)),
-        "tabn" | "tabnext" => Ok(tab(TabAction::Next, argument)),
-        "tabp" | "tabprevious" => Ok(tab(TabAction::Previous, argument)),
-        "tabfirst" => Ok(tab(TabAction::First, argument)),
-        "tablast" => Ok(tab(TabAction::Last, argument)),
-        "tabclose" => Ok(tab(TabAction::Close, argument)),
-        "s" | "substitute" => parse_substitute(range, argument),
-        "g" | "global" => parse_global(range, false, argument, name),
-        "v" | "vglobal" => parse_global(range, true, argument, name),
-        "norm" | "normal" => Ok(ExCommand::Normal { range, bang, keys: argument.into() }),
-        "w" | "write" => Ok(ExCommand::Write { range, all: false, bang, path: optional_argument(argument) }),
-        "wa" | "wall" => Ok(ExCommand::Write { range, all: true, bang, path: optional_argument(argument) }),
-        "wq" | "x" | "xit" => Ok(ExCommand::WriteQuit { bang, path: optional_argument(argument) }),
-        "q" | "quit" => Ok(ExCommand::Quit { all: false, bang }),
-        "qa" | "qall" => Ok(ExCommand::Quit { all: true, bang }),
-        "e" | "edit" => Ok(ExCommand::Edit { bang, path: optional_argument(argument) }),
-        "sp" | "split" => Ok(ExCommand::Split { vertical: false, path: optional_argument(argument) }),
-        "vs" | "vsplit" => Ok(ExCommand::Split { vertical: true, path: optional_argument(argument) }),
-        "clo" | "close" => Ok(ExCommand::Close { bang }),
-        "marks" => Ok(ExCommand::Marks { names: argument.into() }),
-        "reg" | "registers" => Ok(ExCommand::Registers { names: argument.into() }),
-        "grep" | "vimgrep" => parse_grep(argument, name),
-        "cdo" => parse_cdo(argument, name),
-        "u" | "undo" => Ok(ExCommand::Undo),
-        "redo" => Ok(ExCommand::Redo),
-        "echo" => Ok(ExCommand::Echo { expression: argument.into() }),
-        "noh" | "nohlsearch" => Ok(ExCommand::NoHighlight),
-        "h" | "help" => Ok(ExCommand::Help { topic: optional_argument(argument) }),
-        "mes" | "messages" | "debuglog" => Ok(ExCommand::Messages),
-        "convertutf8" => Ok(ExCommand::ConvertUtf8),
-        "term" | "terminal" => {
+struct ExCommandSpec {
+    names: &'static [&'static str],
+    completion: &'static str,
+    parse: ExCommandParser,
+}
+
+const EX_COMMANDS: &[ExCommandSpec] = &[
+    ExCommandSpec { names: &["bn", "bnext"], completion: "bnext", parse: |_, _, bang, argument| Ok(buffer(BufferAction::Next, bang, argument)) },
+    ExCommandSpec { names: &["bp", "bprevious"], completion: "bprevious", parse: |_, _, bang, argument| Ok(buffer(BufferAction::Previous, bang, argument)) },
+    ExCommandSpec { names: &["bf", "bfirst"], completion: "bfirst", parse: |_, _, bang, argument| Ok(buffer(BufferAction::First, bang, argument)) },
+    ExCommandSpec { names: &["bl", "blast"], completion: "blast", parse: |_, _, bang, argument| Ok(buffer(BufferAction::Last, bang, argument)) },
+    ExCommandSpec { names: &["bd", "bdelete"], completion: "bdelete", parse: |_, _, bang, argument| Ok(buffer(BufferAction::Delete, bang, argument)) },
+    ExCommandSpec { names: &["b", "buffer"], completion: "buffer", parse: |_, _, bang, argument| Ok(buffer(BufferAction::Select, bang, argument)) },
+    ExCommandSpec { names: &["cdo"], completion: "cdo", parse: |_, name, _, argument| parse_cdo(argument, name) },
+    ExCommandSpec { names: &["clo", "close"], completion: "close", parse: |_, _, bang, _| Ok(ExCommand::Close { bang }) },
+    ExCommandSpec { names: &["convertutf8"], completion: "convertutf8", parse: |_, _, _, _| Ok(ExCommand::ConvertUtf8) },
+    ExCommandSpec { names: &["debuglog"], completion: "debuglog", parse: |_, _, _, _| Ok(ExCommand::Messages) },
+    ExCommandSpec { names: &["echo"], completion: "echo", parse: |_, _, _, argument| Ok(ExCommand::Echo { expression: argument.into() }) },
+    ExCommandSpec { names: &["e", "edit"], completion: "edit", parse: |_, _, bang, argument| Ok(ExCommand::Edit { bang, path: optional_argument(argument) }) },
+    ExCommandSpec { names: &["find"], completion: "find", parse: |_, _, _, argument| Ok(ExCommand::Find { query: argument.into() }) },
+    ExCommandSpec { names: &["format"], completion: "format", parse: |_, name, _, argument| parse_required_process(argument, name, ProcessCommand::Format) },
+    ExCommandSpec { names: &["g", "global"], completion: "global", parse: |range, name, _, argument| parse_global(range, false, argument, name) },
+    ExCommandSpec { names: &["grep", "vimgrep"], completion: "grep", parse: |_, name, _, argument| parse_grep(argument, name) },
+    ExCommandSpec { names: &["h", "help"], completion: "help", parse: |_, _, _, argument| Ok(ExCommand::Help { topic: optional_argument(argument) }) },
+    ExCommandSpec { names: &["make"], completion: "make", parse: |_, name, _, argument| parse_required_process(argument, name, ProcessCommand::Make) },
+    ExCommandSpec { names: &["marks"], completion: "marks", parse: |_, _, _, argument| Ok(ExCommand::Marks { names: argument.into() }) },
+    ExCommandSpec { names: &["mes", "messages"], completion: "messages", parse: |_, _, _, _| Ok(ExCommand::Messages) },
+    ExCommandSpec { names: &["noh", "nohlsearch"], completion: "nohlsearch", parse: |_, _, _, _| Ok(ExCommand::NoHighlight) },
+    ExCommandSpec {
+        names: &["norm", "normal"],
+        completion: "normal",
+        parse: |range, _, bang, argument| Ok(ExCommand::Normal { range, bang, keys: argument.into() }),
+    },
+    ExCommandSpec { names: &["q", "quit"], completion: "quit", parse: |_, _, bang, _| Ok(ExCommand::Quit { all: false, bang }) },
+    ExCommandSpec { names: &["reg", "registers"], completion: "registers", parse: |_, _, _, argument| Ok(ExCommand::Registers { names: argument.into() }) },
+    ExCommandSpec { names: &["redo"], completion: "redo", parse: |_, _, _, _| Ok(ExCommand::Redo) },
+    ExCommandSpec {
+        names: &["sp", "split"],
+        completion: "split",
+        parse: |_, _, _, argument| Ok(ExCommand::Split { vertical: false, path: optional_argument(argument) }),
+    },
+    ExCommandSpec { names: &["s", "substitute"], completion: "substitute", parse: |range, _, _, argument| parse_substitute(range, argument) },
+    ExCommandSpec { names: &["tabclose"], completion: "tabclose", parse: |_, _, _, argument| Ok(tab(TabAction::Close, argument)) },
+    ExCommandSpec { names: &["tabfirst"], completion: "tabfirst", parse: |_, _, _, argument| Ok(tab(TabAction::First, argument)) },
+    ExCommandSpec { names: &["tablast"], completion: "tablast", parse: |_, _, _, argument| Ok(tab(TabAction::Last, argument)) },
+    ExCommandSpec { names: &["tabnew", "tabe", "tabedit"], completion: "tabnew", parse: |_, _, _, argument| Ok(tab(TabAction::New, argument)) },
+    ExCommandSpec { names: &["tabn", "tabnext"], completion: "tabnext", parse: |_, _, _, argument| Ok(tab(TabAction::Next, argument)) },
+    ExCommandSpec { names: &["tabp", "tabprevious"], completion: "tabprevious", parse: |_, _, _, argument| Ok(tab(TabAction::Previous, argument)) },
+    ExCommandSpec {
+        names: &["term", "terminal"],
+        completion: "terminal",
+        parse: |_, _, _, argument| {
             let mut words = argument.split_whitespace();
             Ok(ExCommand::Terminal { program: words.next().map(Into::into), arguments: words.map(Into::into).collect() })
-        }
-        "make" => parse_required_process(argument, name, ProcessCommand::Make),
-        "format" => parse_required_process(argument, name, ProcessCommand::Format),
-        "find" => Ok(ExCommand::Find { query: argument.into() }),
-        _ => Err(ExError::UnknownCommand(name.into())),
-    }
+        },
+    },
+    ExCommandSpec { names: &["u", "undo"], completion: "undo", parse: |_, _, _, _| Ok(ExCommand::Undo) },
+    ExCommandSpec { names: &["v", "vglobal"], completion: "vglobal", parse: |range, name, _, argument| parse_global(range, true, argument, name) },
+    ExCommandSpec {
+        names: &["vs", "vsplit"],
+        completion: "vsplit",
+        parse: |_, _, _, argument| Ok(ExCommand::Split { vertical: true, path: optional_argument(argument) }),
+    },
+    ExCommandSpec {
+        names: &["wa", "wall"],
+        completion: "wall",
+        parse: |range, _, bang, argument| Ok(ExCommand::Write { range, all: true, bang, path: optional_argument(argument) }),
+    },
+    ExCommandSpec {
+        names: &["w", "write"],
+        completion: "write",
+        parse: |range, _, bang, argument| Ok(ExCommand::Write { range, all: false, bang, path: optional_argument(argument) }),
+    },
+    ExCommandSpec {
+        names: &["wq", "x", "xit"],
+        completion: "wq",
+        parse: |_, _, bang, argument| Ok(ExCommand::WriteQuit { bang, path: optional_argument(argument) }),
+    },
+    ExCommandSpec { names: &["qa", "qall"], completion: "qall", parse: |_, _, bang, _| Ok(ExCommand::Quit { all: true, bang }) },
+];
+
+pub fn ex_command_completions() -> impl Iterator<Item = &'static str> {
+    EX_COMMANDS.iter().map(|command| command.completion)
+}
+
+fn parse_named_ex(range: Option<ExRange>, name: &str, bang: bool, argument: &str) -> Result<ExCommand, ExError> {
+    EX_COMMANDS
+        .iter()
+        .find(|command| command.names.contains(&name))
+        .ok_or_else(|| ExError::UnknownCommand(name.into()))
+        .and_then(|command| (command.parse)(range, name, bang, argument))
 }
 
 fn parse_cdo(argument: &str, name: &str) -> Result<ExCommand, ExError> {
@@ -356,18 +401,17 @@ fn delimited_tail(input: &str, delimiter: char) -> Result<(String, usize), ExErr
     let mut value = String::new();
     let mut escaped = false;
     for (index, character) in input.char_indices() {
-        if escaped {
-            if character != delimiter {
-                value.push('\\');
+        match (escaped, character) {
+            (true, character) => {
+                if character != delimiter {
+                    value.push('\\');
+                }
+                value.push(character);
+                escaped = false;
             }
-            value.push(character);
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == delimiter {
-            return Ok((value, index + character.len_utf8()));
-        } else {
-            value.push(character);
+            (false, '\\') => escaped = true,
+            (false, character) if character == delimiter => return Ok((value, index + character.len_utf8())),
+            (false, character) => value.push(character),
         }
     }
     Err(ExError::UnterminatedDelimiter { delimiter })
@@ -470,6 +514,16 @@ mod tests {
         ];
         for command in commands {
             assert!(parse_ex(command).is_ok(), "failed to parse {command}");
+        }
+    }
+
+    #[test]
+    fn every_completion_is_owned_by_the_parser_table() {
+        let completions = ex_command_completions().collect::<Vec<_>>();
+        assert_eq!(completions.len(), 41);
+        assert_eq!(completions.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), completions.len());
+        for completion in completions {
+            assert!(!matches!(parse_ex(completion), Err(ExError::UnknownCommand(_))), "completion is not parseable: {completion}");
         }
     }
 

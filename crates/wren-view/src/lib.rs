@@ -667,7 +667,13 @@ const fn default_decoration_priority() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineDecoration {
     pub line: usize,
+    #[serde(default = "default_line_decoration_sign")]
+    pub sign: char,
     pub style: CellStyle,
+}
+
+const fn default_line_decoration_sign() -> char {
+    '│'
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2915,11 +2921,16 @@ fn replace_line_number(
 }
 
 fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: usize, relative: bool, line_decorations: &[LineDecoration]) -> CellRow {
-    let style = logical_line
-        .and_then(|line| line_decorations.iter().rev().find(|decoration| decoration.line == line))
-        .map_or(CellStyle::default().with_foreground(CellColor::Theme(CatppuccinColor::Overlay1)), |decoration| decoration.style);
+    let style = CellStyle::default().with_foreground(CellColor::Theme(CatppuccinColor::Overlay1));
     let mut cells = vec![Cell { grapheme: single_byte_grapheme(b' '), width: 1, style }; width];
     if let Some(line) = logical_line {
+        if let Some(decoration) = line_decorations.iter().rev().find(|decoration| decoration.line == line) {
+            if let Some(target) = cells.get_mut(width.saturating_sub(2)) {
+                target.grapheme = character_grapheme(decoration.sign);
+                target.style = decoration.style;
+            }
+            return CellRow { cells };
+        }
         let mut number = if relative && line != cursor_line { line.abs_diff(cursor_line) } else { line.saturating_add(1) };
         let mut reversed = [0_u8; 20];
         let mut digits = 0;
@@ -2949,8 +2960,12 @@ fn logical_line_range(text: &FrameText, line: usize) -> Range<usize> {
 }
 
 fn single_byte_grapheme(byte: u8) -> CellGrapheme {
+    character_grapheme(char::from(byte))
+}
+
+fn character_grapheme(character: char) -> CellGrapheme {
     let mut encoded = [0; 4];
-    CellGrapheme::new(char::from(byte).encode_utf8(&mut encoded))
+    CellGrapheme::new(character.encode_utf8(&mut encoded))
 }
 
 #[cfg(test)]
@@ -3854,10 +3869,13 @@ mod tests {
             "",
             None,
             &[DecorationSpan::new(0..2, syntax, 100)],
-            &[LineDecoration { line: 0, style: git_sign }],
+            &[LineDecoration { line: 0, sign: '│', style: git_sign }],
         );
 
-        assert!(grid.rows[0].cells[..3].iter().all(|cell| cell.style.foreground == git_sign.foreground));
+        assert_eq!(grid.rows[0].cells[..3].iter().map(|cell| cell.grapheme.as_str()).collect::<String>(), " │ ");
+        assert_eq!(grid.rows[0].cells[1].style.foreground, git_sign.foreground);
+        assert_ne!(grid.rows[0].cells[0].style.foreground, git_sign.foreground);
+        assert_ne!(grid.rows[0].cells[2].style.foreground, git_sign.foreground);
         assert_eq!(grid.rows[0].cells[3].grapheme.as_str(), "f");
         assert_eq!(grid.rows[0].cells[3].style.foreground, syntax.foreground);
         assert_eq!(grid.rows[0].cells[4].grapheme.as_str(), "n");

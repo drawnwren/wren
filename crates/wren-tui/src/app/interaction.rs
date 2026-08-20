@@ -23,22 +23,21 @@ impl App {
                 self.populate_ace_jump(target);
             }
             AceJumpState::AwaitLabel { target, mut prefix, targets } => {
-                if key.code == TerminalKeyCode::Backspace {
-                    prefix.pop();
-                } else if let TerminalKeyCode::Char(label) = key.code {
-                    prefix.push(label.to_ascii_lowercase());
-                } else {
-                    return self.set_message("jump cancelled".to_owned());
+                match key.code {
+                    TerminalKeyCode::Backspace => {
+                        prefix.pop();
+                    }
+                    TerminalKeyCode::Char(label) => prefix.push(label.to_ascii_lowercase()),
+                    _ => return self.set_message("jump cancelled".to_owned()),
                 }
                 let matching = targets.iter().filter(|candidate| candidate.label.starts_with(&prefix)).collect::<Vec<_>>();
-                if matching.len() == 1 {
-                    let byte = matching[0].byte;
-                    self.finish_ace_jump(byte);
-                } else if matching.is_empty() {
-                    self.message = format!("no {target:?} jump labeled {prefix}");
-                } else {
-                    self.message = format!("jump {target:?}: {prefix}");
-                    self.ace_jump = Some(AceJumpState::AwaitLabel { target, prefix, targets });
+                match matching.as_slice() {
+                    [candidate] => self.finish_ace_jump(candidate.byte),
+                    [] => self.message = format!("no {target:?} jump labeled {prefix}"),
+                    _ => {
+                        self.message = format!("jump {target:?}: {prefix}");
+                        self.ace_jump = Some(AceJumpState::AwaitLabel { target, prefix, targets });
+                    }
                 }
             }
         }
@@ -241,12 +240,10 @@ impl App {
         );
         let active_is_messages = self.active.has_display_name(MESSAGES_BUFFER_NAME);
         let inactive_index = self.inactive.iter().position(|buffer| buffer.has_display_name(MESSAGES_BUFFER_NAME));
-        let buffer_id = if active_is_messages {
-            self.active.buffer_id
-        } else if let Some(index) = inactive_index {
-            self.inactive[index].buffer_id
-        } else {
-            self.views.add_buffer()
+        let buffer_id = match (active_is_messages, inactive_index) {
+            (true, _) => self.active.buffer_id,
+            (false, Some(index)) => self.inactive[index].buffer_id,
+            (false, None) => self.views.add_buffer(),
         };
         let mut messages = match BufferState::virtual_buffer(buffer_id, document_id, MESSAGES_BUFFER_NAME, text) {
             Ok(messages) => messages,
@@ -254,9 +251,9 @@ impl App {
                 return Err(error);
             }
         };
-        restore_client_state(&mut messages, &self.client_state)?;
+        apply_client_state(&mut messages, &self.client_state)?;
         if let Some(pattern) = self.client_state.search_history.last() {
-            messages.editor.restore_search(pattern.clone(), self.last_search_direction)?;
+            messages.editor.set_search(pattern.clone(), self.last_search_direction)?;
         }
         self.mutations.register(document_id, messages.editor.contents(), true)?;
 
@@ -332,19 +329,19 @@ impl App {
         }
     }
 
-    pub(super) fn after_transaction(&mut self, transaction: Option<wren_types::Transaction>) {
-        self.after_effect(transaction, Vec::new());
+    pub(super) fn after_transaction(&mut self, transactions: impl IntoIterator<Item = Transaction>) {
+        self.after_effect(transactions.into_iter().collect(), Vec::new());
     }
 
-    pub(super) fn after_effect(&mut self, transaction: Option<Transaction>, state_deltas: Vec<StateDelta>) {
-        if transaction.is_none() && state_deltas.is_empty() {
+    pub(super) fn after_effect(&mut self, transactions: TransactionBatch, state_deltas: Vec<StateDelta>) {
+        if transactions.is_empty() && state_deltas.is_empty() {
             return;
         }
         self.apply_state_deltas(&state_deltas);
-        if let Some(transaction) = transaction.as_ref() {
-            self.after_text_transaction(transaction);
+        if !transactions.is_empty() {
+            self.after_text_transactions(&transactions);
         }
-        if let Err(error) = self.mutations.append(self.active.document_id, transaction, state_deltas) {
+        if let Err(error) = self.mutations.append(self.active.document_id, transactions, state_deltas) {
             self.show_error(format!("mutation outbox: {error}"));
         }
     }
@@ -362,13 +359,18 @@ impl App {
         self.client_state_worker.try_save(self.client_state.clone());
     }
 
-    fn after_text_transaction(&mut self, transaction: &Transaction) {
-        if let Some(semantic) = self.semantic_decorations.get_mut(&self.active.buffer_id)
-            && semantic.revision == transaction.base_revision()
-        {
-            semantic.map_through(transaction, self.active.editor.revision());
+    fn after_text_transactions(&mut self, transactions: &[Transaction]) {
+        if let Some(semantic) = self.semantic_decorations.get_mut(&self.active.buffer_id) {
+            for transaction in transactions {
+                if semantic.revision != transaction.base_revision() {
+                    break;
+                }
+                if let Some(revision) = semantic.revision.next() {
+                    semantic.map_through(transaction, revision);
+                }
+            }
         }
-        self.refresh_changed_syntax(transaction);
+        self.refresh_changed_syntax(transactions);
         if let Some(before) = self.active.git_index_text.as_ref().map(Arc::clone) {
             self.schedule_git_hunk_refresh(GitHunkRequest {
                 buffer_id: self.active.buffer_id,

@@ -50,6 +50,7 @@ core_affinity = "0.8"
 dhat = "0.3"
 rmpv = { version = "1", features = ["with-serde"] }
 serde_json = { version = "1", features = ["raw_value"] }
+smallvec = "1"
 tempfile = "3"
 termina = "0.3.3"
 rustix = { version = "1", features = ["fs"] }

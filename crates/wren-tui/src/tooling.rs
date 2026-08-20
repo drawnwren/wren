@@ -182,14 +182,9 @@ pub(super) fn parse_diagnostic_line(line: &str, directory: &Path) -> Option<Quic
     let path = PathBuf::from(raw_path);
     let path = if path.is_absolute() { path } else { directory.join(path) };
     let lowercase = message.to_ascii_lowercase();
-    let severity = if lowercase.contains("error") {
-        Severity::Error
-    } else if lowercase.contains("warning") || lowercase.contains("warn") {
-        Severity::Warning
-    } else if lowercase.contains("hint") {
-        Severity::Hint
-    } else {
-        Severity::Info
-    };
+    let severity = [(Severity::Error, &["error"][..]), (Severity::Warning, &["warning", "warn"][..]), (Severity::Hint, &["hint"][..])]
+        .into_iter()
+        .find(|(_, markers)| markers.iter().any(|marker| lowercase.contains(marker)))
+        .map_or(Severity::Info, |(severity, _)| severity);
     Some(QuickfixEntry::diagnostic(path, line_number.max(1), column.max(1), severity, message))
 }

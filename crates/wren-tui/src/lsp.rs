@@ -170,13 +170,15 @@ pub(super) fn language_server_invocation(path: Option<&Path>) -> Option<Language
         _ => profile.language_id.as_deref().unwrap_or(language),
     };
     let mut settings = profile.settings.clone();
-    if language == "python" {
-        settings["python"]["pythonPath"] = python_interpreter(path).map_or(serde_json::Value::Null, serde_json::Value::String);
-    } else if language == "nix" {
-        settings["nixd"]["nixpkgs"]["expr"] = serde_json::Value::String(nixd_nixpkgs_expression(
-            nixd_expression_path().as_deref(),
-            &env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned()),
-        ));
+    match language {
+        "python" => settings["python"]["pythonPath"] = python_interpreter(path).map_or(serde_json::Value::Null, serde_json::Value::String),
+        "nix" => {
+            settings["nixd"]["nixpkgs"]["expr"] = serde_json::Value::String(nixd_nixpkgs_expression(
+                nixd_expression_path().as_deref(),
+                &env::var("NIXD_NIXPKGS_INPUT").unwrap_or_else(|_| "nixpkgs".to_owned()),
+            ));
+        }
+        _ => {}
     }
     LanguageServerInvocation {
         program: profile.program.to_string(),
@@ -201,28 +203,20 @@ pub(super) fn nixd_nixpkgs_expression(config: Option<&Path>, input: &str) -> Str
 }
 
 pub(super) fn python_interpreter(path: &Path) -> Option<String> {
-    if let Some(virtual_environment) = env::var_os("VIRTUAL_ENV") {
-        let candidate = PathBuf::from(virtual_environment).join("bin/python");
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    let mut directory = path.parent();
-    while let Some(current) = directory {
-        for name in [".venv", "venv"] {
-            let candidate = current.join(name).join("bin/python");
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-        directory = current.parent();
-    }
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join("python3"))
-            .find(|candidate| candidate.is_file())
-            .map(|candidate| candidate.to_string_lossy().into_owned())
-    })
+    env::var_os("VIRTUAL_ENV")
+        .map(PathBuf::from)
+        .map(|directory| directory.join("bin/python"))
+        .filter(|candidate| candidate.is_file())
+        .or_else(|| {
+            path.ancestors()
+                .skip(1)
+                .flat_map(|directory| [".venv", "venv"].map(|name| directory.join(name).join("bin/python")))
+                .find(|candidate| candidate.is_file())
+        })
+        .or_else(|| {
+            env::var_os("PATH").and_then(|path| env::split_paths(&path).map(|directory| directory.join("python3")).find(|candidate| candidate.is_file()))
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
 }
 
 pub(super) fn nixd_expression_path() -> Option<PathBuf> {
@@ -248,7 +242,7 @@ pub(super) fn path_from_file_uri(uri: &str) -> Result<PathBuf> {
     if uri.scheme().as_str() != "file" {
         bail!("unsupported non-file LSP URI {}", uri.as_str());
     }
-    uri.to_file_path().map(|path| path.into_owned()).ok_or_else(|| anyhow!("file LSP URI omitted a path: {}", uri.as_str()))
+    uri.to_file_path().map(std::borrow::Cow::into_owned).ok_or_else(|| anyhow!("file LSP URI omitted a path: {}", uri.as_str()))
 }
 
 pub(super) fn parse_lsp_locations(value: &serde_json::Value) -> Result<Vec<QuickfixEntry>> {
@@ -280,17 +274,12 @@ pub(super) fn render_lsp_text(value: &serde_json::Value) -> String {
         serde_json::Value::Null => String::new(),
         serde_json::Value::String(value) => value.clone(),
         serde_json::Value::Array(values) => values.iter().map(render_lsp_text).filter(|value| !value.is_empty()).collect::<Vec<_>>().join(" · "),
-        serde_json::Value::Object(values) => {
-            for key in ["value", "label", "contents", "signatures", "documentation"] {
-                if let Some(value) = values.get(key) {
-                    let rendered = render_lsp_text(value);
-                    if !rendered.is_empty() {
-                        return rendered;
-                    }
-                }
-            }
-            String::new()
-        }
+        serde_json::Value::Object(values) => ["value", "label", "contents", "signatures", "documentation"]
+            .into_iter()
+            .filter_map(|key| values.get(key))
+            .map(render_lsp_text)
+            .find(|rendered| !rendered.is_empty())
+            .unwrap_or_default(),
         _ => value.to_string(),
     }
 }
@@ -327,10 +316,10 @@ pub(super) fn expand_lsp_snippet_with_stops(snippet: &str) -> (String, Vec<Range
             let digits = placeholder.bytes().take_while(u8::is_ascii_digit).count();
             let stop = placeholder[..digits].parse::<usize>().ok();
             let start = output.len();
-            if let Some((_, default)) = placeholder.split_once(':') {
-                output.push_str(default);
-            } else if let Some((_, choices)) = placeholder.split_once('|') {
-                output.push_str(choices.trim_end_matches('|').split(',').next().unwrap_or_default());
+            match (placeholder.split_once(':'), placeholder.split_once('|')) {
+                (Some((_, default)), _) => output.push_str(default),
+                (None, Some((_, choices))) => output.push_str(choices.trim_end_matches('|').split(',').next().unwrap_or_default()),
+                (None, None) => {}
             }
             if let Some(stop) = stop {
                 stops.push((stop, start..output.len()));

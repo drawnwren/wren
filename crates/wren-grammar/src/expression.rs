@@ -26,12 +26,16 @@ impl ExpressionContext {
         let mut roots = HashMap::new();
         let mut objects = HashMap::<&str, HashMap<CelKey, Value>>::new();
         for (name, value) in &self.values {
-            if let Some(alias) = aliases.get(name) {
-                roots.insert(alias.as_str(), value.clone());
-            } else if let Some((object, field)) = name.split_once('.') {
-                objects.entry(object).or_default().insert(field.into(), value.clone());
-            } else {
-                roots.insert(name.as_str(), value.clone());
+            match (aliases.get(name), name.split_once('.')) {
+                (Some(alias), _) => {
+                    roots.insert(alias.as_str(), value.clone());
+                }
+                (None, Some((object, field))) => {
+                    objects.entry(object).or_default().insert(field.into(), value.clone());
+                }
+                (None, None) => {
+                    roots.insert(name.as_str(), value.clone());
+                }
             }
         }
         roots.extend(objects.into_iter().map(|(name, fields)| (name, Value::Map(CelMap { map: Arc::new(fields) }))));
@@ -77,32 +81,34 @@ fn cel_source(source: &str, context: &ExpressionContext) -> (String, BTreeMap<St
     let mut quote = None;
     while index < source.len() {
         let character = source[index..].chars().next().unwrap_or_default();
-        if quote.is_some() && character == '\\' {
-            let escaped = source[index + 1..].chars().next();
-            output.push(character);
-            escaped.into_iter().for_each(|escaped| output.push(escaped));
-            index += character.len_utf8() + escaped.map_or(0, char::len_utf8);
-            continue;
-        } else if quote == Some(character) {
-            quote = None;
-        } else if quote.is_none() && matches!(character, '\'' | '"') {
-            quote = Some(character);
-        } else if quote.is_none() && (character.is_alphabetic() || character == '_') {
-            let end = source[index..]
-                .char_indices()
-                .take_while(|(_, character)| character.is_alphanumeric() || matches!(character, '_' | '.'))
-                .last()
-                .map_or(index + character.len_utf8(), |(offset, character)| index + offset + character.len_utf8());
-            let name = &source[index..end];
-            if !name.is_ascii() && context.values.contains_key(name) {
-                let next = aliases.len();
-                let alias = aliases.entry(name.to_owned()).or_insert_with(|| format!("__wren_unicode_{next}"));
-                output.push_str(alias);
-            } else {
-                output.push_str(name);
+        match (quote, character) {
+            (Some(_), '\\') => {
+                let escaped = source[index + 1..].chars().next();
+                output.push(character);
+                output.extend(escaped);
+                index += character.len_utf8() + escaped.map_or(0, char::len_utf8);
+                continue;
             }
-            index = end;
-            continue;
+            (Some(active), character) if active == character => quote = None,
+            (None, character @ ('\'' | '"')) => quote = Some(character),
+            (None, character) if character.is_alphabetic() || character == '_' => {
+                let end = source[index..]
+                    .char_indices()
+                    .take_while(|(_, character)| character.is_alphanumeric() || matches!(character, '_' | '.'))
+                    .last()
+                    .map_or(index + character.len_utf8(), |(offset, character)| index + offset + character.len_utf8());
+                let name = &source[index..end];
+                if !name.is_ascii() && context.values.contains_key(name) {
+                    let next = aliases.len();
+                    let alias = aliases.entry(name.to_owned()).or_insert_with(|| format!("__wren_unicode_{next}"));
+                    output.push_str(alias);
+                } else {
+                    output.push_str(name);
+                }
+                index = end;
+                continue;
+            }
+            _ => {}
         }
         output.push(character);
         index += character.len_utf8();

@@ -41,14 +41,16 @@ impl App {
     fn handle_mouse_scroll(&mut self, lines: isize) -> Result<()> {
         self.mouse_selection = None;
         self.ace_jump = None;
-        if self.popup.as_ref().is_some_and(|popup| popup.cursor.is_some()) {
-            self.move_popup_cursor_rows(lines);
-        } else if self.prompt_kind_is_picker() {
-            self.close_editor_popup();
-            self.move_picker(lines);
-        } else {
-            self.close_editor_popup();
-            self.scroll_view_line(lines.signum(), lines.unsigned_abs());
+        match (self.popup.as_ref().is_some_and(|popup| popup.cursor.is_some()), self.prompt_kind_is_picker()) {
+            (true, _) => self.move_popup_cursor_rows(lines),
+            (false, true) => {
+                self.close_editor_popup();
+                self.move_picker(lines);
+            }
+            (false, false) => {
+                self.close_editor_popup();
+                self.scroll_view_line(lines.signum(), lines.unsigned_abs());
+            }
         }
         Ok(())
     }
@@ -175,8 +177,8 @@ impl App {
         }
     }
 
-    pub(super) fn restore_clipboard_register(&mut self, register: char, text: String) {
-        self.active.editor.restore_register(register, text, false);
+    pub(super) fn set_clipboard_register(&mut self, register: char, text: String) {
+        self.active.editor.state_mut().set_register(register, text, false);
     }
 
     pub(super) fn handle_prompt_key(&mut self, key: TerminalKey) -> Result<()> {
@@ -280,9 +282,9 @@ impl App {
     }
 
     pub(super) fn synchronize_search(&mut self, pattern: &str, direction: SearchDirection, persist: bool) -> Result<()> {
-        self.active.editor.restore_search(pattern, direction)?;
+        self.active.editor.set_search(pattern, direction)?;
         for buffer in &mut self.inactive {
-            buffer.editor.restore_search(pattern, direction)?;
+            buffer.editor.set_search(pattern, direction)?;
         }
         self.last_search_direction = direction;
         self.search_highlight = true;
@@ -291,7 +293,7 @@ impl App {
             deltas.push(StateDelta::SearchPattern(pattern.to_owned().into()));
         }
         deltas.push(StateDelta::SearchDirection { backward: direction == SearchDirection::Backward });
-        self.after_effect(None, deltas);
+        self.after_effect(TransactionBatch::new(), deltas);
         Ok(())
     }
 
@@ -299,7 +301,7 @@ impl App {
         if let Some(origin) = self.search_prompt_origin.take() {
             self.active.editor.set_cursor(origin.cursor);
             if let Some((pattern, direction)) = origin.previous_search {
-                self.active.editor.restore_search(pattern, direction)?;
+                self.active.editor.set_search(pattern, direction)?;
             } else {
                 self.active.editor.clear_search();
             }
@@ -325,7 +327,7 @@ impl App {
         if query.is_empty() {
             self.active.editor.set_cursor(cursor);
             if let Some((pattern, direction)) = &origin.previous_search {
-                self.active.editor.restore_search(pattern.clone(), *direction)?;
+                self.active.editor.set_search(pattern.clone(), *direction)?;
             } else {
                 self.active.editor.clear_search();
             }
@@ -337,12 +339,12 @@ impl App {
             Ok(found) => found,
             Err(error) => {
                 self.active.editor.set_cursor(cursor);
-                let _ = self.active.editor.restore_search(query, direction);
+                let _ = self.active.editor.set_search(query, direction);
                 self.search_highlight = false;
                 return self.set_message(error.to_string());
             }
         };
-        self.active.editor.restore_search(query.clone(), direction)?;
+        self.active.editor.set_search(query.clone(), direction)?;
         self.search_highlight = true;
         if let Some(byte) = found {
             self.active.editor.set_cursor(byte);
@@ -367,7 +369,7 @@ impl App {
                     if let Some(command) = EARLY_CUSTOM_COMMANDS
                         .iter()
                         .copied()
-                        .chain(EX_COMMAND_COMPLETIONS.lines())
+                        .chain(ex_command_completions())
                         .chain(LATE_CUSTOM_COMMANDS.iter().copied())
                         .find(|command| command.to_ascii_lowercase().starts_with(&prefix))
                     {
@@ -399,7 +401,7 @@ impl App {
     pub(super) fn execute_prompt(&mut self, prompt: Prompt) -> Result<()> {
         match prompt.kind {
             PromptKind::Command => {
-                self.after_effect(None, vec![StateDelta::CommandHistory(prompt.buffer.clone().into())]);
+                self.after_effect(TransactionBatch::new(), vec![StateDelta::CommandHistory(prompt.buffer.clone().into())]);
                 self.execute_ex(&prompt.buffer)
             }
             PromptKind::Search(direction) => {
@@ -422,7 +424,7 @@ impl App {
                     Err(error) => {
                         if let Some(origin) = origin {
                             if let Some((pattern, direction)) = origin.previous_search {
-                                let _ = self.active.editor.restore_search(pattern, direction);
+                                let _ = self.active.editor.set_search(pattern, direction);
                             } else {
                                 self.active.editor.clear_search();
                             }
@@ -439,7 +441,7 @@ impl App {
                 let value = evaluate_expression(&prompt.buffer, &self.expression_context())?;
                 let text = expression_editor_text(&value);
                 self.active.editor.set_register('=', text.clone(), false);
-                self.after_effect(None, vec![StateDelta::Register { name: '=', text: text.clone().into(), linewise: false }]);
+                self.after_effect(TransactionBatch::new(), vec![StateDelta::Register { name: '=', text: text.clone().into(), linewise: false }]);
                 self.set_message(format!("={text}"))
             }
             PromptKind::Picker(source) => self.open_selected_picker(source, &prompt.buffer),
@@ -788,34 +790,53 @@ impl App {
     }
 
     pub(super) fn handle_normal_key(&mut self, key: TerminalKey) -> Result<bool> {
-        if key.control() && matches!(key.code, TerminalKeyCode::Char('c' | 'C')) {
-            if let Some(cancellation) = self.active_task.take() {
+        match (key.control(), key.alt() || key.super_key(), key.code) {
+            (true, _, TerminalKeyCode::Char('c' | 'C')) => Ok(self.interrupt_editor()),
+            (true, _, TerminalKeyCode::Char('s' | 'S')) => {
+                self.save(None)?;
+                Ok(true)
+            }
+            _ if self.active.editor.mode() != Mode::Normal => Ok(false),
+            (true, _, TerminalKeyCode::Char(character)) => self.handle_control_normal_character(character.to_ascii_lowercase()),
+            (true, _, _) | (false, true, _) => Ok(false),
+            (false, false, TerminalKeyCode::Tab) => {
+                let count = self.take_normal_count().unwrap_or(1);
+                if !self.navigate_jump_count(false, count)? {
+                    self.message = "at newest jump".to_owned();
+                }
+                Ok(true)
+            }
+            (false, false, code @ (TerminalKeyCode::PageUp | TerminalKeyCode::PageDown)) => {
+                let count = self.take_normal_count();
+                self.scroll_page(if code == TerminalKeyCode::PageUp { -1 } else { 1 }, true, count);
+                Ok(true)
+            }
+            (false, false, code) => self.handle_plain_normal_code(code),
+        }
+    }
+
+    fn interrupt_editor(&mut self) -> bool {
+        match (self.active_task.take(), self.active.editor.mode()) {
+            (Some(cancellation), _) => {
                 cancellation.cancel();
                 self.message = "cancelling task".to_owned();
-            } else if matches!(self.active.editor.mode(), Mode::Insert | Mode::Replace) {
-                self.dispatch_key(KeyEvent::plain(KeyCode::Escape));
-            } else {
+            }
+            (None, Mode::Insert | Mode::Replace) => self.dispatch_key(KeyEvent::plain(KeyCode::Escape)),
+            (None, _) => {
                 self.active.editor.cancel_pending();
                 self.message = "cancelled".to_owned();
             }
-            return Ok(true);
         }
-        if key.control() && matches!(key.code, TerminalKeyCode::Char('s' | 'S')) {
-            self.save(None)?;
-            return Ok(true);
-        }
-        if self.active.editor.mode() != Mode::Normal {
-            return Ok(false);
-        }
-        if key.control() {
-            let TerminalKeyCode::Char(character) = key.code else { return Ok(false) };
-            let character = character.to_ascii_lowercase();
-            match character {
-                'h' | 'j' | 'k' | 'l' => {
-                    let _ = self.take_normal_count();
-                    if character == 'k' && self.active_language_server().is_some() {
-                        self.dispatch_lsp_cursor_request(PendingLspRequest::SIGNATURE_HELP)?;
-                    } else {
+        true
+    }
+
+    fn handle_control_normal_character(&mut self, character: char) -> Result<bool> {
+        match character {
+            'h' | 'j' | 'k' | 'l' => {
+                let _ = self.take_normal_count();
+                match (character, self.active_language_server().is_some()) {
+                    ('k', true) => self.dispatch_lsp_cursor_request(PendingLspRequest::SIGNATURE_HELP)?,
+                    (character, _) => {
                         let direction = match character {
                             'h' => WindowDirection::Left,
                             'j' => WindowDirection::Down,
@@ -826,55 +847,43 @@ impl App {
                         self.activate_view_buffer()?;
                     }
                 }
-                'd' | 'u' | 'f' | 'b' => {
-                    let count = self.take_normal_count();
-                    self.scroll_page(if matches!(character, 'u' | 'b') { -1 } else { 1 }, matches!(character, 'f' | 'b'), count);
-                }
-                'w' => {
-                    self.normal_prefix = Some('\u{17}');
-                    self.message.clear();
-                    self.show_normal_prefix_hints('\u{17}');
-                }
-                'o' => {
-                    let count = self.take_normal_count().unwrap_or(1);
-                    if !self.navigate_jump_count(true, count)? {
-                        self.message = "at oldest jump".to_owned();
-                    }
-                }
-                'e' | 'y' => {
-                    let count = self.take_normal_count().unwrap_or(1);
-                    self.scroll_view_line(if character == 'e' { 1 } else { -1 }, count);
-                }
-                'a' | 'x' => {
-                    let direction = if character == 'a' { 1_i64 } else { -1_i64 };
-                    let delta = direction.saturating_mul(i64::try_from(self.take_normal_count().unwrap_or(1)).unwrap_or(i64::MAX));
-                    let transaction = self.active.editor.adjust_number(delta)?;
-                    self.after_transaction(transaction);
-                }
-                'g' => {
-                    let _ = self.take_normal_count();
-                    self.show_file_info();
-                }
-                _ => return Ok(false),
             }
-            return Ok(true);
-        }
-        if key.code == TerminalKeyCode::Tab {
-            let count = self.take_normal_count().unwrap_or(1);
-            if !self.navigate_jump_count(false, count)? {
-                self.message = "at newest jump".to_owned();
+            'd' | 'u' | 'f' | 'b' => {
+                let count = self.take_normal_count();
+                self.scroll_page(if matches!(character, 'u' | 'b') { -1 } else { 1 }, matches!(character, 'f' | 'b'), count);
             }
-            return Ok(true);
+            'w' => {
+                self.normal_prefix = Some('\u{17}');
+                self.message.clear();
+                self.show_normal_prefix_hints('\u{17}');
+            }
+            'o' => {
+                let count = self.take_normal_count().unwrap_or(1);
+                if !self.navigate_jump_count(true, count)? {
+                    self.message = "at oldest jump".to_owned();
+                }
+            }
+            'e' | 'y' => {
+                let count = self.take_normal_count().unwrap_or(1);
+                self.scroll_view_line(if character == 'e' { 1 } else { -1 }, count);
+            }
+            'a' | 'x' => {
+                let direction = if character == 'a' { 1_i64 } else { -1_i64 };
+                let delta = direction.saturating_mul(i64::try_from(self.take_normal_count().unwrap_or(1)).unwrap_or(i64::MAX));
+                let transaction = self.active.editor.adjust_number(delta)?;
+                self.after_transaction(transaction);
+            }
+            'g' => {
+                let _ = self.take_normal_count();
+                self.show_file_info();
+            }
+            _ => return Ok(false),
         }
-        if matches!(key.code, TerminalKeyCode::PageUp | TerminalKeyCode::PageDown) {
-            let count = self.take_normal_count();
-            self.scroll_page(if key.code == TerminalKeyCode::PageUp { -1 } else { 1 }, true, count);
-            return Ok(true);
-        }
-        if key.alt() || key.super_key() {
-            return Ok(false);
-        }
-        match key.code {
+        Ok(true)
+    }
+
+    fn handle_plain_normal_code(&mut self, code: TerminalKeyCode) -> Result<bool> {
+        match code {
             TerminalKeyCode::Char(' ') => {
                 self.active.editor.cancel_pending();
                 self.leader_keys = Some(String::new());
@@ -937,15 +946,15 @@ impl App {
             .leader
             .iter()
             .any(|(candidate, binding)| candidate.len() > sequence.len() && candidate.starts_with(sequence.as_str()) && self.binding_enabled(binding));
-        if has_longer {
-            self.leader_keys = Some(sequence.clone());
-            self.leader_deadline = Some(Instant::now() + Duration::from_millis(500));
-            self.message.clear();
-            self.show_which_key(&sequence);
-        } else if let Some(execute) = exact {
-            execute(self)?;
-        } else {
-            self.message = format!("no mapping for <Space>{sequence}");
+        match (has_longer, exact) {
+            (true, _) => {
+                self.leader_keys = Some(sequence.clone());
+                self.leader_deadline = Some(Instant::now() + Duration::from_millis(500));
+                self.message.clear();
+                self.show_which_key(&sequence);
+            }
+            (false, Some(execute)) => execute(self)?,
+            (false, None) => self.message = format!("no mapping for <Space>{sequence}"),
         }
         Ok(())
     }

@@ -25,26 +25,33 @@ impl App {
     /// Existing full-buffer spans have already been transaction-mapped, so
     /// newly typed syntax appears immediately without a remote LSP round trip
     /// or a whole-file parse on every keypress.
-    pub(super) fn refresh_changed_syntax(&mut self, transaction: &Transaction) {
-        if transaction.is_empty() {
+    pub(super) fn refresh_changed_syntax(&mut self, transactions: &[Transaction]) {
+        if transactions.iter().all(Transaction::is_empty) {
             return;
         }
         let frame = self.active.editor.frame();
         let language_id = language_bundle(self.active.document.presentation_path()).language_id;
-        let (mut targets, replacement) = changed_syntax(&frame.text, transaction, &language_id);
+        let (mut targets, replacement) = changed_syntax_batch(&frame.text, transactions, &language_id);
         if targets.is_empty() {
             return;
         }
         targets.sort_by_key(|target| target.start);
         let pending = self.provider_refresh_ranges.entry(self.active.document_id).or_default();
-        *pending = std::mem::take(pending).into_iter().filter_map(|range| map_range(range, transaction)).chain(targets.iter().cloned()).collect();
+        *pending =
+            std::mem::take(pending).into_iter().filter_map(|range| transactions.iter().try_fold(range, map_range)).chain(targets.iter().cloned()).collect();
         merge_ranges(pending);
         let revision = self.active.editor.revision();
         let state = self.decorations.entry(self.active.buffer_id).or_insert_with(|| BufferDecorations::new(revision, Vec::new()));
-        if state.revision == transaction.base_revision() {
-            state.replace_after_transaction(transaction, revision, &targets, replacement);
+        if transactions.first().is_some_and(|transaction| state.revision == transaction.base_revision()) {
+            for transaction in transactions {
+                let Some(next) = state.revision.next() else {
+                    return;
+                };
+                state.map_through(transaction, next);
+            }
+            state.replace_ranges(revision, &targets, replacement);
         } else {
-            *state = BufferDecorations::new(revision, replacement);
+            *state = BufferDecorations::new(revision, provider_decorations(highlight_text(frame.text.as_ref(), &language_id)));
         }
         self.provider_refresh_due.insert(self.active.document_id, Instant::now() + Duration::from_millis(50));
     }
@@ -420,13 +427,11 @@ impl App {
         let Some(session) = &self.completion else {
             return;
         };
-        if session.candidates.is_empty() {
-            self.completion_index = 0;
-        } else if direction < 0 {
-            self.completion_index = self.completion_index.checked_sub(1).unwrap_or(session.candidates.len() - 1);
-        } else {
-            self.completion_index = (self.completion_index + 1) % session.candidates.len();
-        }
+        self.completion_index = match (session.candidates.len(), direction.is_negative()) {
+            (0, _) => 0,
+            (length, true) => self.completion_index.checked_sub(1).unwrap_or(length - 1),
+            (length, false) => (self.completion_index + 1) % length,
+        };
         self.completion_selected = !session.candidates.is_empty();
         self.completion_documentation_scroll = 0;
         self.update_completion_message();
@@ -480,17 +485,17 @@ impl App {
         if self.snippet_stops.is_empty() {
             return;
         }
-        if direction < 0 {
-            self.snippet_stop_index = self.snippet_stop_index.saturating_sub(1);
-        } else if self.snippet_stop_index + 1 >= self.snippet_stops.len() {
-            if let Some(range) = self.snippet_stops.last() {
-                self.active.editor.set_cursor(range.end);
+        match (direction.is_negative(), self.snippet_stop_index + 1 >= self.snippet_stops.len()) {
+            (true, _) => self.snippet_stop_index = self.snippet_stop_index.saturating_sub(1),
+            (false, true) => {
+                if let Some(range) = self.snippet_stops.last() {
+                    self.active.editor.set_cursor(range.end);
+                }
+                self.snippet_stops.clear();
+                self.snippet_stop_index = 0;
+                return;
             }
-            self.snippet_stops.clear();
-            self.snippet_stop_index = 0;
-            return;
-        } else {
-            self.snippet_stop_index += 1;
+            (false, false) => self.snippet_stop_index += 1,
         }
         if let Some(range) = self.snippet_stops.get(self.snippet_stop_index).cloned() {
             self.active.editor.set_selection_range(range);
@@ -499,30 +504,46 @@ impl App {
 }
 
 fn changed_syntax(text: &FrameText, transaction: &Transaction, language_id: &str) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
+    changed_syntax_ranges(
+        text,
+        transaction.edits().iter().filter_map(|edit| transaction.map_range(edit.range.clone(), Bias::Left, Bias::Right).ok()),
+        language_id,
+    )
+}
+
+fn changed_syntax_batch(text: &FrameText, transactions: &[Transaction], language_id: &str) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
+    let changed = transactions.iter().enumerate().flat_map(|(index, transaction)| {
+        transaction.edits().iter().filter_map(move |edit| {
+            let range = transaction.map_range(edit.range.clone(), Bias::Left, Bias::Right).ok()?;
+            transactions[index + 1..].iter().try_fold(range, |range, following| {
+                Some(following.map_offset(range.start, Bias::Left).ok()?..following.map_offset(range.end, Bias::Right).ok()?)
+            })
+        })
+    });
+    changed_syntax_ranges(text, changed, language_id)
+}
+
+fn changed_syntax_ranges(text: &FrameText, changed: impl IntoIterator<Item = Range<usize>>, language_id: &str) -> (Vec<Range<usize>>, Vec<DecorationSpan>) {
     let text_len = text.len();
-    let mut targets = transaction
-        .edits()
-        .iter()
-        .filter_map(|edit| {
-            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
-            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
+    let mut targets = changed
+        .into_iter()
+        .map(|range| {
+            let start = range.start;
+            let end = range.end;
             let start_line = text.line_of_byte(start.min(text_len));
             let end_line = text.line_of_byte(end.min(text_len));
             let target_start_line = start_line.saturating_sub(1);
             let target_end_line = end_line.saturating_add(2);
-            Some(text.byte_of_line(target_start_line)..text.byte_of_line(target_end_line).max(start).min(text_len))
+            text.byte_of_line(target_start_line)..text.byte_of_line(target_end_line).max(start).min(text_len)
         })
         .collect::<Vec<_>>();
     targets.sort_by_key(|target| target.start);
+    merge_ranges(&mut targets);
     let replacement = targets
         .iter()
         .flat_map(|target| {
             let slice = text.slice(target.clone());
-            let spans = if language_id == "markdown" {
-                provider_decorations(highlight_text(slice.as_ref(), language_id))
-            } else {
-                provider_decorations(lexical_highlight_text(slice.as_ref()))
-            };
+            let spans = provider_decorations(highlight_text(slice.as_ref(), language_id));
             spans.into_iter().map(|mut span| {
                 span.range.start = span.range.start.saturating_add(target.start);
                 span.range.end = span.range.end.saturating_add(target.start);

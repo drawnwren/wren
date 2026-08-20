@@ -123,10 +123,8 @@ impl ExtensionManifest {
         if self.component.is_empty() {
             return Err(ExtensionError::Manifest("component path must not be empty".into()));
         }
-        for capability in &self.capabilities {
-            if capability.kind == ProviderCapability::TaskProvider && capability.placement != HostPlacement::Workspace {
-                return Err(ExtensionError::Placement("task-provider must run in the workspace host".into()));
-            }
+        if self.capabilities.iter().any(|capability| capability.kind == ProviderCapability::TaskProvider && capability.placement != HostPlacement::Workspace) {
+            return Err(ExtensionError::Placement("task-provider must run in the workspace host".into()));
         }
         Ok(())
     }

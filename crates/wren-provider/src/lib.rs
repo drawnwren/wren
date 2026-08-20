@@ -210,13 +210,10 @@ impl LexicalAccelerator {
             *self = Self::initialize_gpu();
         }
         let Self::Gpu(gpu) = self else { return None };
-        match gpu.classify(source, text) {
-            Ok(ranges) => ranges,
-            Err(()) => {
-                *self = Self::Cpu;
-                None
-            }
-        }
+        gpu.classify(source, text).unwrap_or_else(|()| {
+            *self = Self::Cpu;
+            None
+        })
     }
 
     fn initialize_gpu() -> Self {
@@ -361,12 +358,14 @@ impl ProviderActor {
         let mut requested_ranges = demand.visible;
         requested_ranges.extend(demand.near_viewport);
         requested_ranges = coalesce_ranges(requested_ranges, document.text.len());
-        let mut spans = Vec::new();
-        for range in &requested_ranges {
-            let first = document.syntax_prefix_max_end.partition_point(|maximum_end| *maximum_end <= range.start);
-            let last = document.syntax_spans.partition_point(|span| span.range.start < range.end);
-            spans.extend(document.syntax_spans[first..last].iter().filter(|span| span.range.start < range.end && range.start < span.range.end).cloned());
-        }
+        let mut spans = requested_ranges
+            .iter()
+            .flat_map(|range| {
+                let first = document.syntax_prefix_max_end.partition_point(|maximum_end| *maximum_end <= range.start);
+                let last = document.syntax_spans.partition_point(|span| span.range.start < range.end);
+                document.syntax_spans[first..last].iter().filter(move |span| span.range.start < range.end && range.start < span.range.end).cloned()
+            })
+            .collect::<Vec<_>>();
         if document.grammar_backend == GrammarBackend::DynamicWasmFallback || spans.is_empty() {
             for range in &requested_ranges {
                 let source = &document.text[range.clone()];
@@ -945,12 +944,10 @@ fn document_key(document_id: DocumentId, document_revision: DocumentRevision, pr
 }
 
 fn revision_freshness(actual: DocumentRevision, requested: DocumentRevision) -> Freshness {
-    if actual == requested {
-        Freshness::Fresh
-    } else if actual < requested {
-        Freshness::Stale { revisions_behind: requested.get().saturating_sub(actual.get()) }
-    } else {
-        Freshness::LocallyMapped { from_revision: requested }
+    match actual.cmp(&requested) {
+        std::cmp::Ordering::Equal => Freshness::Fresh,
+        std::cmp::Ordering::Less => Freshness::Stale { revisions_behind: requested.get().saturating_sub(actual.get()) },
+        std::cmp::Ordering::Greater => Freshness::LocallyMapped { from_revision: requested },
     }
 }
 

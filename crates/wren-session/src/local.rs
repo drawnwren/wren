@@ -273,12 +273,13 @@ impl LocalDocument {
 }
 
 fn read_extended_attributes(path: &Path) -> io::Result<Vec<(OsString, Vec<u8>)>> {
-    let mut attributes = Vec::new();
-    for name in xattr::list(path)? {
-        if let Some(value) = xattr::get(path, &name)? {
-            attributes.push((name, value));
-        }
-    }
+    let mut attributes = xattr::list(path)?
+        .filter_map(|name| match xattr::get(path, &name) {
+            Ok(Some(value)) => Some(Ok((name, value))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     attributes.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(attributes)
 }

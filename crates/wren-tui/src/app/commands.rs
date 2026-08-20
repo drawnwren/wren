@@ -307,14 +307,13 @@ impl App {
         let pattern = self.effective_search_pattern(pattern)?;
         let compiled = self.active.editor.compile_search_pattern(&pattern, CaseOverride::Default)?;
         let text = self.active.editor.contents();
-        let mut selected = Vec::new();
-        for line in lines {
-            let start = self.active.editor.text().byte_of_line(line);
-            let end = self.active.editor.text().byte_of_line(line.saturating_add(1));
-            if compiled.is_match(&text[start..end]) != invert {
-                selected.push((line, start..end));
-            }
-        }
+        let selected = lines
+            .filter_map(|line| {
+                let start = self.active.editor.text().byte_of_line(line);
+                let end = self.active.editor.text().byte_of_line(line.saturating_add(1));
+                (compiled.is_match(&text[start..end]) != invert).then_some((line, start..end))
+            })
+            .collect::<Vec<_>>();
         self.synchronize_search(&pattern, SearchDirection::Forward, persist_pattern)?;
         let selected_ranges = || selected.iter().map(|(_, range)| range.clone()).collect();
         match &command {
@@ -356,9 +355,9 @@ impl App {
         let document_id = stable_document_id(Some(&resolved));
         let buffer_id = self.views.add_buffer();
         let (mut buffer, message) = BufferState::open(buffer_id, document_id, Some(&resolved), None)?;
-        restore_client_state(&mut buffer, &self.client_state)?;
+        apply_client_state(&mut buffer, &self.client_state)?;
         if let Some(pattern) = self.client_state.search_history.last() {
-            buffer.editor.restore_search(pattern.clone(), self.last_search_direction)?;
+            buffer.editor.set_search(pattern.clone(), self.last_search_direction)?;
         }
         let replace_stale = !buffer.editor.is_dirty();
         self.mutations.register(document_id, buffer.editor.contents(), replace_stale)?;
@@ -439,7 +438,7 @@ impl App {
     }
 
     pub(super) fn persist_jump_list(&mut self) {
-        self.after_effect(None, vec![StateDelta::JumpList { entries: self.jump_history.clone(), current: self.jump_index }]);
+        self.after_effect(TransactionBatch::new(), vec![StateDelta::JumpList { entries: self.jump_history.clone(), current: self.jump_index }]);
     }
 
     pub(super) fn record_active_file(&mut self) {

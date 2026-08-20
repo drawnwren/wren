@@ -202,7 +202,7 @@ fn scenario_b1(iterations: u64, path: &Path, known_offset: u64, heads: &SharedDo
         let grid = layout.desired_grid(&EngineFrame::new(text, 0));
         let speculative = elapsed_nanos(started);
         anyhow::ensure!(heads.validate(SessionEpoch::new(1), &state)? == HeadValidation::Correct, "scenario B1 frontier was not head-valid");
-        black_box(grid);
+        let _ = black_box(grid);
         let correct = elapsed_nanos(started);
         timings.record(speculative, correct, elapsed_nanos(started))?;
     }
@@ -218,7 +218,7 @@ fn scenario_full_read(iterations: u64, path: &Path) -> Result<Timings> {
         let mut layout = ViewportLayout::new(120, 40);
         let grid = layout.desired_grid(&EngineFrame::new(text, 0));
         let speculative = elapsed_nanos(started);
-        black_box(grid);
+        let _ = black_box(grid);
         let correct = elapsed_nanos(started);
         timings.record(speculative, correct, elapsed_nanos(started))?;
     }
@@ -239,7 +239,7 @@ fn scenario_c(iterations: u64, directory: &Path, text: &str) -> Result<Timings> 
         let mut layout = ViewportLayout::new(120, 40);
         let grid = layout.desired_grid(&EngineFrame::new(document.text(), 0));
         let speculative = elapsed_nanos(started);
-        black_box(grid);
+        let _ = black_box(grid);
         let correct = elapsed_nanos(started);
         timings.record(speculative, correct, elapsed_nanos(started))?;
     }
@@ -263,7 +263,7 @@ fn probe(path: &Path) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("probe read {}", path.display()))?;
     let text = String::from_utf8(bytes).context("probe file must be UTF-8")?;
     let mut layout = ViewportLayout::new(120, 40);
-    black_box(layout.desired_grid(&EngineFrame::new(text, 0)));
+    let _ = black_box(layout.desired_grid(&EngineFrame::new(text, 0)));
     Ok(())
 }
 

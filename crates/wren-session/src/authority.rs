@@ -434,25 +434,20 @@ impl SessionAuthority {
             value = value.checked_add(1).ok_or(AuthorityError::CounterOverflow)?;
             Ok(SessionSequence::new(value))
         };
-        let mut events = Vec::with_capacity(mutation.documents.len() + mutation.state_deltas.len());
-        for document in &mutation.documents {
-            events.push(SessionEvent {
-                session_sequence: next()?,
-                origin: EventOrigin::Client(mutation.client_id),
-                payload: SessionEventPayload::DocumentDelta {
+        let payloads = mutation
+            .documents
+            .iter()
+            .map(|document| {
+                Ok::<_, AuthorityError>(SessionEventPayload::DocumentDelta {
                     document_id: document.document_id,
                     accepted_revision: document.accepted_revision()?,
                     transactions: document.transactions.clone(),
-                },
-            });
-        }
-        for delta in &mutation.state_deltas {
-            events.push(SessionEvent {
-                session_sequence: next()?,
-                origin: EventOrigin::Client(mutation.client_id),
-                payload: SessionEventPayload::StateDelta(delta.clone()),
-            });
-        }
+                })
+            })
+            .chain(mutation.state_deltas.iter().map(|delta| Ok::<_, AuthorityError>(SessionEventPayload::StateDelta(delta.clone()))));
+        let events = payloads
+            .map(|payload| Ok(SessionEvent { session_sequence: next()?, origin: EventOrigin::Client(mutation.client_id), payload: payload? }))
+            .collect::<Result<Vec<_>, AuthorityError>>()?;
         let final_sequence = events.last().map_or(self.session_sequence, |event| event.session_sequence);
         Ok((events, final_sequence))
     }

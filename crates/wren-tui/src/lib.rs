@@ -23,11 +23,12 @@ use wren_client_state::{ClientViewStateStore, DurableClientState};
 use wren_command::{CancellationToken, TaskContext, TaskFailure, TaskRunner};
 use wren_config::{CommandRegistry, WorkspaceTrust, executable_hash, parse_and_validate};
 use wren_engine::{
-    CaseOverride, DurableUndoState, Editor, EngineError, FrameText, Mode, SearchDirection, VimPattern, VimReplacement, resolve_previous_replacement,
+    CaseOverride, DurableUndoState, Editor, EditorState, EngineError, FrameText, Mode, SearchDirection, TransactionBatch, VimPattern, VimReplacement,
+    resolve_previous_replacement,
 };
 use wren_grammar::{
-    BufferAction, EX_COMMAND_COMPLETIONS, ExAddress, ExCommand, ExRange, ExpressionContext, KeyCode, KeyEvent, Modifiers, ParseState, SubstituteFlags,
-    TabAction, Value, evaluate_expression, expression_editor_text, parse_ex,
+    BufferAction, ExAddress, ExCommand, ExRange, ExpressionContext, KeyCode, KeyEvent, Modifiers, ParseState, SubstituteFlags, TabAction, Value,
+    evaluate_expression, ex_command_completions, expression_editor_text, parse_ex,
 };
 use wren_position::{utf16_column_to_byte, utf16_position_to_byte};
 use wren_presenter::Presenter;
@@ -200,7 +201,7 @@ const fn clipboard_selection(register: char) -> ClipboardSelection {
     if register == '*' { ClipboardSelection::Primary } else { ClipboardSelection::Clipboard }
 }
 
-fn restore_clipboard_for_input(app: &mut App, terminal: &mut SystemTerminalBackend, event: &TerminalInput) {
+fn load_clipboard_for_input(app: &mut App, terminal: &mut SystemTerminalBackend, event: &TerminalInput) {
     let Some(register) = app.clipboard_register_for_paste(event) else {
         return;
     };
@@ -216,7 +217,7 @@ fn restore_clipboard_for_input(app: &mut App, terminal: &mut SystemTerminalBacke
         }
     };
     if let Some(text) = clipboard {
-        app.restore_clipboard_register(register, text);
+        app.set_clipboard_register(register, text);
     }
 }
 
@@ -235,7 +236,7 @@ fn handle_terminal_event(
     if matches!(event, TerminalInput::Ignored) {
         return false;
     }
-    restore_clipboard_for_input(app, terminal, &event);
+    load_clipboard_for_input(app, terminal, &event);
     app.foreground_frame_pending = true;
     let result = match event {
         TerminalInput::Mouse { action: action @ (MouseAction::Click | MouseAction::Drag | MouseAction::Release), column, row } => {
@@ -608,14 +609,13 @@ fn search_decorations(app: &App, buffer: &BufferState, range: Range<usize>) -> V
 fn add_git_decorations(buffer: &BufferState, lines: &mut Vec<LineDecoration>) {
     lines.extend(buffer.git_hunks.iter().map(|hunk| {
         let line = if hunk.after.start == hunk.after.end { hunk.after.start.saturating_sub(1) } else { hunk.after.start } as usize;
-        let color = if hunk.before.start == hunk.before.end {
-            CatppuccinColor::Green
-        } else if hunk.after.start == hunk.after.end {
-            CatppuccinColor::Red
-        } else {
-            CatppuccinColor::Yellow
+        let color = match (hunk.before.start == hunk.before.end, hunk.after.start == hunk.after.end) {
+            (true, _) => CatppuccinColor::Green,
+            (false, true) => CatppuccinColor::Red,
+            (false, false) => CatppuccinColor::Yellow,
         };
-        LineDecoration { line, style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold() }
+        let sign = if hunk.after.start == hunk.after.end { '_' } else { '│' };
+        LineDecoration { line, sign, style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold() }
     }));
 }
 
@@ -630,8 +630,17 @@ fn add_diagnostic_decorations(app: &App, buffer: &BufferState, path: &Path, span
             Severity::Hint | Severity::None => CatppuccinColor::Teal,
         };
         spans.push(DecorationSpan::new(start..end, CellStyle::default().with_foreground(CellColor::Theme(color)).with_underline(), 2_000_000));
-        lines
-            .push(LineDecoration { line: diagnostic.line.saturating_sub(1), style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold() });
+        let sign = match diagnostic.severity {
+            Severity::Error => 'E',
+            Severity::Warning => 'W',
+            Severity::Info => 'I',
+            Severity::Hint | Severity::None => 'H',
+        };
+        lines.push(LineDecoration {
+            line: diagnostic.line.saturating_sub(1),
+            sign,
+            style: CellStyle::default().with_foreground(CellColor::Theme(color)).with_bold(),
+        });
     }
 }
 
@@ -639,11 +648,11 @@ fn add_breakpoint_decorations(app: &App, path: &Path, lines: &mut Vec<LineDecora
     let Some(breakpoints) = app.breakpoints.get(path) else {
         return;
     };
-    lines.extend(
-        breakpoints
-            .keys()
-            .map(|line| LineDecoration { line: line.saturating_sub(1), style: CellStyle::themed(CatppuccinColor::Red, CatppuccinColor::Surface0).with_bold() }),
-    );
+    lines.extend(breakpoints.keys().map(|line| LineDecoration {
+        line: line.saturating_sub(1),
+        sign: '●',
+        style: CellStyle::themed(CatppuccinColor::Red, CatppuccinColor::Surface0).with_bold(),
+    }));
 }
 
 fn add_buffer_decorations(app: &App, decorations: &mut DecorationSetBuilder) -> Vec<(BufferId, Vec<LineDecoration>)> {
@@ -1209,24 +1218,26 @@ impl BufferState {
         editor.set_indent_options(indent.expand_tabs, indent.width, indent.width, true);
         editor.set_expand_region_keys(true);
         editor.set_read_only(opened.read_only);
-        if let Some(cursor) = recovered_cursor {
-            editor.set_cursor(cursor);
-            editor.mark_dirty();
-        } else if let Some(line) = line {
-            editor.set_cursor(editor.text().byte_of_line(line.saturating_sub(1)));
+        match (recovered_cursor, line) {
+            (Some(cursor), _) => {
+                editor.set_cursor(cursor);
+                editor.mark_dirty();
+            }
+            (None, Some(line)) => editor.set_cursor(editor.text().byte_of_line(line.saturating_sub(1))),
+            (None, None) => {}
         }
         if recovered_revision.is_none()
             && let Some(path) = document.presentation_path()
-            && let Some(state) = load_undo_state(path, base_hash)?
+            && let Some(undo) = load_undo_state(path, base_hash)?
         {
-            editor.restore_undo_state(state)?;
+            let mut state = EditorState::default();
+            state.set_undo(undo);
+            editor.restore(state)?;
         }
-        let message = if let Some(revision) = recovered_revision {
-            format!("recovered unsaved revision {revision}")
-        } else if opened.read_only {
-            format!("read-only {:?} byte view", opened.encoding)
-        } else {
-            String::new()
+        let message = match (recovered_revision, opened.read_only) {
+            (Some(revision), _) => format!("recovered unsaved revision {revision}"),
+            (None, true) => format!("read-only {:?} byte view", opened.encoding),
+            (None, false) => String::new(),
         };
         Ok((
             Self {
@@ -1484,11 +1495,6 @@ impl DecorationState {
         }
     }
 
-    fn invalidate_transaction(&mut self, transaction: &Transaction) {
-        self.invalidated.extend(transaction_current_edit_ranges(transaction));
-        merge_ranges(&mut self.invalidated);
-    }
-
     fn replace_ranges(&mut self, ranges: &[Range<usize>], mut spans: Vec<DecorationSpan>) {
         self.overrides.retain(|span| !ranges.iter().any(|range| ranges_overlap(&span.range, range)));
         spans.sort_by(decoration_order);
@@ -1536,12 +1542,16 @@ impl BufferDecorations {
 
     fn map_through(&mut self, transaction: &Transaction, revision: DocumentRevision) {
         self.state.advance(transaction);
-        self.state.invalidate_transaction(transaction);
         self.revision = revision;
     }
 
+    #[cfg(test)]
     fn replace_after_transaction(&mut self, transaction: &Transaction, revision: DocumentRevision, ranges: &[Range<usize>], replacement: Vec<DecorationSpan>) {
         self.state.advance(transaction);
+        self.replace_ranges(revision, ranges, replacement);
+    }
+
+    fn replace_ranges(&mut self, revision: DocumentRevision, ranges: &[Range<usize>], replacement: Vec<DecorationSpan>) {
         self.state.replace_ranges(ranges, replacement);
         self.revision = revision;
     }
@@ -1564,9 +1574,7 @@ impl BufferDecorations {
     }
 
     fn prepare_mapped_visible(&self, transaction: &Transaction, range: Range<usize>) {
-        let mut state = self.state_after(transaction);
-        state.invalidate_transaction(transaction);
-        self.prepare_visible_state(range, state);
+        self.prepare_visible_state(range, self.state_after(transaction));
     }
 
     fn prepare_replaced_visible(&self, transaction: &Transaction, ranges: &[Range<usize>], replacement: Vec<DecorationSpan>, range: Range<usize>) {
@@ -1629,18 +1637,6 @@ fn map_range(range: Range<usize>, transaction: &Transaction) -> Option<Range<usi
     let start = transaction.map_offset(range.start, Bias::Left).ok()?;
     let end = transaction.map_offset(range.end, Bias::Right).ok()?;
     (start < end).then_some(start..end)
-}
-
-fn transaction_current_edit_ranges(transaction: &Transaction) -> Vec<Range<usize>> {
-    transaction
-        .edits()
-        .iter()
-        .filter_map(|edit| {
-            let start = transaction.map_offset(edit.range.start, Bias::Left).ok()?;
-            let end = transaction.map_offset(edit.range.end, Bias::Right).ok()?;
-            (start < end).then_some(start..end)
-        })
-        .collect()
 }
 
 fn unmap_range(range: Range<usize>, transaction: &Transaction) -> Range<usize> {
@@ -1973,12 +1969,11 @@ fn parse_inccommand_substitute(input: &str) -> Option<ExCommand> {
 fn has_unescaped_tilde(input: &str) -> bool {
     let mut escaped = false;
     for character in input.chars() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '~' {
-            return true;
+        match (escaped, character) {
+            (true, _) => escaped = false,
+            (false, '\\') => escaped = true,
+            (false, '~') => return true,
+            (false, _) => {}
         }
     }
     false
@@ -2048,16 +2043,14 @@ fn ex_normal_keys(input: &str) -> Vec<KeyEvent> {
     let mut keys = Vec::new();
     let mut rest = input;
     while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix("<Esc>") {
-            keys.push(KeyEvent::plain(KeyCode::Escape));
+        if let Some((after, code)) = [("<Esc>", KeyCode::Escape), ("<CR>", KeyCode::Enter), ("<Tab>", KeyCode::Tab)]
+            .into_iter()
+            .find_map(|(prefix, code)| rest.strip_prefix(prefix).map(|after| (after, code)))
+        {
+            keys.push(KeyEvent::plain(code));
             rest = after;
-        } else if let Some(after) = rest.strip_prefix("<CR>") {
-            keys.push(KeyEvent::plain(KeyCode::Enter));
-            rest = after;
-        } else if let Some(after) = rest.strip_prefix("<Tab>") {
-            keys.push(KeyEvent::plain(KeyCode::Tab));
-            rest = after;
-        } else if let Some(character) = rest.chars().next() {
+        } else {
+            let Some(character) = rest.chars().next() else { break };
             keys.push(KeyEvent::character(character));
             rest = &rest[character.len_utf8()..];
         }
@@ -2095,7 +2088,7 @@ fn complete_path(fragment: &str) -> Option<String> {
     let prefix = expanded.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
     let mut matches =
         std::fs::read_dir(directory).ok()?.filter_map(Result::ok).filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix)).collect::<Vec<_>>();
-    matches.sort_by_key(|entry| entry.file_name());
+    matches.sort_by_key(std::fs::DirEntry::file_name);
     let entry = matches.first()?;
     let path = entry.path();
     let mut completed = if fragment.starts_with("~/") {
