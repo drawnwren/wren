@@ -3,6 +3,15 @@ use super::*;
 impl App {
     pub(super) fn handle_input(&mut self, input: TerminalInput) -> Result<()> {
         self.foreground_frame_pending = true;
+        if self.save_conflict.is_some() {
+            return match input {
+                TerminalInput::Key(key) => {
+                    self.handle_save_conflict_key(key)?;
+                    Ok(())
+                }
+                _ => Ok(()),
+            };
+        }
         if self.input_focus.is_terminal() {
             return self.handle_terminal_input(input);
         }

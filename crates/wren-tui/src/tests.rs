@@ -190,6 +190,104 @@ fn app_opens_edits_and_safely_saves_a_real_file() {
     assert_eq!(fs::read_to_string(&path).expect("saved source"), "fn main() {}\n");
 }
 
+fn replace_active_text(app: &mut App, range: Range<usize>, replacement: &str) {
+    let transaction = Transaction::new(app.active.editor.revision(), vec![Edit::new(range, replacement)]).expect("transaction");
+    app.active.editor.apply_transaction(transaction.clone()).expect("apply edit");
+    app.after_transaction([transaction]);
+}
+
+#[test]
+fn externally_changed_file_offers_take_theirs_and_preserves_the_fresh_disk_snapshot() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "base\n", None);
+    replace_active_text(&mut app, 0..4, "ours");
+    fs::write(&path, "theirs\n").expect("external writer");
+
+    app.test_ex("w");
+
+    assert!(app.save_conflict.is_some());
+    assert!(app.popup.as_ref().is_some_and(|popup| popup.text.contains("1  take theirs") && popup.text.contains("4  replay")));
+    app.test_input(TerminalInput::Key(terminal_character('1')));
+
+    assert_eq!(app.active.editor.contents(), "theirs\n");
+    assert!(!app.active.editor.is_dirty());
+    assert_eq!(fs::read_to_string(path).expect("disk contents"), "theirs\n");
+    assert!(app.save_conflict.is_none());
+}
+
+#[test]
+fn externally_changed_file_can_explicitly_take_ours() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "base\n", None);
+    replace_active_text(&mut app, 0..4, "ours");
+    fs::write(&path, "theirs\n").expect("external writer");
+
+    app.test_ex("w");
+    app.test_input(TerminalInput::Key(terminal_character('2')));
+
+    assert_eq!(fs::read_to_string(path).expect("forced save"), "ours\n");
+    assert!(!app.active.editor.is_dirty());
+    assert!(app.save_conflict.is_none());
+}
+
+#[test]
+fn external_conflict_merge_opens_an_editable_pane_with_disjoint_changes() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "one\ntwo\n", None);
+    replace_active_text(&mut app, 0..3, "ours");
+    fs::write(&path, "one\ntheirs\n").expect("external writer");
+
+    app.test_ex("w");
+    app.test_input(TerminalInput::Key(terminal_character('3')));
+
+    assert_eq!(app.active.editor.contents(), "ours\ntheirs\n");
+    assert!(app.active.editor.is_dirty());
+    assert!(app.active.name().starts_with("Merge:"));
+    assert_eq!(app.views.window_count(), 2);
+    assert_eq!(app.inactive.len(), 1, "the original local replica remains beside the merge pane");
+    assert!(app.message.contains("semantic merge pane"));
+}
+
+#[test]
+fn external_conflict_replay_applies_our_disjoint_edit_on_theirs_without_writing() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "one\ntwo\n", None);
+    replace_active_text(&mut app, 0..3, "ours");
+    fs::write(&path, "one\ntheirs\n").expect("external writer");
+
+    app.test_ex("w");
+    app.test_input(TerminalInput::Key(terminal_character('4')));
+
+    assert_eq!(app.active.editor.contents(), "ours\ntheirs\n");
+    assert!(app.active.editor.is_dirty());
+    assert_eq!(fs::read_to_string(path).expect("replay does not force a save"), "one\ntheirs\n");
+    assert!(app.save_conflict.is_none());
+}
+
+#[test]
+fn replay_rechecks_the_disk_and_uses_a_newer_writer_snapshot() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "one\ntwo\nthree\n", None);
+    replace_active_text(&mut app, 0..3, "ours");
+    fs::write(&path, "one\ntheirs\nthree\n").expect("first external writer");
+
+    app.test_ex("w");
+    fs::write(&path, "one\ntheirs\nnewest\n").expect("second external writer");
+    app.test_input(TerminalInput::Key(terminal_character('4')));
+
+    assert_eq!(app.active.editor.contents(), "ours\ntheirs\nnewest\n");
+    assert_eq!(fs::read_to_string(path).expect("replay does not force a save"), "one\ntheirs\nnewest\n");
+}
+
+#[test]
+fn replay_routes_overlapping_edits_to_the_semantic_merge_pane() {
+    let (_directory, path, mut app) = app_with_fixture("conflict.txt", "base\n", None);
+    replace_active_text(&mut app, 0..4, "ours");
+    fs::write(&path, "theirs\n").expect("external writer");
+
+    app.test_ex("w");
+    app.test_input(TerminalInput::Key(terminal_character('4')));
+
+    assert!(app.active.name().starts_with("Merge:"));
+    assert!(app.active.editor.contents().contains("<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs"));
+    assert!(app.message.contains("conflict block"));
+}
+
 #[test]
 fn space_w_uses_the_same_write_path_without_quitting_a_new_file() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -859,8 +957,8 @@ fn large_rust_open_navigation_and_edit_stay_within_frame_budgets() {
 #[test]
 fn immediate_highlight_overtakes_queued_background_provider_work() {
     let (sender, requests) = mpsc::sync_channel(8);
-    let (immediate_sender, immediate_requests) = mpsc::channel();
-    let (results, _receiver) = mpsc::channel();
+    let (immediate_sender, immediate_requests) = mpsc::sync_channel(4);
+    let (results, _receiver) = mpsc::sync_channel(16);
     let (started_sender, started_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let update_order = Arc::new(Mutex::new(Vec::new()));
@@ -869,7 +967,7 @@ fn immediate_highlight_overtakes_queued_background_provider_work() {
         let mut actor = ProviderActor::default();
         let mut first_update = true;
         provider_loop(requests, immediate_requests, results, |request| {
-            if let ProviderRequest::UpdateDocument { document_id, .. } = request {
+            if let ProviderRequest::OpenDocument { document_id, .. } = request {
                 observed_order.lock().expect("update order").push(*document_id);
                 if first_update {
                     first_update = false;
@@ -888,6 +986,7 @@ fn immediate_highlight_overtakes_queued_background_provider_work() {
             document_id,
             revision,
             text: "fn background() {}\n".into(),
+            transactions: Vec::new(),
             bundle: bundle.clone(),
             visible: 0..19,
             near_viewport: 0..19,
@@ -899,7 +998,7 @@ fn immediate_highlight_overtakes_queued_background_provider_work() {
     sender.send(refresh(first)).expect("queue active refresh");
     started_receiver.recv_timeout(Duration::from_secs(1)).expect("first refresh started");
     sender.send(refresh(second)).expect("queue waiting refresh");
-    let (reply, response) = mpsc::channel();
+    let (reply, response) = mpsc::sync_channel(1);
     immediate_sender
         .send(ProviderWorkerMessage::HighlightNow(Box::new(ImmediateHighlight {
             document_id: immediate,
@@ -919,15 +1018,15 @@ fn immediate_highlight_overtakes_queued_background_provider_work() {
 
 #[test]
 fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
-    let (sender, requests) = mpsc::channel();
-    let (_immediate_sender, immediate_requests) = mpsc::channel();
-    let (results, receiver) = mpsc::channel();
+    let (sender, requests) = mpsc::sync_channel(8);
+    let (_immediate_sender, immediate_requests) = mpsc::sync_channel(4);
+    let (results, receiver) = mpsc::sync_channel(16);
     let updates = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&updates);
     let worker = thread::spawn(move || {
         let mut actor = ProviderActor::default();
         provider_loop(requests, immediate_requests, results, |request| {
-            if matches!(request, ProviderRequest::UpdateDocument { .. }) {
+            if matches!(request, ProviderRequest::OpenDocument { .. }) {
                 observed.fetch_add(1, Ordering::Relaxed);
             }
             actor.handle(request.clone())
@@ -942,6 +1041,7 @@ fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
                 document_id: DocumentId::new(1),
                 revision,
                 text: FrameText::from(text.as_str()),
+                transactions: Vec::new(),
                 bundle: language_bundle(Some(Path::new("latency.rs"))),
                 visible: visible.clone(),
                 near_viewport: visible,
@@ -957,9 +1057,9 @@ fn viewport_demands_do_not_reupload_or_reparse_an_unchanged_document() {
 
 #[test]
 fn background_provider_coalesces_queued_stale_document_revisions() {
-    let (sender, requests) = mpsc::channel();
-    let (_immediate_sender, immediate_requests) = mpsc::channel();
-    let (results, _receiver) = mpsc::channel();
+    let (sender, requests) = mpsc::sync_channel(8);
+    let (_immediate_sender, immediate_requests) = mpsc::sync_channel(4);
+    let (results, _receiver) = mpsc::sync_channel(16);
     let (started_sender, started_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let updates = Arc::new(Mutex::new(Vec::new()));
@@ -968,7 +1068,7 @@ fn background_provider_coalesces_queued_stale_document_revisions() {
         let mut actor = ProviderActor::default();
         let mut first = true;
         provider_loop(requests, immediate_requests, results, |request| {
-            if let ProviderRequest::UpdateDocument { revision, .. } = request {
+            if let ProviderRequest::OpenDocument { revision, .. } = request {
                 observed.lock().expect("updates").push(*revision);
                 if first {
                     first = false;
@@ -985,6 +1085,7 @@ fn background_provider_coalesces_queued_stale_document_revisions() {
             document_id: DocumentId::new(1),
             revision: DocumentRevision::new(revision),
             text: FrameText::from(format!("fn revision_{revision}() {{}}\n")),
+            transactions: Vec::new(),
             bundle: language_bundle(Some(Path::new("coalesced.rs"))),
             visible: 0..24,
             near_viewport: 0..24,
@@ -1003,9 +1104,9 @@ fn background_provider_coalesces_queued_stale_document_revisions() {
 
 #[test]
 fn unchanged_provider_text_advances_revision_without_reupload_or_reparse() {
-    let (sender, requests) = mpsc::channel();
-    let (_immediate_sender, immediate_requests) = mpsc::channel();
-    let (results, receiver) = mpsc::channel();
+    let (sender, requests) = mpsc::sync_channel(8);
+    let (_immediate_sender, immediate_requests) = mpsc::sync_channel(4);
+    let (results, receiver) = mpsc::sync_channel(16);
     let updates = Arc::new(AtomicUsize::new(0));
     let advances = Arc::new(AtomicUsize::new(0));
     let observed_updates = Arc::clone(&updates);
@@ -1014,7 +1115,7 @@ fn unchanged_provider_text_advances_revision_without_reupload_or_reparse() {
         let mut actor = ProviderActor::default();
         provider_loop(requests, immediate_requests, results, |request| {
             match request {
-                ProviderRequest::UpdateDocument { .. } => {
+                ProviderRequest::OpenDocument { .. } => {
                     observed_updates.fetch_add(1, Ordering::Relaxed);
                 }
                 ProviderRequest::AdvanceDocumentRevision { .. } => {
@@ -1032,6 +1133,7 @@ fn unchanged_provider_text_advances_revision_without_reupload_or_reparse() {
             document_id: DocumentId::new(1),
             revision: DocumentRevision::new(revision),
             text: text.clone(),
+            transactions: Vec::new(),
             bundle: language_bundle(Some(Path::new("unchanged.rs"))),
             visible: 0..text.len(),
             near_viewport: 0..text.len(),

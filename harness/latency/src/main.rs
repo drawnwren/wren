@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -132,13 +133,18 @@ impl Write for CountingWriter {
 
 struct MeasuringBackend {
     terminal: TerminaBackend<CountingWriter>,
-    writes: u64,
-    patches: u64,
+    stats: Arc<BackendStats>,
+}
+
+#[derive(Default)]
+struct BackendStats {
+    writes: AtomicU64,
+    patches: AtomicU64,
 }
 
 impl MeasuringBackend {
-    fn new() -> Self {
-        Self { terminal: TerminaBackend::new(CountingWriter::default()), writes: 0, patches: 0 }
+    fn new(stats: Arc<BackendStats>) -> Self {
+        Self { terminal: TerminaBackend::new(CountingWriter::default()), stats }
     }
 }
 
@@ -146,8 +152,8 @@ impl TerminalBackend for MeasuringBackend {
     type Error = TerminalError;
 
     fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
-        self.writes = self.writes.saturating_add(1);
-        self.patches = self.patches.saturating_add(u64::try_from(terminal_update_operations(update)).unwrap_or(u64::MAX));
+        self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.patches.fetch_add(u64::try_from(terminal_update_operations(update)).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.terminal.submit(update)
     }
 }
@@ -282,7 +288,7 @@ struct PreparedRealtimeCase {
     model: ClientViewModel,
     buffer_id: BufferId,
     completion: Option<CompletionSession>,
-    baseline: Arc<wren_view::DesiredGrid>,
+    baseline: wren_view::DesiredGrid,
 }
 
 fn prepare_realtime_case(case: RealtimeCase) -> Result<PreparedRealtimeCase> {
@@ -314,7 +320,7 @@ fn prepare_realtime_case(case: RealtimeCase) -> Result<PreparedRealtimeCase> {
     // production workspace state before the clock starts instead of
     // benchmarking a cold first frame for every key.
     let frames = [(buffer_id, editor.frame())];
-    let baseline = Arc::new(layout.desired_workspace_grid(&model, &frames, "NORMAL", None));
+    let baseline = layout.desired_workspace_grid(&model, &frames, "NORMAL", None);
     Ok(PreparedRealtimeCase { editor, layout, model, buffer_id, completion, baseline })
 }
 
@@ -382,7 +388,7 @@ fn production_metrics(iterations: u64) -> Result<ProductionMetrics> {
 }
 
 fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
-    let backend = Arc::new(Mutex::new(MeasuringBackend::new()));
+    let backend = Arc::new(BackendStats::default());
     let terminal_latency = Arc::new(TerminalLatency::new()?);
     let observer_latency = Arc::clone(&terminal_latency);
     let (presented_sender, presented_receiver) = mpsc::sync_channel(1);
@@ -390,7 +396,7 @@ fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
         observer_latency.completed(epoch);
         let _ = presented_sender.send(epoch);
     });
-    let presenter = Presenter::start_observed(Arc::clone(&backend), Some(observer))?;
+    let presenter = Presenter::start_observed(MeasuringBackend::new(Arc::clone(&backend)), Some(observer))?;
 
     let mut commit = SampleSeries::new()?;
     let mut frame_snapshot = SampleSeries::new()?;
@@ -401,7 +407,7 @@ fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
         let case = REALTIME_CASES[(iteration as usize) % REALTIME_CASES.len()];
         let mut prepared = prepare_realtime_case(case)?;
         let baseline_epoch = prepared.baseline.epoch;
-        presenter.publish(Arc::clone(&prepared.baseline))?;
+        presenter.publish(prepared.baseline.clone())?;
         let presented_epoch = presented_receiver.recv_timeout(Duration::from_secs(1)).context("presenter did not complete the scenario baseline")?;
         anyhow::ensure!(presented_epoch == baseline_epoch, "presenter completed an unexpected scenario baseline");
         let started = Instant::now();
@@ -410,7 +416,7 @@ fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
         let frame = prepared.editor.frame();
         let frame_ready = Instant::now();
         let frames = [(prepared.buffer_id, frame)];
-        let desired = Arc::new(prepared.layout.desired_workspace_grid(&prepared.model, &frames, "NORMAL", None));
+        let desired = prepared.layout.desired_workspace_grid(&prepared.model, &frames, "NORMAL", None);
         let desired_ready = Instant::now();
         let commit_elapsed = duration_nanos(committed.duration_since(started));
         let frame_elapsed = duration_nanos(frame_ready.duration_since(committed));
@@ -428,10 +434,8 @@ fn realtime_metrics(iterations: u64) -> Result<RealtimeMetrics> {
         anyhow::ensure!(presented_epoch == desired_epoch, "presenter completed an unexpected frame epoch");
     }
     let presenter = presenter.finish()?;
-    let (backend_writes, terminal_patches) = {
-        let backend = backend.lock();
-        (backend.writes, backend.patches)
-    };
+    let backend_writes = backend.writes.load(Ordering::Relaxed);
+    let terminal_patches = backend.patches.load(Ordering::Relaxed);
     let terminal = terminal_latency.measurements()?;
     Ok(RealtimeMetrics { commit, frame_snapshot, grid_build, desired_grid, cases, terminal, presenter, backend_writes, terminal_patches })
 }

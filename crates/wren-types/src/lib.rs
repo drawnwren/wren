@@ -1,10 +1,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::ops::Range;
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 #[must_use]
@@ -212,7 +214,6 @@ pub type SemanticGroupId = Id<14>;
 pub type WorkspaceGeneration = Id<15>;
 #[cfg(any(test, feature = "benchmarking"))]
 pub type ViewId = Id<16>;
-#[cfg(any(test, feature = "benchmarking", feature = "test-support"))]
 pub type ConfigGeneration = Id<17>;
 pub type CommandTaskId = Id<18>;
 #[cfg(any(test, feature = "test-support"))]
@@ -228,17 +229,133 @@ impl Id<6> {
     }
 }
 
+/// UTF-8 insertion text stored inline when it fits the physical-input fast
+/// path. Longer edits keep their existing heap-backed representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InlineText {
+    Inline { len: u8, bytes: [u8; Self::CAPACITY] },
+    Heap(Box<str>),
+}
+
+impl InlineText {
+    pub const CAPACITY: usize = 32;
+
+    #[must_use]
+    pub fn new(text: &str) -> Self {
+        if text.len() <= Self::CAPACITY {
+            let mut bytes = [0; Self::CAPACITY];
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            Self::Inline { len: text.len() as u8, bytes }
+        } else {
+            Self::Heap(text.into())
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { len, bytes } => {
+                // `bytes` is only constructed from a valid `str` above.
+                match std::str::from_utf8(&bytes[..usize::from(*len)]) {
+                    Ok(text) => text,
+                    Err(_) => unreachable!("inline text only stores valid UTF-8"),
+                }
+            }
+            Self::Heap(text) => text,
+        }
+    }
+
+    #[must_use]
+    pub fn into_boxed_str(self) -> Box<str> {
+        match self {
+            Self::Inline { .. } => self.as_str().into(),
+            Self::Heap(text) => text,
+        }
+    }
+}
+
+impl Deref for InlineText {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for InlineText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for InlineText {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<String> for InlineText {
+    fn from(text: String) -> Self {
+        if text.len() <= Self::CAPACITY { Self::new(&text) } else { Self::Heap(text.into_boxed_str()) }
+    }
+}
+
+impl From<Box<str>> for InlineText {
+    fn from(text: Box<str>) -> Self {
+        if text.len() <= Self::CAPACITY { Self::new(&text) } else { Self::Heap(text) }
+    }
+}
+
+impl Serialize for InlineText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for InlineText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// A byte-offset edit against the transaction's explicit base revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edit {
     pub range: Range<usize>,
-    pub insert: Box<str>,
+    pub insert: InlineText,
 }
 
 impl Edit {
     #[must_use]
-    pub fn new(range: Range<usize>, insert: impl Into<Box<str>>) -> Self {
+    pub fn new(range: Range<usize>, insert: impl Into<InlineText>) -> Self {
         Self { range, insert: insert.into() }
+    }
+}
+
+/// A stack-resident transaction input for the common one-edit physical-input
+/// path. It spills only when a command genuinely contains multiple edits.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RealtimeEditBatch {
+    edits: SmallVec<[Edit; 1]>,
+}
+
+impl RealtimeEditBatch {
+    #[must_use]
+    pub fn single(range: Range<usize>, insert: impl Into<InlineText>) -> Self {
+        let mut edits = SmallVec::new();
+        edits.push(Edit::new(range, insert));
+        Self { edits }
+    }
+
+    #[must_use]
+    pub fn into_transaction(self, base_revision: DocumentRevision) -> Result<Transaction, TransactionError> {
+        Transaction::from_realtime(base_revision, self)
     }
 }
 
@@ -247,7 +364,7 @@ impl Edit {
 #[serde(try_from = "TransactionData")]
 pub struct Transaction {
     base_revision: DocumentRevision,
-    edits: Vec<Edit>,
+    edits: SmallVec<[Edit; 1]>,
     /// Preserves anchor provenance when a composition cannot be represented by
     /// the final byte edits alone (for example, an edit at a collapsed edge).
     #[doc(hidden)]
@@ -305,6 +422,10 @@ pub enum TransactionError {
 
 impl Transaction {
     pub fn new(base_revision: DocumentRevision, edits: Vec<Edit>) -> Result<Self, TransactionError> {
+        Self::with_edits(base_revision, edits.into())
+    }
+
+    fn with_edits(base_revision: DocumentRevision, edits: SmallVec<[Edit; 1]>) -> Result<Self, TransactionError> {
         let transaction = Self {
             base_revision,
             edits,
@@ -316,10 +437,15 @@ impl Transaction {
     }
 
     #[must_use]
-    pub const fn empty(base_revision: DocumentRevision) -> Self {
+    pub fn from_realtime(base_revision: DocumentRevision, edits: RealtimeEditBatch) -> Result<Self, TransactionError> {
+        Self::with_edits(base_revision, edits.edits)
+    }
+
+    #[must_use]
+    pub fn empty(base_revision: DocumentRevision) -> Self {
         Self {
             base_revision,
-            edits: Vec::new(),
+            edits: SmallVec::new(),
             #[cfg(test)]
             composition: None,
         }
@@ -513,7 +639,7 @@ impl Transaction {
 
         let base_revision = self.base_revision.next().ok_or(TransactionError::RevisionOverflow)?;
         let (_, inverse) = self.edits.iter().zip(deleted_text).enumerate().try_fold(
-            (0_i128, Vec::with_capacity(self.edits.len())),
+            (0_i128, SmallVec::<[Edit; 1]>::new()),
             |(delta, mut inverse), (index, (edit, deleted))| {
                 let expected = edit.range.len();
                 if deleted.len() != expected {
@@ -526,14 +652,14 @@ impl Transaction {
                 Ok((delta + insert_len - deleted_len, inverse))
             },
         )?;
-        Self::new(base_revision, inverse)
+        Self::with_edits(base_revision, inverse)
     }
 
     /// Extracts deleted strings from `base_text` and returns the inverse.
     #[cfg(test)]
     pub fn inverted_against(&self, base_text: &str) -> Result<Self, TransactionError> {
         self.validate_for_text(base_text)?;
-        let mut deleted = Vec::with_capacity(self.edits.len());
+        let mut deleted = SmallVec::<[Box<str>; 1]>::new();
         for edit in &self.edits {
             let text = base_text.get(edit.range.clone()).ok_or(TransactionError::OutOfBounds { offset: edit.range.end, len: base_text.len() })?;
             deleted.push(Box::<str>::from(text));
@@ -553,7 +679,7 @@ impl Transaction {
                 pieces.push(Piece::Base(cursor..edit.range.start));
             }
             if !edit.insert.is_empty() {
-                pieces.push(Piece::Inserted { text: edit.insert.clone(), anchor: edit.range.start });
+                pieces.push(Piece::Inserted { text: edit.insert.clone().into_boxed_str(), anchor: edit.range.start });
             }
             cursor = edit.range.end;
         }
@@ -1236,7 +1362,7 @@ fn apply_symbolic_edits(pieces: &[Piece], edits: &[Edit], base_extent: usize) ->
         output.extend(slice_pieces(pieces, cursor..edit.range.start)?);
         if !edit.insert.is_empty() {
             let anchor_position = if edit.range.is_empty() { edit.range.start } else { edit.range.end };
-            output.push(Piece::Inserted { text: edit.insert.clone(), anchor: anchor_at_position(pieces, anchor_position, base_extent)? });
+            output.push(Piece::Inserted { text: edit.insert.clone().into_boxed_str(), anchor: anchor_at_position(pieces, anchor_position, base_extent)? });
         }
         cursor = edit.range.end;
     }
@@ -1400,6 +1526,17 @@ mod tests {
         let selection = SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 2, head: 4 }] };
         let mapped = selection.map_through(&transaction).expect("mapping succeeds");
         assert_eq!(mapped.ranges, vec![SelRange { anchor: 2, head: 6 }]);
+    }
+
+    #[test]
+    fn realtime_edit_batch_keeps_common_text_inline() {
+        let transaction = RealtimeEditBatch::single(4..4, "界").into_transaction(DocumentRevision::new(7)).expect("transaction");
+        assert!(matches!(transaction.edits()[0].insert, InlineText::Inline { .. }));
+        assert_eq!(transaction.edits()[0].insert.as_ref(), "界");
+
+        let long = "x".repeat(InlineText::CAPACITY + 1);
+        let transaction = RealtimeEditBatch::single(4..4, long).into_transaction(DocumentRevision::new(7)).expect("transaction");
+        assert!(matches!(transaction.edits()[0].insert, InlineText::Heap(_)));
     }
 
     #[test]

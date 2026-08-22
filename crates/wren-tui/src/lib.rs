@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ls_types::{CodeActionOrCommand, CodeActionResponse, CodeLens, Command as LspCommand, DocumentChangeOperation, DocumentChanges, OneOf, WorkspaceEdit};
+use merge3::{Merge3, MergeGroup};
 use parking_lot::Mutex as LocalMutex;
 use serde::{Deserialize, Serialize};
 use wren_client_state::{ClientViewStateStore, DurableClientState};
@@ -118,7 +119,6 @@ const GIT_HUNK_IDLE_PERIOD: Duration = Duration::from_millis(50);
 const LSP_START_IDLE_PERIOD: Duration = Duration::from_millis(750);
 const LSP_SEMANTIC_IDLE_PERIOD: Duration = Duration::from_millis(750);
 type PresenterBackend = TerminaBackend<std::io::Stdout>;
-type SharedPresenterBackend = Arc<LocalMutex<PresenterBackend>>;
 
 pub fn main_entry() -> Result<()> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--internal-provider-host")) {
@@ -143,8 +143,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
     let mut terminal = SystemTerminalBackend::open().context("open interactive terminal")?;
     let dimensions = terminal.size().context("query terminal size")?;
     let (columns, rows) = (dimensions.columns, dimensions.rows);
-    let output = Arc::new(LocalMutex::new(TerminaBackend::new(std::io::stdout())));
-    let presenter = Presenter::start(Arc::clone(&output))?;
+    let presenter = Presenter::start(TerminaBackend::new(std::io::stdout()))?;
     let mut layout = ViewportLayout::new(columns, rows);
     layout.configure_dotfile_profile();
     app.resize_terminal_to(dimensions);
@@ -162,7 +161,7 @@ fn run_editor(cli: &Cli) -> Result<()> {
         if let Some(input) = input {
             let (input, next) = coalesce_mouse_scroll_input(input, |timeout| terminal.poll_input(Some(timeout)).context("drain terminal input"))?;
             pending_input = next;
-            needs_render |= handle_terminal_event(input, &mut app, &mut terminal, &output, &mut layout);
+            needs_render |= handle_terminal_event(input, &mut app, &mut terminal, &presenter, &mut layout);
         }
         // Quitting is a local editor action. Once accepted, leave the event
         // loop before polling providers or language servers so their state can
@@ -225,7 +224,7 @@ fn handle_terminal_event(
     event: TerminalInput,
     app: &mut App,
     terminal: &mut SystemTerminalBackend,
-    output: &SharedPresenterBackend,
+    output: &Presenter<PresenterBackend>,
     layout: &mut ViewportLayout,
 ) -> bool {
     if let TerminalInput::Resized(dimensions) = event {
@@ -249,7 +248,7 @@ fn handle_terminal_event(
     }
     app.capture_debug_output();
     for (register, text) in app.take_clipboard_writes() {
-        if let Err(error) = output.lock().copy_osc52(clipboard_selection(register), &text) {
+        if let Err(error) = output.try_copy_osc52(clipboard_selection(register), text) {
             app.show_error(format!("clipboard: {error}"));
         }
     }
@@ -309,13 +308,13 @@ fn input_requires_render(input: &TerminalInput) -> bool {
     !matches!(input, TerminalInput::Ignored)
 }
 
-fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
+fn desired_frame(layout: &mut ViewportLayout, app: &App) -> DesiredGrid {
     layout.set_theme(app.theme);
     layout.set_terminal_sidebar_visible(app.agent_sidebar_visible && !app.input_focus.is_terminal());
     if app.input_focus.is_terminal() {
         let mut grid = app.desired_terminal_grid(layout);
         grid.resolve_theme(app.theme);
-        return Arc::new(grid);
+        return grid;
     }
     let frame = app.active.editor.frame();
     layout.ensure_cursor_visible(&frame, 1);
@@ -335,7 +334,7 @@ fn desired_frame(layout: &mut ViewportLayout, app: &App) -> Arc<DesiredGrid> {
     prefetch_document_end(layout, app, &frames, &line_decorations);
     let mut grid = apply_editor_overlays(layout, app, grid, prompt.is_none());
     grid.resolve_theme(app.theme);
-    Arc::new(grid)
+    grid
 }
 
 fn prepare_realtime_view_updates(
@@ -454,7 +453,7 @@ impl std::fmt::Display for DesiredFrameTimings {
 }
 
 #[cfg(test)]
-fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<DesiredGrid>, DesiredFrameTimings) {
+fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (DesiredGrid, DesiredFrameTimings) {
     let total_at = Instant::now();
     let mut stage_at = total_at;
     let mut timings = DesiredFrameTimings::default();
@@ -468,7 +467,7 @@ fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<Desire
     if app.input_focus.is_terminal() {
         let mut grid = app.desired_terminal_grid(layout);
         grid.resolve_theme(app.theme);
-        return (Arc::new(grid), timings);
+        return (grid, timings);
     }
     let frame = app.active.editor.frame();
     layout.ensure_cursor_visible(&frame, 1);
@@ -494,7 +493,6 @@ fn desired_frame_profiled(layout: &mut ViewportLayout, app: &App) -> (Arc<Desire
     prefetch_document_end(layout, app, &frames, &line_decorations);
     let mut grid = apply_editor_overlays(layout, app, grid, prompt.is_none());
     grid.resolve_theme(app.theme);
-    let grid = Arc::new(grid);
     measure(7);
     timings.total = total_at.elapsed();
     (grid, timings)
@@ -1162,6 +1160,10 @@ struct BufferState {
     mixed_line_endings: bool,
     wal: Option<WalWorker>,
     base_hash: [u8; 32],
+    /// The normalized content that established `base_hash`. It is retained so
+    /// an external-save conflict can be resolved as a real three-way merge,
+    /// rather than guessing from the current editor buffer.
+    base_text: Arc<str>,
     git_index_text: Option<Arc<str>>,
     git_hunks: Vec<GitHunk>,
     git_branch: Option<Box<str>>,
@@ -1194,6 +1196,7 @@ impl BufferState {
         wal: Option<LocalWal>,
     ) -> Result<(Self, String)> {
         let base_hash = document.base_hash();
+        let base_text: Arc<str> = Arc::from(opened.text.as_str());
         let git_index_text = document.presentation_path().and_then(|path| {
             let root = git_root_for(path).ok()?;
             let relative = path.strip_prefix(&root).ok()?;
@@ -1211,7 +1214,14 @@ impl BufferState {
             recovered.map(|state| (state.text, Some(state.cursor), Some(state.revision))).unwrap_or((opened.text, None, None));
         let indent = detect_indent_style(&text);
         let initial_git_hunks = git_index_text.as_ref().map_or_else(Vec::new, |index_text| git_hunks(index_text, &text));
-        let store = DefaultText::from_reader(Cursor::new(text.as_bytes())).context("create text store")?;
+        let store = if recovered_revision.is_none() {
+            document
+                .mapped_text_store()
+                .context("open eligible mapped text store")?
+                .unwrap_or(DefaultText::from_reader(Cursor::new(text.as_bytes())).context("create text store")?)
+        } else {
+            DefaultText::from_reader(Cursor::new(text.as_bytes())).context("create recovery text store")?
+        };
         let mut editor = Editor::new(store);
         editor.set_search_options(true, true);
         editor.set_clipboard_unnamed(true);
@@ -1249,6 +1259,7 @@ impl BufferState {
                 mixed_line_endings: opened.mixed_line_endings,
                 wal: wal.map(WalWorker::start).transpose()?,
                 base_hash,
+                base_text,
                 git_index_text,
                 git_hunks: initial_git_hunks,
                 git_branch,
@@ -1267,6 +1278,47 @@ impl BufferState {
         Ok(buffer)
     }
 
+    fn merge_buffer(buffer_id: BufferId, document_id: DocumentId, path: &Path) -> Result<Self> {
+        let (document, opened) = LocalDocument::open(path)?;
+        let (mut buffer, _) = Self::from_opened(buffer_id, document_id, document, opened, None, None)?;
+        let name = format!("Merge: {}", path.display());
+        buffer.display_name = Some(name.into_boxed_str());
+        Ok(buffer)
+    }
+
+    fn configured_editor(text: &str, read_only: bool) -> Result<Editor> {
+        let indent = detect_indent_style(text);
+        let store = DefaultText::from_reader(Cursor::new(text.as_bytes())).context("create text store")?;
+        let mut editor = Editor::new(store);
+        editor.set_search_options(true, true);
+        editor.set_clipboard_unnamed(true);
+        editor.set_indent_options(indent.expand_tabs, indent.width, indent.width, true);
+        editor.set_expand_region_keys(true);
+        editor.set_read_only(read_only);
+        Ok(editor)
+    }
+
+    /// Discards the local replica in favour of a newly opened disk snapshot.
+    /// The caller registers the returned text with the mutation worker before
+    /// accepting further local edits.
+    fn reload_from_disk(&mut self) -> Result<String> {
+        let opened = self.document.reload()?;
+        let text = opened.text;
+        self.editor = Self::configured_editor(&text, opened.read_only)?;
+        self.class = opened.class;
+        self.mixed_line_endings = opened.mixed_line_endings;
+        self.base_hash = self.document.base_hash();
+        self.base_text = Arc::from(text.as_str());
+        self.git_index_text = self.document.presentation_path().and_then(|path| {
+            let root = git_root_for(path).ok()?;
+            let relative = path.strip_prefix(&root).ok()?;
+            git_index_contents(&root, relative).ok().map(Arc::from)
+        });
+        self.git_hunks = self.git_index_text.as_ref().map_or_else(Vec::new, |index| git_hunks(index, &text));
+        self.git_branch = self.document.presentation_path().and_then(git_branch_for).map(String::into_boxed_str);
+        Ok(text)
+    }
+
     fn name(&self) -> String {
         if let Some(name) = &self.display_name {
             return name.to_string();
@@ -1279,7 +1331,10 @@ impl BufferState {
     }
 
     fn refresh_git_hunks(&mut self) {
-        self.git_hunks = self.git_index_text.as_ref().map_or_else(Vec::new, |index| git_hunks(index, self.editor.frame().text.as_ref()));
+        self.git_hunks = self.git_index_text.as_ref().map_or_else(Vec::new, |index| {
+            let text = self.editor.frame().text.materialize_for_task();
+            git_hunks(index, &text)
+        });
     }
 }
 
@@ -1299,6 +1354,8 @@ struct App {
     provider_submitted: BTreeMap<DocumentId, ProviderDemandKey>,
     provider_refresh_due: BTreeMap<DocumentId, Instant>,
     provider_refresh_ranges: BTreeMap<DocumentId, Vec<Range<usize>>>,
+    provider_pending_transactions: BTreeMap<DocumentId, Vec<Transaction>>,
+    provider_resync_required: BTreeSet<DocumentId>,
     decorations: BTreeMap<BufferId, BufferDecorations>,
     semantic_decorations: BTreeMap<BufferId, BufferDecorations>,
     prompt: Option<Prompt>,
@@ -1307,6 +1364,7 @@ struct App {
     search_highlight: bool,
     last_substitute: Option<LastSubstitute>,
     substitute_confirmation: Option<SubstituteConfirmation>,
+    save_conflict: Option<SaveConflict>,
     message: String,
     debug_messages: Vec<(Severity, Box<str>)>,
     tasks: TaskRunner,
@@ -1368,6 +1426,20 @@ struct App {
     started_at: Instant,
     foreground_frame_pending: bool,
     quit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SaveConflict {
+    path: PathBuf,
+    base: Arc<str>,
+    ours: Arc<str>,
+    theirs: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreeWayMerge {
+    text: String,
+    conflicts: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2069,6 +2141,66 @@ fn stable_document_id(path: Option<&Path>) -> DocumentId {
     };
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     DocumentId::new(stable_hash(canonical.to_string_lossy().bytes()).max(2))
+}
+
+/// Merges meaningfully independent edits from the disk and local replicas.
+/// The base snapshot makes this a semantic three-way operation: a line is
+/// selected for its relationship to the common document state, not simply by
+/// preferring whichever complete file was read last. Overlapping changes stay
+/// explicit in the output so the merge pane never silently drops either side.
+fn semantic_three_way_merge(base: &str, ours: &str, theirs: &str) -> ThreeWayMerge {
+    let base_lines = base.split_inclusive('\n').collect::<Vec<_>>();
+    let ours_lines = ours.split_inclusive('\n').collect::<Vec<_>>();
+    let theirs_lines = theirs.split_inclusive('\n').collect::<Vec<_>>();
+    // Fast path for a stable line shape. Treat each line as a semantic unit
+    // relative to its shared base so independently changed neighbouring lines
+    // do not become one coarse textual conflict region.
+    if base_lines.len() == ours_lines.len() && base_lines.len() == theirs_lines.len() {
+        let mut text = String::with_capacity(base.len().max(ours.len()).max(theirs.len()));
+        let mut conflicts = 0;
+        for ((base, ours), theirs) in base_lines.iter().zip(&ours_lines).zip(&theirs_lines) {
+            match (*ours == *theirs, *ours == *base, *theirs == *base) {
+                (true, _, _) | (_, true, false) => text.push_str(theirs),
+                (_, false, true) => text.push_str(ours),
+                _ => {
+                    conflicts += 1;
+                    text.push_str("<<<<<<< ours\n");
+                    append_merge_lines(&mut text, &[*ours]);
+                    text.push_str("=======\n");
+                    append_merge_lines(&mut text, &[*theirs]);
+                    text.push_str(">>>>>>> theirs\n");
+                }
+            }
+        }
+        return ThreeWayMerge { text, conflicts };
+    }
+    let mut text = String::with_capacity(base.len().max(ours.len()).max(theirs.len()));
+    let mut conflicts = 0;
+    for group in Merge3::new(&base_lines, &ours_lines, &theirs_lines).merge_groups() {
+        match group {
+            MergeGroup::Unchanged(lines) | MergeGroup::Same(lines) | MergeGroup::A(lines) | MergeGroup::B(lines) => {
+                text.extend(lines.iter().copied());
+            }
+            MergeGroup::Conflict(_base, ours, theirs) => {
+                conflicts += 1;
+                text.push_str("<<<<<<< ours\n");
+                append_merge_lines(&mut text, ours);
+                text.push_str("=======\n");
+                append_merge_lines(&mut text, theirs);
+                text.push_str(">>>>>>> theirs\n");
+            }
+        }
+    }
+    ThreeWayMerge { text, conflicts }
+}
+
+fn append_merge_lines(output: &mut String, lines: &[&str]) {
+    for line in lines {
+        output.push_str(line);
+    }
+    if !lines.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

@@ -8,6 +8,7 @@ license.workspace = true
 benchmarking = []
 
 [dependencies]
+crossbeam-queue.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 wren-scheduling = { version = "0.1.0", path = "../wren-scheduling" }

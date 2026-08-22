@@ -19,6 +19,10 @@ pub(super) struct ProviderRefresh {
     pub(super) document_id: DocumentId,
     pub(super) revision: DocumentRevision,
     pub(super) text: FrameText,
+    /// A contiguous editor revision chain. When it cannot be replayed from
+    /// the provider's revision, the worker deliberately resynchronizes with
+    /// this refresh's snapshot instead of guessing.
+    pub(super) transactions: Vec<Transaction>,
     pub(super) bundle: LanguageBundle,
     pub(super) visible: Range<usize>,
     pub(super) near_viewport: Range<usize>,
@@ -28,7 +32,7 @@ pub(super) struct ProviderRefresh {
 pub(super) struct ProviderCompletion {
     pub(super) document_id: DocumentId,
     pub(super) revision: DocumentRevision,
-    pub(super) text: Arc<str>,
+    pub(super) text: FrameText,
     pub(super) bundle: LanguageBundle,
     pub(super) byte: usize,
 }
@@ -66,7 +70,7 @@ pub(super) struct ImmediateHighlight {
     pub(super) revision: DocumentRevision,
     pub(super) text: Arc<str>,
     pub(super) bundle: LanguageBundle,
-    pub(super) reply: mpsc::Sender<Result<Vec<HighlightSpan>, String>>,
+    pub(super) reply: mpsc::SyncSender<Result<Vec<HighlightSpan>, String>>,
 }
 
 pub(super) enum ProviderWorkerResult {
@@ -76,8 +80,8 @@ pub(super) enum ProviderWorkerResult {
 }
 
 pub(super) struct ProviderWorker {
-    sender: mpsc::SyncSender<ProviderWorkerMessage>,
-    immediate_sender: mpsc::Sender<ProviderWorkerMessage>,
+    sender: Option<mpsc::SyncSender<ProviderWorkerMessage>>,
+    immediate_sender: Option<mpsc::SyncSender<ProviderWorkerMessage>>,
     results: mpsc::Receiver<ProviderWorkerResult>,
     join: Option<JoinHandle<()>>,
 }
@@ -101,20 +105,25 @@ pub(super) struct GitHunkResult {
 }
 
 pub(super) struct GitHunkWorker {
-    sender: mpsc::Sender<GitHunkRequest>,
+    sender: mpsc::SyncSender<GitHunkRequest>,
     results: mpsc::Receiver<GitHunkResult>,
 }
 
 impl GitHunkWorker {
     pub(super) fn start() -> Result<Self> {
-        let (sender, requests) = mpsc::channel();
-        let (results, receiver) = mpsc::channel();
+        Self::start_with_limits(wren_scheduling::RuntimeLimits::default())
+    }
+
+    fn start_with_limits(limits: wren_scheduling::RuntimeLimits) -> Result<Self> {
+        let capacity = limits.provider_demand_documents.min(2).max(1);
+        let (sender, requests) = mpsc::sync_channel(capacity);
+        let (results, receiver) = mpsc::sync_channel(capacity);
         wren_scheduling::spawn_background("wren-git-hunks", move || git_hunk_loop(requests, results)).context("spawn Git hunk worker")?;
         Ok(Self { sender, results: receiver })
     }
 
     pub(super) fn refresh(&self, request: GitHunkRequest) {
-        let _ = self.sender.send(request);
+        let _ = self.sender.try_send(request);
     }
 
     pub(super) fn try_result(&self) -> Option<GitHunkResult> {
@@ -122,11 +131,14 @@ impl GitHunkWorker {
     }
 }
 
-fn git_hunk_loop(requests: mpsc::Receiver<GitHunkRequest>, results: mpsc::Sender<GitHunkResult>) {
+fn git_hunk_loop(requests: mpsc::Receiver<GitHunkRequest>, results: mpsc::SyncSender<GitHunkResult>) {
     while let Ok(request) = requests.recv() {
-        let after = request.after.shared();
+        let after = request.after.materialize_for_task();
         let hunks = git_hunks(&request.before, &after);
-        if results.send(GitHunkResult { buffer_id: request.buffer_id, revision: request.revision, hunks }).is_err() {
+        if matches!(
+            results.try_send(GitHunkResult { buffer_id: request.buffer_id, revision: request.revision, hunks }),
+            Err(mpsc::TrySendError::Disconnected(_))
+        ) {
             return;
         }
     }
@@ -140,27 +152,31 @@ pub(super) fn join_worker_thread(join: &mut Option<JoinHandle<()>>) {
 
 impl ProviderWorker {
     pub(super) fn start() -> Result<Self> {
-        let (sender, requests) = mpsc::sync_channel(8);
-        let (immediate_sender, immediate_requests) = mpsc::channel();
-        let (results, receiver) = mpsc::channel();
+        Self::start_with_limits(wren_scheduling::RuntimeLimits::default())
+    }
+
+    fn start_with_limits(limits: wren_scheduling::RuntimeLimits) -> Result<Self> {
+        let (sender, requests) = mpsc::sync_channel(limits.provider_revision_slots.max(1));
+        let (immediate_sender, immediate_requests) = mpsc::sync_channel(limits.provider_demand_documents.div_ceil(2).max(1));
+        let (results, receiver) = mpsc::sync_channel(limits.task_slots.saturating_add(limits.provider_demand_documents).max(1));
         #[cfg(not(test))]
         let executable = env::current_exe().context("locate provider executable")?;
         let join = wren_scheduling::spawn_background("wren-provider-supervisor", move || {
             #[cfg(test)]
-            provider_actor_loop(requests, immediate_requests, results);
+            provider_actor_loop(requests, immediate_requests, results, limits.provider_demand_documents);
             #[cfg(not(test))]
-            provider_process_loop(executable, requests, immediate_requests, results);
+            provider_process_loop(executable, requests, immediate_requests, results, limits.provider_demand_documents);
         })
         .context("spawn provider supervisor")?;
-        Ok(Self { sender, immediate_sender, results: receiver, join: Some(join) })
+        Ok(Self { sender: Some(sender), immediate_sender: Some(immediate_sender), results: receiver, join: Some(join) })
     }
 
     pub(super) fn try_refresh(&self, refresh: ProviderRefresh) -> bool {
-        self.sender.try_send(ProviderWorkerMessage::Refresh(Box::new(refresh))).is_ok()
+        self.sender.as_ref().is_some_and(|sender| sender.try_send(ProviderWorkerMessage::Refresh(Box::new(refresh))).is_ok())
     }
 
     pub(super) fn try_complete(&self, completion: ProviderCompletion) -> bool {
-        self.sender.try_send(ProviderWorkerMessage::Complete(Box::new(completion))).is_ok()
+        self.sender.as_ref().is_some_and(|sender| sender.try_send(ProviderWorkerMessage::Complete(Box::new(completion))).is_ok())
     }
 
     pub(super) fn try_result(&self) -> Option<ProviderWorkerResult> {
@@ -174,14 +190,16 @@ impl ProviderWorker {
         text: Arc<str>,
         bundle: LanguageBundle,
     ) -> Result<Vec<HighlightSpan>> {
-        let (reply, response) = mpsc::channel();
-        self.immediate_sender
-            .send(ProviderWorkerMessage::HighlightNow(Box::new(ImmediateHighlight { document_id, revision, text, bundle, reply })))
-            .map_err(|_| anyhow!("provider process stopped"))?;
+        let (reply, response) = mpsc::sync_channel(1);
+        let immediate_sender = self.immediate_sender.as_ref().ok_or_else(|| anyhow!("provider process stopped"))?;
+        immediate_sender
+            .try_send(ProviderWorkerMessage::HighlightNow(Box::new(ImmediateHighlight { document_id, revision, text, bundle, reply })))
+            .map_err(|error| anyhow!("immediate provider highlight queue unavailable: {error}"))?;
         // Wake an idle provider without putting the synchronous request behind
         // already queued viewport or completion work. A full background queue
         // already guarantees that the worker is awake.
-        if matches!(self.sender.try_send(ProviderWorkerMessage::Wake), Err(mpsc::TrySendError::Disconnected(_))) {
+        let sender = self.sender.as_ref().ok_or_else(|| anyhow!("provider process stopped"))?;
+        if matches!(sender.try_send(ProviderWorkerMessage::Wake), Err(mpsc::TrySendError::Disconnected(_))) {
             return Err(anyhow!("provider process stopped"));
         }
         response.recv_timeout(Duration::from_millis(200)).map_err(|_| anyhow!("immediate provider highlight timed out"))?.map_err(anyhow::Error::msg)
@@ -190,7 +208,16 @@ impl ProviderWorker {
 
 impl Drop for ProviderWorker {
     fn drop(&mut self) {
-        let _ = self.sender.send(ProviderWorkerMessage::Stop);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(ProviderWorkerMessage::Stop);
+        }
+        if let Some(sender) = self.immediate_sender.take() {
+            let _ = sender.try_send(ProviderWorkerMessage::Stop);
+        }
+        // A bounded queue may already be full when teardown starts. Closing
+        // both producers is the guaranteed stop signal in that case: after
+        // draining any already accepted work the worker sees disconnection
+        // instead of waiting forever for a Stop message it could not enqueue.
         join_worker_thread(&mut self.join);
     }
 }
@@ -200,52 +227,94 @@ fn provider_process_loop(
     executable: PathBuf,
     requests: mpsc::Receiver<ProviderWorkerMessage>,
     immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
-    results: mpsc::Sender<ProviderWorkerResult>,
+    results: mpsc::SyncSender<ProviderWorkerResult>,
+    demand_capacity: usize,
 ) {
     let supervisor = ProviderSupervisor::spawn_with_args(&executable, ["--internal-provider-host"]);
     let mut supervisor = match supervisor {
         Ok(supervisor) => supervisor,
         Err(error) => {
             let message = error.to_string();
-            return provider_loop(requests, immediate_requests, results, move |_| Err(provider_error(&message)));
+            return provider_loop_with_demand_capacity(requests, immediate_requests, results, demand_capacity, move |_| Err(provider_error(&message)));
         }
     };
     if let Err(error) = supervisor.request(&ProviderRequest::Hello { protocol: 1 }) {
         let message = error.to_string();
-        return provider_loop(requests, immediate_requests, results, move |_| Err(provider_error(&message)));
+        return provider_loop_with_demand_capacity(requests, immediate_requests, results, demand_capacity, move |_| Err(provider_error(&message)));
     }
-    provider_loop(requests, immediate_requests, results, |request| supervisor.request(request));
+    provider_loop_with_demand_capacity(requests, immediate_requests, results, demand_capacity, |request| supervisor.request(request));
 }
 
 #[cfg(test)]
 fn provider_actor_loop(
     requests: mpsc::Receiver<ProviderWorkerMessage>,
     immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
-    results: mpsc::Sender<ProviderWorkerResult>,
+    results: mpsc::SyncSender<ProviderWorkerResult>,
+    demand_capacity: usize,
 ) {
     let mut actor = ProviderActor::default();
-    provider_loop(requests, immediate_requests, results, |request| actor.handle(request.clone()));
+    provider_loop_with_demand_capacity(requests, immediate_requests, results, demand_capacity, |request| actor.handle(request.clone()));
 }
 
+#[cfg(test)]
 pub(super) fn provider_loop(
     requests: mpsc::Receiver<ProviderWorkerMessage>,
     immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
-    results: mpsc::Sender<ProviderWorkerResult>,
+    results: mpsc::SyncSender<ProviderWorkerResult>,
+    request: impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
+) {
+    provider_loop_with_demand_capacity(requests, immediate_requests, results, wren_scheduling::RuntimeLimits::default().provider_demand_documents, request);
+}
+
+fn provider_loop_with_demand_capacity(
+    requests: mpsc::Receiver<ProviderWorkerMessage>,
+    immediate_requests: mpsc::Receiver<ProviderWorkerMessage>,
+    results: mpsc::SyncSender<ProviderWorkerResult>,
+    demand_capacity: usize,
     mut request: impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) {
-    // A viewport demand is not a document update. Keeping these identities
-    // separate avoids serializing and reparsing the entire buffer on every
-    // scroll while still replacing the provider snapshot on each revision.
+    // Revision payloads and viewport demand deliberately have different
+    // delivery semantics. The former remains attached to the newest demand
+    // for its document; the latter is scheduled by the provider's bounded
+    // latest-wins queue. Keeping the payload map pruned with queue evictions
+    // prevents an unbounded side queue from defeating the scheduler.
     let mut uploaded = UploadedProviderDocuments::new();
-    let mut pending = std::collections::VecDeque::new();
+    let mut demands = wren_provider::LatestDemandQueue::new(demand_capacity);
+    let mut pending_refreshes = BTreeMap::new();
+    let mut controls = std::collections::VecDeque::new();
     loop {
-        let Some(message) = next_provider_message(&requests, &immediate_requests, &mut pending) else {
+        let message = match immediate_requests.try_recv() {
+            Ok(message) => Some(message),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                if let Some(queued) = demands.pop()
+                    && let Some(refresh) = pending_refreshes.remove(&queued.document_id)
+                {
+                    let result = refresh_provider(refresh, &mut uploaded, &mut request);
+                    if matches!(results.try_send(result), Err(mpsc::TrySendError::Disconnected(_))) {
+                        return;
+                    }
+                    continue;
+                }
+                controls.pop_front()
+            }
+        }
+        .or_else(|| requests.recv().ok());
+        let Some(message) = message else {
             return;
         };
         let result = match message {
             ProviderWorkerMessage::Refresh(refresh) => {
-                let refresh = coalesce_provider_refresh(*refresh, &requests, &mut pending);
-                Some(refresh_provider(refresh, &mut uploaded, &mut request))
+                schedule_provider_refresh(*refresh, &mut demands, &mut pending_refreshes);
+                // Drain the bounded ingress before parsing so a typing burst
+                // produces one newest demand rather than redundant provider
+                // parses. Completion and control work keep FIFO ordering.
+                while let Ok(message) = requests.try_recv() {
+                    match message {
+                        ProviderWorkerMessage::Refresh(refresh) => schedule_provider_refresh(*refresh, &mut demands, &mut pending_refreshes),
+                        control => controls.push_back(control),
+                    }
+                }
+                None
             }
             ProviderWorkerMessage::Complete(completion) => Some(complete_provider(*completion, &mut uploaded, &mut request)),
             ProviderWorkerMessage::HighlightNow(highlight) => {
@@ -255,7 +324,7 @@ pub(super) fn provider_loop(
             ProviderWorkerMessage::Wake => None,
             ProviderWorkerMessage::Stop => return,
         };
-        if result.is_some_and(|result| results.send(result).is_err()) {
+        if result.is_some_and(|result| matches!(results.try_send(result), Err(mpsc::TrySendError::Disconnected(_)))) {
             return;
         }
     }
@@ -264,45 +333,36 @@ pub(super) fn provider_loop(
 struct UploadedProviderDocument {
     revision: DocumentRevision,
     generation: wren_types::ProviderGeneration,
-    text: Arc<str>,
+    text: FrameText,
 }
 
 type UploadedProviderDocuments = BTreeMap<DocumentId, UploadedProviderDocument>;
 
-fn next_provider_message(
-    requests: &mpsc::Receiver<ProviderWorkerMessage>,
-    immediate_requests: &mpsc::Receiver<ProviderWorkerMessage>,
-    pending: &mut std::collections::VecDeque<ProviderWorkerMessage>,
-) -> Option<ProviderWorkerMessage> {
-    match immediate_requests.try_recv() {
-        Ok(message) => Some(message),
-        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => pending.pop_front().or_else(|| requests.recv().ok()),
+fn schedule_provider_refresh(refresh: ProviderRefresh, demands: &mut wren_provider::LatestDemandQueue, pending: &mut BTreeMap<DocumentId, ProviderRefresh>) {
+    let document_id = refresh.document_id;
+    let demand = ProviderDemand {
+        revision: refresh.revision,
+        visible: vec![refresh.visible.clone()],
+        near_viewport: vec![refresh.near_viewport.clone()],
+        priority: Priority::Visible,
+    };
+    if let Some(previous) = pending.remove(&document_id) {
+        pending.insert(document_id, coalesce_refresh(previous, refresh));
+    } else {
+        pending.insert(document_id, refresh);
+    }
+    if let Some(evicted) = demands.push(document_id, demand) {
+        pending.remove(&evicted);
     }
 }
 
-fn coalesce_provider_refresh(
-    mut newest: ProviderRefresh,
-    requests: &mpsc::Receiver<ProviderWorkerMessage>,
-    pending: &mut std::collections::VecDeque<ProviderWorkerMessage>,
-) -> ProviderRefresh {
-    while let Ok(message) = requests.try_recv() {
-        match message {
-            ProviderWorkerMessage::Refresh(candidate) if candidate.document_id == newest.document_id => {
-                newest = *candidate;
-            }
-            ProviderWorkerMessage::Refresh(candidate) => {
-                if let Some(ProviderWorkerMessage::Refresh(queued)) =
-                    pending.iter_mut().find(|message| matches!(message, ProviderWorkerMessage::Refresh(queued) if queued.document_id == candidate.document_id))
-                {
-                    *queued = candidate;
-                } else {
-                    pending.push_back(ProviderWorkerMessage::Refresh(candidate));
-                }
-            }
-            ProviderWorkerMessage::Wake => {}
-            control => pending.push_back(control),
-        }
+fn coalesce_refresh(previous: ProviderRefresh, mut newest: ProviderRefresh) -> ProviderRefresh {
+    if newest.revision < previous.revision {
+        return previous;
     }
+    let mut transactions = previous.transactions;
+    transactions.extend(newest.transactions);
+    newest.transactions = transactions;
     newest
 }
 
@@ -317,8 +377,9 @@ fn provider_error(message: &str) -> wren_provider::ProviderError {
 fn ensure_provider_document(
     document_id: DocumentId,
     revision: DocumentRevision,
-    text: Arc<str>,
+    text: FrameText,
     bundle: LanguageBundle,
+    transactions: &[Transaction],
     uploaded: &mut UploadedProviderDocuments,
     request: &mut impl FnMut(&ProviderRequest) -> Result<ProviderResponse, wren_provider::ProviderError>,
 ) -> Result<(), wren_provider::ProviderError> {
@@ -328,11 +389,19 @@ fn ensure_provider_document(
     }
     let (context, update) = if let Some(document) = uploaded.get(&document_id)
         && document.generation == generation
-        && document.text.as_ref() == text.as_ref()
+        && document.text.same_snapshot(&text)
     {
         ("document revision advance", ProviderRequest::AdvanceDocumentRevision { document_id, from_revision: document.revision, revision, generation })
+    } else if let Some(document) = uploaded.get(&document_id)
+        && document.generation == generation
+        && transactions_form_chain(document.revision, revision, transactions)
+    {
+        (
+            "document transaction replay",
+            ProviderRequest::ApplyTransactions { document_id, from_revision: document.revision, revision, generation, transactions: transactions.to_vec() },
+        )
     } else {
-        ("document update", ProviderRequest::UpdateDocument { document_id, revision, text: text.as_ref().into(), bundle })
+        ("document open", ProviderRequest::OpenDocument { document_id, revision, text: text.materialize_for_task().as_ref().into(), bundle })
     };
     match request(&update)? {
         ProviderResponse::Updated { .. } => {
@@ -343,6 +412,23 @@ fn ensure_provider_document(
     }
 }
 
+fn transactions_form_chain(from_revision: DocumentRevision, revision: DocumentRevision, transactions: &[Transaction]) -> bool {
+    if transactions.is_empty() {
+        return false;
+    }
+    let mut current = from_revision;
+    for transaction in transactions {
+        if transaction.base_revision() != current {
+            return false;
+        }
+        let Some(next) = current.next() else {
+            return false;
+        };
+        current = next;
+    }
+    current == revision
+}
+
 fn refresh_provider(
     refresh: ProviderRefresh,
     uploaded: &mut UploadedProviderDocuments,
@@ -350,8 +436,7 @@ fn refresh_provider(
 ) -> ProviderWorkerResult {
     let document_id = refresh.document_id;
     let revision = refresh.revision;
-    let text = refresh.text.shared();
-    let outcome = ensure_provider_document(document_id, revision, text, refresh.bundle, uploaded, request).and_then(|()| {
+    let outcome = ensure_provider_document(document_id, revision, refresh.text, refresh.bundle, &refresh.transactions, uploaded, request).and_then(|()| {
         request(&ProviderRequest::Demand {
             document_id,
             demand: ProviderDemand { revision, visible: vec![refresh.visible], near_viewport: vec![refresh.near_viewport], priority: Priority::Visible },
@@ -386,7 +471,7 @@ fn complete_provider(
 ) -> ProviderWorkerResult {
     let document_id = completion.document_id;
     let revision = completion.revision;
-    let outcome = ensure_provider_document(document_id, revision, completion.text, completion.bundle, uploaded, request)
+    let outcome = ensure_provider_document(document_id, revision, completion.text, completion.bundle, &[], uploaded, request)
         .and_then(|()| request(&ProviderRequest::Complete { document_id, revision, byte: completion.byte }));
     checked_provider_response(document_id, uploaded, outcome, |response| match response {
         ProviderResponse::Completion(result) if result.freshness == Freshness::Fresh => Ok(ProviderWorkerResult::Completion {
@@ -405,7 +490,7 @@ fn highlight_immediately(
 ) {
     let ImmediateHighlight { document_id, revision, text, bundle, reply } = highlight;
     let text_len = text.len();
-    let outcome = ensure_provider_document(document_id, revision, text, bundle, uploaded, request).and_then(|()| {
+    let outcome = ensure_provider_document(document_id, revision, FrameText::from(text.as_ref()), bundle, &[], uploaded, request).and_then(|()| {
         request(&ProviderRequest::Demand {
             document_id,
             demand: ProviderDemand { revision, visible: std::iter::once(0..text_len).collect(), near_viewport: Vec::new(), priority: Priority::Visible },

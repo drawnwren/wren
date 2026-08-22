@@ -902,14 +902,30 @@ impl App {
             .join("\n");
         let (line, column) = self.active.editor.cursor_line_column();
         let stacks = format!("▾ current thread\n  {}:{}:{}", self.active.name(), line + 1, column + 1);
-        let repl =
-            self.terminal.as_ref().map(|_| self.terminal_frame().text.to_string()).unwrap_or_else(|| "Press <Space>dl to start the debugger REPL".to_owned());
+        let repl = self
+            .terminal
+            .as_ref()
+            .map(|_| self.terminal_frame().text.materialize_for_task().to_string())
+            .unwrap_or_else(|| "Press <Space>dl to start the debugger REPL".to_owned());
+        let limits = wren_scheduling::RuntimeLimits::for_terminal(self.viewport_columns, self.viewport_rows);
+        let runtime_limits = format!(
+            "frames={} mutations={} provider-revisions={} provider-demands={} tasks={}\ncontrol={} KiB bulk={} KiB snapshots={} MiB row-cache={} KiB",
+            limits.frame_slots,
+            limits.pending_mutations,
+            limits.provider_revision_slots,
+            limits.provider_demand_documents,
+            limits.task_slots,
+            limits.control_frame_bytes / 1024,
+            limits.bulk_chunk_bytes / 1024,
+            limits.provider_snapshot_bytes / (1024 * 1024),
+            limits.retained_row_bytes / 1024,
+        );
         DebugOverlay {
             panels: [
                 DebugPanel { title: "Scopes", text: "▸ Locals\n▸ Arguments\n▸ Registers".into() },
                 DebugPanel { title: "Breakpoints", text: if breakpoints.is_empty() { "No breakpoints".into() } else { breakpoints.into() } },
                 DebugPanel { title: "Stacks", text: stacks.into() },
-                DebugPanel { title: "Watches", text: "Add watches from the REPL".into() },
+                DebugPanel { title: "Limits", text: runtime_limits.into() },
                 DebugPanel { title: "REPL", text: repl.into() },
                 DebugPanel { title: "Console", text: if self.message.is_empty() { "Debugger console".into() } else { self.message.clone().into() } },
             ],

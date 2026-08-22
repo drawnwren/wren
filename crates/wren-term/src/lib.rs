@@ -20,6 +20,13 @@ pub trait TerminalBackend {
     type Error;
 
     fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error>;
+
+    /// Optional terminal-control operation. Presentation owns the terminal
+    /// writer, so callers enqueue controls instead of acquiring a writer lock
+    /// from the physical-input path.
+    fn copy_osc52(&mut self, _selection: ClipboardSelection, _text: &str) -> Result<(), String> {
+        Err("terminal backend does not support OSC 52 clipboard writes".to_owned())
+    }
 }
 
 #[must_use]
@@ -285,6 +292,10 @@ impl<W: Write> TerminalBackend for TerminaBackend<W> {
 
     fn submit(&mut self, update: &TerminalUpdate) -> Result<(), Self::Error> {
         self.renderer.submit(&mut self.writer, update)
+    }
+
+    fn copy_osc52(&mut self, selection: ClipboardSelection, text: &str) -> Result<(), String> {
+        Self::copy_osc52(self, selection, text).map_err(|error| error.to_string())
     }
 }
 

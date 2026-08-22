@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use thiserror::Error;
 use wren_grammar::{Command, Grammar, KeyCode, KeyEvent, Modifiers, Motion, Operator, ParseResult, ParseState, RangeKind, Register, TargetAction, TextObject};
+use wren_position::LazyLinePositionIndex;
 use wren_text::{DefaultText, TextStore};
 use wren_types::{
-    Anchor, Bias, DocumentRevision, Edit, SelRange, SelectionSet, Transaction, TransactionError, floor_char_boundary, merge_ranges, ranges_overlap,
+    Anchor, Bias, DocumentRevision, Edit, RealtimeEditBatch, SelRange, SelectionSet, Transaction, TransactionError, floor_char_boundary, merge_ranges,
+    ranges_overlap,
 };
 
 use crate::{CaseOverride, EngineFrame, FrameText, VimPattern};
@@ -151,12 +153,9 @@ impl EditorState {
 #[derive(Debug, Clone, Default)]
 struct SearchMatchCache {
     revision: Option<DocumentRevision>,
-    all: Option<Vec<Range<usize>>>,
     windows: BTreeMap<(usize, usize), CachedMatchWindow>,
     #[cfg(test)]
     window_scans: usize,
-    #[cfg(test)]
-    full_scans: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -167,48 +166,17 @@ struct CachedMatchWindow {
 }
 
 impl SearchState {
-    fn find_from(&self, text: &str, revision: DocumentRevision, direction: SearchDirection, cursor: usize) -> Option<usize> {
-        let cursor = cursor.min(text.len());
-        let after = next_char_boundary(text, cursor);
-        let mut cache = self.cache.borrow_mut();
-        cache.prepare_revision(revision);
-        if direction == SearchDirection::Backward && cache.all.is_none() {
-            cache.all = Some(self.compiled.find_iter(text).map(|found| found.range()).collect());
-            #[cfg(test)]
-            {
-                cache.full_scans += 1;
-            }
-        }
-        if let Some(ranges) = &cache.all {
-            return match direction {
-                SearchDirection::Forward => {
-                    let index = ranges.partition_point(|range| range.start < after);
-                    ranges.get(index).or_else(|| ranges.first()).map(|range| range.start)
-                }
-                SearchDirection::Backward => {
-                    let index = ranges.partition_point(|range| range.start < cursor);
-                    index.checked_sub(1).and_then(|index| ranges.get(index)).or_else(|| ranges.last()).map(|range| range.start)
-                }
-            };
-        }
-        drop(cache);
-        find_search_from(&self.compiled, text, direction, cursor)
+    /// Finds a nearby match without ever making a contiguous copy of the
+    /// complete document. Synchronous input only examines bounded windows.
+    fn find_from_frame(&self, text: &FrameText, revision: DocumentRevision, direction: SearchDirection, cursor: usize) -> Option<usize> {
+        self.cache.borrow_mut().prepare_revision(revision);
+        find_search_in_frame_windows(&self.compiled, text, direction, cursor)
     }
 
     fn match_ranges(&self, text: &str, revision: DocumentRevision, byte_range: Range<usize>, text_origin: usize, limit: usize) -> Vec<Range<usize>> {
         let key = (byte_range.start, byte_range.end);
         let mut cache = self.cache.borrow_mut();
         cache.prepare_revision(revision);
-        if let Some(all) = &cache.all {
-            let start = all.partition_point(|range| range.start < byte_range.start);
-            return all[start..]
-                .iter()
-                .take_while(|range| range.start < byte_range.end)
-                .filter(|range| is_non_empty_range_within(range, &byte_range))
-                .take(limit)
-                .cloned()
-                .collect();
-        }
         if let Some(window) = cache.windows.get(&key)
             && (window.complete || window.ranges.len() >= limit)
         {
@@ -280,7 +248,6 @@ impl SearchState {
             windows.insert((window.start, window.end), CachedMatchWindow { ranges: mapped, complete: cached.complete });
         }
         cache.revision = Some(revision);
-        cache.all = None;
         cache.windows = windows;
     }
 }
@@ -337,6 +304,14 @@ fn previous_frame_char_boundary(text: &FrameText, byte: usize) -> usize {
     byte
 }
 
+fn floor_frame_char_boundary(text: &FrameText, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
 fn next_frame_char_boundary(text: &FrameText, byte: usize) -> usize {
     let mut byte = byte.saturating_add(1).min(text.len());
     while byte < text.len() && !text.is_char_boundary(byte) {
@@ -349,7 +324,6 @@ impl SearchMatchCache {
     fn prepare_revision(&mut self, revision: DocumentRevision) {
         if self.revision != Some(revision) {
             self.revision = Some(revision);
-            self.all = None;
             self.windows.clear();
         }
     }
@@ -372,27 +346,47 @@ fn intersect_ranges(left: &Range<usize>, right: &Range<usize>) -> Option<Range<u
     (!intersection.is_empty()).then_some(intersection)
 }
 
-fn find_search_from(pattern: &VimPattern, text: &str, direction: SearchDirection, cursor: usize) -> Option<usize> {
-    let cursor = cursor.min(text.len());
+const SYNCHRONOUS_SEARCH_WINDOW_BYTES: usize = 64 * 1024;
+
+fn frame_search_window(text: &FrameText, range: Range<usize>) -> (usize, String) {
+    let start = text.floor_char_boundary(range.start);
+    let end = text.floor_char_boundary(range.end.max(start));
+    let mut window = String::with_capacity(end.saturating_sub(start));
+    let _ = text.visit_chunks(start..end, |chunk| {
+        window.push_str(chunk);
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    (start, window)
+}
+
+fn first_search_match_in_frame_window(pattern: &VimPattern, text: &FrameText, range: Range<usize>, start: usize) -> Option<usize> {
+    let (origin, window) = frame_search_window(text, range);
+    let offset = start.saturating_sub(origin).min(window.len());
+    pattern.find_at(&window, offset).map(|found| origin + found.start())
+}
+
+fn last_search_match_in_frame_window(pattern: &VimPattern, text: &FrameText, range: Range<usize>, before: usize) -> Option<usize> {
+    let (origin, window) = frame_search_window(text, range);
+    pattern.find_iter(&window).map(|found| origin + found.start()).filter(|start| *start < before).last()
+}
+
+fn find_search_in_frame_windows(pattern: &VimPattern, text: &FrameText, direction: SearchDirection, cursor: usize) -> Option<usize> {
+    let cursor = text.floor_char_boundary(cursor);
     match direction {
         SearchDirection::Forward => {
-            let after = next_char_boundary(text, cursor);
-            pattern
-                .find_at(text, after)
-                .map(|found| found.start())
-                .or_else(|| pattern.find_at(text, 0).filter(|found| found.start() < after).map(|found| found.start()))
+            let after = text.next_char_boundary(cursor);
+            let nearby_end = text.floor_char_boundary(after.saturating_add(SYNCHRONOUS_SEARCH_WINDOW_BYTES));
+            first_search_match_in_frame_window(pattern, text, after..nearby_end, after).or_else(|| {
+                let wrap_end = text.floor_char_boundary(after.min(SYNCHRONOUS_SEARCH_WINDOW_BYTES));
+                first_search_match_in_frame_window(pattern, text, 0..wrap_end, 0)
+            })
         }
         SearchDirection::Backward => {
-            let mut before = None;
-            let mut wrapped = None;
-            for found in pattern.find_iter(text) {
-                if found.start() < cursor {
-                    before = Some(found.start());
-                } else {
-                    wrapped = Some(found.start());
-                }
-            }
-            before.or(wrapped)
+            let nearby_start = text.floor_char_boundary(cursor.saturating_sub(SYNCHRONOUS_SEARCH_WINDOW_BYTES));
+            last_search_match_in_frame_window(pattern, text, nearby_start..cursor, cursor).or_else(|| {
+                let wrap_start = text.floor_char_boundary(text.len().saturating_sub(SYNCHRONOUS_SEARCH_WINDOW_BYTES));
+                last_search_match_in_frame_window(pattern, text, wrap_start..text.len(), text.len())
+            })
         }
     }
 }
@@ -469,6 +463,7 @@ pub struct Editor {
     clean_frame_text: Option<FrameText>,
     frame_text: FrameText,
     revision: DocumentRevision,
+    position_index: RefCell<LazyLinePositionIndex>,
     selections: SelectionSet,
     mode: Mode,
     pending_keys: Vec<KeyEvent>,
@@ -510,6 +505,7 @@ impl Editor {
             clean_frame_text: Some(frame_text.clone()),
             frame_text,
             revision: DocumentRevision::new(0),
+            position_index: RefCell::default(),
             selections: SelectionSet { primary: 0, ranges: vec![SelRange { anchor: 0, head: 0 }] },
             mode: Mode::Normal,
             pending_keys: Vec::with_capacity(8),
@@ -614,7 +610,7 @@ impl Editor {
 
     #[must_use]
     pub fn contents(&self) -> String {
-        self.frame_text.store().slice(0..self.frame_text.len()).into_owned()
+        self.frame_text.materialize_for_task().to_string()
     }
 
     #[must_use]
@@ -699,11 +695,16 @@ impl Editor {
 
     #[must_use]
     pub fn cursor_line_column(&self) -> (usize, usize) {
-        let text = self.text();
-        let cursor = self.primary_cursor().min(text.len_bytes());
-        let line = text.line_of_byte(cursor);
-        let start = text.byte_of_line(line);
-        let column = text.slice(start..cursor).chars().count();
+        let cursor = self.primary_cursor().min(self.frame_text.len());
+        let line = self.frame_text.line_of_byte(cursor);
+        let start = self.frame_text.byte_of_line(line);
+        let column = self
+            .position_index
+            .borrow_mut()
+            .line(self.frame_text.store(), line)
+            .ok()
+            .and_then(|index| index.absolute_byte_to_position(cursor).ok())
+            .map_or_else(|| frame_character_count(&self.frame_text, start, cursor), |position| position.scalar);
         (line, column)
     }
 
@@ -813,36 +814,56 @@ impl Editor {
 
     pub fn adjust_number(&mut self, delta: i64) -> Result<Option<Transaction>, EngineError> {
         self.ensure_writable()?;
-        let text = self.contents();
-        let cursor = self.primary_cursor().min(text.len());
-        let line_start = line_start(&text, cursor);
-        let line_end = line_end(&text, cursor);
-        let mut start = if cursor < line_end && text.as_bytes().get(cursor).is_some_and(u8::is_ascii_digit) {
+        let cursor = self.primary_cursor().min(self.frame_text.len());
+        let line_start = frame_line_start(&self.frame_text, cursor);
+        let line_end = frame_line_end(&self.frame_text, cursor);
+        let mut start = if cursor < line_end && self.frame_text.character_at(cursor).is_some_and(|character| character.is_ascii_digit()) {
             cursor
         } else {
-            let Some(relative) = text[cursor..line_end].find(|character: char| character.is_ascii_digit()) else {
-                return Ok(None);
-            };
-            cursor + relative
+            let mut scan = cursor;
+            loop {
+                if scan >= line_end {
+                    return Ok(None);
+                }
+                if self.frame_text.character_at(scan).is_some_and(|character| character.is_ascii_digit()) {
+                    break scan;
+                }
+                let next = self.frame_text.next_char_boundary(scan);
+                if next == scan {
+                    return Ok(None);
+                }
+                scan = next;
+            }
         };
-        while start > line_start && text.as_bytes().get(start - 1).is_some_and(u8::is_ascii_digit) {
-            start -= 1;
+        while start > line_start {
+            let previous = self.frame_text.previous_char_boundary(start);
+            if !self.frame_text.character_at(previous).is_some_and(|character| character.is_ascii_digit()) {
+                break;
+            }
+            start = previous;
         }
-        if start > line_start && text.as_bytes().get(start - 1) == Some(&b'-') {
-            start -= 1;
+        if start > line_start {
+            let previous = self.frame_text.previous_char_boundary(start);
+            if self.frame_text.character_at(previous) == Some('-') {
+                start = previous;
+            }
         }
-        let digit_start = start + usize::from(text.as_bytes().get(start) == Some(&b'-'));
+        let digit_start = if self.frame_text.character_at(start) == Some('-') { self.frame_text.next_char_boundary(start) } else { start };
         let mut end = digit_start;
-        while end < line_end && text.as_bytes().get(end).is_some_and(u8::is_ascii_digit) {
-            end += 1;
+        while end < line_end && self.frame_text.character_at(end).is_some_and(|character| character.is_ascii_digit()) {
+            end = self.frame_text.next_char_boundary(end);
         }
-        let original = &text[start..end];
+        let mut original = String::with_capacity(end.saturating_sub(start));
+        let _ = self.frame_text.visit_chunks(start..end, |chunk| {
+            original.push_str(chunk);
+            std::ops::ControlFlow::<()>::Continue(())
+        });
         let Ok(value) = original.parse::<i128>() else {
             return Ok(None);
         };
         let changed = value.saturating_add(i128::from(delta));
         let digit_width = end.saturating_sub(digit_start);
-        let replacement = if original.strip_prefix('-').unwrap_or(original).starts_with('0') && changed >= 0 {
+        let replacement = if original.strip_prefix('-').unwrap_or(&original).starts_with('0') && changed >= 0 {
             format!("{changed:0digit_width$}")
         } else {
             changed.to_string()
@@ -877,7 +898,7 @@ impl Editor {
     }
 
     pub fn set_cursor(&mut self, byte: usize) {
-        let destination = floor_char_boundary(self.frame_text.as_ref(), byte.min(self.frame_text.as_ref().len()));
+        let destination = floor_frame_char_boundary(&self.frame_text, byte.min(self.frame_text.len()));
         self.collapse_selection(destination);
     }
 
@@ -886,11 +907,14 @@ impl Editor {
     pub fn set_cursor_line_column(&mut self, line: usize, column: usize) {
         let line = line.min(self.frame_text.line_of_byte(self.frame_text.len()));
         let start = self.frame_text.byte_of_line(line);
-        let raw_end = self.frame_text.byte_of_line(line.saturating_add(1));
-        let line = self.frame_text.slice(start..raw_end);
-        let content_len = line.len().saturating_sub(usize::from(line.as_bytes().last() == Some(&b'\n')));
-        let relative = line[..content_len].char_indices().nth(column).map_or(content_len, |(byte, _)| byte);
-        self.set_cursor(start.saturating_add(relative));
+        let destination = self
+            .position_index
+            .get_mut()
+            .line(self.frame_text.store(), line)
+            .ok()
+            .and_then(|index| index.scalar_to_byte(column).ok())
+            .map_or_else(|| frame_nth_character_or_end(&self.frame_text, start, frame_line_end(&self.frame_text, start), column), |byte| start + byte);
+        self.set_cursor(destination);
     }
 
     /// Pre-fault the synchronous single-key navigation path before the first
@@ -913,9 +937,8 @@ impl Editor {
     }
 
     pub fn set_selection_range(&mut self, range: Range<usize>) {
-        let text = self.frame_text.as_ref();
-        let start = floor_char_boundary(text, range.start.min(text.len()));
-        let end = floor_char_boundary(text, range.end.min(text.len()).max(start));
+        let start = floor_frame_char_boundary(&self.frame_text, range.start.min(self.frame_text.len()));
+        let end = floor_frame_char_boundary(&self.frame_text, range.end.min(self.frame_text.len()).max(start));
         self.set_primary_selection(start, end);
     }
 
@@ -926,9 +949,8 @@ impl Editor {
         self.cancel_pending();
         self.visual_region_history.clear();
         self.mode = Mode::Visual;
-        let text = self.frame_text.as_ref();
-        let anchor = floor_char_boundary(text, anchor.min(text.len()));
-        let head = floor_char_boundary(text, head.min(text.len()));
+        let anchor = floor_frame_char_boundary(&self.frame_text, anchor.min(self.frame_text.len()));
+        let head = floor_frame_char_boundary(&self.frame_text, head.min(self.frame_text.len()));
         self.set_primary_selection(anchor, head);
     }
 
@@ -1123,15 +1145,15 @@ impl Editor {
 
     #[must_use]
     pub fn selection_byte_range(&self) -> Range<usize> {
-        let text = self.frame_text.as_ref();
         let Some(selection) = self.selections.ranges.get(self.selections.primary) else {
             return 0..0;
         };
         if self.mode == Mode::VisualLine {
-            line_start(text, selection.anchor.min(selection.head))..line_end_with_newline(text, selection.anchor.max(selection.head))
+            frame_line_start(&self.frame_text, selection.anchor.min(selection.head))
+                ..frame_line_end_with_newline(&self.frame_text, selection.anchor.max(selection.head))
         } else if self.mode == Mode::Visual {
             let start = selection.anchor.min(selection.head);
-            let end = next_char_boundary(text, selection.anchor.max(selection.head));
+            let end = self.frame_text.next_char_boundary(selection.anchor.max(selection.head));
             start..end
         } else {
             selection.head..selection.head
@@ -1169,10 +1191,15 @@ impl Editor {
             return self.replace_insert_text(text);
         }
         let cursor = self.primary_cursor();
-        let transaction = Transaction::new(self.revision, vec![Edit::new(cursor..cursor, text.to_owned())])?;
+        let transaction = RealtimeEditBatch::single(cursor..cursor, text).into_transaction(self.revision)?;
         self.insert_capture.push_str(text);
         self.apply_recorded(transaction.clone(), true)?;
         Ok(Some(transaction))
+    }
+
+    fn insert_character(&mut self, character: char) -> Result<Option<Transaction>, EngineError> {
+        let mut encoded = [0_u8; char::MAX_LEN_UTF8];
+        self.insert_text(character.encode_utf8(&mut encoded))
     }
 
     pub fn apply_transaction(&mut self, transaction: Transaction) -> Result<(), EngineError> {
@@ -1229,7 +1256,7 @@ impl Editor {
             return Ok(None);
         }
         let compiled = self.compile_search_pattern(pattern, CaseOverride::Default)?;
-        Ok(find_search_from(&compiled, &self.contents(), direction, cursor))
+        Ok(find_search_in_frame_windows(&compiled, &self.frame_text, direction, cursor))
     }
 
     #[must_use]
@@ -1270,7 +1297,7 @@ impl Editor {
     }
 
     fn move_to_search_match(&mut self, direction: SearchDirection) -> bool {
-        let byte = self.state.search.as_ref().and_then(|search| search.find_from(&self.contents(), self.revision, direction, self.primary_cursor()));
+        let byte = self.state.search.as_ref().and_then(|search| search.find_from_frame(&self.frame_text, self.revision, direction, self.primary_cursor()));
         let Some(byte) = byte else {
             return false;
         };
@@ -1287,10 +1314,10 @@ impl Editor {
     }
 
     #[cfg(test)]
-    fn search_scan_counts(&self) -> (usize, usize) {
-        self.state.search.as_ref().map_or((0, 0), |search| {
+    fn search_scan_count(&self) -> usize {
+        self.state.search.as_ref().map_or(0, |search| {
             let cache = search.cache.borrow();
-            (cache.window_scans, cache.full_scans)
+            cache.window_scans
         })
     }
 
@@ -1303,13 +1330,12 @@ impl Editor {
             KeyCode::Char(character) if key.modifiers.is_empty() && self.smart_indent && matches!(character, '}' | ']' | ')') => {
                 self.insert_smart_closing_delimiter(character)
             }
-            KeyCode::Char(character) if key.modifiers.is_empty() => self.insert_text(&character.to_string()),
+            KeyCode::Char(character) if key.modifiers.is_empty() => self.insert_character(character),
             KeyCode::Enter => {
-                let text = self.contents();
                 let cursor = self.primary_cursor();
-                let start = line_start(&text, cursor);
-                let mut indent: String = text[start..line_end(&text, start)].chars().take_while(|character| matches!(character, ' ' | '\t')).collect();
-                if self.smart_indent && text[start..cursor].trim_end().ends_with(['{', '[', '(']) {
+                let start = frame_line_start(&self.frame_text, cursor);
+                let mut indent = frame_line_indentation(&self.frame_text, start);
+                if self.smart_indent && frame_prefix_ends_with_open_delimiter(&self.frame_text, start, cursor) {
                     indent.push_str(&" ".repeat(self.shift_width));
                 }
                 self.insert_text(&format!("\n{indent}"))
@@ -1336,33 +1362,39 @@ impl Editor {
             }
             KeyCode::Char('w') if key.modifiers == Modifiers::CONTROL => {
                 let cursor = self.primary_cursor();
-                let start = Self::motion_destination(self.frame_text.as_ref(), cursor, Motion::WordBackward, 1);
+                let start = frame_motion_destination(&self.frame_text, cursor, Motion::WordBackward, 1);
                 self.delete_insert_range(start, cursor)
             }
             KeyCode::Char('u') if key.modifiers == Modifiers::CONTROL => {
                 let cursor = self.primary_cursor();
-                let text = self.contents();
-                self.delete_insert_range(line_start(&text, cursor), cursor)
+                self.delete_insert_range(frame_line_start(&self.frame_text, cursor), cursor)
             }
             _ => Ok(None),
         }
     }
 
     fn insert_smart_closing_delimiter(&mut self, character: char) -> Result<Option<Transaction>, EngineError> {
-        let text = self.contents();
         let cursor = self.primary_cursor();
-        let start = line_start(&text, cursor);
-        let prefix = &text[start..cursor];
-        if !prefix.chars().all(|character| matches!(character, ' ' | '\t')) {
-            return self.insert_text(&character.to_string());
+        let start = frame_line_start(&self.frame_text, cursor);
+        if !frame_prefix_is_indentation(&self.frame_text, start, cursor) {
+            return self.insert_character(character);
         }
-        let remove_start = if prefix.ends_with('\t') {
-            previous_char_boundary(&text, cursor)
+        let remove_start = if self.frame_text.character_at(self.frame_text.previous_char_boundary(cursor)) == Some('\t') {
+            self.frame_text.previous_char_boundary(cursor)
         } else {
-            let spaces = prefix.as_bytes().iter().rev().take(self.shift_width).take_while(|byte| **byte == b' ').count();
-            cursor.saturating_sub(spaces)
+            let mut remove_start = cursor;
+            for _ in 0..self.shift_width {
+                let previous = self.frame_text.previous_char_boundary(remove_start);
+                if previous == remove_start || self.frame_text.character_at(previous) != Some(' ') {
+                    break;
+                }
+                remove_start = previous;
+            }
+            remove_start
         };
-        let transaction = Transaction::new(self.revision, vec![Edit::new(remove_start..cursor, character.to_string())])?;
+        let mut encoded = [0_u8; char::MAX_LEN_UTF8];
+        let inserted: &str = character.encode_utf8(&mut encoded);
+        let transaction = RealtimeEditBatch::single(remove_start..cursor, inserted).into_transaction(self.revision)?;
         self.apply_recorded(transaction.clone(), true)?;
         self.insert_capture.push(character);
         Ok(Some(transaction))
@@ -1431,7 +1463,7 @@ impl Editor {
                 let Some(anchor) = self.state.marks.get(&target).copied() else {
                     return Ok(TransactionBatch::new());
                 };
-                let destination = if linewise { first_non_blank(self.frame_text.as_ref(), anchor.byte) } else { anchor.byte };
+                let destination = if linewise { frame_first_non_blank(&self.frame_text, anchor.byte) } else { anchor.byte };
                 if destination != self.primary_cursor() {
                     self.jumps.push(self.primary_cursor());
                 }
@@ -1445,18 +1477,11 @@ impl Editor {
         self.ensure_writable()?;
         let destination = match style {
             InsertStyle::Append => {
-                let text = self.contents();
                 let cursor = self.primary_cursor();
-                (cursor < line_end(&text, cursor)).then(|| next_char_boundary(&text, cursor))
+                (cursor < frame_line_end(&self.frame_text, cursor)).then(|| self.frame_text.next_char_boundary(cursor))
             }
-            InsertStyle::LineStart => {
-                let text = self.contents();
-                Some(first_non_blank(&text, self.primary_cursor()))
-            }
-            InsertStyle::LineEnd => {
-                let text = self.contents();
-                Some(line_end(&text, self.primary_cursor()))
-            }
+            InsertStyle::LineStart => Some(frame_first_non_blank(&self.frame_text, self.primary_cursor())),
+            InsertStyle::LineEnd => Some(frame_line_end(&self.frame_text, self.primary_cursor())),
             _ => None,
         };
         if let Some(destination) = destination {
@@ -1537,9 +1562,8 @@ impl Editor {
     fn leave_insert(&mut self) {
         self.mode = Mode::Normal;
         if !self.insert_capture.is_empty() {
-            let text = self.contents();
             let cursor = self.primary_cursor();
-            let destination = previous_char_boundary(&text, cursor).max(line_start(&text, cursor));
+            let destination = self.frame_text.previous_char_boundary(cursor).max(frame_line_start(&self.frame_text, cursor));
             self.collapse_selection(destination);
             if let Some(group) = &mut self.insert_group {
                 group.after = self.selections.clone();
@@ -1597,19 +1621,16 @@ impl Editor {
     fn invert_transaction(&self, transaction: &Transaction) -> Result<Transaction, EngineError> {
         let text = self.frame_text.store();
         let text_len = text.len_bytes();
-        let deleted = transaction
-            .edits()
-            .iter()
-            .map(|edit| {
-                if edit.range.end > text_len {
-                    return Err(TransactionError::OutOfBounds { offset: edit.range.end, len: text_len });
-                }
-                [edit.range.start, edit.range.end]
-                    .into_iter()
-                    .try_for_each(|offset| text.is_char_boundary(offset).then_some(()).ok_or(TransactionError::NotCharBoundary { offset }))?;
-                Ok(text.slice(edit.range.clone()).into_owned().into_boxed_str())
-            })
-            .collect::<Result<Vec<_>, TransactionError>>()?;
+        let mut deleted = SmallVec::<[Box<str>; 1]>::new();
+        for edit in transaction.edits() {
+            if edit.range.end > text_len {
+                return Err(TransactionError::OutOfBounds { offset: edit.range.end, len: text_len }.into());
+            }
+            [edit.range.start, edit.range.end]
+                .into_iter()
+                .try_for_each(|offset| text.is_char_boundary(offset).then_some(()).ok_or(TransactionError::NotCharBoundary { offset }))?;
+            deleted.push(text.slice(edit.range.clone()).into_owned().into_boxed_str());
+        }
         transaction.invert(&deleted).map_err(Into::into)
     }
 
@@ -1621,8 +1642,20 @@ impl Editor {
             search.map_literal_cache_through(transaction, &frame_text, revision);
         }
         self.frame_text = frame_text;
+        self.position_index.get_mut().invalidate_transaction(self.frame_text.store(), transaction);
         self.refresh_dirty();
-        self.selections = self.selections.map_through(transaction)?;
+        if self.selections.ranges.len() == 1 {
+            let range = &mut self.selections.ranges[0];
+            let (anchor_bias, head_bias) = match range.anchor.cmp(&range.head) {
+                std::cmp::Ordering::Less => (Bias::Left, Bias::Right),
+                std::cmp::Ordering::Greater => (Bias::Right, Bias::Left),
+                std::cmp::Ordering::Equal => (Bias::Right, Bias::Right),
+            };
+            range.anchor = transaction.map_offset(range.anchor, anchor_bias)?;
+            range.head = transaction.map_offset(range.head, head_bias)?;
+        } else {
+            self.selections = self.selections.map_through(transaction)?;
+        }
         for anchor in self.state.marks.values_mut() {
             *anchor = (*anchor).map_through(transaction)?;
         }
@@ -1661,16 +1694,15 @@ impl Editor {
         if inserted.is_empty() {
             return Ok(None);
         }
-        let text = self.contents();
         let cursor = self.primary_cursor();
         let mut end = cursor;
         if !inserted.contains('\n') {
             for _ in inserted.chars() {
-                if end >= text.len() {
+                if end >= self.frame_text.len() {
                     break;
                 }
-                let next = next_char_boundary(&text, end);
-                if text.as_bytes().get(end) == Some(&b'\n') {
+                let next = self.frame_text.next_char_boundary(end);
+                if self.frame_text.character_at(end) == Some('\n') {
                     break;
                 }
                 end = next;
@@ -1713,8 +1745,7 @@ impl Editor {
 
     fn delete_insert_forward(&mut self) -> Result<Option<Transaction>, EngineError> {
         let cursor = self.primary_cursor();
-        let text = self.contents();
-        self.delete_insert_range(cursor, next_char_boundary(&text, cursor))
+        self.delete_insert_range(cursor, self.frame_text.next_char_boundary(cursor))
     }
 
     fn delete_insert_range(&mut self, start: usize, end: usize) -> Result<Option<Transaction>, EngineError> {
@@ -1727,18 +1758,18 @@ impl Editor {
     }
 
     fn open_line(&mut self, above: bool) -> Result<Option<Transaction>, EngineError> {
-        let text = self.contents();
         let cursor = self.primary_cursor();
-        let start = line_start(&text, cursor);
-        let end = line_end(&text, cursor);
-        let mut indent: String = text[start..end].chars().take_while(|character| character.is_whitespace()).collect();
-        if !above && self.smart_indent && text[start..end].trim_end().ends_with(['{', '[', '(']) {
+        let start = frame_line_start(&self.frame_text, cursor);
+        let end = frame_line_end(&self.frame_text, cursor);
+        let mut indent = frame_line_indentation(&self.frame_text, start);
+        if !above && self.smart_indent && frame_prefix_ends_with_open_delimiter(&self.frame_text, start, end) {
             indent.push_str(&" ".repeat(self.shift_width));
         }
         let (position, inserted, destination, style) = if above {
             (start, format!("{indent}\n"), start, InsertStyle::OpenAbove)
-        } else if end < text.len() {
-            (end + 1, format!("{indent}\n"), end + 1, InsertStyle::OpenBelow)
+        } else if end < self.frame_text.len() {
+            let next = self.frame_text.next_char_boundary(end);
+            (next, format!("{indent}\n"), next, InsertStyle::OpenBelow)
         } else {
             (end, format!("\n{indent}"), end + 1, InsertStyle::OpenBelow)
         };
@@ -1845,41 +1876,40 @@ impl Editor {
     }
 
     fn delete_chars(&mut self, backward: bool, count: u32, register: Option<Register>) -> Result<Option<Transaction>, EngineError> {
-        let text = self.contents();
         let cursor = self.primary_cursor();
         let mut edge = cursor;
         for _ in 0..count {
             edge = if backward {
-                previous_char_boundary(&text, edge)
+                self.frame_text.previous_char_boundary(edge)
             } else {
-                let next = next_char_boundary(&text, edge);
-                if text[edge..next].contains('\n') { edge } else { next }
+                let next = self.frame_text.next_char_boundary(edge);
+                if self.frame_text.character_at(edge) == Some('\n') { edge } else { next }
             };
         }
         let range = edge.min(cursor)..edge.max(cursor);
         if range.is_empty() {
             return Ok(None);
         }
-        self.write_delete_register(register, &text[range.clone()], false);
+        let deleted = self.frame_text.slice(range.clone()).into_owned();
+        self.write_delete_register(register, &deleted, false);
         let transaction = Transaction::new(self.revision, vec![Edit::new(range, "")])?;
         self.apply_recorded(transaction.clone(), false)?;
         Ok(Some(transaction))
     }
 
     fn join_lines(&mut self, count: u32) -> Result<Option<Transaction>, EngineError> {
-        let text = self.contents();
-        let mut position = line_end(&text, self.primary_cursor());
+        let mut position = frame_line_end(&self.frame_text, self.primary_cursor());
         let mut edits = Vec::new();
         for _ in 0..count.max(1) {
-            if position >= text.len() || text.as_bytes().get(position) != Some(&b'\n') {
+            if position >= self.frame_text.len() || self.frame_text.character_at(position) != Some('\n') {
                 break;
             }
-            let mut end = position + 1;
-            while end < text.len() && matches!(text.as_bytes()[end], b' ' | b'\t') {
-                end += 1;
+            let mut end = self.frame_text.next_char_boundary(position);
+            while end < self.frame_text.len() && matches!(self.frame_text.character_at(end), Some(' ' | '\t')) {
+                end = self.frame_text.next_char_boundary(end);
             }
             edits.push(Edit::new(position..end, " "));
-            position = line_end(&text, end);
+            position = frame_line_end(&self.frame_text, end);
         }
         if edits.is_empty() {
             return Ok(None);
@@ -1892,13 +1922,12 @@ impl Editor {
     }
 
     fn replace_chars(&mut self, character: char, count: u32) -> Result<Option<Transaction>, EngineError> {
-        let text = self.contents();
         let start = self.primary_cursor();
         let mut end = start;
         let mut replaced = 0;
-        while replaced < count && end < text.len() {
-            let next = next_char_boundary(&text, end);
-            if text[end..next].contains('\n') {
+        while replaced < count && end < self.frame_text.len() {
+            let next = self.frame_text.next_char_boundary(end);
+            if self.frame_text.character_at(end) == Some('\n') {
                 break;
             }
             end = next;
@@ -1916,15 +1945,14 @@ impl Editor {
 
     fn toggle_case(&mut self, count: u32) -> Result<Option<Transaction>, EngineError> {
         self.ensure_writable()?;
-        let text = self.contents();
         let mut cursor = self.primary_cursor();
         let mut edits = Vec::new();
         for _ in 0..count {
-            if cursor >= text.len() {
+            if cursor >= self.frame_text.len() {
                 break;
             }
-            let next = next_char_boundary(&text, cursor);
-            let Some(character) = text[cursor..next].chars().next() else {
+            let next = self.frame_text.next_char_boundary(cursor);
+            let Some(character) = self.frame_text.character_at(cursor) else {
                 break;
             };
             if character == '\n' {
@@ -1940,7 +1968,7 @@ impl Editor {
         }
         let transaction = Transaction::new(self.revision, edits)?;
         self.apply_recorded(transaction.clone(), false)?;
-        let destination = normal_cursor_destination(&self.contents(), cursor);
+        let destination = frame_normal_cursor_destination(&self.frame_text, cursor);
         self.finish_recorded_edit(destination);
         Ok(Some(transaction))
     }
@@ -1949,26 +1977,24 @@ impl Editor {
         let Some(value) = self.read_register(register).cloned() else {
             return Ok(None);
         };
-        let text = self.contents();
         let cursor = self.primary_cursor();
         let position = if value.linewise {
-            if before { line_start(&text, cursor) } else { line_end_with_newline(&text, cursor) }
+            if before { frame_line_start(&self.frame_text, cursor) } else { frame_line_end_with_newline(&self.frame_text, cursor) }
         } else if before {
             cursor
         } else {
-            next_char_boundary(&text, cursor).min(line_end(&text, cursor))
+            self.frame_text.next_char_boundary(cursor).min(frame_line_end(&self.frame_text, cursor))
         };
         let inserted = value.text.repeat(usize::try_from(count).unwrap_or(1));
         let inserted_len = inserted.len();
         let transaction = Transaction::new(self.revision, vec![Edit::new(position..position, inserted)])?;
         self.apply_recorded(transaction.clone(), false)?;
-        let new_text = self.contents();
         let destination = if value.linewise {
-            first_non_blank(&new_text, position)
+            frame_first_non_blank(&self.frame_text, position)
         } else if inserted_len == 0 {
             position
         } else {
-            previous_char_boundary(&new_text, position.saturating_add(inserted_len))
+            self.frame_text.previous_char_boundary(position.saturating_add(inserted_len))
         };
         self.finish_recorded_edit(destination);
         Ok(Some(transaction))
@@ -1997,13 +2023,12 @@ impl Editor {
                         let transaction = self.repeated_insert(*style, text)?;
                         self.apply_recorded(transaction.clone(), false)?;
                         if let Some(edit) = transaction.edits().first() {
-                            let current = self.contents();
                             let destination = match style {
                                 InsertStyle::OpenAbove | InsertStyle::OpenBelow => {
                                     let content_start = edit.range.start + usize::from(edit.insert.starts_with('\n'));
-                                    first_non_blank(&current, content_start)
+                                    frame_first_non_blank(&self.frame_text, content_start)
                                 }
-                                _ => previous_char_boundary(&current, edit.range.start.saturating_add(edit.insert.len())),
+                                _ => self.frame_text.previous_char_boundary(edit.range.start.saturating_add(edit.insert.len())),
                             };
                             self.collapse_selection(destination);
                             if let Some(group) = self.state.undo.last_mut() {
@@ -2033,35 +2058,33 @@ impl Editor {
     }
 
     fn position_for_insert(&mut self, style: InsertStyle) {
-        let text = self.contents();
         let cursor = self.primary_cursor();
         let destination = match style {
             InsertStyle::Insert | InsertStyle::Replace => cursor,
-            InsertStyle::Append => next_char_boundary(&text, cursor).min(line_end(&text, cursor)),
-            InsertStyle::LineStart => first_non_blank(&text, cursor),
-            InsertStyle::LineEnd => line_end(&text, cursor),
-            InsertStyle::OpenAbove => line_start(&text, cursor),
-            InsertStyle::OpenBelow => line_end_with_newline(&text, cursor),
+            InsertStyle::Append => self.frame_text.next_char_boundary(cursor).min(frame_line_end(&self.frame_text, cursor)),
+            InsertStyle::LineStart => frame_first_non_blank(&self.frame_text, cursor),
+            InsertStyle::LineEnd => frame_line_end(&self.frame_text, cursor),
+            InsertStyle::OpenAbove => frame_line_start(&self.frame_text, cursor),
+            InsertStyle::OpenBelow => frame_line_end_with_newline(&self.frame_text, cursor),
         };
         self.collapse_selection(destination);
     }
 
     fn repeated_insert(&mut self, style: InsertStyle, inserted: &str) -> Result<Transaction, EngineError> {
-        let text = self.contents();
         let cursor = self.primary_cursor();
         let (position, content) = match style {
-            InsertStyle::OpenAbove => (line_start(&text, cursor), format!("{inserted}\n")),
+            InsertStyle::OpenAbove => (frame_line_start(&self.frame_text, cursor), format!("{inserted}\n")),
             InsertStyle::OpenBelow => {
-                let end = line_end(&text, cursor);
-                if end < text.len() { (end + 1, format!("{inserted}\n")) } else { (end, format!("\n{inserted}")) }
+                let end = frame_line_end(&self.frame_text, cursor);
+                if end < self.frame_text.len() { (self.frame_text.next_char_boundary(end), format!("{inserted}\n")) } else { (end, format!("\n{inserted}")) }
             }
             InsertStyle::Replace => {
                 let mut end = cursor;
                 for _ in inserted.chars() {
-                    if end >= text.len() || text.as_bytes().get(end) == Some(&b'\n') {
+                    if end >= self.frame_text.len() || self.frame_text.character_at(end) == Some('\n') {
                         break;
                     }
-                    end = next_char_boundary(&text, end);
+                    end = self.frame_text.next_char_boundary(end);
                 }
                 return Ok(Transaction::new(self.revision, vec![Edit::new(cursor..end, inserted.to_owned())])?);
             }
@@ -2082,17 +2105,21 @@ impl Editor {
         if motion == Motion::DocumentEnd {
             self.document_end_destination()
         } else {
-            let text = self.frame_text.as_ref();
-            normal_cursor_destination(text, Self::motion_destination(text, self.primary_cursor(), motion, count))
+            frame_normal_cursor_destination(&self.frame_text, frame_motion_destination(&self.frame_text, self.primary_cursor(), motion, count))
         }
     }
 
     fn document_end_destination(&self) -> usize {
         let start = self.frame_text.byte_of_line(self.frame_text.line_of_byte(self.frame_text.len()));
-        let tail = self.frame_text.slice(start..self.frame_text.len());
-        let offset = tail.char_indices().find(|(_, character)| !matches!(character, ' ' | '\t')).map_or(tail.len(), |(offset, _)| offset);
-        let offset = if offset == tail.len() && !tail.is_empty() { previous_char_boundary(&tail, offset) } else { offset };
-        start.saturating_add(offset)
+        let end = self.frame_text.len();
+        let mut cursor = self.frame_text.cursor(start);
+        while cursor.byte() < end {
+            let position = cursor.byte();
+            if !matches!(cursor.next(), Some(' ' | '\t')) {
+                return position;
+            }
+        }
+        if end > start { self.frame_text.previous_char_boundary(end) } else { start }
     }
 
     fn motion_destination(text: &str, cursor: usize, motion: Motion, count: u32) -> usize {
@@ -2270,6 +2297,363 @@ fn register_key(register: Option<Register>) -> Option<char> {
     }
 }
 
+fn frame_character_count(text: &FrameText, start: usize, end: usize) -> usize {
+    let mut cursor = text.cursor(start);
+    let mut count = 0;
+    while cursor.byte() < end && cursor.next().is_some() {
+        count += 1;
+    }
+    count
+}
+
+fn frame_nth_character_or_end(text: &FrameText, start: usize, end: usize, column: usize) -> usize {
+    let mut cursor = text.cursor(start);
+    for _ in 0..column {
+        if cursor.byte() >= end || cursor.next().is_none() {
+            return end;
+        }
+    }
+    cursor.byte().min(end)
+}
+
+fn frame_line_start(text: &FrameText, byte: usize) -> usize {
+    text.byte_of_line(text.line_of_byte(byte.min(text.len())))
+}
+
+fn frame_line_end(text: &FrameText, byte: usize) -> usize {
+    let start = frame_line_start(text, byte);
+    let next = text.byte_of_line(text.line_of_byte(start).saturating_add(1));
+    if next > start && text.character_at(text.previous_char_boundary(next)) == Some('\n') { text.previous_char_boundary(next) } else { next }
+}
+
+fn frame_line_end_with_newline(text: &FrameText, byte: usize) -> usize {
+    let end = frame_line_end(text, byte);
+    if text.character_at(end) == Some('\n') { text.next_char_boundary(end) } else { end }
+}
+
+fn frame_normal_cursor_destination(text: &FrameText, byte: usize) -> usize {
+    let byte = text.floor_char_boundary(byte.min(text.len()));
+    let start = frame_line_start(text, byte);
+    let end = frame_line_end(text, byte);
+    if end > start && byte >= end { text.previous_char_boundary(end) } else { byte }
+}
+
+fn frame_first_non_blank(text: &FrameText, byte: usize) -> usize {
+    let start = frame_line_start(text, byte);
+    let end = frame_line_end(text, byte);
+    let mut cursor = text.cursor(start);
+    while cursor.byte() < end {
+        let position = cursor.byte();
+        if !matches!(cursor.next(), Some(' ' | '\t')) {
+            return position;
+        }
+    }
+    end
+}
+
+fn frame_last_non_blank(text: &FrameText, byte: usize) -> usize {
+    let start = frame_line_start(text, byte);
+    let end = frame_line_end(text, byte);
+    let mut cursor = text.cursor(start);
+    let mut last = start;
+    while cursor.byte() < end {
+        let position = cursor.byte();
+        if !matches!(cursor.next(), Some(' ' | '\t')) {
+            last = position;
+        }
+    }
+    last
+}
+
+fn frame_byte_at_line_column(text: &FrameText, byte: usize, column: usize) -> usize {
+    let start = frame_line_start(text, byte);
+    let end = frame_line_end(text, byte);
+    let destination = frame_nth_character_or_end(text, start, end, column);
+    if destination == end { frame_last_non_blank(text, byte) } else { destination }
+}
+
+fn frame_vertical_motion(text: &FrameText, byte: usize, direction: i8) -> usize {
+    let start = frame_line_start(text, byte);
+    let column = frame_character_count(text, start, byte);
+    let target_start = if direction < 0 {
+        if start == 0 {
+            return byte;
+        }
+        frame_line_start(text, text.previous_char_boundary(start))
+    } else {
+        let next = frame_line_end_with_newline(text, byte);
+        if next >= text.len() {
+            return byte;
+        }
+        next
+    };
+    frame_nth_character_or_end(text, target_start, frame_line_end(text, target_start), column)
+}
+
+fn frame_forward_word(text: &FrameText, byte: usize, big: bool) -> usize {
+    let mut cursor = text.cursor(byte);
+    let Some(first) = cursor.next() else {
+        return cursor.byte();
+    };
+    let class = word_class(first, big);
+    while text.character_at(cursor.byte()).is_some_and(|character| word_class(character, big) == class) {
+        let _ = cursor.next();
+    }
+    while text.character_at(cursor.byte()).is_some_and(char::is_whitespace) {
+        let _ = cursor.next();
+    }
+    cursor.byte()
+}
+
+fn frame_backward_word(text: &FrameText, byte: usize, big: bool) -> usize {
+    let mut cursor = text.previous_char_boundary(byte.min(text.len()));
+    while cursor > 0 && text.character_at(cursor).is_some_and(char::is_whitespace) {
+        cursor = text.previous_char_boundary(cursor);
+    }
+    let class = text.character_at(cursor).map_or(0, |character| word_class(character, big));
+    while cursor > 0 {
+        let previous = text.previous_char_boundary(cursor);
+        if text.character_at(previous).map_or(0, |character| word_class(character, big)) != class {
+            break;
+        }
+        cursor = previous;
+    }
+    cursor
+}
+
+fn frame_end_word(text: &FrameText, byte: usize, big: bool) -> usize {
+    let mut cursor = text.floor_char_boundary(byte.min(text.len()));
+    while text.character_at(cursor).is_some_and(char::is_whitespace) {
+        cursor = text.next_char_boundary(cursor);
+    }
+    let class = text.character_at(cursor).map_or(0, |character| word_class(character, big));
+    while cursor < text.len() {
+        let next = text.next_char_boundary(cursor);
+        if next >= text.len() || text.character_at(next).map_or(0, |character| word_class(character, big)) != class {
+            return cursor;
+        }
+        cursor = next;
+    }
+    cursor
+}
+
+fn frame_word_end_backward(text: &FrameText, byte: usize) -> usize {
+    let mut cursor = text.previous_char_boundary(byte.min(text.len()));
+    while cursor > 0 && text.character_at(cursor).is_some_and(char::is_whitespace) {
+        cursor = text.previous_char_boundary(cursor);
+    }
+    cursor
+}
+
+fn frame_paragraph_forward(text: &FrameText, byte: usize) -> usize {
+    let mut cursor = text.next_char_boundary(byte.min(text.len()));
+    let mut previous_newline = false;
+    while let Some(character) = text.character_at(cursor) {
+        if character == '\n' && previous_newline {
+            return cursor;
+        }
+        previous_newline = character == '\n';
+        cursor = text.next_char_boundary(cursor);
+    }
+    text.len()
+}
+
+fn frame_paragraph_backward(text: &FrameText, byte: usize) -> usize {
+    let before = frame_line_start(text, byte.min(text.len()));
+    let mut cursor = 0;
+    let mut previous_newline = false;
+    let mut boundary = None;
+    while cursor < before.saturating_sub(1) {
+        let Some(character) = text.character_at(cursor) else {
+            break;
+        };
+        if character == '\n' && previous_newline {
+            boundary = Some(text.next_char_boundary(cursor));
+        }
+        previous_newline = character == '\n';
+        cursor = text.next_char_boundary(cursor);
+    }
+    let mut cursor = boundary.unwrap_or(0);
+    while cursor < before && text.character_at(cursor) == Some('\n') {
+        cursor = text.next_char_boundary(cursor);
+    }
+    cursor
+}
+
+fn frame_matching_pair(text: &FrameText, byte: usize) -> usize {
+    let line_end = frame_line_end(text, byte);
+    let mut cursor = text.cursor(byte.min(text.len()));
+    let mut candidate = None;
+    while cursor.byte() < line_end {
+        let position = cursor.byte();
+        let Some(character) = cursor.next() else {
+            break;
+        };
+        if matches!(character, '(' | ')' | '[' | ']' | '{' | '}') {
+            candidate = Some((position, character));
+            break;
+        }
+    }
+    let Some((origin, character)) = candidate else {
+        return byte;
+    };
+    let (open, close, forward) = match character {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return byte,
+    };
+    let mut depth = 0_u32;
+    if forward {
+        let mut cursor = text.cursor(origin);
+        while let Some(current) = cursor.next() {
+            if current == open {
+                depth = depth.saturating_add(1);
+            } else if current == close {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return text.previous_char_boundary(cursor.byte());
+                }
+            }
+        }
+    } else {
+        let mut cursor = origin;
+        loop {
+            let Some(current) = text.character_at(cursor) else {
+                break;
+            };
+            if current == close {
+                depth = depth.saturating_add(1);
+            } else if current == open {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            if cursor == 0 {
+                break;
+            }
+            cursor = text.previous_char_boundary(cursor);
+        }
+    }
+    byte
+}
+
+fn frame_find_on_line(text: &FrameText, byte: usize, needle: char, forward: bool) -> usize {
+    let start = frame_line_start(text, byte);
+    let end = frame_line_end(text, byte);
+    if forward {
+        let mut cursor = text.cursor(text.next_char_boundary(byte).min(end));
+        while cursor.byte() < end {
+            let position = cursor.byte();
+            if cursor.next() == Some(needle) {
+                return position;
+            }
+        }
+    } else {
+        let mut cursor = text.floor_char_boundary(byte);
+        while cursor > start {
+            cursor = text.previous_char_boundary(cursor);
+            if text.character_at(cursor) == Some(needle) {
+                return cursor;
+            }
+        }
+    }
+    byte
+}
+
+fn frame_line_indentation(text: &FrameText, start: usize) -> String {
+    let end = frame_line_end(text, start);
+    let mut cursor = text.cursor(start);
+    let mut indent = String::new();
+    while cursor.byte() < end {
+        match cursor.next() {
+            Some(character @ (' ' | '\t')) => indent.push(character),
+            _ => break,
+        }
+    }
+    indent
+}
+
+fn frame_prefix_is_indentation(text: &FrameText, start: usize, end: usize) -> bool {
+    let mut cursor = text.cursor(start);
+    while cursor.byte() < end {
+        if !matches!(cursor.next(), Some(' ' | '\t')) {
+            return false;
+        }
+    }
+    true
+}
+
+fn frame_prefix_ends_with_open_delimiter(text: &FrameText, start: usize, end: usize) -> bool {
+    let mut cursor = text.floor_char_boundary(end);
+    while cursor > start {
+        cursor = text.previous_char_boundary(cursor);
+        match text.character_at(cursor) {
+            Some(' ' | '\t') => {}
+            Some(character) => return matches!(character, '{' | '[' | '('),
+            None => return false,
+        }
+    }
+    false
+}
+
+fn frame_motion_destination(text: &FrameText, cursor: usize, motion: Motion, count: u32) -> usize {
+    let mut destination = cursor.min(text.len());
+    if motion == Motion::LineFirstNonBlank {
+        for _ in 1..count.max(1) {
+            destination = frame_vertical_motion(text, destination, 1);
+        }
+        return frame_first_non_blank(text, destination);
+    }
+    if motion == Motion::Column {
+        return frame_byte_at_line_column(text, destination, count.saturating_sub(1) as usize);
+    }
+    for _ in 0..count {
+        destination = match motion {
+            Motion::Left => text.previous_char_boundary(destination).max(frame_line_start(text, destination)),
+            Motion::Right => text.next_char_boundary(destination).min(frame_line_end(text, destination)),
+            Motion::WordBackward | Motion::BigWordBackward => frame_backward_word(text, destination, matches!(motion, Motion::BigWordBackward)),
+            Motion::WordForward | Motion::BigWordForward => frame_forward_word(text, destination, matches!(motion, Motion::BigWordForward)),
+            Motion::WordEnd | Motion::BigWordEnd => frame_end_word(text, destination, matches!(motion, Motion::BigWordEnd)),
+            Motion::WordEndBackward => frame_word_end_backward(text, destination),
+            Motion::LineStart => frame_line_start(text, destination),
+            Motion::FirstNonBlank | Motion::LineFirstNonBlank => frame_first_non_blank(text, destination),
+            Motion::NextLineFirstNonBlank => frame_first_non_blank(text, frame_vertical_motion(text, destination, 1)),
+            Motion::PreviousLineFirstNonBlank => frame_first_non_blank(text, frame_vertical_motion(text, destination, -1)),
+            Motion::LastNonBlank => frame_last_non_blank(text, destination),
+            Motion::Column => frame_byte_at_line_column(text, destination, count.saturating_sub(1) as usize),
+            Motion::LineEnd => frame_line_end(text, destination),
+            Motion::GoToLine => text.byte_of_line(count.saturating_sub(1) as usize),
+            Motion::DocumentEnd => frame_first_non_blank(text, frame_line_start(text, text.len())),
+            Motion::WholeLine => frame_line_end_with_newline(text, destination),
+            Motion::Up => frame_vertical_motion(text, destination, -1),
+            Motion::Down => frame_vertical_motion(text, destination, 1),
+            Motion::Find { character, forward, till } => {
+                let found = frame_find_on_line(text, destination, character, forward);
+                match (till, found.cmp(&destination)) {
+                    (true, std::cmp::Ordering::Greater) => text.previous_char_boundary(found),
+                    (true, std::cmp::Ordering::Less) => text.next_char_boundary(found),
+                    _ => found,
+                }
+            }
+            Motion::ParagraphForward => frame_paragraph_forward(text, destination),
+            Motion::ParagraphBackward => frame_paragraph_backward(text, destination),
+            Motion::MatchPair => frame_matching_pair(text, destination),
+            // Text objects produce an edit range and remain on the explicitly
+            // named cold path until their range builders accept chunk cursors.
+            Motion::Inside(object) | Motion::Around(object) => {
+                let source = text.materialize_for_cold_path();
+                text_object_range(source, destination, object, matches!(motion, Motion::Around(_))).start
+            }
+        };
+    }
+    text.floor_char_boundary(destination.min(text.len()))
+}
+
 fn previous_char_boundary(text: &str, byte: usize) -> usize {
     text[..floor_char_boundary(text, byte)].char_indices().next_back().map_or(0, |(index, _)| index)
 }
@@ -2309,13 +2693,6 @@ fn line_end(text: &str, byte: usize) -> usize {
 fn line_end_with_newline(text: &str, byte: usize) -> usize {
     let end = line_end(text, byte);
     if end < text.len() { end + 1 } else { end }
-}
-
-fn normal_cursor_destination(text: &str, byte: usize) -> usize {
-    let byte = floor_char_boundary(text, byte.min(text.len()));
-    let start = line_start(text, byte);
-    let end = line_end(text, byte);
-    if end > start && byte >= end { previous_char_boundary(text, end) } else { byte }
 }
 
 fn first_non_blank(text: &str, byte: usize) -> usize {
@@ -2615,12 +2992,10 @@ fn line_edits(text: &str, range: Range<usize>, indent: bool, shift_width: usize)
 mod tests {
     use std::io::Cursor;
 
-    use wren_text::CropText;
-
     use super::*;
 
     fn editor(source: &str) -> Editor {
-        Editor::new(CropText::from_reader(Cursor::new(source)).expect("load text"))
+        Editor::new(DefaultText::from_reader(Cursor::new(source)).expect("load text"))
     }
 
     fn feed(editor: &mut Editor, keys: &str) {
@@ -2810,12 +3185,12 @@ mod tests {
         let end = cached.text().len_bytes();
         assert_eq!(cached.search_match_ranges(0..end, 16).len(), 2);
         assert_eq!(cached.search_match_ranges(0..end, 16).len(), 2);
-        assert_eq!(cached.search_scan_counts().0, 1);
+        assert_eq!(cached.search_scan_count(), 1);
 
         cached.apply_transaction(Transaction::new(cached.revision(), vec![Edit::new(end..end, "one")]).expect("transaction")).expect("edit");
         let new_end = cached.text().len_bytes();
         assert_eq!(cached.search_match_ranges(0..new_end, 16).len(), 3);
-        assert_eq!(cached.search_scan_counts().0, 1);
+        assert_eq!(cached.search_scan_count(), 1);
 
         let mut crossing = editor("val_ tail");
         crossing.set_search("value_", SearchDirection::Forward).expect("literal search");
@@ -2824,7 +3199,7 @@ mod tests {
         crossing.apply_transaction(Transaction::new(crossing.revision(), vec![Edit::new(3..3, "ue")]).expect("crossing transaction")).expect("crossing edit");
         let end = crossing.text().len_bytes();
         assert_eq!(crossing.search_match_ranges(0..end, 16), vec![0..6]);
-        assert_eq!(crossing.search_scan_counts().0, 1);
+        assert_eq!(crossing.search_scan_count(), 1);
     }
 
     #[test]
@@ -2836,7 +3211,7 @@ mod tests {
         editor.apply_transaction(Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")]).expect("transaction")).expect("edit");
         let end = editor.text().len_bytes();
         assert_eq!(editor.search_match_ranges(0..end, 16).len(), 3);
-        assert_eq!(editor.search_scan_counts().0, 2);
+        assert_eq!(editor.search_scan_count(), 2);
     }
 
     #[test]
@@ -2846,11 +3221,11 @@ mod tests {
         let end = editor.text().len_bytes();
 
         assert_eq!(editor.search_match_ranges(0..end, 1), vec![0..3]);
-        assert_eq!(editor.search_scan_counts().0, 1);
+        assert_eq!(editor.search_scan_count(), 1);
         assert_eq!(editor.search_match_ranges(0..end, 8), vec![0..3, 4..7, 8..11]);
-        assert_eq!(editor.search_scan_counts().0, 2);
+        assert_eq!(editor.search_scan_count(), 2);
         assert_eq!(editor.search_match_ranges(0..end, 2), vec![0..3, 4..7]);
-        assert_eq!(editor.search_scan_counts().0, 2);
+        assert_eq!(editor.search_scan_count(), 2);
     }
 
     #[test]
@@ -2865,19 +3240,16 @@ mod tests {
     }
 
     #[test]
-    fn backward_search_reuses_its_revision_indexed_match_offsets() {
+    fn backward_search_uses_bounded_chunk_windows() {
         let mut editor = editor("one two one three one\n");
         editor.set_cursor(editor.text().len_bytes());
         editor.search("one", SearchDirection::Backward).expect("backward search");
-        assert_eq!(editor.search_scan_counts().1, 1);
         assert!(editor.search_next(false));
         assert!(editor.search_next(false));
-        assert_eq!(editor.search_scan_counts().1, 1);
 
         let end = editor.text().len_bytes();
         editor.apply_transaction(Transaction::new(editor.revision(), vec![Edit::new(end..end, "one")]).expect("transaction")).expect("edit");
         assert!(editor.search_next(false));
-        assert_eq!(editor.search_scan_counts().1, 2);
     }
 
     #[test]
@@ -3071,6 +3443,22 @@ mod tests {
 
         assert_eq!(editor.primary_cursor(), editor.frame_text.len());
         assert!(!editor.frame_text.is_materialized());
+    }
+
+    #[test]
+    fn realtime_motions_edits_and_search_do_not_materialize_the_document() {
+        let source = "alpha 0042 beta (x)\n".repeat(8_192);
+        let mut editor = editor(&source);
+
+        editor.set_cursor(source.find("0042").expect("number"));
+        editor.adjust_number(1).expect("adjust number");
+        feed(&mut editor, "lwje0$fb%k");
+        assert!(editor.search("beta", SearchDirection::Forward).expect("search"));
+        assert!(editor.search_next(false));
+        feed(&mut editor, "iX\u{1b}");
+
+        assert!(!editor.frame_text.is_materialized());
+        assert_eq!(editor.frame_text.materialization_count(), 0);
     }
 
     #[test]

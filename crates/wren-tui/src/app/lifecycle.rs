@@ -26,7 +26,7 @@ impl App {
         let jump_index = client_state.jump_index.filter(|index| *index < jump_history.len());
         let root_workspace = env::current_dir().map(|path| std::fs::canonicalize(&path).unwrap_or(path)).unwrap_or_else(|_| PathBuf::from("."));
         let mutations = MutationWorker::start(&root_workspace)?;
-        mutations.register(document_id, active.editor.frame().text.as_ref().to_owned(), !active.editor.is_dirty())?;
+        mutations.register(document_id, active.editor.frame().text.materialize_for_task().to_string(), !active.editor.is_dirty())?;
         let (theme, theme_message) = load_theme();
         push_message(&mut messages, theme_message);
         let (keymap, keymap_message) = load_keymap();
@@ -48,6 +48,8 @@ impl App {
             provider_submitted: BTreeMap::new(),
             provider_refresh_due: BTreeMap::new(),
             provider_refresh_ranges: BTreeMap::new(),
+            provider_pending_transactions: BTreeMap::new(),
+            provider_resync_required: BTreeSet::new(),
             decorations: BTreeMap::new(),
             semantic_decorations: BTreeMap::new(),
             prompt: None,
@@ -56,9 +58,10 @@ impl App {
             search_highlight: false,
             last_substitute: None,
             substitute_confirmation: None,
+            save_conflict: None,
             message: messages.join("; "),
             debug_messages: Vec::new(),
-            tasks: TaskRunner::new(1, 8)?,
+            tasks: TaskRunner::new(1, wren_scheduling::RuntimeLimits::default().task_slots.saturating_sub(1))?,
             active_task: None,
             next_task_id: 1,
             terminal: None,

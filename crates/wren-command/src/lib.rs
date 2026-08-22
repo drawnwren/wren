@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 #[cfg(any(test, feature = "benchmarking"))]
 use std::time::{Duration, Instant};
 
@@ -127,7 +127,7 @@ struct BarrierState {
 pub struct TaskRunner {
     pool: rayon::ThreadPool,
     results: Receiver<TaskResult>,
-    result_sender: Sender<TaskResult>,
+    result_sender: SyncSender<TaskResult>,
     barriers: Arc<Mutex<BarrierState>>,
     pending: Arc<AtomicUsize>,
     capacity: usize,
@@ -142,15 +142,9 @@ impl TaskRunner {
             .start_handler(|_| wren_scheduling::mark_background())
             .build()
             .map_err(|error| TaskRunnerError::Spawn(error.to_string().into()))?;
-        let (result_sender, results) = mpsc::channel();
-        Ok(Self {
-            pool,
-            results,
-            result_sender,
-            barriers: Arc::new(Mutex::new(BarrierState::default())),
-            pending: Arc::new(AtomicUsize::new(0)),
-            capacity: workers.saturating_add(queue_capacity.max(1)),
-        })
+        let capacity = workers.saturating_add(queue_capacity.max(1));
+        let (result_sender, results) = mpsc::sync_channel(capacity);
+        Ok(Self { pool, results, result_sender, barriers: Arc::new(Mutex::new(BarrierState::default())), pending: Arc::new(AtomicUsize::new(0)), capacity })
     }
 
     pub fn submit(

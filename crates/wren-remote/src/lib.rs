@@ -131,6 +131,8 @@ pub struct OpenSshChannel {
     child: Child,
     input: ChildStdin,
     output: ChildStdout,
+    encoder: wren_proto::FramedEncoder,
+    decoder: wren_proto::FramedDecoder,
 }
 
 #[cfg(any(test, feature = "client"))]
@@ -140,16 +142,22 @@ impl OpenSshChannel {
             Command::new(&spec.executable).args(spec.arguments(lane)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()?;
         let input = child.stdin.take().ok_or_else(|| io::Error::other("ssh stdin unavailable"))?;
         let output = child.stdout.take().ok_or_else(|| io::Error::other("ssh stdout unavailable"))?;
-        Ok(Self { child, input, output })
+        Ok(Self {
+            child,
+            input,
+            output,
+            encoder: wren_proto::FramedEncoder::with_capacity(64 * 1024),
+            decoder: wren_proto::FramedDecoder::with_capacity(64 * 1024),
+        })
     }
 
     pub fn send(&mut self, envelope: &wren_proto::Envelope) -> Result<(), RemoteError> {
-        wren_proto::write_envelope(&mut self.input, envelope, MAX_FRAME_BYTES)?;
+        self.encoder.write(&mut self.input, envelope, MAX_FRAME_BYTES)?;
         Ok(())
     }
 
     pub fn receive(&mut self) -> Result<Option<wren_proto::Envelope>, RemoteError> {
-        Ok(wren_proto::read_envelope(&mut self.output, MAX_FRAME_BYTES)?)
+        Ok(self.decoder.read(&mut self.output, MAX_FRAME_BYTES)?)
     }
 
     fn request<T>(

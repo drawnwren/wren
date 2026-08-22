@@ -4,7 +4,9 @@ mod editor;
 mod search;
 
 use std::borrow::Cow;
+use std::ops::ControlFlow;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use wren_text::{DefaultText, TextStore};
@@ -35,10 +37,22 @@ pub struct FrameText {
     single_line_change: Option<FrameTextChange>,
 }
 
+/// A positionable, allocation-free reader over a [`FrameText`] snapshot.
+///
+/// The cursor deliberately exposes byte positions because transactions and
+/// selections are byte-addressed.  Its character operations cross piece-tree
+/// and rope chunks without requesting a contiguous copy of the document.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameTextCursor<'a> {
+    text: &'a FrameText,
+    byte: usize,
+}
+
 #[derive(Debug)]
 struct FrameSnapshot {
     text: DefaultText,
     materialized: OnceLock<Arc<str>>,
+    materializations: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +66,18 @@ pub struct FrameTextChange {
 
 impl FrameText {
     pub(crate) fn from_store(text: DefaultText) -> Self {
-        Self { snapshot: Arc::new(FrameSnapshot { text, materialized: OnceLock::new() }), previous_snapshot: None, single_line_change: None }
+        Self {
+            snapshot: Arc::new(FrameSnapshot { text, materialized: OnceLock::new(), materializations: AtomicUsize::new(0) }),
+            previous_snapshot: None,
+            single_line_change: None,
+        }
     }
 
     fn following(&self, transaction: &Transaction) -> Self {
         let mut text = self.snapshot.text.clone();
         text.apply(transaction);
         Self {
-            snapshot: Arc::new(FrameSnapshot { text, materialized: OnceLock::new() }),
+            snapshot: Arc::new(FrameSnapshot { text, materialized: OnceLock::new(), materializations: AtomicUsize::new(0) }),
             previous_snapshot: Some(Arc::downgrade(&self.snapshot)),
             single_line_change: self.single_line_change(transaction),
         }
@@ -78,13 +96,13 @@ impl FrameText {
         let [edit] = transaction.edits() else {
             return None;
         };
-        if edit.insert.contains('\n') || self.slice(edit.range.clone()).contains('\n') {
+        if edit.insert.contains('\n') || self.contains_newline(edit.range.clone()) {
             return None;
         }
         let line = self.line_of_byte(edit.range.start);
         let old_start = self.byte_of_line(line);
         let next_line = self.byte_of_line(line.saturating_add(1));
-        let old_end = if next_line > old_start && self.slice(next_line - 1..next_line) == "\n" { next_line - 1 } else { next_line };
+        let old_end = if next_line > old_start && self.character_at(next_line - 1) == Some('\n') { next_line - 1 } else { next_line };
         let new_end = old_end.checked_sub(edit.range.len())?.checked_add(edit.insert.len())?;
         Some(FrameTextChange { line, old_start, old_end, new_start: old_start, new_end })
     }
@@ -104,13 +122,105 @@ impl FrameText {
         self.snapshot.text.is_char_boundary(byte)
     }
 
+    /// Returns a cursor positioned on the preceding character boundary.
+    #[must_use]
+    pub fn cursor(&self, byte: usize) -> FrameTextCursor<'_> {
+        FrameTextCursor { text: self, byte: self.floor_char_boundary(byte) }
+    }
+
+    /// Clamps an offset to the preceding UTF-8 character boundary.
+    #[must_use]
+    pub fn floor_char_boundary(&self, byte: usize) -> usize {
+        let mut byte = byte.min(self.len());
+        while byte > 0 && !self.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        byte
+    }
+
+    /// Returns the boundary immediately following the character at `byte`.
+    #[must_use]
+    pub fn next_char_boundary(&self, byte: usize) -> usize {
+        let byte = self.floor_char_boundary(byte);
+        self.character_at(byte).map_or(byte, |character| byte + character.len_utf8())
+    }
+
+    /// Returns the boundary immediately preceding `byte`.
+    #[must_use]
+    pub fn previous_char_boundary(&self, byte: usize) -> usize {
+        let byte = self.floor_char_boundary(byte);
+        if byte == 0 {
+            return 0;
+        }
+        let mut previous = byte - 1;
+        while previous > 0 && !self.is_char_boundary(previous) {
+            previous -= 1;
+        }
+        previous
+    }
+
+    /// Reads one character without requiring the character to live in a
+    /// contiguous storage segment.
+    #[must_use]
+    pub fn character_at(&self, byte: usize) -> Option<char> {
+        let byte = self.floor_char_boundary(byte);
+        if byte == self.len() {
+            return None;
+        }
+        let mut character = None;
+        let _ = self.visit_chunks(byte..byte.saturating_add(char::MAX_LEN_UTF8), |chunk| {
+            character = chunk.chars().next();
+            ControlFlow::Break(())
+        });
+        character
+    }
+
     #[must_use]
     pub fn slice(&self, range: Range<usize>) -> Cow<'_, str> {
-        self.snapshot.text.slice(range.start.min(self.len())..range.end.min(self.len()).max(range.start.min(self.len())))
+        self.snapshot.text.slice(self.bounded_char_range(range))
+    }
+
+    /// Returns a borrowed range only when the active text backend can provide
+    /// it without copying. Realtime callers should use [`Self::visit_chunks`]
+    /// when a range can cross storage segments.
+    #[must_use]
+    pub fn contiguous(&self, range: Range<usize>) -> Option<&str> {
+        self.snapshot.text.contiguous(self.bounded_char_range(range))
+    }
+
+    /// Visits the storage chunks for a bounded range without materializing the
+    /// document. This is the realtime text-access boundary.
+    pub fn visit_chunks<R>(&self, range: Range<usize>, visit: impl FnMut(&str) -> ControlFlow<R>) -> Option<R> {
+        self.snapshot.text.visit_chunks(self.bounded_char_range(range), visit)
+    }
+
+    fn contains_newline(&self, range: Range<usize>) -> bool {
+        let mut found = false;
+        let _ = self.visit_chunks(range, |chunk| {
+            if chunk.contains('\n') {
+                found = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        found
+    }
+
+    fn bounded_char_range(&self, range: Range<usize>) -> Range<usize> {
+        let start = self.floor_char_boundary(range.start);
+        let mut end = range.end.min(self.len()).max(start);
+        while end > start && !self.is_char_boundary(end) {
+            end -= 1;
+        }
+        start..end
     }
 
     fn materialized(&self) -> &Arc<str> {
-        self.snapshot.materialized.get_or_init(|| Arc::from(self.snapshot.text.slice(0..self.len()).into_owned()))
+        self.snapshot.materialized.get_or_init(|| {
+            self.snapshot.materializations.fetch_add(1, Ordering::Relaxed);
+            Arc::from(self.snapshot.text.slice(0..self.len()).into_owned())
+        })
     }
 
     #[must_use]
@@ -124,8 +234,22 @@ impl FrameText {
     }
 
     #[must_use]
-    pub fn shared(&self) -> Arc<str> {
+    pub fn materialize_for_task(&self) -> Arc<str> {
         Arc::clone(self.materialized())
+    }
+
+    /// Number of complete-document materializations performed for this
+    /// immutable frame. Realtime tests use this to enforce the no-copy path.
+    #[must_use]
+    pub fn materialization_count(&self) -> usize {
+        self.snapshot.materializations.load(Ordering::Relaxed)
+    }
+
+    /// This is intentionally crate-private: editor commands that have not yet
+    /// been ported to chunk cursors must name their cold-path materialization
+    /// explicitly instead of receiving it through `Deref` or `AsRef`.
+    pub(crate) fn materialize_for_cold_path(&self) -> &str {
+        self.materialized()
     }
 
     /// Returns whether both values refer to the same immutable editor
@@ -150,6 +274,37 @@ impl FrameText {
     }
 }
 
+impl FrameTextCursor<'_> {
+    /// Current byte position in the snapshot.
+    #[must_use]
+    pub const fn byte(self) -> usize {
+        self.byte
+    }
+
+    /// Moves to the preceding character boundary and returns the character at
+    /// the new position, if any.
+    pub fn previous(&mut self) -> Option<char> {
+        let previous = self.text.previous_char_boundary(self.byte);
+        if previous == self.byte {
+            return None;
+        }
+        self.byte = previous;
+        self.text.character_at(previous)
+    }
+
+    /// Returns the character at the current position and advances past it.
+    pub fn next(&mut self) -> Option<char> {
+        let character = self.text.character_at(self.byte)?;
+        self.byte += character.len_utf8();
+        Some(character)
+    }
+
+    /// Repositions the cursor on the preceding character boundary.
+    pub fn seek(&mut self, byte: usize) {
+        self.byte = self.text.floor_char_boundary(byte);
+    }
+}
+
 impl PartialEq for FrameText {
     fn eq(&self, other: &Self) -> bool {
         self.snapshot.text.content_eq(&other.snapshot.text)
@@ -157,20 +312,6 @@ impl PartialEq for FrameText {
 }
 
 impl Eq for FrameText {}
-
-impl std::ops::Deref for FrameText {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.materialized()
-    }
-}
-
-impl AsRef<str> for FrameText {
-    fn as_ref(&self) -> &str {
-        self.materialized()
-    }
-}
 
 impl<T: Into<Arc<str>>> From<T> for FrameText {
     fn from(text: T) -> Self {
@@ -201,11 +342,13 @@ mod tests {
         let edited = original.edited(&transaction).expect("edited snapshot");
 
         assert!(!edited.is_materialized());
+        assert_eq!(edited.materialization_count(), 0);
         assert_eq!(edited.slice(6..11), "βeta");
         assert_eq!(edited.byte_of_line(2), 12);
         assert!(!edited.is_materialized());
-        assert_eq!(edited.shared().as_ref(), "alpha\nβeta\ngamma\n");
+        assert_eq!(edited.materialize_for_task().as_ref(), "alpha\nβeta\ngamma\n");
         assert!(edited.is_materialized());
+        assert_eq!(edited.materialization_count(), 1);
     }
 
     #[test]
@@ -235,7 +378,7 @@ mod tests {
         assert!(edited.is_char_boundary(2));
         assert!(!edited.is_char_boundary(1));
         assert_eq!(edited.line_of_byte(8), 1);
-        assert_eq!(edited.shared().as_ref(), "λ one\nβ three\n");
+        assert_eq!(edited.materialize_for_task().as_ref(), "λ one\nβ three\n");
     }
 
     #[test]
@@ -247,6 +390,6 @@ mod tests {
         let restored = edited.edited(&inverse).expect("restored snapshot");
 
         assert!(!restored.same_snapshot(&original));
-        assert_eq!(restored.as_ref(), original.as_ref());
+        assert_eq!(restored.materialize_for_task(), original.materialize_for_task());
     }
 }

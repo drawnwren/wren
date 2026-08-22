@@ -40,11 +40,18 @@ pub(crate) struct RecordStore {
     path: PathBuf,
     magic: &'static [u8; 8],
     writer: Arc<Mutex<Option<File>>>,
+    buffers: Arc<Mutex<RecordBuffers>>,
+}
+
+#[derive(Debug, Default)]
+struct RecordBuffers {
+    records: Vec<u8>,
+    payload: Vec<u8>,
 }
 
 impl RecordStore {
     pub(crate) fn new(store: &'static str, path: impl Into<PathBuf>, magic: &'static [u8; 8]) -> Self {
-        Self { store, path: path.into(), magic, writer: Arc::new(Mutex::new(None)) }
+        Self { store, path: path.into(), magic, writer: Arc::new(Mutex::new(None)), buffers: Arc::new(Mutex::new(RecordBuffers::default())) }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -76,23 +83,34 @@ impl RecordStore {
             options.create(true).append(true).custom_flags(nix::fcntl::OFlag::O_DSYNC.bits());
             *writer = Some(options.open(&self.path).map_err(|error| self.error(error))?);
         }
-        self.write_many(writer.as_mut().ok_or_else(|| self.error(io::Error::other("record writer unavailable")))?, values)
+        let mut buffers = self.buffers.lock();
+        let RecordBuffers { records, payload } = &mut *buffers;
+        let records = self.encode_many(records, payload, values)?;
+        writer.as_mut().ok_or_else(|| self.error(io::Error::other("record writer unavailable")))?.write_all(records).map_err(|error| self.error(error))
     }
 
     /// Serializes independently recoverable records into one write. The caller
     /// chooses the durability frontier after this returns.
     pub(crate) fn write_many<T: Serialize>(&self, writer: &mut impl Write, values: &[T]) -> Result<(), DurableRecordError> {
-        let records = values.iter().try_fold(Vec::new(), |mut records, value| {
-            let payload = serde_json::to_vec(value).map_err(|source| DurableRecordError::Serialization { store: self.store, source })?;
+        let mut records = Vec::new();
+        let mut payload = Vec::new();
+        let records = self.encode_many(&mut records, &mut payload, values)?;
+        writer.write_all(&records).map_err(|error| self.error(error))
+    }
+
+    fn encode_many<'a, T: Serialize>(&self, records: &'a mut Vec<u8>, payload: &mut Vec<u8>, values: &[T]) -> Result<&'a [u8], DurableRecordError> {
+        records.clear();
+        for value in values {
+            payload.clear();
+            serde_json::to_writer(&mut *payload, value).map_err(|source| DurableRecordError::Serialization { store: self.store, source })?;
             let length = u64::try_from(payload.len()).map_err(|_| self.malformed("record length exceeds u64"))?;
             records.reserve(self.magic.len() + LENGTH_LEN + CHECKSUM_LEN + payload.len());
             records.extend_from_slice(self.magic);
             records.extend_from_slice(&length.to_le_bytes());
-            records.extend_from_slice(blake3::hash(&payload).as_bytes());
-            records.extend_from_slice(&payload);
-            Ok::<_, DurableRecordError>(records)
-        })?;
-        writer.write_all(&records).map_err(|error| self.error(error))
+            records.extend_from_slice(blake3::hash(payload).as_bytes());
+            records.extend_from_slice(payload);
+        }
+        Ok(records)
     }
 
     pub(crate) fn recover<T: DeserializeOwned>(&self) -> Result<Vec<T>, DurableRecordError> {

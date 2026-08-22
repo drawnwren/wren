@@ -110,46 +110,89 @@ pub struct RemoteReply {
     pub body: Vec<u8>,
 }
 
-pub fn encode_frame(envelope: &Envelope, limit: usize) -> Result<Vec<u8>, ProtocolError> {
-    envelope.validate()?;
-    let payload = postcard::to_allocvec(envelope).map_err(|error| ProtocolError::Decode(error.to_string()))?;
-    if payload.len() > limit {
-        return Err(ProtocolError::FrameTooLarge { actual: payload.len(), limit });
-    }
-    let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::FrameTooLarge { actual: payload.len(), limit })?;
-    let mut bytes = Vec::with_capacity(payload.len() + 4);
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    Ok(bytes)
+/// Reusable length-delimited control-frame encoder. A connection keeps this
+/// buffer for its lifetime, avoiding one payload allocation plus one framing
+/// allocation for every request.
+#[derive(Debug, Default)]
+pub struct FramedEncoder {
+    bytes: Vec<u8>,
 }
 
-/// Reads one length-delimited envelope. EOF before a new delimiter is a clean
-/// connection close; EOF after any delimiter byte is an I/O error.
+impl FramedEncoder {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { bytes: Vec::with_capacity(capacity.saturating_add(4)) }
+    }
+
+    pub fn encode<'a>(&'a mut self, envelope: &Envelope, limit: usize) -> Result<&'a [u8], ProtocolError> {
+        envelope.validate()?;
+        self.bytes.clear();
+        self.bytes.resize(4, 0);
+        postcard::to_io(envelope, &mut self.bytes).map_err(|error| ProtocolError::Decode(error.to_string()))?;
+        let payload_len = self.bytes.len().saturating_sub(4);
+        if payload_len > limit {
+            return Err(ProtocolError::FrameTooLarge { actual: payload_len, limit });
+        }
+        let length = u32::try_from(payload_len).map_err(|_| ProtocolError::FrameTooLarge { actual: payload_len, limit })?;
+        self.bytes[..4].copy_from_slice(&length.to_be_bytes());
+        Ok(&self.bytes)
+    }
+
+    pub fn write(&mut self, writer: &mut impl Write, envelope: &Envelope, limit: usize) -> Result<(), TransportError> {
+        writer.write_all(self.encode(envelope, limit)?)?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+/// Reusable decoder scratch for a control connection. The configured frame
+/// limit is still enforced before the buffer grows.
+#[derive(Debug, Default)]
+pub struct FramedDecoder {
+    payload: Vec<u8>,
+}
+
+impl FramedDecoder {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self { payload: Vec::with_capacity(capacity) }
+    }
+
+    /// Reads one length-delimited envelope. EOF before a new delimiter is a
+    /// clean connection close; EOF after any delimiter byte is an I/O error.
+    pub fn read(&mut self, reader: &mut impl Read, limit: usize) -> Result<Option<Envelope>, TransportError> {
+        let mut delimiter = [0_u8; 4];
+        let read = reader.read(&mut delimiter)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        reader.read_exact(&mut delimiter[read..])?;
+        let length = u32::from_be_bytes(delimiter) as usize;
+        if length > limit {
+            return Err(ProtocolError::FrameTooLarge { actual: length, limit }.into());
+        }
+        self.payload.resize(length, 0);
+        reader.read_exact(&mut self.payload)?;
+        let (envelope, trailing) = postcard::take_from_bytes::<Envelope>(&self.payload).map_err(|error| ProtocolError::Decode(error.to_string()))?;
+        if !trailing.is_empty() {
+            return Err(ProtocolError::TrailingBytes(trailing.len()).into());
+        }
+        envelope.validate()?;
+        Ok(Some(envelope))
+    }
+}
+
+pub fn encode_frame(envelope: &Envelope, limit: usize) -> Result<Vec<u8>, ProtocolError> {
+    let mut encoder = FramedEncoder::default();
+    Ok(encoder.encode(envelope, limit)?.to_vec())
+}
+
 pub fn read_envelope(reader: &mut impl Read, limit: usize) -> Result<Option<Envelope>, TransportError> {
-    let mut delimiter = [0_u8; 4];
-    let read = reader.read(&mut delimiter)?;
-    if read == 0 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut delimiter[read..])?;
-    let length = u32::from_be_bytes(delimiter) as usize;
-    if length > limit {
-        return Err(ProtocolError::FrameTooLarge { actual: length, limit }.into());
-    }
-    let mut payload = vec![0_u8; length];
-    reader.read_exact(&mut payload)?;
-    let (envelope, trailing) = postcard::take_from_bytes::<Envelope>(&payload).map_err(|error| ProtocolError::Decode(error.to_string()))?;
-    if !trailing.is_empty() {
-        return Err(ProtocolError::TrailingBytes(trailing.len()).into());
-    }
-    envelope.validate()?;
-    Ok(Some(envelope))
+    FramedDecoder::default().read(reader, limit)
 }
 
 pub fn write_envelope(writer: &mut impl Write, envelope: &Envelope, limit: usize) -> Result<(), TransportError> {
-    writer.write_all(&encode_frame(envelope, limit)?)?;
-    writer.flush()?;
-    Ok(())
+    FramedEncoder::default().write(writer, envelope, limit)
 }
 
 #[cfg(test)]

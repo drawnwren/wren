@@ -1,10 +1,11 @@
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata, Permissions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 use thiserror::Error;
+use wren_text::{DefaultText, TextStore};
 pub use wren_types::FileIdentity;
 use wren_types::{DocumentClass, DocumentProfile};
 use xattr::FileExt as _;
@@ -80,12 +81,36 @@ pub struct LocalDocument {
 }
 
 impl LocalDocument {
+    /// Opens an eligible large, UTF-8/LF document with a mapped immutable
+    /// base. Other encodings and line-ending policies stay on the ordinary
+    /// normalized path so saving remains byte-for-byte faithful.
+    pub fn mapped_text_store(&self) -> Result<Option<DefaultText>, SaveError> {
+        const MAPPED_TEXT_THRESHOLD: u64 = 8 * 1024 * 1024;
+        let Some(path) = self.resolved_path.as_ref() else {
+            return Ok(None);
+        };
+        if self.encoding != DocumentEncoding::Utf8 || self.line_endings.iter().any(|ending| *ending != LineEnding::Lf) {
+            return Ok(None);
+        }
+        if !path.exists() {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
+        if metadata.len() < MAPPED_TEXT_THRESHOLD {
+            return Ok(None);
+        }
+        DefaultText::from_mapped_path(path).map(Some).map_err(|source| io_error(path, source))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, OpenedDocument), SaveError> {
         let presentation_path = path.as_ref().to_path_buf();
         let resolved_path = fs::canonicalize(&presentation_path).map_err(|source| io_error(&presentation_path, source))?;
-        let bytes = fs::read(&resolved_path).map_err(|source| io_error(&resolved_path, source))?;
-        let metadata = fs::metadata(&resolved_path).map_err(|source| io_error(&resolved_path, source))?;
-        let stamp = stamp(&metadata, &bytes);
+        // Hash as the document is read. Normal documents still keep their
+        // decoded text for the existing editing contract, while eligible
+        // large documents immediately replace that temporary base with an
+        // mmap-piece store in the TUI.
+        let (metadata, bytes, content_hash) = read_file_streaming(&resolved_path).map_err(|source| io_error(&resolved_path, source))?;
+        let stamp = FileStamp { identity: file_identity(&metadata), content_hash };
         let extended_attributes = read_extended_attributes(&resolved_path).map_err(|source| io_error(&resolved_path, source))?;
         let decoded = decode(&bytes);
         let document = Self {
@@ -178,14 +203,53 @@ impl LocalDocument {
 
     pub fn save(&mut self, text: &str) -> Result<SaveReport, SaveError> {
         let path = self.resolved_path.clone().ok_or(SaveError::NoPath)?;
-        self.save_to_path(&path, text, false)
+        self.save_to_path(&path, text, false, false)
+    }
+
+    /// Streams an eligible mapped editor store into the replacement file. The
+    /// large-file path keeps the file payload out of one contiguous save
+    /// buffer; line-ending conversion remains on the ordinary string path.
+    pub fn save_store(&mut self, text: &DefaultText) -> Result<SaveReport, SaveError> {
+        let path = self.resolved_path.clone().ok_or(SaveError::NoPath)?;
+        self.save_store_to_path(&path, text, false)
     }
 
     pub fn save_as(&mut self, path: impl AsRef<Path>, text: &str) -> Result<SaveReport, SaveError> {
-        self.save_to_path(path.as_ref(), text, true)
+        self.save_to_path(path.as_ref(), text, true, false)
     }
 
-    fn save_to_path(&mut self, requested_path: &Path, text: &str, save_as: bool) -> Result<SaveReport, SaveError> {
+    pub fn save_store_as(&mut self, path: impl AsRef<Path>, text: &DefaultText) -> Result<SaveReport, SaveError> {
+        self.save_store_to_path(path.as_ref(), text, true)
+    }
+
+    /// Explicitly overwrites a document after the caller has shown and
+    /// acknowledged an external-change conflict. Ordinary saves must use
+    /// [`Self::save`], which retains the identity and content preconditions.
+    pub fn save_ours(&mut self, text: &str) -> Result<SaveReport, SaveError> {
+        let path = self.resolved_path.clone().ok_or(SaveError::NoPath)?;
+        self.save_to_path(&path, text, false, true)
+    }
+
+    /// Reads the current on-disk text without changing this document's tracked
+    /// identity. Conflict resolution uses this fresh snapshot as its "theirs"
+    /// side and will still revalidate when it eventually saves.
+    pub fn read_current_text(&self) -> Result<String, SaveError> {
+        let path = self.resolved_path.as_ref().ok_or(SaveError::NoPath)?;
+        let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
+        Ok(decode(&bytes).opened.text)
+    }
+
+    /// Reopens the current resource and adopts its identity, metadata, and
+    /// line-ending policy. This is intentionally an explicit conflict action;
+    /// it never happens as part of a normal save.
+    pub fn reload(&mut self) -> Result<OpenedDocument, SaveError> {
+        let path = self.presentation_path.clone().ok_or(SaveError::NoPath)?;
+        let (document, opened) = Self::open(path)?;
+        *self = document;
+        Ok(opened)
+    }
+
+    fn save_to_path(&mut self, requested_path: &Path, text: &str, save_as: bool, force: bool) -> Result<SaveReport, SaveError> {
         if self.encoding != DocumentEncoding::Utf8 {
             return Err(SaveError::ReadOnly { path: requested_path.to_path_buf(), encoding: self.encoding });
         }
@@ -195,7 +259,9 @@ impl LocalDocument {
         } else {
             requested_path.to_path_buf()
         };
-        self.validate_precondition(&path, save_as)?;
+        if !force {
+            self.validate_precondition(&path, save_as)?;
+        }
         let bytes = self.encode(text);
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut temporary = NamedTempFile::new_in(parent).map_err(|source| io_error(&path, source))?;
@@ -211,7 +277,9 @@ impl LocalDocument {
         // durable file frontier without paying for an intermediate flush.
         temporary.as_file().sync_all().map_err(|source| io_error(&path, source))?;
 
-        self.validate_precondition(&path, save_as)?;
+        if !force {
+            self.validate_precondition(&path, save_as)?;
+        }
         let warning = hard_link_warning(&path).map_err(|source| io_error(&path, source))?;
         temporary.persist(&path).map_err(|error| io_error(&path, error.error))?;
         sync_directory(parent).map_err(|source| io_error(parent, source))?;
@@ -230,6 +298,64 @@ impl LocalDocument {
         Ok(SaveReport { bytes_written: bytes.len(), warning, stamp: new_stamp })
     }
 
+    fn save_store_to_path(&mut self, requested_path: &Path, text: &DefaultText, save_as: bool) -> Result<SaveReport, SaveError> {
+        if self.encoding != DocumentEncoding::Utf8 {
+            return Err(SaveError::ReadOnly { path: requested_path.to_path_buf(), encoding: self.encoding });
+        }
+        if self.line_endings.iter().any(|ending| *ending != LineEnding::Lf) || self.default_line_ending != LineEnding::Lf {
+            return Err(SaveError::Io {
+                path: requested_path.to_path_buf(),
+                source: io::Error::new(io::ErrorKind::Unsupported, "streamed save requires LF line endings"),
+            });
+        }
+        let path = if save_as && requested_path.exists() {
+            fs::canonicalize(requested_path).map_err(|source| io_error(requested_path, source))?
+        } else {
+            requested_path.to_path_buf()
+        };
+        self.validate_precondition(&path, save_as)?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut temporary = NamedTempFile::new_in(parent).map_err(|source| io_error(&path, source))?;
+        if let Some(permissions) = &self.permissions {
+            temporary.as_file().set_permissions(permissions.clone()).map_err(|source| io_error(&path, source))?;
+        }
+        for (name, value) in &self.extended_attributes {
+            temporary.as_file().set_xattr(name, value).map_err(|source| io_error(&path, source))?;
+        }
+        let mut hasher = blake3::Hasher::new();
+        let mut written = 0_usize;
+        let result = text.visit_chunks(0..text.len_bytes(), |chunk| {
+            let write = temporary.write_all(chunk.as_bytes()).map(|()| {
+                hasher.update(chunk.as_bytes());
+                written = written.saturating_add(chunk.len());
+            });
+            match write {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(error) => std::ops::ControlFlow::Break(error),
+            }
+        });
+        if let Some(error) = result {
+            return Err(io_error(&path, error));
+        }
+        temporary.flush().map_err(|source| io_error(&path, source))?;
+        filetime::set_file_handle_times(temporary.as_file(), self.accessed, None).map_err(|source| io_error(&path, source))?;
+        temporary.as_file().sync_all().map_err(|source| io_error(&path, source))?;
+        self.validate_precondition(&path, save_as)?;
+        let warning = hard_link_warning(&path).map_err(|source| io_error(&path, source))?;
+        temporary.persist(&path).map_err(|error| io_error(&path, error.error))?;
+        sync_directory(parent).map_err(|source| io_error(parent, source))?;
+
+        let metadata = fs::metadata(&path).map_err(|source| io_error(&path, source))?;
+        let new_stamp = FileStamp { identity: file_identity(&metadata), content_hash: *hasher.finalize().as_bytes() };
+        self.presentation_path = Some(requested_path.to_path_buf());
+        self.permissions = Some(metadata.permissions());
+        self.accessed = metadata.accessed().ok().map(filetime::FileTime::from_system_time);
+        self.extended_attributes = read_extended_attributes(&path).map_err(|source| io_error(&path, source))?;
+        self.resolved_path = Some(path);
+        self.stamp = Some(new_stamp.clone());
+        Ok(SaveReport { bytes_written: written, warning, stamp: new_stamp })
+    }
+
     fn validate_precondition(&self, path: &Path, save_as: bool) -> Result<(), SaveError> {
         if save_as {
             if path.exists() {
@@ -239,9 +365,8 @@ impl LocalDocument {
         }
         match &self.stamp {
             Some(expected) => {
-                let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
-                let metadata = fs::metadata(path).map_err(|source| io_error(path, source))?;
-                let current = stamp(&metadata, &bytes);
+                let (metadata, _bytes, content_hash) = read_file_streaming(path).map_err(|source| io_error(path, source))?;
+                let current = FileStamp { identity: file_identity(&metadata), content_hash };
                 if current.identity != expected.identity {
                     return Err(SaveError::ExternalChange { path: path.to_path_buf(), reason: "file identity changed".to_owned() });
                 }
@@ -270,6 +395,29 @@ impl LocalDocument {
         }
         encoded
     }
+}
+
+/// Reads a document through a bounded reusable chunk, calculating its content
+/// hash during the read. The returned byte vector is only the compatibility
+/// bridge for decoders that still require a complete normal-document view;
+/// callers that select `MmapPieceText` do not retain it as editor storage.
+fn read_file_streaming(path: &Path) -> io::Result<(Metadata, Vec<u8>, [u8; 32])> {
+    const CHUNK_BYTES: usize = 256 * 1024;
+    let metadata_before = fs::metadata(path)?;
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata_before.len()).unwrap_or(CHUNK_BYTES).min(16 * 1024 * 1024));
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let metadata_after = fs::metadata(path)?;
+    Ok((metadata_after, bytes, *hasher.finalize().as_bytes()))
 }
 
 fn read_extended_attributes(path: &Path) -> io::Result<Vec<(OsString, Vec<u8>)>> {
@@ -458,6 +606,7 @@ mod tests {
     use std::io::Write as _;
 
     use tempfile::tempdir;
+    use wren_types::{DocumentRevision, Edit, Transaction};
 
     use super::*;
 
@@ -475,6 +624,21 @@ mod tests {
     }
 
     #[test]
+    fn mapped_piece_store_saves_without_materializing_a_document_string() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("mapped.txt");
+        fs::write(&path, "alpha\nbeta\ngamma\n").expect("fixture");
+        let (mut document, _) = LocalDocument::open(&path).expect("open");
+        let mut text = DefaultText::from_mapped_path(&path).expect("map source");
+        assert!(text.is_mapped_piece_text());
+        let transaction = Transaction::new(DocumentRevision::new(0), vec![Edit::new(6..10, "BETA")]).expect("valid edit");
+        text.apply(&transaction);
+        let report = document.save_store(&text).expect("stream save");
+        assert_eq!(report.bytes_written, "alpha\nBETA\ngamma\n".len());
+        assert_eq!(fs::read_to_string(&path).expect("read saved text"), "alpha\nBETA\ngamma\n");
+    }
+
+    #[test]
     fn refuses_to_overwrite_external_changes() {
         let directory = tempdir().expect("temporary directory");
         let path = directory.path().join("race.txt");
@@ -483,6 +647,25 @@ mod tests {
         fs::write(&path, "external").expect("external write");
         assert!(matches!(document.save("editor"), Err(SaveError::ExternalChange { .. })));
         assert_eq!(fs::read_to_string(&path).expect("read"), "external");
+    }
+
+    #[test]
+    fn explicit_conflict_actions_can_read_reload_or_take_ours() {
+        let directory = tempdir().expect("temporary directory");
+        let path = directory.path().join("race.txt");
+        fs::write(&path, "base").expect("fixture");
+        let (mut document, _) = LocalDocument::open(&path).expect("open");
+        fs::write(&path, "theirs").expect("external write");
+
+        assert_eq!(document.read_current_text().expect("read theirs"), "theirs");
+        assert!(matches!(document.save("ours"), Err(SaveError::ExternalChange { .. })));
+        document.save_ours("ours").expect("explicit overwrite");
+        assert_eq!(fs::read_to_string(&path).expect("ours written"), "ours");
+
+        fs::write(&path, "new theirs").expect("second external write");
+        let opened = document.reload().expect("reload theirs");
+        assert_eq!(opened.text, "new theirs");
+        document.save(&opened.text).expect("reloaded document saves normally");
     }
 
     #[test]

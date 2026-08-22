@@ -31,14 +31,39 @@ impl App {
         if let Some(wal) = &self.active.wal {
             wal.barrier().context("make recovery WAL durable before save")?;
         }
-        let report = match path {
-            Some(path) => self.active.document.save_as(path, &self.active.editor.contents()),
-            None => self.active.document.save(&self.active.editor.contents()),
-        }?;
+        let streamed = self.active.editor.text().is_mapped_piece_text();
+        let mut materialized = None;
+        let report = if streamed {
+            match path {
+                Some(path) => self.active.document.save_store_as(path, self.active.editor.text()),
+                None => self.active.document.save_store(self.active.editor.text()),
+            }
+        } else {
+            let text = self.active.editor.contents();
+            materialized = Some(text);
+            match path {
+                Some(path) => self.active.document.save_as(path, materialized.as_deref().unwrap_or_default()),
+                None => self.active.document.save(materialized.as_deref().unwrap_or_default()),
+            }
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(wren_session::SaveError::ExternalChange { path: changed, reason }) if path.is_none() => {
+                let ours = materialized.unwrap_or_else(|| self.active.editor.contents());
+                return self.present_save_conflict(changed, reason, ours);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let text = materialized.unwrap_or_else(|| self.active.editor.contents());
+        self.finish_save(report, path.is_some(), text)
+    }
+
+    fn finish_save(&mut self, report: wren_session::SaveReport, save_as: bool, text: String) -> Result<()> {
         self.active.editor.mark_clean();
         self.active.base_hash = report.stamp.content_hash;
+        self.active.base_text = Arc::from(text);
         save_undo_state(&mut self.active)?;
-        if path.is_some() {
+        if save_as {
             if let Some(wal) = &self.active.wal {
                 wal.clear().context("compact old recovery WAL after save-as")?;
             }
@@ -54,6 +79,145 @@ impl App {
             None => format!("{} bytes written", report.bytes_written),
         };
         Ok(())
+    }
+
+    fn present_save_conflict(&mut self, path: PathBuf, reason: String, ours: String) -> Result<()> {
+        let theirs = self.active.document.read_current_text()?;
+        self.save_conflict =
+            Some(SaveConflict { path: path.clone(), base: Arc::clone(&self.active.base_text), ours: Arc::from(ours), theirs: Arc::from(theirs) });
+        self.popup = Some(TextPopup::new(
+            "File changed on disk",
+            format!(
+                "{}\n{}\n\n1  take theirs — discard local edits\n2  take ours — overwrite disk\n3  merge — open a semantic three-way merge pane\n4  replay — take theirs and replay local edits\nEsc  keep editing without resolving",
+                path.display(),
+                reason,
+            ),
+        ));
+        self.popup_deadline = None;
+        self.message = "file changed on disk; choose 1 theirs, 2 ours, 3 merge, or 4 replay".to_owned();
+        Ok(())
+    }
+
+    pub(super) fn handle_save_conflict_key(&mut self, key: TerminalKey) -> Result<bool> {
+        let Some(conflict) = self.save_conflict.clone() else {
+            return Ok(false);
+        };
+        if key.command_modified() {
+            return Ok(true);
+        }
+        match key.code {
+            TerminalKeyCode::Escape | TerminalKeyCode::Char('q' | 'Q') => {
+                self.save_conflict = None;
+                self.close_editor_popup();
+                self.message = "save conflict left unresolved; local edits are still intact".to_owned();
+            }
+            TerminalKeyCode::Char('1') => self.take_theirs(conflict)?,
+            TerminalKeyCode::Char('2') => self.take_ours(conflict)?,
+            TerminalKeyCode::Char('3') => self.open_semantic_merge(conflict)?,
+            TerminalKeyCode::Char('4') => self.replay_ours(conflict)?,
+            _ => self.message = "save conflict: press 1 theirs, 2 ours, 3 merge, 4 replay, or Esc".to_owned(),
+        }
+        Ok(true)
+    }
+
+    fn take_theirs(&mut self, _conflict: SaveConflict) -> Result<()> {
+        let document_id = self.active.document_id;
+        let text = self.active.reload_from_disk()?;
+        self.mutations.register(document_id, text, true)?;
+        if let Some(wal) = &self.active.wal {
+            wal.clear().context("clear recovery WAL after taking disk version")?;
+        }
+        self.decorations.remove(&self.active.buffer_id);
+        self.semantic_decorations.remove(&self.active.buffer_id);
+        self.provider_submitted.remove(&document_id);
+        self.provider_refresh_due.remove(&document_id);
+        self.provider_refresh_ranges.remove(&document_id);
+        self.save_conflict = None;
+        self.close_editor_popup();
+        self.message = "took the current disk version; local edits were discarded".to_owned();
+        self.prime_active_syntax();
+        Ok(())
+    }
+
+    fn take_ours(&mut self, _conflict: SaveConflict) -> Result<()> {
+        let text = self.active.editor.contents();
+        let report = self.active.document.save_ours(&text)?;
+        self.save_conflict = None;
+        self.close_editor_popup();
+        self.finish_save(report, false, text)
+    }
+
+    fn open_semantic_merge(&mut self, conflict: SaveConflict) -> Result<()> {
+        let buffer_id = self.views.add_buffer();
+        let merge_document_id = DocumentId::new(stable_hash(format!("merge:{}:{}", conflict.path.display(), buffer_id.get()).bytes()).max(2));
+        // Open the merge pane first, then derive the merge from the exact
+        // snapshot it tracked. If a writer changes the file during this step,
+        // the next `:write` sees the normal precondition failure rather than
+        // saving a merge made against a stale "theirs" value.
+        let mut merge = BufferState::merge_buffer(buffer_id, merge_document_id, &conflict.path)?;
+        let merged = semantic_three_way_merge(&conflict.base, &conflict.ours, &merge.base_text);
+        merge.editor = BufferState::configured_editor(&merged.text, false)?;
+        merge.editor.mark_dirty();
+        apply_client_state(&mut merge, &self.client_state)?;
+        self.mutations.register(merge_document_id, merged.text, true)?;
+        self.views.split_active(SplitAxis::Vertical)?;
+        let previous = std::mem::replace(&mut self.active, merge);
+        self.inactive.push(previous);
+        self.views.set_active_buffer(buffer_id);
+        self.save_conflict = None;
+        self.close_editor_popup();
+        self.message = if merged.conflicts == 0 {
+            "semantic merge pane opened beside the original; review it, then :write".to_owned()
+        } else {
+            format!("semantic merge pane opened with {} conflict block(s); resolve <<<<<<< / ======= / >>>>>>>, then :write", merged.conflicts)
+        };
+        self.prime_active_syntax();
+        Ok(())
+    }
+
+    fn replay_ours(&mut self, conflict: SaveConflict) -> Result<()> {
+        let theirs = self.refresh_conflict_theirs(&conflict)?;
+        let merged = semantic_three_way_merge(&conflict.base, &conflict.ours, &theirs);
+        if merged.conflicts > 0 {
+            return self.open_semantic_merge(conflict);
+        }
+        // Reload immediately before applying the replay. A second writer is
+        // allowed to race this action; if it did, retain both versions and ask
+        // again rather than replaying against a stale snapshot.
+        let current = self.active.reload_from_disk()?;
+        if current.as_str() != theirs.as_ref() {
+            // `reload_from_disk` adopted the newest disk revision, but the
+            // local edits still describe a change from the original conflict
+            // base. Retain that base for the retry so a second writer cannot
+            // make us replay local edits against the wrong ancestor.
+            self.active.base_text = Arc::clone(&conflict.base);
+            return self.present_save_conflict(conflict.path, "file changed again while preparing replay".to_owned(), conflict.ours.to_string());
+        }
+        let document_id = self.active.document_id;
+        self.mutations.register(document_id, current.clone(), true)?;
+        let transaction = Transaction::new(self.active.editor.revision(), vec![Edit::new(0..current.len(), merged.text)])?;
+        self.active.editor.apply_transaction(transaction.clone())?;
+        self.after_transaction([transaction]);
+        self.save_conflict = None;
+        self.close_editor_popup();
+        self.message = "took the disk version and replayed the local edits; review and :write".to_owned();
+        Ok(())
+    }
+
+    fn refresh_conflict_theirs(&mut self, conflict: &SaveConflict) -> Result<Arc<str>> {
+        let current: Arc<str> = Arc::from(self.active.document.read_current_text()?);
+        if current != conflict.theirs {
+            self.save_conflict = Some(SaveConflict { theirs: Arc::clone(&current), ..conflict.clone() });
+            self.popup = Some(TextPopup::new(
+                "File changed again",
+                format!(
+                    "{} changed again while resolving this conflict. The choices now use the newest disk version.\n\n1 take theirs\n2 take ours\n3 merge\n4 replay\nEsc cancel",
+                    conflict.path.display()
+                ),
+            ));
+            self.popup_deadline = None;
+        }
+        Ok(current)
     }
 
     pub(super) fn status_overlay(&self) -> StatusOverlay {

@@ -1263,13 +1263,24 @@ impl ViewportLayout {
         let start_byte = frame.text.byte_of_line(self.top_line);
         let mut builder = GridBuilder::new(self.width.saturating_sub(layout.gutter), layout.content_height, self.tab_width, start_byte, self.top_line);
         let end_byte = frame.text.byte_of_line(self.top_line.saturating_add(layout.content_height));
-        let visible = frame.text.slice(start_byte..end_byte);
-        builder.push_grapheme_document(&visible, frame.cursor_byte, decorations);
+        builder.push_frame_document(&frame.text, start_byte..end_byte, frame.cursor_byte, decorations);
         let mut row_lines = builder.row_lines.clone();
         row_lines.resize(layout.content_height, None);
         row_lines.truncate(layout.content_height);
         let mut rows = builder.rows;
-        let mut cursor = builder.cursor.unwrap_or((0, 0));
+        // A logical-line viewport can exhaust its physical rows before it
+        // reaches the cursor (for example, several wrapped Markdown lines).
+        // In that case, keep the cursor in the same viewport coordinate space
+        // as cached frames instead of falling back to the top-left cell.
+        let mut cursor = builder.cursor.unwrap_or_else(|| {
+            frame_cursor_visual_position(
+                &frame.text,
+                start_byte..frame.cursor_byte.min(frame.text.len()).max(start_byte),
+                self.width.saturating_sub(layout.gutter).max(1),
+                layout.content_height,
+                self.tab_width,
+            )
+        });
         if layout.gutter > 0 {
             let cursor_line = frame.text.line_of_byte(frame.cursor_byte);
             prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, layout.gutter, self.relative_numbers, line_decorations);
@@ -1394,8 +1405,7 @@ impl ViewportLayout {
     fn cached_line_rows(&mut self, request: EditorRenderRequest<'_>, line: usize, remaining: usize, decoration_indices: Option<&[usize]>) -> Vec<Arc<CellRow>> {
         let Range { start, end } = logical_line_range(&request.frame.text, line);
         let content_width = self.width.saturating_sub(self.editor_gutter(self.width)).max(1);
-        let visible = request.frame.text.slice(start..end);
-        let row_count = visual_line_rows_bounded(&visible, content_width, self.tab_width, remaining);
+        let row_count = frame_visual_line_rows_bounded(&request.frame.text, start..end, content_width, self.tab_width, remaining);
         let cursor_line = request.frame.text.line_of_byte(request.frame.cursor_byte);
         let key = (line, self.relative_numbers.then_some(cursor_line));
         let exact = self.cached_logical_rows.get(&key);
@@ -1443,7 +1453,7 @@ impl ViewportLayout {
             let range = start..line_end;
             let indices = decorations.overlapping_indices(range.clone());
             let width = self.width.saturating_sub(self.editor_gutter(self.width)).max(1);
-            if visual_line_rows_bounded(&cached.text.slice(start..line_end), width, self.tab_width, end - index) <= end - index {
+            if frame_visual_line_rows_bounded(&cached.text, start..line_end, width, self.tab_width, end - index) <= end - index {
                 self.cached_logical_rows.insert(
                     (*line, cached.relative_cursor_line),
                     CachedLogicalRow {
@@ -1494,8 +1504,7 @@ impl ViewportLayout {
     ) -> Vec<CellRow> {
         let gutter = self.editor_gutter(self.width);
         let mut builder = GridBuilder::new(self.width.saturating_sub(gutter), height.max(1), self.tab_width, start, logical_line);
-        let visible = text.slice(start..end);
-        builder.push_grapheme_document(&visible, usize::MAX, decorations);
+        builder.push_frame_document(text, start..end, usize::MAX, decorations);
         let mut rows = builder.rows;
         if gutter > 0 {
             prepend_line_numbers(&mut rows, &builder.row_lines, cursor_line, gutter, self.relative_numbers, line_decorations);
@@ -1512,14 +1521,15 @@ impl ViewportLayout {
         let content_height = self.editor_content_height(status, prompt);
         let gutter = self.editor_gutter(self.width);
         let cursor_byte = frame.cursor_byte.min(frame.text.len());
-        let cursor_line = frame.text.line_of_byte(cursor_byte);
-        let line_start = frame.text.byte_of_line(cursor_line);
-        let visible = frame.text.slice(line_start..cursor_byte.max(line_start));
-        let (column, wrapped_row) =
-            cursor_visual_position(&visible, 0, visible.len(), self.width.saturating_sub(gutter).max(1), content_height, self.tab_width);
-        let base_row =
-            self.cached_editor_render.as_ref().and_then(|cached| cached.content_row_lines.iter().position(|line| *line == Some(cursor_line))).unwrap_or(0);
-        let mut cursor = (column, base_row.saturating_add(wrapped_row).min(content_height.saturating_sub(1)));
+        let viewport_start = frame.text.byte_of_line(self.top_line);
+        let (column, row) = frame_cursor_visual_position(
+            &frame.text,
+            viewport_start..cursor_byte.max(viewport_start),
+            self.width.saturating_sub(gutter).max(1),
+            content_height,
+            self.tab_width,
+        );
+        let mut cursor = (column, row);
         cursor.0 = cursor.0.saturating_add(gutter);
         if let Some(label) = prompt {
             cursor = self.prompt_cursor(label);
@@ -2694,6 +2704,38 @@ impl GridBuilder {
         }
     }
 
+    fn push_frame_document(&mut self, text: &FrameText, range: Range<usize>, cursor_byte: usize, decorations: &[DecorationSpan]) {
+        let all_ascii = text
+            .visit_chunks(range.clone(), |chunk| if chunk.is_ascii() { std::ops::ControlFlow::Continue(()) } else { std::ops::ControlFlow::Break(()) })
+            .is_none();
+        if !all_ascii {
+            // Grapheme boundaries can cross arbitrary storage chunks. Keep the
+            // exact Unicode behavior on a bounded viewport while the common
+            // ASCII path below stays entirely chunk-backed.
+            let visible = text.slice(range);
+            self.push_grapheme_document(&visible, cursor_byte, decorations);
+            return;
+        }
+
+        let mut absolute_byte = self.document_start;
+        let mut decoration_resolver = DecorationResolver::new_at(decorations, self.document_start);
+        if cursor_byte < self.document_start {
+            self.cursor = Some((0, 0));
+        }
+        let _ = text.visit_chunks(range, |chunk| {
+            for byte in chunk.bytes() {
+                self.mark_cursor(absolute_byte, cursor_byte);
+                let style = decoration_resolver.style_or_default(absolute_byte..absolute_byte.saturating_add(1));
+                absolute_byte = absolute_byte.saturating_add(1);
+                if !self.push_document_ascii(byte, style) {
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+        self.mark_cursor(absolute_byte, cursor_byte);
+    }
+
     fn push_grapheme_document(&mut self, visible: &str, cursor_byte: usize, decorations: &[DecorationSpan]) {
         if visible.is_ascii() {
             self.push_ascii_document(visible.as_bytes(), cursor_byte, decorations);
@@ -2956,7 +2998,7 @@ fn line_number_prefix(logical_line: Option<usize>, cursor_line: usize, width: us
 fn logical_line_range(text: &FrameText, line: usize) -> Range<usize> {
     let start = text.byte_of_line(line);
     let end = text.byte_of_line(line.saturating_add(1));
-    start..end.saturating_sub(usize::from(end > start && text.slice(end - 1..end).as_ref() == "\n"))
+    start..end.saturating_sub(usize::from(end > start && text.character_at(end - 1) == Some('\n')))
 }
 
 fn single_byte_grapheme(byte: u8) -> CellGrapheme {
@@ -3183,6 +3225,11 @@ fn single_line_change(old: &FrameText, new: &FrameText) -> Option<FrameTextChang
     if let Some(change) = new.single_line_change_from(old) {
         return Some(change);
     }
+    // This fallback compares unrelated snapshots. The normal incremental path
+    // above uses the transaction's already-bounded change record; name the
+    // rare full materialization explicitly instead of relying on `Deref`.
+    let old = old.materialize_for_task();
+    let new = new.materialize_for_task();
     let mut difference = old.bytes().zip(new.bytes()).position(|(left, right)| left != right).unwrap_or_else(|| old.len().min(new.len()));
     if old == new {
         return None;
@@ -3197,7 +3244,8 @@ fn single_line_change(old: &FrameText, new: &FrameText) -> Option<FrameTextChang
     if old.get(..old_start) != new.get(..new_start) || old.get(old_end..) != new.get(new_end..) {
         return None;
     }
-    Some(FrameTextChange { line: old.line_of_byte(old_start), old_start, old_end, new_start, new_end })
+    let line = old[..old_start].bytes().filter(|byte| *byte == b'\n').count();
+    Some(FrameTextChange { line, old_start, old_end, new_start, new_end })
 }
 
 fn retain_decorations(decorations: &[DecorationSpan], shared: Option<&SharedDecorations>) -> SharedDecorations {
@@ -3234,6 +3282,72 @@ fn visual_line_rows_bounded(text: &str, width: usize, tab_width: usize, limit: u
         }
     }
     row.saturating_add(1)
+}
+
+/// Computes wrapping for the normal ASCII source path directly over storage
+/// chunks. Unicode/control-heavy content keeps the exact bounded fallback;
+/// it never causes a whole-document materialization.
+fn frame_visual_line_rows_bounded(text: &FrameText, range: Range<usize>, width: usize, tab_width: usize, limit: usize) -> usize {
+    if !frame_range_is_simple_ascii(text, range.clone()) {
+        return visual_line_rows_bounded(&text.slice(range), width, tab_width, limit);
+    }
+    let mut row = 0;
+    let mut column = 0;
+    let _ = text.visit_chunks(range, |chunk| {
+        for byte in chunk.bytes() {
+            advance_ascii_visual_byte(&mut row, &mut column, width, tab_width, byte);
+            if row >= limit {
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    if row >= limit { limit.saturating_add(1) } else { row.saturating_add(1) }
+}
+
+fn frame_cursor_visual_position(text: &FrameText, range: Range<usize>, width: usize, height: usize, tab_width: usize) -> (usize, usize) {
+    if !frame_range_is_simple_ascii(text, range.clone()) {
+        let visible = text.slice(range);
+        return cursor_visual_position(&visible, 0, visible.len(), width, height, tab_width);
+    }
+    let mut row = 0;
+    let mut column = 0;
+    let _ = text.visit_chunks(range, |chunk| {
+        for byte in chunk.bytes() {
+            advance_ascii_visual_byte(&mut row, &mut column, width, tab_width, byte);
+            if row >= height {
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    (column.min(width.saturating_sub(1)), row.min(height.saturating_sub(1)))
+}
+
+fn frame_range_is_simple_ascii(text: &FrameText, range: Range<usize>) -> bool {
+    text.visit_chunks(range, |chunk| {
+        if chunk.bytes().all(|byte| matches!(byte, b'\n' | b'\t' | b' '..=b'~')) {
+            std::ops::ControlFlow::Continue(())
+        } else {
+            std::ops::ControlFlow::Break(())
+        }
+    })
+    .is_none()
+}
+
+fn advance_ascii_visual_byte(row: &mut usize, column: &mut usize, width: usize, tab_width: usize, byte: u8) {
+    match byte {
+        b'\n' => {
+            *row = row.saturating_add(1);
+            *column = 0;
+        }
+        b'\t' => {
+            for _ in 0..tab_width.max(1) - (*column % tab_width.max(1)) {
+                advance_visual_cell(row, column, width, 1);
+            }
+        }
+        _ => advance_visual_cell(row, column, width, 1),
+    }
 }
 
 fn cursor_visual_position(text: &str, start_byte: usize, cursor_byte: usize, width: usize, height: usize, tab_width: usize) -> (usize, usize) {
@@ -3821,6 +3935,16 @@ mod tests {
     }
 
     #[test]
+    fn ascii_viewport_render_reads_frame_chunks_without_materializing() {
+        let text = FrameText::from("alpha beta\nsecond line\n");
+        let mut builder = GridBuilder::new(20, 2, 4, 0, 0);
+
+        builder.push_frame_document(&text, 0..text.len(), 0, &[]);
+
+        assert_eq!(text.materialization_count(), 0);
+    }
+
+    #[test]
     fn controls_are_escaped_before_terminal_patches() {
         let frame = EngineFrame::new("a\u{1b}\u{0}b", 0);
         let grid = ViewportLayout::new(20, 2).desired_grid(&frame);
@@ -3909,6 +4033,22 @@ mod tests {
         assert!(Arc::ptr_eq(&first.rows[0], &second.rows[0]));
         assert!(Arc::ptr_eq(&first.rows[1], &second.rows[1]));
         assert_eq!(second.cursor, (0, 1));
+    }
+
+    #[test]
+    fn cached_cursor_coordinates_follow_the_wrapped_viewport() {
+        let text = "skip\nabcdefghijkl\nmnopqrs\ntail";
+        let mut cached = ViewportLayout::new(8, 3);
+        cached.top_line = 1;
+        let _ = cached.desired_grid(&EngineFrame::new(text, 5));
+
+        for cursor in [6, 11, 15, 19, 23] {
+            let cached_grid = cached.desired_grid(&EngineFrame::new(text, cursor));
+            let mut fresh = ViewportLayout::new(8, 3);
+            fresh.top_line = 1;
+            let fresh_grid = fresh.desired_grid(&EngineFrame::new(text, cursor));
+            assert_eq!(cached_grid.cursor, fresh_grid.cursor, "cursor byte {cursor}");
+        }
     }
 
     #[test]

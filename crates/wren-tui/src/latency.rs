@@ -5,7 +5,6 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use wren_presenter::{PresentationObserver, Presenter};
 use wren_term::{TerminaBackend, TerminalBackend, TerminalError, TerminalInput, TerminalKey, TerminalKeyCode};
@@ -139,7 +138,7 @@ struct TilingProbe {
     presenter: Presenter<TerminaBackend<SharedCountingWriter>>,
     presented: mpsc::Receiver<u64>,
     presenter_bytes: Arc<AtomicU64>,
-    previous: Option<Arc<DesiredGrid>>,
+    previous: Option<DesiredGrid>,
     diagnostic_update: TerminalUpdate,
     setup_presentations: u64,
     samples: Vec<TilingPerformanceSample>,
@@ -158,7 +157,7 @@ impl TilingProbe {
         let diagnostic_terminal = TerminaBackend::new(CountingWriter::default());
         let presenter_writer = SharedCountingWriter::default();
         let presenter_bytes = Arc::clone(&presenter_writer.bytes);
-        let backend = Arc::new(Mutex::new(TerminaBackend::new(presenter_writer)));
+        let backend = TerminaBackend::new(presenter_writer);
         let (presented_sender, presented) = mpsc::sync_channel(1);
         let observer: PresentationObserver = Arc::new(move |epoch| {
             let _ = presented_sender.send(epoch);
@@ -196,12 +195,13 @@ impl TilingProbe {
         self.set_animation_time(elapsed);
         let frame = desired_frame(&mut self.layout, &self.app);
         let epoch = frame.epoch;
-        self.presenter.publish(Arc::clone(&frame))?;
+        let diagnostic = frame.clone();
+        self.presenter.publish(frame)?;
         let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("tiling performance setup presentation timed out")?;
         anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
-        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_update);
+        diff_into(self.previous.as_ref(), &diagnostic, &mut self.diagnostic_update);
         self.diagnostic_terminal.submit(&self.diagnostic_update)?;
-        self.previous = Some(frame);
+        self.previous = Some(diagnostic);
         self.setup_presentations = self.setup_presentations.saturating_add(1);
         Ok(())
     }
@@ -215,7 +215,8 @@ impl TilingProbe {
         let frame = desired_frame(&mut self.layout, &self.app);
         let desired_frame_nanos = elapsed_nanos(started);
         let epoch = frame.epoch;
-        self.presenter.publish(Arc::clone(&frame))?;
+        let diagnostic = frame.clone();
+        self.presenter.publish(frame)?;
         let presented = self.presented.recv_timeout(Duration::from_secs(5)).context("tiling performance presentation timed out")?;
         anyhow::ensure!(presented == epoch, "presenter completed an unexpected epoch");
         let full_render_nanos = elapsed_nanos(started);
@@ -231,12 +232,12 @@ impl TilingProbe {
         self.diagnostic_update.rows.clear();
         self.diagnostic_update.raster_overlay = None;
         let diff_started = Instant::now();
-        diff_into(self.previous.as_deref(), &frame, &mut self.diagnostic_update);
+        diff_into(self.previous.as_ref(), &diagnostic, &mut self.diagnostic_update);
         let diff_nanos = elapsed_nanos(diff_started);
         let terminal_started = Instant::now();
         self.diagnostic_terminal.submit(&self.diagnostic_update)?;
         let terminal_write_nanos = elapsed_nanos(terminal_started);
-        anyhow::ensure!(frame.raster_overlay.is_some(), "tiling performance sample did not render the startup tiling");
+        anyhow::ensure!(diagnostic.raster_overlay.is_some(), "tiling performance sample did not render the startup tiling");
         self.samples.push(TilingPerformanceSample {
             scenario: scenario.into(),
             width,
@@ -248,7 +249,7 @@ impl TilingProbe {
             terminal_patches: terminal_update_operations(&self.diagnostic_update),
             terminal_bytes,
         });
-        self.previous = Some(frame);
+        self.previous = Some(diagnostic);
         Ok(())
     }
 }
@@ -472,7 +473,7 @@ fn start_probe(mut app: App, open_started: Instant) -> Result<StartedProbe> {
     let mut layout = ViewportLayout::new(WIDTH, HEIGHT);
     layout.configure_dotfile_profile();
     app.resize_terminal(HEIGHT, WIDTH);
-    let backend = Arc::new(Mutex::new(MeasuringBackend::new()?));
+    let backend = MeasuringBackend::new()?;
     let (presented_sender, presented) = mpsc::sync_channel(1);
     let observer: PresentationObserver = Arc::new(move |epoch| {
         let _ = presented_sender.send(epoch);

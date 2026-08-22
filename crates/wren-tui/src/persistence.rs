@@ -589,7 +589,7 @@ type PendingWalFrame = ([u8; 32], u64, FrameText, usize);
 
 fn persist_wal_frame(wal: &LocalWal, frame: PendingWalFrame) -> Result<()> {
     let (base_hash, revision, text, cursor) = frame;
-    let text = text.shared();
+    let text = text.materialize_for_task();
     if *blake3::hash(text.as_bytes()).as_bytes() == base_hash {
         wal.clear()?;
     } else {

@@ -15,8 +15,8 @@ impl App {
         let bundle = language_bundle(self.active.document.presentation_path());
         let language_id = bundle.language_id.clone();
         let frame = self.active.editor.frame();
-        let text = frame.text.as_ref();
-        let spans = provider_decorations(highlight_text(text, &language_id));
+        let text = frame.text.materialize_for_task();
+        let spans = provider_decorations(highlight_text(&text, &language_id));
         self.decorations.insert(self.active.buffer_id, BufferDecorations::new(revision, spans));
         self.provider_refresh_ranges.entry(self.active.document_id).or_insert_with(|| Vec::with_capacity(4));
     }
@@ -28,6 +28,15 @@ impl App {
     pub(super) fn refresh_changed_syntax(&mut self, transactions: &[Transaction]) {
         if transactions.iter().all(Transaction::is_empty) {
             return;
+        }
+        const MAX_PENDING_PROVIDER_TRANSACTIONS: usize = 64;
+        let document_id = self.active.document_id;
+        let pending_transactions = self.provider_pending_transactions.entry(document_id).or_default();
+        if pending_transactions.len().saturating_add(transactions.len()) > MAX_PENDING_PROVIDER_TRANSACTIONS {
+            pending_transactions.clear();
+            self.provider_resync_required.insert(document_id);
+        } else {
+            pending_transactions.extend(transactions.iter().cloned());
         }
         let frame = self.active.editor.frame();
         let language_id = language_bundle(self.active.document.presentation_path()).language_id;
@@ -51,7 +60,8 @@ impl App {
             }
             state.replace_ranges(revision, &targets, replacement);
         } else {
-            *state = BufferDecorations::new(revision, provider_decorations(highlight_text(frame.text.as_ref(), &language_id)));
+            let text = frame.text.materialize_for_task();
+            *state = BufferDecorations::new(revision, provider_decorations(highlight_text(&text, &language_id)));
         }
         self.provider_refresh_due.insert(self.active.document_id, Instant::now() + Duration::from_millis(50));
     }
@@ -157,6 +167,11 @@ impl App {
                     document_id: buffer.document_id,
                     revision: buffer.editor.revision(),
                     text: buffer.editor.frame().text,
+                    transactions: if self.provider_resync_required.contains(&buffer.document_id) {
+                        Vec::new()
+                    } else {
+                        self.provider_pending_transactions.get(&buffer.document_id).cloned().unwrap_or_default()
+                    },
                     bundle: language_bundle(buffer.document.presentation_path()),
                     visible,
                     near_viewport,
@@ -173,11 +188,16 @@ impl App {
         let key = ProviderDemandKey::from(&refresh);
         let already_submitted = self.provider_submitted.get(&refresh.document_id) == Some(&key);
         let still_debouncing = self.provider_refresh_due.get(&refresh.document_id).is_some_and(|due| now < *due);
-        if already_submitted || still_debouncing || !self.provider.try_refresh(refresh.clone()) {
+        if already_submitted || still_debouncing {
             return;
         }
-        self.provider_submitted.insert(refresh.document_id, key);
-        self.provider_refresh_due.remove(&refresh.document_id);
+        let document_id = refresh.document_id;
+        if self.provider.try_refresh(refresh) {
+            self.provider_submitted.insert(document_id, key);
+            self.provider_refresh_due.remove(&document_id);
+            self.provider_pending_transactions.remove(&document_id);
+            self.provider_resync_required.remove(&document_id);
+        }
     }
 
     pub(super) fn poll_provider_results(&mut self) -> bool {
@@ -202,6 +222,7 @@ impl App {
                 }
                 ProviderWorkerResult::Failed { document_id, message } => {
                     self.provider_submitted.remove(&document_id);
+                    self.provider_resync_required.insert(document_id);
                     self.show_error(format!("provider: {message}"));
                     changed = true;
                 }
@@ -286,7 +307,7 @@ impl App {
         let completion = ProviderCompletion {
             document_id: self.active.document_id,
             revision: self.active.editor.revision(),
-            text: self.active.editor.frame().text.shared(),
+            text: self.active.editor.frame().text,
             bundle: language_bundle(self.active.document.presentation_path()),
             byte: self.active.editor.primary_cursor(),
         };

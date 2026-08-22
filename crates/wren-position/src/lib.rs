@@ -1,19 +1,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-#[cfg(test)]
 use std::collections::BTreeMap;
-#[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
-#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
-#[cfg(test)]
 use wren_text::TextStore;
-#[cfg(test)]
 use wren_types::{Anchor, ConfigGeneration, DocumentClass, Transaction};
 
 use thiserror::Error;
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinePosition {
     pub byte: usize,
@@ -23,7 +17,6 @@ pub struct LinePosition {
     pub cell: usize,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionIndex {
     base_byte: usize,
@@ -37,19 +30,16 @@ pub enum PositionError {
     OutOfRange { value: usize },
     #[error("byte {byte} is not a UTF-8 scalar boundary")]
     NotScalarBoundary { byte: usize },
-    #[cfg(test)]
     #[error("cell {cell} lies inside a wide grapheme")]
     InsideWideGrapheme { cell: usize },
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LspPositionEncoding {
     Utf8,
     Utf16,
 }
 
-#[cfg(test)]
 #[must_use]
 pub fn negotiate_lsp_position_encoding(peer: &[LspPositionEncoding]) -> LspPositionEncoding {
     if peer.contains(&LspPositionEncoding::Utf8) { LspPositionEncoding::Utf8 } else { LspPositionEncoding::Utf16 }
@@ -90,13 +80,11 @@ pub fn utf16_position_to_byte(text: &str, line_starts: &[usize], line: usize, co
     Ok(start + relative)
 }
 
-#[cfg(test)]
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LazyLinePositionIndex {
     lines: BTreeMap<usize, PositionIndex>,
 }
 
-#[cfg(test)]
 impl LazyLinePositionIndex {
     pub fn line<T: TextStore>(&mut self, store: &T, line: usize) -> Result<&PositionIndex, PositionError> {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.lines.entry(line) {
@@ -118,7 +106,6 @@ impl LazyLinePositionIndex {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayCheckpoint {
     pub byte_offset: usize,
@@ -128,15 +115,13 @@ pub struct DisplayCheckpoint {
     pub exact: bool,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayLookup {
     pub checkpoint: DisplayCheckpoint,
     pub scanned_bytes: usize,
 }
 
-#[cfg(test)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DisplayIndex {
     checkpoints: BTreeMap<usize, DisplayCheckpoint>,
     config_generation: ConfigGeneration,
@@ -144,7 +129,6 @@ pub struct DisplayIndex {
     exact_scan_budget_bytes: usize,
 }
 
-#[cfg(test)]
 impl DisplayIndex {
     #[must_use]
     pub fn new(config_generation: ConfigGeneration, tab_width: usize) -> Self {
@@ -208,7 +192,6 @@ impl DisplayIndex {
     }
 }
 
-#[cfg(test)]
 impl PositionIndex {
     #[must_use]
     pub fn new(line: &str, base_byte: usize) -> Self {

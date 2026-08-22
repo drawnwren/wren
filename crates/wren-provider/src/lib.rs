@@ -13,7 +13,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Pattern};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tree_sitter::{Query, QueryCursor, QueryMatch, QueryPredicateArg, StreamingIterator};
+use tree_sitter::{InputEdit, Point, Query, QueryCursor, QueryMatch, QueryPredicateArg, StreamingIterator, Tree};
 #[cfg(test)]
 use wren_types::Bias;
 use wren_types::{
@@ -27,6 +27,25 @@ pub enum ProviderRequest {
     Hello {
         protocol: u32,
     },
+    /// Opens (or resynchronizes) the provider-owned document snapshot. This
+    /// is reserved for first open, process restart, and a detected delta gap.
+    OpenDocument {
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        text: Box<str>,
+        bundle: LanguageBundle,
+    },
+    /// Applies a contiguous revision chain to provider-owned text. Normal
+    /// typing uses this request instead of shipping a replacement snapshot.
+    ApplyTransactions {
+        document_id: DocumentId,
+        from_revision: DocumentRevision,
+        revision: DocumentRevision,
+        generation: ProviderGeneration,
+        transactions: Vec<Transaction>,
+    },
+    /// Legacy snapshot spelling accepted for protocol compatibility. New
+    /// callers use `OpenDocument`.
     UpdateDocument {
         document_id: DocumentId,
         revision: DocumentRevision,
@@ -130,16 +149,21 @@ pub enum ProviderError {
     StaleCompletion { expected: DocumentRevision, actual: DocumentRevision },
     #[error("provider document is at revision {expected:?}, cannot advance from {actual:?}")]
     StaleDocumentRevision { expected: DocumentRevision, actual: DocumentRevision },
+    #[error("provider document revision counter overflow")]
+    CounterOverflow,
 }
 
 #[derive(Debug, Clone)]
 struct ProviderDocument {
     revision: DocumentRevision,
-    text: Box<str>,
+    text: String,
+    language_id: Arc<str>,
     generation: ProviderGeneration,
-    syntax_spans: Vec<HighlightSpan>,
-    syntax_prefix_max_end: Vec<usize>,
     grammar_backend: GrammarBackend,
+    /// The provider keeps Tree-sitter's previous tree so a revision delta can
+    /// edit it before the next parse. This is deliberately provider-owned:
+    /// the interactive client never needs to parse or retain syntax trees.
+    syntax_tree: Option<Tree>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,7 +269,6 @@ pub struct ProviderActor {
     lexical_accelerator: LexicalAccelerator,
 }
 
-#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug, Clone)]
 pub struct QueuedDemand {
     pub document_id: DocumentId,
@@ -255,7 +278,6 @@ pub struct QueuedDemand {
 
 /// Bounded latest-wins scheduler. A document can occupy only one queue slot;
 /// newer revisions replace obsolete work before it reaches the provider.
-#[cfg(any(test, feature = "benchmarking"))]
 #[derive(Debug)]
 pub struct LatestDemandQueue {
     capacity: usize,
@@ -264,25 +286,33 @@ pub struct LatestDemandQueue {
     pending: BTreeMap<DocumentId, QueuedDemand>,
 }
 
-#[cfg(any(test, feature = "benchmarking"))]
 impl LatestDemandQueue {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self { capacity: capacity.max(1), sequence: 0, dropped: 0, pending: BTreeMap::new() }
     }
 
-    pub fn push(&mut self, document_id: DocumentId, demand: ProviderDemand) {
+    /// Queues the newest demand for `document_id` and returns the document
+    /// evicted by the fixed-capacity scheduler, if any. Callers use that
+    /// identity to drop their matching pending payload as well, so a demand
+    /// lane cannot retain an unbounded side map behind a bounded queue.
+    pub fn push(&mut self, document_id: DocumentId, demand: ProviderDemand) -> Option<DocumentId> {
         self.sequence = self.sequence.saturating_add(1);
         if self.pending.contains_key(&document_id) {
             self.dropped = self.dropped.saturating_add(1);
+            self.pending.insert(document_id, QueuedDemand { document_id, demand, sequence: self.sequence });
+            return None;
         } else if self.pending.len() >= self.capacity {
             let eviction = self.pending.iter().min_by_key(|(_, queued)| (queued.demand.priority, queued.sequence)).map(|(id, _)| *id);
             if let Some(eviction) = eviction {
                 self.pending.remove(&eviction);
                 self.dropped = self.dropped.saturating_add(1);
+                self.pending.insert(document_id, QueuedDemand { document_id, demand, sequence: self.sequence });
+                return Some(eviction);
             }
         }
         self.pending.insert(document_id, QueuedDemand { document_id, demand, sequence: self.sequence });
+        None
     }
 
     pub fn pop(&mut self) -> Option<QueuedDemand> {
@@ -291,13 +321,11 @@ impl LatestDemandQueue {
     }
 
     #[must_use]
-    #[cfg(any(test, feature = "benchmarking"))]
     pub fn depth(&self) -> usize {
         self.pending.len()
     }
 
     #[must_use]
-    #[cfg(any(test, feature = "benchmarking"))]
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
@@ -319,20 +347,30 @@ impl ProviderActor {
     pub fn handle(&mut self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         match request {
             ProviderRequest::Hello { protocol } => Ok(ProviderResponse::Hello { protocol }),
-            ProviderRequest::UpdateDocument { document_id, revision, text, bundle } => {
-                let generation = bundle.provider_generation();
-                let (grammar_backend, mut syntax_spans) = query_tree_sitter_spans(&text, &bundle.language_id)
-                    .map_or_else(|| (GrammarBackend::DynamicWasmFallback, Vec::new()), |spans| (GrammarBackend::BundledNative, spans));
-                syntax_spans.sort_by_key(|span| (span.range.start, span.range.end, span.priority));
-                let mut maximum_end = 0;
-                let syntax_prefix_max_end = syntax_spans
-                    .iter()
-                    .map(|span| {
-                        maximum_end = maximum_end.max(span.range.end);
-                        maximum_end
-                    })
-                    .collect();
-                self.documents.insert(document_id, ProviderDocument { revision, text, generation, syntax_spans, syntax_prefix_max_end, grammar_backend });
+            ProviderRequest::OpenDocument { document_id, revision, text, bundle } | ProviderRequest::UpdateDocument { document_id, revision, text, bundle } => {
+                self.open_document(document_id, revision, text, bundle)
+            }
+            ProviderRequest::ApplyTransactions { document_id, from_revision, revision, generation, transactions } => {
+                let document = self.documents.get_mut(&document_id).ok_or(ProviderError::UnknownDocument(document_id))?;
+                if document.revision != from_revision || document.generation != generation {
+                    return Err(ProviderError::StaleDocumentRevision { expected: document.revision, actual: from_revision });
+                }
+                for transaction in &transactions {
+                    if transaction.base_revision() != document.revision {
+                        return Err(ProviderError::StaleDocumentRevision { expected: document.revision, actual: transaction.base_revision() });
+                    }
+                    let edits = apply_transaction_in_place(&mut document.text, transaction)?;
+                    if let Some(tree) = &mut document.syntax_tree {
+                        for edit in edits {
+                            tree.edit(&edit);
+                        }
+                    }
+                    document.revision = document.revision.next().ok_or(ProviderError::CounterOverflow)?;
+                }
+                if document.revision != revision {
+                    return Err(ProviderError::StaleDocumentRevision { expected: document.revision, actual: revision });
+                }
+                refresh_document_syntax(document);
                 Ok(ProviderResponse::Updated { key: document_key(document_id, revision, generation) })
             }
             ProviderRequest::AdvanceDocumentRevision { document_id, from_revision, revision, generation } => {
@@ -351,6 +389,27 @@ impl ProviderActor {
         }
     }
 
+    fn open_document(
+        &mut self,
+        document_id: DocumentId,
+        revision: DocumentRevision,
+        text: Box<str>,
+        bundle: LanguageBundle,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let generation = bundle.provider_generation();
+        let mut document = ProviderDocument {
+            revision,
+            text: text.into(),
+            language_id: bundle.language_id.into(),
+            generation,
+            grammar_backend: GrammarBackend::DynamicWasmFallback,
+            syntax_tree: None,
+        };
+        refresh_document_syntax(&mut document);
+        self.documents.insert(document_id, document);
+        Ok(ProviderResponse::Updated { key: document_key(document_id, revision, generation) })
+    }
+
     fn highlight(&mut self, document_id: DocumentId, demand: ProviderDemand) -> Result<HighlightResult, ProviderError> {
         let (documents, lexical_accelerator) = (&self.documents, &mut self.lexical_accelerator);
         let document = documents.get(&document_id).ok_or(ProviderError::UnknownDocument(document_id))?;
@@ -358,14 +417,12 @@ impl ProviderActor {
         let mut requested_ranges = demand.visible;
         requested_ranges.extend(demand.near_viewport);
         requested_ranges = coalesce_ranges(requested_ranges, document.text.len());
-        let mut spans = requested_ranges
-            .iter()
-            .flat_map(|range| {
-                let first = document.syntax_prefix_max_end.partition_point(|maximum_end| *maximum_end <= range.start);
-                let last = document.syntax_spans.partition_point(|span| span.range.start < range.end);
-                document.syntax_spans[first..last].iter().filter(move |span| span.range.start < range.end && range.start < span.range.end).cloned()
-            })
-            .collect::<Vec<_>>();
+        let mut spans = document
+            .syntax_tree
+            .as_ref()
+            .filter(|_| document.grammar_backend == GrammarBackend::BundledNative)
+            .and_then(|tree| query_tree_sitter_spans_for_ranges(&document.text, &document.language_id, tree, &requested_ranges))
+            .unwrap_or_default();
         if document.grammar_backend == GrammarBackend::DynamicWasmFallback || spans.is_empty() {
             for range in &requested_ranges {
                 let source = &document.text[range.clone()];
@@ -416,16 +473,88 @@ impl ProviderActor {
     }
 }
 
+/// Applies one transaction right-to-left and returns the matching Tree-sitter
+/// edits in the same order. Processing from the right keeps every remaining
+/// base-revision byte offset and point valid without constructing an
+/// intermediate full-document snapshot.
+fn apply_transaction_in_place(text: &mut String, transaction: &Transaction) -> Result<Vec<InputEdit>, ProviderError> {
+    transaction
+        .validate_boundaries(text.len(), |offset| text.is_char_boundary(offset))
+        .map_err(|error| ProviderError::Json(serde_json::Error::io(io::Error::other(format!("provider transaction boundary: {error}")))))?;
+    let mut tree_edits = Vec::with_capacity(transaction.edits().len());
+    for edit in transaction.edits().iter().rev() {
+        tree_edits.push(tree_sitter_input_edit(text, edit));
+        text.replace_range(edit.range.clone(), edit.insert.as_ref());
+    }
+    Ok(tree_edits)
+}
+
+fn tree_sitter_input_edit(text: &str, edit: &Edit) -> InputEdit {
+    let start_position = tree_sitter_point(text, edit.range.start);
+    let old_end_position = tree_sitter_point(text, edit.range.end);
+    let inserted = edit.insert.as_ref();
+    let newline_count = inserted.bytes().filter(|byte| *byte == b'\n').count();
+    let new_end_position = if newline_count == 0 {
+        Point { row: start_position.row, column: start_position.column.saturating_add(inserted.len()) }
+    } else {
+        Point {
+            row: start_position.row.saturating_add(newline_count),
+            column: inserted.len().saturating_sub(inserted.rfind('\n').unwrap_or(0).saturating_add(1)),
+        }
+    };
+    InputEdit {
+        start_byte: edit.range.start,
+        old_end_byte: edit.range.end,
+        new_end_byte: edit.range.start.saturating_add(inserted.len()),
+        start_position,
+        old_end_position,
+        new_end_position,
+    }
+}
+
+fn tree_sitter_point(text: &str, byte: usize) -> Point {
+    let prefix = &text[..byte];
+    let row = prefix.bytes().filter(|value| *value == b'\n').count();
+    let column = prefix.rfind('\n').map_or(byte, |newline| byte.saturating_sub(newline.saturating_add(1)));
+    Point { row, column }
+}
+
+fn refresh_document_syntax(document: &mut ProviderDocument) {
+    let tree = parse_tree_sitter(&document.text, &document.language_id, document.syntax_tree.as_ref());
+    document.grammar_backend = if tree.is_some() { GrammarBackend::BundledNative } else { GrammarBackend::DynamicWasmFallback };
+    document.syntax_tree = tree;
+}
+
 fn query_tree_sitter_spans(text: &str, language_id: &str) -> Option<Vec<HighlightSpan>> {
+    let tree = parse_tree_sitter(text, language_id, None)?;
+    query_tree_sitter_spans_for_tree(text, language_id, &tree, query_worker_count(text.len()))
+}
+
+#[cfg(test)]
+fn query_tree_sitter_spans_with_workers(text: &str, language_id: &str, workers: usize) -> Option<Vec<HighlightSpan>> {
+    let tree = parse_tree_sitter(text, language_id, None)?;
+    query_tree_sitter_spans_for_tree(text, language_id, &tree, workers)
+}
+
+fn query_worker_count(text_len: usize) -> usize {
     const BYTES_PER_QUERY_WORKER: usize = 256 * 1024;
     const MAX_QUERY_WORKERS: usize = 4;
 
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let workers = text.len().div_ceil(BYTES_PER_QUERY_WORKER).clamp(1, MAX_QUERY_WORKERS).min(available);
-    query_tree_sitter_spans_with_workers(text, language_id, workers)
+    text_len.div_ceil(BYTES_PER_QUERY_WORKER).clamp(1, MAX_QUERY_WORKERS).min(available)
 }
 
-fn query_tree_sitter_spans_with_workers(text: &str, language_id: &str, workers: usize) -> Option<Vec<HighlightSpan>> {
+fn parse_tree_sitter(text: &str, language_id: &str, previous: Option<&Tree>) -> Option<Tree> {
+    use ast_grep_language::{LanguageExt, SupportLang};
+
+    let supported = language_id.parse::<SupportLang>().ok()?;
+    let language = supported.get_ts_language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    parser.parse(text, previous)
+}
+
+fn query_tree_sitter_spans_for_tree(text: &str, language_id: &str, tree: &Tree, workers: usize) -> Option<Vec<HighlightSpan>> {
     use ast_grep_language::{LanguageExt, SupportLang};
 
     let supported = language_id.parse::<SupportLang>().ok()?;
@@ -434,9 +563,6 @@ fn query_tree_sitter_spans_with_workers(text: &str, language_id: &str, workers: 
     let capture_kinds = query.capture_names().iter().map(|kind| Arc::<str>::from(*kind)).collect::<Vec<_>>();
     let pattern_priorities = query_pattern_priorities(&query);
     let capture_offsets = query_capture_offsets(&query);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&language).ok()?;
-    let tree = parser.parse(text, None)?;
     let root = tree.root_node();
     let ranges = query_worker_ranges(root, text.len(), workers);
     let mut spans = if let [range] = ranges.as_slice() {
@@ -456,6 +582,27 @@ fn query_tree_sitter_spans_with_workers(text: &str, language_id: &str, workers: 
         .flatten()
         .collect()
     };
+    normalize_highlight_spans(&mut spans);
+    Some(spans)
+}
+
+/// Queries only the currently demanded ranges from an already incrementally
+/// parsed tree. Viewport demand is intentionally bounded, so keeping this
+/// serial avoids spinning up work whose scheduling cost exceeds the query.
+fn query_tree_sitter_spans_for_ranges(text: &str, language_id: &str, tree: &Tree, ranges: &[Range<usize>]) -> Option<Vec<HighlightSpan>> {
+    use ast_grep_language::{LanguageExt, SupportLang};
+
+    let supported = language_id.parse::<SupportLang>().ok()?;
+    let language = supported.get_ts_language();
+    let query = cached_highlight_query(language_id, &language)?;
+    let capture_kinds = query.capture_names().iter().map(|kind| Arc::<str>::from(*kind)).collect::<Vec<_>>();
+    let pattern_priorities = query_pattern_priorities(&query);
+    let capture_offsets = query_capture_offsets(&query);
+    let root = tree.root_node();
+    let mut spans = ranges
+        .iter()
+        .flat_map(|range| collect_query_spans(&query, root, text, &capture_kinds, &pattern_priorities, &capture_offsets, range.clone()))
+        .collect::<Vec<_>>();
     normalize_highlight_spans(&mut spans);
     Some(spans)
 }
@@ -894,15 +1041,37 @@ impl ProviderSupervisor {
 
     fn remember(&mut self, request: &ProviderRequest) {
         match request {
-            ProviderRequest::UpdateDocument { document_id, .. } => {
+            ProviderRequest::OpenDocument { document_id, .. } | ProviderRequest::UpdateDocument { document_id, .. } => {
                 self.open_documents.insert(*document_id, request.clone());
             }
             ProviderRequest::AdvanceDocumentRevision { document_id, from_revision, revision, generation } => {
-                if let Some(ProviderRequest::UpdateDocument { revision: stored_revision, bundle, .. }) = self.open_documents.get_mut(document_id)
-                    && stored_revision == from_revision
-                    && bundle.provider_generation() == *generation
-                {
-                    *stored_revision = *revision;
+                if let Some(snapshot) = self.open_documents.get_mut(document_id) {
+                    match snapshot {
+                        ProviderRequest::OpenDocument { revision: stored_revision, bundle, .. }
+                        | ProviderRequest::UpdateDocument { revision: stored_revision, bundle, .. }
+                            if stored_revision == from_revision && bundle.provider_generation() == *generation =>
+                        {
+                            *stored_revision = *revision;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ProviderRequest::ApplyTransactions { document_id, from_revision, revision, generation, transactions } => {
+                if let Some(snapshot) = self.open_documents.get_mut(document_id) {
+                    match snapshot {
+                        ProviderRequest::OpenDocument { revision: stored_revision, text, bundle, .. }
+                        | ProviderRequest::UpdateDocument { revision: stored_revision, text, bundle, .. }
+                            if stored_revision == from_revision && bundle.provider_generation() == *generation =>
+                        {
+                            let mut current = text.to_string();
+                            if transactions.iter().try_for_each(|transaction| apply_transaction_in_place(&mut current, transaction).map(|_| ())).is_ok() {
+                                *text = current.into_boxed_str();
+                                *stored_revision = *revision;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -1036,6 +1205,79 @@ mod tests {
             ProviderResponse::Highlight(result) => result,
             response => panic!("expected highlight, got {response:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_replay_updates_provider_owned_text_without_a_snapshot_reopen() {
+        let mut actor = ProviderActor::default();
+        let document_id = DocumentId::new(91);
+        let bundle = bundle();
+        actor
+            .handle(ProviderRequest::OpenDocument {
+                document_id,
+                revision: DocumentRevision::new(1),
+                text: "fn old_name() {}\n".into(),
+                bundle: bundle.clone(),
+            })
+            .expect("open provider document");
+        let transaction = Transaction::new(DocumentRevision::new(1), vec![Edit::new(3..11, "new_name")]).expect("valid replacement");
+        actor
+            .handle(ProviderRequest::ApplyTransactions {
+                document_id,
+                from_revision: DocumentRevision::new(1),
+                revision: DocumentRevision::new(2),
+                generation: bundle.provider_generation(),
+                transactions: vec![transaction],
+            })
+            .expect("replay transaction");
+        let ProviderResponse::Completion(result) = actor
+            .handle(ProviderRequest::Complete { document_id, revision: DocumentRevision::new(2), byte: "fn new_n".len() })
+            .expect("complete replayed document")
+        else {
+            panic!("provider completion response expected");
+        };
+        assert_eq!(result.freshness, Freshness::Fresh);
+        assert!(result.candidates.iter().any(|candidate| candidate.label.as_ref() == "new_name"));
+    }
+
+    #[test]
+    fn transaction_replay_edits_and_reuses_the_provider_syntax_tree() {
+        let mut actor = ProviderActor::default();
+        let document_id = DocumentId::new(92);
+        let bundle = bundle();
+        let source = "fn first() {}\nfn second() {}\n";
+        actor
+            .handle(ProviderRequest::OpenDocument { document_id, revision: DocumentRevision::new(1), text: source.into(), bundle: bundle.clone() })
+            .expect("open provider document");
+        let previous_tree = actor.documents.get(&document_id).and_then(|document| document.syntax_tree.clone()).expect("native syntax tree");
+        let transaction = Transaction::new(DocumentRevision::new(1), vec![Edit::new(3..8, "first\n// inserted")]).expect("valid replacement");
+        actor
+            .handle(ProviderRequest::ApplyTransactions {
+                document_id,
+                from_revision: DocumentRevision::new(1),
+                revision: DocumentRevision::new(2),
+                generation: bundle.provider_generation(),
+                transactions: vec![transaction],
+            })
+            .expect("replay transaction");
+        let document = actor.documents.get(&document_id).expect("document remains open");
+        let current_tree = document.syntax_tree.as_ref().expect("incrementally reparsed tree");
+        assert!(previous_tree.changed_ranges(current_tree).next().is_some(), "the edited tree must carry the transaction delta into reparsing");
+        let ProviderResponse::Highlight(highlight) = actor
+            .handle(ProviderRequest::Demand {
+                document_id,
+                demand: ProviderDemand {
+                    revision: DocumentRevision::new(2),
+                    visible: vec![0..source.len().saturating_add(16)],
+                    near_viewport: Vec::new(),
+                    priority: Priority::Visible,
+                },
+            })
+            .expect("query incrementally parsed tree")
+        else {
+            panic!("highlight response expected");
+        };
+        assert!(highlight.spans.iter().any(|span| span.kind.as_ref() == "comment"), "query results must come from the incrementally parsed tree");
     }
 
     fn assert_highlights(source: &str, language: &str, expected: &[(&str, &str)]) {
